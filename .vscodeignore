@@ -1,0 +1,15 @@
+.agents/**
+.git/**
+.gitignore
+.vscodeignore
+AGENTS.md
+ReferenceSrc/**
+__pycache__/**
+*.pyc
+*.log
+*.vsix
+test_monitor_codex_usage.py
+usage_monitor_*.json
+usage_monitor_*.jsonl
+usage_monitor_*.json.*
+usage_monitor_*.jsonl.*

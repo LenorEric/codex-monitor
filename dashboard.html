@@ -1,0 +1,412 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex Usage Monitor</title>
+<style>
+:root{color-scheme:dark;--bg:#0f1115;--panel:#171a21;--panel2:#1d222b;--text:#e8ecf1;--muted:#9aa4b2;--border:#2a303a;--blue:#4f8cff;--green:#4cc38a;--orange:#f3a43b;--red:#ff6b6b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 system-ui,-apple-system,Segoe UI,Arial,sans-serif}
+header{position:sticky;top:0;z-index:5;background:rgba(15,17,21,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(10px)}
+.bar{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:14px 18px}
+.title{font-size:17px;font-weight:650}.sub{color:var(--muted);font-size:12px}.controls,.range-buttons,.quota{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.quota{font-variant-numeric:tabular-nums}.quota span{border:1px solid var(--border);background:var(--panel2);border-radius:7px;padding:5px 9px;white-space:nowrap}
+button,.date-range{height:30px;border:1px solid var(--border);background:var(--panel2);color:var(--text);border-radius:7px;padding:0 10px}
+button{cursor:pointer}
+button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#fff}
+.date-range{color-scheme:dark;width:138px}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;padding:16px 18px}.wide{grid-column:1/-1}
+.card{border:1px solid var(--border);background:var(--panel);border-radius:8px;padding:12px;min-width:0}
+.card-title{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:8px}.card h2{font-size:14px;margin:0}
+.rate{color:var(--text);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
+.meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:8px}
+.chart{width:100%;height:280px;display:block}
+.window-progress{display:grid;grid-template-columns:max-content minmax(120px,1fr) max-content;gap:8px 12px;align-items:center;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-variant-numeric:tabular-nums}
+.progress-label{min-width:88px;font-weight:650}.progress-track{height:10px;overflow:hidden;background:var(--panel2);border-radius:999px}
+.progress-fill{width:0;height:100%;background:var(--blue);border-radius:inherit;transition:width .3s ease}.progress-value{text-align:right}
+.progress-reset{grid-column:2/-1;color:var(--muted);font-size:12px}.usage-fill{background:var(--blue)}
+.window-progress.weekly .time-fill,.window-progress.weekly .usage-fill{background:var(--green)}
+.empty{height:280px;display:flex;align-items:center;justify-content:center;color:var(--muted);border:1px dashed var(--border);border-radius:6px}
+.tooltip{position:fixed;display:none;pointer-events:none;background:#101318;border:1px solid var(--border);border-radius:7px;padding:9px;box-shadow:0 12px 32px rgba(0,0,0,.35)}
+.tooltip{max-width:360px;z-index:20;color:var(--text)}
+.legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+.status{padding:0 18px 14px;color:var(--muted)}
+@media(max-width:900px){.grid{grid-template-columns:1fr}.bar{align-items:flex-start;flex-direction:column}.chart{height:250px}}
+</style>
+</head>
+<body>
+<header>
+<div class="bar">
+<div><div class="title">Codex Usage Monitor</div><div class="sub" id="subtitle">Loading history...</div></div>
+<div class="quota"><span id="top5h">5h: -</span><span id="top7d">7d: -</span></div>
+<div class="controls"><div class="range-buttons" id="ranges"></div><button id="prevDate" aria-label="Previous day">&lt;</button><input class="date-range" id="rangeDate" type="date" aria-label="Calendar day"><button id="nextDate" aria-label="Next day">&gt;</button></div>
+</div>
+<div class="status" id="status"></div>
+</header>
+<main class="grid compact-grid">
+<section class="card">
+<div class="card-title"><h2>5h Delta Cost vs Delta Usage</h2><span class="rate" id="rate5h">Cost / 100%: -</span></div>
+<div class="meta"><span>Cumulative delta % on X axis</span><span>Cumulative delta USD on Y axis</span></div>
+<canvas class="chart" id="scatter5h"></canvas>
+<div class="window-progress">
+<span class="progress-label">5h time</span><div class="progress-track"><div class="progress-fill time-fill" id="time5hFill"></div></div><span class="progress-value" id="time5hValue">-</span>
+<span class="progress-reset" id="time5hReset">Reset: -</span>
+<span class="progress-label">5h usage</span><div class="progress-track"><div class="progress-fill usage-fill" id="usage5hFill"></div></div><span class="progress-value" id="usage5hValue">-</span>
+</div>
+</section>
+<section class="card">
+<div class="card-title"><h2>7d Delta Cost vs Delta Usage</h2><span class="rate" id="rate7d">Cost / 100%: -</span></div>
+<div class="meta"><span>Cumulative delta % on X axis</span><span>Cumulative delta USD on Y axis</span></div>
+<canvas class="chart" id="scatter7d"></canvas>
+<div class="window-progress weekly">
+<span class="progress-label">7d time</span><div class="progress-track"><div class="progress-fill time-fill" id="time7dFill"></div></div><span class="progress-value" id="time7dValue">-</span>
+<span class="progress-reset" id="time7dReset">Reset: -</span>
+<span class="progress-label">7d usage</span><div class="progress-track"><div class="progress-fill usage-fill" id="usage7dFill"></div></div><span class="progress-value" id="usage7dValue">-</span>
+</div>
+</section>
+</main>
+<div class="tooltip" id="tip"></div>
+<script>
+const ranges=[["5h",5*3600],["24h",24*3600],["7d",7*24*3600],["30d",30*24*3600],["All",0]];
+const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null;
+let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), payload={points:[],events:{fiveHour:[],sevenDay:[]}}, pendingSeriesRequest=null;
+const fmt=n=>n==null?"-":new Intl.NumberFormat().format(Math.round(n));
+const usd=n=>n==null?"-":`$${new Intl.NumberFormat(undefined,{minimumFractionDigits:0,maximumFractionDigits:2}).format(Number(n))}`;
+const pct=n=>n==null?"-":`${Math.round(n)}%`;
+const chartStates={}, NODE_RADIUS=5, CHART_MARGINS={l:48,r:18,t:16,b:34};
+function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()}
+function allEvents(){return [...((payload.events||{}).fiveHour||[]),...((payload.events||{}).sevenDay||[])]}
+function pointFromSample(sample){
+  if(!sample)return null;
+  const windowPoint=label=>{
+    const window=(sample.windows||{})[label]||{};
+    return {raw:window.usedPercent??null,continuous:window.usedPercent??null,resetAt:window.resetAt,path:window.path};
+  };
+  return {checkedAt:sample.checkedAt,timestamp:eventTimestamp(sample),fiveHour:windowPoint("5h"),sevenDay:windowPoint("7d"),cost:sample.cost||{}};
+}
+function eventTimestamp(p){
+  const value=Number(p.timestamp);
+  if(Number.isFinite(value))return value;
+  const parsed=Date.parse(p.checkedAt||"")/1000;
+  return Number.isFinite(parsed)?parsed:null;
+}
+function updateWindowTime(id,display,resetAt,durationSeconds){
+  const resetMs=Date.parse(resetAt||""), fill=document.getElementById(`${id}Fill`), value=document.getElementById(`${id}Value`), reset=document.getElementById(`${id}Reset`);
+  if(Number.isFinite(display?.timePercent)){
+    const elapsed=Math.max(0,Math.min(100,display.timePercent));
+    fill.style.width=`${elapsed}%`;value.textContent=display.timeText;reset.textContent=`Reset: ${display.resetText}`;return;
+  }
+  if(!Number.isFinite(resetMs)){fill.style.width="0%";value.textContent="-";reset.textContent="Reset: -";return}
+  const elapsed=Math.max(0,Math.min(100,(1-(resetMs-Date.now())/(durationSeconds*1000))*100));
+  fill.style.width=`${elapsed}%`;value.textContent=`${elapsed.toFixed(1)}%`;reset.textContent=`Reset: ${new Date(resetMs).toLocaleString()}`;
+}
+function updateUsageProgress(id,percent){
+  const fill=document.getElementById(`${id}Fill`), value=document.getElementById(`${id}Value`);
+  if(!Number.isFinite(percent)){fill.style.width="0%";value.textContent="-";return}
+  const bounded=Math.max(0,Math.min(100,percent));
+  fill.style.width=`${bounded}%`;value.textContent=`${percent.toFixed(1)}%`;
+}
+function hasRealEvents(list){return list.some(p=>!p.synthetic)}
+function selectedDateBounds(){
+  const parts=(selectedDate||"").split("-").map(Number);
+  if(parts.length!==3||parts.some(n=>!Number.isInteger(n)))return null;
+  const [year,month,day]=parts, start=new Date(year,month-1,day), end=new Date(year,month-1,day+1);
+  if(start.getFullYear()!==year||start.getMonth()!==month-1||start.getDate()!==day)return null;
+  return {startMs:start.getTime(),endMs:end.getTime()};
+}
+function localDateValue(date){
+  return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;
+}
+function shiftSelectedDate(days){
+  const bounds=selectedDateBounds(), date=bounds?new Date(bounds.startMs):new Date();
+  date.setDate(date.getDate()+days);
+  selectedDate=localDateValue(date);selected="Date";setupControls();drawAll(true);
+}
+function syncControls(){
+  document.querySelectorAll("[data-range]").forEach(b=>b.classList.toggle("active",b.dataset.range===selected));
+  const date=document.getElementById("rangeDate");
+  date.value=selectedDate;
+  date.classList.toggle("active",selected==="Date");
+}
+function activateDateInput(){
+  if(!selectedDate)selectedDate=localDateValue(new Date());
+  if(selected==="Date"){syncControls();return}
+  selected="Date";syncControls();drawAll(true);
+}
+function filteredEvents(list){
+  if(selected==="All"||!list.length)return list;
+  const withFallback=filtered=>hasRealEvents(filtered)||!hasRealEvents(list)?filtered:list;
+  if(selected==="Date"){
+    const bounds=selectedDateBounds();
+    if(!bounds){selected=previousRange||"24h";setupControls();return filteredEvents(list)}
+    const filtered=list.filter(p=>p.synthetic||(eventTimestamp(p)!=null&&eventTimestamp(p)*1000>=bounds.startMs&&eventTimestamp(p)*1000<bounds.endMs));
+    return hasRealEvents(filtered)?filtered:[];
+  }
+  const timed=allEvents().map(eventTimestamp).filter(value=>value!=null);
+  if(!timed.length)return list;
+  const max=Math.max(...timed), secs=Object.fromEntries(ranges)[selected];
+  return withFallback(list.filter(p=>p.synthetic||eventTimestamp(p)==null||eventTimestamp(p)>=max-secs));
+}
+function setupControls(){
+  document.getElementById("ranges").innerHTML=ranges.map(([r])=>`<button data-range="${r}" class="${r===selected?"active":""}">${r}</button>`).join("");
+  document.querySelectorAll("[data-range]").forEach(b=>b.onclick=()=>{selected=b.dataset.range;previousRange=selected;setupControls();drawAll(true)});
+  const date=document.getElementById("rangeDate");
+  syncControls();
+  date.onclick=activateDateInput;
+  date.onfocus=activateDateInput;
+  date.onchange=()=>{selectedDate=date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}setupControls();drawAll(true)};
+  document.getElementById("prevDate").onclick=()=>shiftSelectedDate(-1);
+  document.getElementById("nextDate").onclick=()=>shiftSelectedDate(1);
+}
+function requestSeries(){
+  if(!vscode)return fetch("/api/series",{cache:"no-store"}).then(response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()});
+  if(pendingSeriesRequest)return pendingSeriesRequest;
+  pendingSeriesRequest=new Promise((resolve,reject)=>{
+    const receive=event=>{
+      if(event.data?.type!=="codexUsageSeries")return;
+      removeEventListener("message",receive);clearTimeout(timeout);pendingSeriesRequest=null;
+      event.data.error?reject(new Error(event.data.error)):resolve(event.data.payload);
+    };
+    const timeout=setTimeout(()=>{removeEventListener("message",receive);pendingSeriesRequest=null;reject(new Error("Python monitor did not respond"))},10000);
+    addEventListener("message",receive);
+    vscode.postMessage({type:"getCodexUsageSeries"});
+  });
+  return pendingSeriesRequest;
+}
+async function load(){
+  try{
+    payload=await requestSeries();
+    const e=payload.events||{}, five=e.fiveHour||[], seven=e.sevenDay||[], stats=payload.historyStats||{}, points=payload.points||[], latest=points[points.length-1]||pointFromSample(payload.lastSample);
+    const display=payload.display||{}, displayWindows=display.windows||{};
+    const fiveReal=stats.fiveHourRealEvents??five.filter(p=>!p.synthetic).length, sevenReal=stats.sevenDayRealEvents??seven.filter(p=>!p.synthetic).length;
+    document.getElementById("subtitle").textContent=`${fiveReal} five-hour delta pairs, ${sevenReal} seven-day delta pairs`;
+    document.getElementById("top5h").textContent=`5h: ${displayWindows["5h"]?.usageText??pct(latest?.fiveHour?.raw)}`;
+    document.getElementById("top7d").textContent=`7d: ${displayWindows["7d"]?.usageText??pct(latest?.sevenDay?.raw)}`;
+    updateWindowTime("time5h",displayWindows["5h"],latest?.fiveHour?.resetAt,5*3600);
+    updateWindowTime("time7d",displayWindows["7d"],latest?.sevenDay?.resetAt,7*24*3600);
+    updateUsageProgress("usage5h",latest?.fiveHour?.raw);
+    updateUsageProgress("usage7d",latest?.sevenDay?.raw);
+    document.getElementById("status").textContent=latest
+      ?`Latest: ${new Date(latest.checkedAt).toLocaleString()} | raw cost ${usd(latest.cost.totalCostUsd)}`
+      :"No valid delta pairs yet. Keep this page open while polling.";
+    drawAll();
+  }catch(e){
+    document.getElementById("status").textContent=`Dashboard refresh failed; retrying automatically. ${e.message||e}`;
+  }
+}
+function scale(values,minPad=0){
+  const nums=values.filter(Number.isFinite);
+  if(!nums.length)return [0,1];
+  let lo=Math.min(...nums), hi=Math.max(...nums);
+  if(lo===hi){lo-=1;hi+=1}
+  const pad=(hi-lo)*minPad;
+  return [lo-pad,hi+pad];
+}
+function scaleFromZero(values,minPad=0){
+  const nums=values.filter(Number.isFinite), hi=nums.length?Math.max(0,...nums):0;
+  return [0,hi>0?hi*(1+minPad):1];
+}
+function rebaseDeltaEvents(list){
+  let percent=0, cost=0, window=(list.find(p=>p.window)||{}).window;
+  const result=[{checkedAt:null,timestamp:null,window,deltaPercent:0,deltaCostUsd:0,cumulativePercent:0,cumulativeCostUsd:0,rawKeys:["baseline"],synthetic:true}];
+  for(const p of list.filter(p=>!p.synthetic)){
+    percent+=p.deltaPercent||0;
+    cost+=p.deltaCostUsd||0;
+    result.push({...p,cumulativePercent:percent,cumulativeCostUsd:cost,rawKeys:[p.checkedAt]});
+  }
+  return result;
+}
+function denseMergeMetrics(id,list){
+  const rect=document.getElementById(id).getBoundingClientRect(), maxPercent=Math.max(0,...list.map(p=>p.cumulativePercent||0)), maxCost=Math.max(0,...list.map(p=>p.cumulativeCostUsd||0));
+  return {plotWidth:Math.max(1,rect.width-CHART_MARGINS.l-CHART_MARGINS.r),plotHeight:Math.max(1,rect.height-CHART_MARGINS.t-CHART_MARGINS.b),maxPercent:maxPercent*1.03||1,maxCost:maxCost*1.08||1,minDistance:NODE_RADIUS*4};
+}
+function denseDeltaDistance(a,b,metrics){
+  return Math.hypot(((b.cumulativePercent||0)-(a.cumulativePercent||0))/metrics.maxPercent*metrics.plotWidth, ((b.cumulativeCostUsd||0)-(a.cumulativeCostUsd||0))/metrics.maxCost*metrics.plotHeight);
+}
+function mergeDenseDeltaEvents(list,metrics){
+  const result=list.filter(p=>p.synthetic);
+  let pending=null, percent=0, cost=0;
+  const flush=()=>{
+    if(!pending)return;
+    percent+=pending.deltaPercent||0;cost+=pending.deltaCostUsd||0;
+    result.push({...pending,cumulativePercent:percent,cumulativeCostUsd:cost});
+    pending=null;
+  };
+  const mergeTrailing=()=>{
+    if(!pending)return;
+    const index=result.map(p=>!p.synthetic).lastIndexOf(true);
+    if(index<0)return flush();
+    const previous=result[index];
+    percent+=pending.deltaPercent||0;cost+=pending.deltaCostUsd||0;
+    result[index]={
+      ...pending,deltaPercent:(previous.deltaPercent||0)+(pending.deltaPercent||0),deltaCostUsd:(previous.deltaCostUsd||0)+(pending.deltaCostUsd||0),
+      cumulativePercent:percent,cumulativeCostUsd:cost,mergedCount:(previous.mergedCount||1)+(pending.mergedCount||1),
+      mergedFrom:previous.mergedFrom||previous.checkedAt,mergedTo:pending.mergedTo||pending.checkedAt,rawKeys:[...(previous.rawKeys||[previous.checkedAt]),...(pending.rawKeys||[pending.checkedAt])],
+    };
+    pending=null;
+  };
+  for(const p of list.filter(p=>!p.synthetic)){
+    pending=pending?{
+      ...p,deltaPercent:(pending.deltaPercent||0)+(p.deltaPercent||0),deltaCostUsd:(pending.deltaCostUsd||0)+(p.deltaCostUsd||0),
+      mergedCount:(pending.mergedCount||1)+1,mergedFrom:pending.mergedFrom||pending.checkedAt,mergedTo:p.checkedAt,
+      rawKeys:[...(pending.rawKeys||[pending.checkedAt]),...(p.rawKeys||[p.checkedAt])],
+    }:p;
+    if(denseDeltaDistance(result[result.length-1]||{cumulativePercent:0,cumulativeCostUsd:0},{cumulativePercent:percent+(pending.deltaPercent||0),cumulativeCostUsd:cost+(pending.deltaCostUsd||0)},metrics)>metrics.minDistance)flush();
+  }
+  mergeTrailing();
+  return result;
+}
+function chart(id, series, opts={}){
+  const c=document.getElementById(id), ctx=c.getContext("2d"), dpr=devicePixelRatio||1, rect=c.getBoundingClientRect();
+  c.width=rect.width*dpr;c.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,rect.width,rect.height);
+  const w=rect.width,h=rect.height,m=CHART_MARGINS;
+  if(!series.some(s=>s.points.length)){ctx.fillStyle=css("--muted");ctx.textAlign="center";ctx.fillText("No data for this range",w/2,h/2);return}
+  const xs=series.flatMap(s=>s.points.map(p=>p.x).filter(Number.isFinite)), ys=series.flatMap(s=>s.points.map(p=>p.y).filter(Number.isFinite));
+  const [x0,x1]=opts.xDomain||scale(xs,.03), [y0,y1]=opts.yDomain||scale(ys,.08);
+  const X=x=>m.l+(x-x0)/(x1-x0)*(w-m.l-m.r), Y=y=>h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
+  const previous=chartStates[id], previousSeries=previous?.series||[];
+  const eventTime=p=>Number.isFinite(p.ref.timestamp)?p.ref.timestamp:Date.parse(p.ref.checkedAt||"")/1000;
+  const parsedTime=s=>Number.isFinite(Date.parse(s||"")/1000)?Date.parse(s)/1000:null;
+  const pointKey=p=>p.ref.synthetic?"baseline":p.ref.mergedCount>1?`${p.ref.mergedFrom}|${p.ref.mergedTo}`:p.ref.checkedAt;
+  const preparePoint=p=>{
+    const time=eventTime(p), from=parsedTime(p.ref.mergedFrom)??time, to=parsedTime(p.ref.mergedTo)??time;
+    return {...p,tx:X(p.x),ty:Y(p.y),x:X(p.x),y:Y(p.y),r:NODE_RADIUS,key:pointKey(p),time,from,to,rawKeys:p.ref.rawKeys||[p.ref.checkedAt||"baseline"],merged:(p.ref.mergedCount||1)>1};
+  };
+  const currentSeries=series.map(s=>({name:s.name,color:s.color,points:s.points.filter(p=>Number.isFinite(p.x)&&Number.isFinite(p.y)).map(preparePoint)}));
+  const makeLineLayer=drawSeries=>{
+    const layer=document.createElement("canvas"), lctx=layer.getContext("2d");
+    layer.width=c.width;layer.height=c.height;lctx.setTransform(dpr,0,0,dpr,0,0);
+    for(const s of drawSeries){
+      if(!s.points.length)continue;
+      lctx.strokeStyle=s.color;lctx.lineWidth=2;lctx.beginPath();
+      s.points.forEach((p,index)=>{const x=p.tx??p.x, y=p.ty??p.y; if(index)lctx.lineTo(x,y);else lctx.moveTo(x,y)});
+      lctx.stroke();
+    }
+    return layer;
+  };
+  const drawAxes=()=>{
+    ctx.strokeStyle=css("--border");ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(m.l,m.t);ctx.lineTo(m.l,h-m.b);ctx.lineTo(w-m.r,h-m.b);ctx.stroke();
+    ctx.fillStyle=css("--muted");ctx.font="11px system-ui";ctx.textAlign="right";
+    for(let i=0;i<=4;i++){
+      const y=m.t+i*(h-m.t-m.b)/4, v=y1-(y1-y0)*i/4;
+      ctx.fillText(opts.yFmt?opts.yFmt(v):fmt(v),m.l-7,y+4);
+      ctx.strokeStyle="rgba(255,255,255,.06)";ctx.beginPath();ctx.moveTo(m.l,y);ctx.lineTo(w-m.r,y);ctx.stroke();
+    }
+    ctx.textAlign="center";
+    for(let i=0;i<=3;i++){const x=m.l+i*(w-m.l-m.r)/3, v=x0+(x1-x0)*i/3;ctx.fillText(opts.xFmt?opts.xFmt(v):fmt(v),x,h-10)}
+  };
+  const currentLineLayer=makeLineLayer(currentSeries), previousLineLayer=previous?.lineLayer;
+  const transitions=currentSeries.flatMap((s,seriesIndex)=>{
+    const previousPoints=previousSeries[seriesIndex]?.points||[], oldOwners=new Map(), newOwners=new Map(), moves=new Map();
+    for(const p of previousPoints)for(const rawKey of p.rawKeys||[p.key])oldOwners.set(rawKey,p);
+    for(const p of s.points)for(const rawKey of p.rawKeys||[p.key])newOwners.set(rawKey,p);
+    for(const rawKey of new Set([...oldOwners.keys(),...newOwners.keys()])){
+      const oldPoint=oldOwners.get(rawKey), newPoint=newOwners.get(rawKey);
+      if(oldPoint&&newPoint){
+        const key=`${oldPoint.key}->${newPoint.key}`;
+        if(!moves.has(key))moves.set(key,{s,p:newPoint,rawKeys:[],startX:oldPoint.x,startY:oldPoint.y,endX:newPoint.tx,endY:newPoint.ty,startR:oldPoint.r||NODE_RADIUS,endR:NODE_RADIUS,startA:oldPoint.alpha??1,endA:1});
+        moves.get(key).rawKeys.push(rawKey);
+      }else if(newPoint){
+        const key=`appear:${newPoint.key}`;
+        if(!moves.has(key))moves.set(key,{s,p:newPoint,rawKeys:[],startX:newPoint.tx,startY:newPoint.ty,endX:newPoint.tx,endY:newPoint.ty,startR:0,endR:NODE_RADIUS,startA:0,endA:1});
+        moves.get(key).rawKeys.push(rawKey);
+      }else if(oldPoint){
+        const key=`leave:${oldPoint.key}`;
+        if(!moves.has(key))moves.set(key,{s,p:null,rawKeys:[],startX:oldPoint.x,startY:oldPoint.y,endX:oldPoint.x,endY:oldPoint.y,startR:oldPoint.r||NODE_RADIUS,endR:0,startA:oldPoint.alpha??1,endA:0});
+        moves.get(key).rawKeys.push(rawKey);
+      }
+    }
+    return [...moves.values()];
+  });
+  const snapshotSeries=progress=>currentSeries.map(s=>({points:transitions.filter(t=>t.s.name===s.name).map(t=>{
+    const x=t.startX+(t.endX-t.startX)*progress, y=t.startY+(t.endY-t.startY)*progress, r=t.startR+(t.endR-t.startR)*progress, alpha=t.startA+(t.endA-t.startA)*progress;
+    return {...(t.p||{}),key:t.p?.key||`leaving:${t.startX}:${t.startY}:${t.endX}:${t.endY}`,rawKeys:t.rawKeys,x,y,r,alpha,from:t.p?.from??0,to:t.p?.to??0,time:t.p?.time??0,merged:t.p?.merged??false};
+  }).filter(p=>p.r>0&&p.alpha>0)}));
+  const drawLayer=(layer,alpha)=>{
+    if(!layer||alpha<=0)return;
+    ctx.globalAlpha=alpha;ctx.drawImage(layer,0,0,w,h);ctx.globalAlpha=1;
+  };
+  const liveLineLayer=document.createElement("canvas"), liveLineCtx=liveLineLayer.getContext("2d");
+  liveLineLayer.width=c.width;liveLineLayer.height=c.height;
+  const updateLiveLineLayer=progress=>{
+    liveLineCtx.setTransform(1,0,0,1,0,0);liveLineCtx.clearRect(0,0,liveLineLayer.width,liveLineLayer.height);
+    if(previousLineLayer&&1-progress>0){liveLineCtx.globalAlpha=1-progress;liveLineCtx.drawImage(previousLineLayer,0,0)}
+    if(currentLineLayer&&progress>0){liveLineCtx.globalAlpha=progress;liveLineCtx.drawImage(currentLineLayer,0,0)}
+    liveLineCtx.globalAlpha=1;
+  };
+  if(previous?.frame)cancelAnimationFrame(previous.frame);
+  const drawFrame=(progress, hit)=>{
+    ctx.clearRect(0,0,w,h);
+    drawAxes();
+    updateLiveLineLayer(progress);
+    drawLayer(previousLineLayer,1-progress);
+    drawLayer(currentLineLayer,progress);
+    for(const t of transitions){
+      const x=t.startX+(t.endX-t.startX)*progress, y=t.startY+(t.endY-t.startY)*progress, r=t.startR+(t.endR-t.startR)*progress, alpha=t.startA+(t.endA-t.startA)*progress;
+      if(r<=0||alpha<=0)continue;
+      ctx.globalAlpha=alpha;ctx.fillStyle=t.s.color;ctx.beginPath();ctx.arc(x,y,r,0,Math.PI*2);ctx.fill();ctx.globalAlpha=1;
+      if(progress===1&&t.p)hit.push({...t.p,s:t.s,x,y});
+    }
+    chartStates[id]={series:snapshotSeries(progress),lineLayer:liveLineLayer,frame:null};
+  };
+  const hit=[], finish=()=>{
+    chartStates[id]={series:currentSeries.map(s=>({points:s.points.map(p=>({...p,x:p.tx,y:p.ty,r:NODE_RADIUS}))})),lineLayer:currentLineLayer,frame:null};
+  c.onmousemove=e=>showTip(e,hit);
+  c.onmouseleave=hideTip;
+  };
+  if(!opts.animate||!previousLineLayer){drawFrame(1,hit);finish();return}
+  const started=performance.now(), duration=820, ease=t=>1-Math.pow(1-t,3);
+  const step=now=>{
+    const progress=ease(Math.min(1,(now-started)/duration));
+    hit.length=0;drawFrame(progress,hit);
+    if(progress<1)chartStates[id]={...chartStates[id],frame:requestAnimationFrame(step)};else finish();
+  };
+  step(started);
+}
+function showTip(e,hit){
+  let best=null, bd=1e9;
+  for(const p of hit){const d=Math.hypot(e.offsetX-p.x,e.offsetY-p.y); if(d<bd){bd=d;best=p}}
+  if(!best||bd>18)return hideTip();
+  const p=best.ref, tip=document.getElementById("tip"), rows=[
+    `<b>${p.checkedAt?new Date(p.checkedAt).toLocaleString():"Baseline"}</b>`,
+    best.s.name,
+    `Delta ${pct(p.deltaPercent)} / ${usd(p.deltaCostUsd)}`,
+    `Cumulative delta ${pct(p.cumulativePercent)} / ${usd(p.cumulativeCostUsd)}`,
+  ];
+  if(Number.isFinite(p.rawPercent))rows.push(`Raw ${p.window} usage ${pct(p.rawPercent)}`);
+  if(Number.isFinite(p.normalizedPercent))rows.push(`Plus-normalized usage ${pct(p.normalizedPercent)}`);
+  if(p.plan&&p.plan!=="unknown")rows.push(`Plan ${p.plan} (${p.planMultiplier||1}x)`);
+  if(Number.isFinite(p.sampleCostUsd))rows.push(`Raw cumulative cost ${usd(p.sampleCostUsd)}`);
+  if(p.mergedCount>1)rows.push(`Merged ${p.mergedCount} points from ${new Date(p.mergedFrom).toLocaleString()} to ${new Date(p.mergedTo).toLocaleString()}`);
+  if(p.resetAt)rows.push(`Reset ${p.resetAt}`);
+  tip.innerHTML=rows.join("<br>");
+  tip.style.display="block";
+  positionTip(e,tip);
+}
+function hideTip(){document.getElementById("tip").style.display="none"}
+function positionTip(e,tip){
+  const offset=14, margin=6, w=tip.offsetWidth, h=tip.offsetHeight;
+  const left=e.clientX+offset+w>innerWidth&&e.clientX-offset-w>=margin?e.clientX-offset-w:e.clientX+offset;
+  const top=e.clientY+offset+h>innerHeight&&e.clientY-offset-h>=margin?e.clientY-offset-h:e.clientY+offset;
+  tip.style.left=`${Math.min(Math.max(margin,left),Math.max(margin,innerWidth-w-margin))}px`;
+  tip.style.top=`${Math.min(Math.max(margin,top),Math.max(margin,innerHeight-h-margin))}px`;
+}
+function updateRate(id,list){
+  const real=list.filter(p=>!p.synthetic&&(p.deltaPercent||0)>0), percent=real.reduce((s,p)=>s+(p.deltaPercent||0),0), cost=real.reduce((s,p)=>s+(p.deltaCostUsd||0),0);
+  document.getElementById(id).textContent=`Cost / 100%: ${percent>0?usd(cost/percent*100):"-"}`;
+}
+function drawDeltaChart(id,name,color,list,animate=false){
+  const rebased=rebaseDeltaEvents(list), merged=mergeDenseDeltaEvents(rebased,denseMergeMetrics(id,rebased)), points=merged.map(p=>({x:p.cumulativePercent,y:p.cumulativeCostUsd,ref:p}));
+  chart(id,[{name,color,points}],{xFmt:pct,yFmt:usd,xDomain:scaleFromZero(points.map(p=>p.x),.03),yDomain:scaleFromZero(points.map(p=>p.y),.08),animate});
+}
+function drawAll(animate=false){
+  const e=payload.events||{}, five=filteredEvents(e.fiveHour||[]), seven=filteredEvents(e.sevenDay||[]);
+  updateRate("rate5h",five);updateRate("rate7d",seven);
+  drawDeltaChart("scatter5h","5h delta",css("--blue"),five,animate);
+  drawDeltaChart("scatter7d","7d delta",css("--green"),seven,animate);
+}
+setupControls();load();setInterval(load,5000);addEventListener("resize",drawAll);
+</script>
+</body>
+</html>

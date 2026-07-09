@@ -1,0 +1,16 @@
+ReferenceSrc/
+cc-switch-main/
+
+__pycache__/
+*.py[cod]
+
+usage_monitor_*.json
+usage_monitor_*.jsonl
+usage_monitor_*.json.*
+usage_monitor_*.jsonl.*
+
+*.log
+
+.venv/
+venv/
+env/

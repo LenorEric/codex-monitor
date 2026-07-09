@@ -1,0 +1,40 @@
+{
+  "name": "codex-usage-monitor",
+  "displayName": "Codex Usage Monitor",
+  "description": "Shows Python-backed Codex rate-limit usage in the VS Code status bar and a details view.",
+  "version": "0.1.1",
+  "publisher": "lenor",
+  "author": "Lenor",
+  "engines": {
+    "vscode": "^1.96.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "keywords": [
+    "codex",
+    "rate-limit",
+    "usage",
+    "monitor"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./extension.js",
+  "extensionKind": [
+    "workspace"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "codexUsageMonitor.showDetails",
+        "title": "Codex Usage Monitor: Show Details"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "node --check extension.js",
+    "check": "node --check extension.js",
+    "test": "python -m unittest test_monitor_codex_usage.py"
+  }
+}
