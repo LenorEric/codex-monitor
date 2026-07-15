@@ -803,14 +803,14 @@ function usageGapLabel(seconds){
 function drawUsageTimeFolds(ctx,folds,top,bottom,part="all"){
   ctx.save();ctx.font="10px system-ui";ctx.textAlign="center";ctx.textBaseline="top";
   folds.forEach(gap=>{
-    const center=(gap.x0+gap.x1)/2, label=usageGapLabel(gap.duration);
+    const center=(gap.x0+gap.x1)/2, label=usageGapLabel(gap.duration), labelWidth=ctx.measureText(label).width;
     ctx.globalAlpha=gap.alpha??1;
     if(part!=="labels"){
       ctx.fillStyle="rgba(154,164,178,.065)";ctx.fillRect(gap.x0,top,gap.x1-gap.x0,bottom-top);
       ctx.strokeStyle="rgba(154,164,178,.32)";ctx.lineWidth=1;ctx.setLineDash([2,3]);ctx.beginPath();ctx.moveTo(gap.x0,top);ctx.lineTo(gap.x0,bottom);ctx.moveTo(gap.x1,top);ctx.lineTo(gap.x1,bottom);ctx.stroke();ctx.setLineDash([]);
       ctx.strokeStyle="rgba(232,236,241,.58)";ctx.lineWidth=1.25;ctx.beginPath();ctx.moveTo(center-5,bottom-4);ctx.lineTo(center-1,bottom+2);ctx.moveTo(center+1,bottom-4);ctx.lineTo(center+5,bottom+2);ctx.stroke();
     }
-    if(part!=="geometry"){ctx.fillStyle=css("--muted");ctx.fillText(label,center,top+3)}
+    if(part!=="geometry"){ctx.fillStyle=css("--panel");ctx.fillRect(center-labelWidth/2-3,top+3,labelWidth+6,13);ctx.fillStyle=css("--muted");ctx.fillText(label,center,top+3)}
   });
   ctx.globalAlpha=1;ctx.restore();
 }

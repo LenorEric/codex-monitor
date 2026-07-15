@@ -1,16 +1,46 @@
 ReferenceSrc/
 cc-switch-main/
+vsc-extension-release/
+/*.vsix
 
 __pycache__/
 *.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
 
 usage_monitor_*.json
 usage_monitor_*.jsonl
 usage_monitor_*.json.*
 usage_monitor_*.jsonl.*
+usage-monitor-accounts/
+.account-test-*/
+
+# Local Codex Switch state and credentials must never be committed.
+.codex-switch/
+auth.json
+config.json
+machine.json
+skills.json
+cloud-state.json
+.env
+.env.*
+!.env.example
 
 *.log
+*.tmp
+*.bak
+*.swp
+~$*
 
 .venv/
 venv/
 env/
+node_modules/
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
