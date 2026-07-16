@@ -9,6 +9,7 @@ RELEASE_DIR = ROOT / "release"
 RUNTIME_DIR = RELEASE_DIR / "runtime"
 VSCE_VERSION = "3.9.2"
 RUNTIME_FILES = (
+    "LICENSE",
     "dashboard.html",
     "management.html",
     "monitor_accounts.py",

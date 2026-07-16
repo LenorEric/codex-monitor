@@ -1,120 +1,327 @@
+<div align="center">
+
 # Codex Usage Monitor
 
-Codex Usage Monitor shows the authoritative 5-hour and 7-day usage reported by a manually started Python monitor in the VS Code status bar. Click the status-bar item to open **Codex Usage Details**, which loads the current dashboard UI and data from the same Python server as the browser dashboard.
-The dashboard also plots saved 5-hour and 7-day usage percentages over time for the accounts selected by the shared Accounts filter and Date/5h/24h/7d/30d/All range selector.
+**A local-first Codex quota, token, cost, account, skill, and encrypted-sync dashboard for VS Code.**
 
-Start the monitor before using the extension:
+[![Version](https://img.shields.io/badge/version-1.0.0-4f8cff)](#quick-start)
+[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
+[![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#requirements)
+[![License](https://img.shields.io/badge/license-GPL--3.0-22c55e)](https://www.gnu.org/licenses/gpl-3.0.html)
+
+English · <a href="./README.zh-CN.md">简体中文</a>
+
+</div>
+
+Codex Usage Monitor combines the authoritative 5-hour and 7-day limits reported by the Codex service with locally parsed session tokens and estimated cost.
+A lightweight Python service owns the data, dashboard, account vault, managed skills, and optional encrypted WebDAV synchronization; the VS Code extension adds a status-bar summary and opens the same live dashboard.
+
+> [!IMPORTANT]
+> The extension does not start the Python monitor. Start `python monitor_codex_usage.py` first and keep it running.
+
+## Why use it?
+
+| Capability | What you get |
+| --- | --- |
+| Live quota monitoring | Authoritative 5-hour and 7-day percentages, reset times, plan-aware history curves, and lightweight five-second status refreshes. |
+| Token and cost analytics | Fresh input, cached input, cache writes, output, cache-hit rate, per-model totals, Standard/Fast attribution, and estimated cost. |
+| Multiple Codex accounts | Safe local account switching, login-slot creation, rename/delete controls, identity validation, and per-account history attribution. |
+| Skill management | Discover Codex and Gemini skills, move them into one private managed store, assign them with strict links or managed fallbacks, and synchronize changes. |
+| Encrypted multi-machine sync | AES-256-GCM WebDAV packages for skills, move-only account transfer, and incremental usage journals with verified writes. |
+| Local-first privacy | Credentials and raw recorder data stay under `~/.codex-switch`; dashboard payloads redact secrets and cloud-downloaded history never contaminates local recorder files. |
+| Resilient operation | Atomic local writes, bounded incremental session-log scanning, revision-keyed response caches, conditional cloud updates, rollback-aware key rotation, and extensive unit coverage. |
+
+## How it fits together
+
+```mermaid
+flowchart LR
+    C[Codex auth and session logs] --> M[Python monitor :8765]
+    M --> D[Browser dashboard]
+    M --> V[VS Code status bar and webview]
+    M --> L[Local vault and history<br/>~/.codex-switch]
+    M <--> W[Optional encrypted WebDAV]
+```
+
+The monitor is authoritative. The extension polls `/api/status` while visible, reloads `/api/series` only when its revision changes, and uses its bundled dashboard only when the live page cannot be reached.
+
+## Requirements
+
+- Python 3.12 or newer on Windows and Linux.
+- VS Code 1.96 or newer for the extension.
+- A working Codex login in the normal `CODEX_HOME`.
+- Port `8765` available.
+- Python dependencies from `requirements.txt`—currently `cryptography>=46.0.0,<47`.
+- Network/proxy access compatible with the environment variables recognized by Python and `monitor_common.py`.
+
+## Quick start
+
+### 1. Install the standalone runtime
+
+Use the matching artifacts from `release/`:
+
+1. Copy `release/runtime/` to a permanent location.
+2. Open a terminal in that directory.
+3. Install the dependency and start the monitor:
+
+```console
+python -m pip install -r requirements.txt
+python monitor_codex_usage.py --dashboard
+```
+
+Without `--dashboard`, the service starts normally but does not open a browser:
 
 ```console
 python monitor_codex_usage.py
 ```
 
-## Deployment release
+### 2. Install the VS Code extension
 
-Run `python build_release.py` (or `npm run release`) to rebuild the self-contained `release/` directory. It contains the versioned VS Code extension package and a `runtime/` directory with the complete standalone Python monitor, dashboard assets, dependency list, and runtime instructions. Install the `.vsix`, copy `runtime/` to the target machine, run `python -m pip install -r requirements.txt` there, and then start `python monitor_codex_usage.py`.
+Install `release/codex-usage-monitor-1.0.0.vsix` from VS Code:
 
-The release builder recreates only generated files inside `release/`. Local credentials, account vaults, usage history, configuration, logs, caches, tests, reference projects, and development review files are excluded from both the release and the VS Code package.
+1. Open **Extensions**.
+2. Select **Views and More Actions (…) → Install from VSIX…**.
+3. Choose the VSIX and reload VS Code if requested.
 
-The monitor serves the Python dashboard/API on fixed port 8765. Its bind IP is selected on the management page's **Config file** tab and defaults to `0.0.0.0`, which listens on every network interface; `127.0.0.1` limits access to this computer. Restart the monitor after changing it. The extension always connects through `http://127.0.0.1:8765`, so either bind choice remains compatible. The default command does not open a browser; use `python monitor_codex_usage.py --dashboard` to open the dashboard in the default browser after starting the server. The extension fetches the current dashboard HTML whenever the details panel is opened or its command is invoked again, so dashboard UI changes do not require repackaging the extension. Its bundled dashboard remains available as a fallback when the live HTML cannot be fetched. The extension never starts another Python process, does not parse Codex session logs for rate-limit values, and contributes no VS Code settings. Monitor behavior remains configured through `~/.codex-switch/config.json` and the defaults in `monitor_codex_usage.py`.
-The status bar and visible dashboard poll the lightweight `/api/status` endpoint every five seconds. Historical `/api/series` data is loaded when the dashboard opens and only reloaded when its revision changes; hidden dashboards skip polling,
-concurrent requests are deduplicated, and unchanged series responses reuse a pre-serialized in-memory cache. `/api/series` remains available for older clients, and the extension falls back to it when connected to an older monitor without `/api/status`.
+The command line is also supported:
 
-## Requirements
+```console
+code --install-extension release/codex-usage-monitor-1.0.0.vsix
+```
 
-- Python 3.12 or newer on Windows and Linux.
-- A manually running `python monitor_codex_usage.py`.
-- A working Codex login in the normal `CODEX_HOME`.
-- The proxy requirements enforced by `monitor_common.py`.
-- Python dependencies installed with `python -m pip install -r requirements.txt`.
+### 3. Complete first-run setup
 
-## Skills and encrypted backup
+1. Keep the Python monitor running.
+2. Open `http://127.0.0.1:8765` or click the Codex status-bar item.
+3. Create a control password when prompted. Initial setup is accepted only from the same computer, and `123456` is rejected.
+4. Use **Manage skills & accounts** for account, skill, WebDAV, server, and configuration operations.
 
-Open **Manage skills & accounts** from the dashboard. At startup the backend scans `CODEX_HOME/skills` and `~/.gemini/config/skills` for child directories containing `SKILL.md`.
-The management page reuses that result until **Scan skills** explicitly refreshes it or a backend skill operation invalidates it.
-Choosing **Manage selected** verifies and moves each skill into `~/.codex-switch/skills`, then creates strict per-skill directory symlinks for its default application. Skill names use a portable ASCII allowlist.
-On Windows, a native directory junction is used when creating a symbolic link is not permitted. On non-Windows platforms, a monitor-owned directory copy is used when symbolic links are unavailable; it is refreshed from the private managed source and removed only when its opaque ownership marker matches local state. Projection creation never invokes a command shell.
-A failed symlink leaves the verified private copy managed and reports a retryable projection error.
-A managed skill takes precedence over a valid same-name local skill directory, replacing it with the managed link and marking that application assigned; unrelated files and links remain conflicts and are preserved.
-Codex content wins when both application directories contain the same unmanaged skill name, and that skill defaults to both projections.
+You now have local quota, token, cost, model, and account history. WebDAV is optional.
 
-Assignments are stored in versioned `skills.json` and remain local to the machine. Each managed skill and its tombstone history use a separate encrypted cloud package; a small encrypted index identifies the current package for each skill. Packages contain no assignment state.
-An explicit WebDAV Fetch merges remote additions and updates into the managed skill store without removing managed-only skills; remote content overwrites same-name managed content, and existing assignments are preserved.
-Push merges the local managed set with the current remote snapshot without removing remote-only skills; local content overwrites same-name remote content.
-Manual Push compares every local skill with the cloud and uploads separate packages only for changed skill names. If everything already matches, it performs no index rewrite and reports **Nothing to push**; otherwise the success notification's double-click detail lists added and updated skills. Accounts are never uploaded by Push.
-Newly fetched skills remain unassigned unless a same-name local skill is replaced by the managed link. Fetch refreshes the released-account listing but does not download, restore, or upload account files; account transfer requires explicit **Bind** or **Release**.
-The backend exact-restore operation remains available for API clients, creates a local safety ZIP, replaces the private set exactly, and preserves surviving assignments.
+## Using the dashboard
 
-Edit `~/.codex-switch/config.json` to configure WebDAV, then restart the monitor; configuration, machine identity, and cloud state are loaded into backend memory at startup.
-Enabled WebDAV endpoints must use HTTPS; plaintext HTTP is accepted only for literal localhost, `127.0.0.1`, or `::1` development endpoints.
-The management page and every account, skill, and cloud control API require the control password. New configurations have no default password: the dashboard asks you to create one when it first opens, and `123456` is rejected. Creating or changing the password generates a random `control.passwordSalt` and stores a separate scrypt `control.passwordHash`. A nonempty hash without a valid separate salt is treated as compromised; the management page instructs you to remove `passwordHash` from `config.json`, restart the monitor, and create a new password. Legacy configurations still support `control.password` as a one-time import field. A signed `HttpOnly` cookie remembers successful unlocks for 30 days, including in the VS Code extension.
-The WebDAV login `password` remains plaintext because it must be sent to the WebDAV server.
-Authorization and account-identity headers are scoped to the original request and are never copied to redirects; authenticated cross-origin and HTTPS downgrade redirects are rejected.
-WebDAV configuration includes `encryptionPassphrase` as an empty staging field and stores the derived value in `encryptionPassphraseHash`. A raw passphrase submitted through the management page or written to the staging field is converted to a hash and the staging field is immediately cleared when configuration is loaded. The hash is reproducible across machines with scrypt `n=32768`, `r=8`, `p=1`, a 32-byte output, and a deterministic salt derived from the normalized WebDAV base URL and username. URL schemes, trailing/repeated slashes, query strings, fragments, host case, and default HTTP/HTTPS ports do not affect the normalized identity. Every machine using an encrypted remote root must use the same normalized URL, username, and passphrase. If both passphrase fields are empty, second-layer encryption is disabled and WebDAV payloads are stored as plaintext. Updating a legacy or current passphrase downloads and decrypts all remote payloads, re-encrypts and verifies them with the new key, and commits the new configuration only after the remote rotation succeeds.
+The top cards show the latest 5-hour and 7-day usage, reset times, plan, and active account. The charts and selectors provide:
 
-If WebDAV authentication succeeds but cloud decryption fails, the management page offers to reload `config.json` and retry or to overwrite the inaccessible cloud root from local data. Overwrite permanently removes cloud-only skills, accounts, and usage history.
-Run `python monitor_codex_usage.py --reencrypt-cloud` to refresh nonces and verify every encrypted payload with the already configured key. This command does not rotate from a different old hash.
-Backend operations keep the in-memory cloud state synchronized with atomic file writes.
-A remote encryption descriptor is initialized only after an exact WebDAV 404, then read back and protected by verified `If-None-Match: *` behavior.
-Network, authentication, and server failures never trigger descriptor replacement.
-Jianguoyun/Nutstore uses `https://dav.jianguoyun.com/dav/` and an application password. API responses redact the password and encryption passphrase. Use **Test WebDAV** before Push.
-Push intentionally overwrites same-name cloud skills and never uploads accounts. Conditional ETag writes protect skill-pointer merges and the explicit Bind/Release account moves when the server enforces them.
-Servers such as Jianguoyun that ignore conditional writes can use `allowOptimisticWrites`, but account exclusivity is then best-effort rather than guaranteed.
-Skill and account payloads use AES-256-GCM with a scrypt-derived key, authenticated manifests, SHA-256 hashes, sizes, and read-back verification.
-Salted scrypt values prevent direct recovery of raw control passwords and encryption passphrases, but weak or reused passwords can still be found by offline guessing.
-Use long, unique values; a stored derived cloud key also grants decryption access to someone who separately obtains the WebDAV ciphertext and credentials.
+- **Date / 5h / 24h / 7d / 30d / All** time ranges.
+- Model filters for token and cost analysis.
+- Account filters shared by quota, token, and cost views.
+- **Local** and **Merged** token/cost datasets.
+- Separate colored quota curves per selected account.
+- Fresh input, cached input, output, cache write, cache-hit rate, and estimated cost.
 
-`config.json` intentionally stores the WebDAV login password and cookie-signing secret locally. The control password is stored only as a verifier with its separate random salt, and the encryption credential only as the identity-salted scrypt-derived key. The file is written with restrictive permissions where the platform supports them.
-It is sensitive: never commit, sync, log, screenshot, or include `~/.codex-switch` in support bundles. Losing the passphrase makes remote backups unrecoverable.
-Keep a separate protected recovery copy of the configuration and restart affected Codex terminals after an account switch or release because running processes may retain credentials.
+The Local/Merged selector controls token and cost data. Quota curves always use merged quota history because the service percentage is shared across machines and should not be presented as machine-local consumption.
 
-Cloud traffic is event-driven. **Push** uploads managed skills only. Skills are name-merged with the current cloud snapshot, with local same-name content taking precedence and cloud-only names retained. Push, Fetch, bind, release, restore, and WebDAV test operations share one serialized backend operation queue so simultaneous requests cannot mutate cloud state concurrently. Rename and Delete are local-only account operations.
-User-initiated Push, Fetch, Bind, Release, Restore, WebDAV Test, and cloud-backed Unmanage actions immediately show a persistent Started message, then replace it with a Finished, Pass, or Error message when the operation returns.
-Editing managed skill content starts that skill's own two-minute stability window. Once stable, only that skill package is uploaded; edits to another skill neither delay nor join the upload. Binding and releasing accounts do not schedule Push because those actions complete their own move directly.
-The five-second change check compares canonical manifests without creating ZIP files. Unchanged files reuse identity, size, and nanosecond-time keyed hashes, with a full content rehash at least hourly.
-ZIP construction and a fresh race-safe content verification happen only when a snapshot is actually needed. Disabling `skillsAutoUpload` also disables this periodic observation.
-If a skill changes during its upload, its new version starts another two-minute stability window. Each stable skill version is attempted at most three times with 30 seconds between failures.
-A final failure appears in the management page and marks the Push button, while successful automatic pushes remain silent.
-Every five minutes the backend runs Fetch: an unchanged version-2 skill index compares its immutable package hashes with cached local content manifests and downloads only mismatched skill packages, while an unchanged legacy combined snapshot is skipped when its applied baseline still matches. The released cloud-account candidate list is refreshed even when no skill package is downloaded. Account files still move only through explicit Bind and Release. An explicit fetch, Push, or restore establishes the local skill baseline.
+The extension contributes **Codex Usage Monitor: Show Details**. Opening it fetches the current dashboard, and invoking it again refreshes the same view. Webview status and history requests are independently deduplicated.
 
-When WebDAV is enabled, encrypted usage-data synchronization is also enabled by default through `webdav.usageDataAutoSync`. It runs independently every 30 minutes and synchronizes only delta/cost intervals, quota history, and token-session history; detailed sample logs, runtime state, credentials, and skill data are excluded. Set `usageDataAutoSync` to `false` and restart to disable it without changing skill or account cloud behavior.
+## Managing Codex accounts
 
-Usage traffic is incremental. Each machine publishes a small conditional-write pointer plus compressed, encrypted immutable chunks containing only new or changed locally originated records and retention tombstones. Other machines use pointer ETags and applied-head cursors to download only unseen chunks. The first publication is a live checkpoint, and a later checkpoint replaces a long revision tail only when it reduces bootstrap transfer by at least 25 percent. Quota synchronization run-length compacts idle periods per account: for an unchanged 5h/7d percentage, plan, and reset-cycle plateau it publishes only the first and latest observation, followed by the first changed observation. For example, five readings at 5 percent followed by 6 percent publish only A, E, and F; the complete A-F history remains local. Existing quota and token history is adopted on first sync; old compact cost pairs remain local because they do not contain enough interval metadata for safe cross-machine correlation.
+The account vault lives in `~/.codex-switch/accounts`. On first startup, the current valid `auth.json` becomes **Current account**.
 
-Downloaded usage records never replace or append to the three local recorder files. They are retained by source machine in `usage_monitor_sync_cache.json`, and the dashboard derives a separate Merged dataset from that cache plus the untouched local data. Use the **Local** and **Merged** buttons to switch token and cost/delta views; Local is the default. The 5h and 7d Usage-vs-Time curves are always Merged because quota percentage is shared across machines. On the first startup with this separated layout, identifiable remote-origin rows written by older versions are moved from the recorder files into the cache and remote cursors are cleared once so authoritative checkpoints can rebuild any source revisions previously collapsed by merging.
+### Create and sign in to another account
 
-Cross-machine cost ratios are derived from source intervals rather than by adding already-derived percentages. For a matching account, window, plan, and reset cycle, the monitor splits overlapping `startPercent → endPercent` intervals at every observed boundary, counts each percentage slice once, and adds each covering machine's proportional per-model cost. Thus two machines that each spend $1 while shared usage rises 1 percent produce $2 per percent even when their polling timestamps differ.
-Routine OpenAI token refreshes update only the local vault. Account uploads occur for explicit **Push**, when Fetch confirms that this machine owns the binding, and when registration, binding, release, or interrupted-operation recovery requires verified cloud state.
+1. Open **Manage skills & accounts**.
+2. Choose **Create / login** and enter a local label.
+3. The monitor securely saves the outgoing account and removes the live `auth.json`.
+4. Run the normal Codex login in a new or restarted terminal.
+5. The dashboard adopts the completed login automatically.
 
-## Account switching
+Restart existing Codex terminals after switching accounts because a running process may retain old credentials.
 
-The dashboard account selector switches only the live Codex `auth.json`. All accounts continue using the same `CODEX_HOME`, including its `config.toml`, MCP servers, sessions, conversation context, prompts, and skills.
+### Switch, rename, and delete
 
-On the first monitor startup, the current `auth.json` is saved as **Current account**. All monitor-owned saved data lives under `~/.codex-switch`: account credentials and the manifest are under `accounts`.
-Delta history, compact per-account quota history, per-session token/cost history, the detailed sample log, runtime state, and the downloaded usage cache use `usage_monitor_history.jsonl`, `usage_monitor_quota_history.jsonl`, `usage_monitor_token_sessions.jsonl`, `usage_monitor_samples.jsonl`, `usage_monitor_state.json`, and `usage_monitor_sync_cache.json`. The first three files remain local recorder output; the cache is machine-local derived synchronization state. Per-session token counts remain raw counts; cost applies the recorded Fast service tier at 2x for GPT-5.4, 2.5x for GPT-5.5 and GPT-5.6, and a defensive 2x fallback for any other model unexpectedly reported as Fast.
-The detailed sample log remains ordinary backward-compatible JSONL. It appends normally up to its configured cap, then atomically streams the newest complete rows into a replacement file targeted at 80% of the cap.
-This provides hysteresis before another compaction is needed.
-Startup idempotently seeds quota history from available raw readings retained in the detailed sample log, including original percentages that delta validation rejected, then appends each fresh reading without model separation.
-Quota persistence occurs before trusted-baseline and local-cost delta processing, so those rules never suppress the percentage curve. The first startup after upgrading moves these files from their legacy repository/auth-adjacent locations when the destination does not already exist.
-The `accounts/` directory contains refresh tokens and must be treated like `auth.json`: do not copy `.codex-switch` into a repository, logs, screenshots, or support bundles.
+- **Switch** replaces only the live Codex `auth.json`; it never changes shared `config.toml`, sessions, prompts, MCP servers, or skills.
+- **Rename** rewrites the local label across persisted monitor history.
+- **Delete** is local-only and cannot delete the active account or the sole remaining local account.
+- Before an outgoing signed-in account is saved, its live and vaulted `id_token` and `account_id` must match exactly.
+- The same authenticated identity cannot occupy two ready local slots.
 
-To add an account, open **Manage skills & accounts**, choose **Create / login**, enter a name, and confirm. The monitor atomically saves the current login and removes live `auth.json`; then run Codex login in a new or restarted terminal. The dashboard detects the next valid login automatically. Restart existing Codex terminals after switching accounts because a running process may retain its previous authentication state.
+### Move an account between machines
 
-The monitor serializes account switching only with the credential-refresh section of polling. Ordinary percentage requests using a still-valid access token do not block account switching; if an account changes while such a request is in flight, its stale result is discarded. When OpenAI rotates a refresh token, the complete updated `auth.json` is mirrored into the active saved account before the usage request continues. Usage history remains shared, while account-switch boundaries reset delta baselines so usage from two accounts is not joined into one interval.
+Account cloud storage uses move semantics:
 
-Before saving the outgoing account for a switch or new login, the monitor requires the live and saved `auth.json` copies to have identical `tokens.id_token` and `tokens.account_id` values. A mismatch or missing verification field refuses the account change without replacing either credential copy and displays a safe error in the dashboard. Managed labels identify local `auth.json` slots only: authenticated-account matching and usage-history merging use `tokens.account_id`, with a hash of `tokens.id_token` as the fallback. A machine cannot keep the same authenticated identity in two ready managed slots. Bind reports an error and leaves the released cloud payload untouched if that identity already exists locally. If a newly added empty slot detects a login already managed by another slot, the existing slot receives the new `auth.json`, the live file is removed, and the new slot stays empty for another login; the dashboard reports what happened.
+- **Release** uploads and verifies the newest local account payload, then removes the local vault record.
+- **Bind** downloads and integrity-checks a released payload, commits it locally, then removes and verifies removal of the cloud copy.
+- **Push** and **Fetch** never upload local account credentials.
+- **Rename** and **Delete** never mutate a cloud account payload.
 
-Successful new-account preparation and account switches print a concise `Account event:` message to the monitor console. These messages contain escaped display labels only and never include credential contents.
+At least one verified copy is preserved when a Bind or Release operation fails. Empty awaiting-login slots can also be released and bound.
 
-Account cloud storage uses move semantics rather than backup semantics. **Bind** downloads and integrity-checks the encrypted account file without testing whether its token works, saves it in the local vault, and only then removes and verifies removal of the cloud copy. **Release** uploads and verifies the newest local account file before switching or removing the local vault record. Empty accounts are transferred as awaiting-login placeholders, so another machine can Bind, sign in, and Release them normally. A locally bound account therefore has no cloud copy. **Rename** and **Delete** affect only local records and never remove or rewrite cloud account payloads. If Bind cannot remove the cloud payload, the verified local copy is retained for recovery; if Release cannot verify its upload, the local vault, manifest, and live `auth.json` remain unchanged.
+## Managing skills
 
-Delta history is attributed independently by both model and account. Account buttons in the dashboard filter and rebase the charts just like model buttons, and both filters can be combined. Rows record the matching saved account slot and label, or **Unknown** when credentials do not match a registered account or attribution is unavailable. A saved account's current label is used while it exists; the recorded label remains available after deletion.
+The backend scans `CODEX_HOME/skills` and `~/.gemini/config/skills` for directories containing `SKILL.md`.
 
-Token usage is recorded per Codex session using cumulative-to-delta parsing aligned with cc-switch. The dashboard summary between Reset Time vs Usage and Usage vs Time shows fresh input, cached input, output, cache write, cache hit rate, and estimated token cost for the selected time span, models, and accounts. Cache reads use `cached_tokens`; cache writes use `cache_write_tokens` and are charged at the model's cache-write input rate when applicable. A session keeps the account attribution assigned when it is first recorded.
-Session logs are scanned incrementally in process memory. Unchanged files require metadata checks only, appended files are read from the previous byte offset, and only a truncated, replaced, or same-size rewritten file is rebuilt.
-Partial JSONL records, replay boundaries, model/service-tier state, and cumulative token state are carried across polls; no cursor data is persisted.
+1. Open **Manage skills & accounts**.
+2. Select **Scan skills** when you need a fresh discovery pass.
+3. Select skills and choose **Manage selected**.
+4. Assign each managed skill to Codex, Gemini, or both.
 
-Quota history is attributed by account only. The usage-over-time charts follow the shared Accounts filter, draw a separately colored curve for every selected account, and do not follow the model filter.
-A curve always connects gaps of at most 30 minutes and always breaks gaps of at least two hours. For gaps over 30 minutes but under two hours, the inclusive absolute raw-usage thresholds are 10 percentage points for Plus and 2 points for Pro or Pro Lite on the 5h chart, and 5 points for Plus and 1 point for Pro or Pro Lite on the 7d chart. Unknown and mixed-plan readings use the conservative Pro threshold for that window.
-Use `--quota-history` to override the quota-history path; `--compact-history-days` applies to both delta and quota history.
+Managed content is moved into `~/.codex-switch/skills`.
+The monitor creates strict per-skill symbolic links; Windows uses native directory junctions when symlinks are unavailable, while non-Windows systems use an ownership-marked managed copy as a fallback. Existing unrelated paths are preserved as conflicts.
 
-Access-token lifetime is estimated from the JWT `iat` and `exp` claims. The monitor refreshes once 30% of that lifetime remains; for example, a 10-day token is refreshed during its final 3 days. Tokens without a usable `iat` claim retain the 60-second fallback margin.
+Cloud behavior is name-based:
+
+- **Push:** local same-name content wins, remote-only skills remain, and accounts are never included.
+- **Fetch:** remote same-name content wins, local-only skills remain, and existing assignments are preserved.
+- **Unmanage:** immediately publishes a tombstone when cloud synchronization is configured.
+- **Restore:** exact API restore creates a local safety ZIP before replacing the managed set.
+
+Changed managed skills receive independent two-minute stability windows. Stable content is uploaded automatically up to three times, with 30 seconds between failures.
+The five-second observer hashes incrementally and performs a bounded full verification; disabling `skillsAutoUpload` disables this observation.
+
+## WebDAV and encrypted synchronization
+
+Open **Manage skills & accounts → Config file**. Configure the remote without manually editing secrets unless recovery requires it.
+
+| Setting | Purpose |
+| --- | --- |
+| Enabled | Turns WebDAV-backed features on or off. |
+| Base URL | HTTPS WebDAV endpoint. Plain HTTP is allowed only for literal loopback development URLs. |
+| Username / password | WebDAV credentials. The login password must remain locally recoverable because it is sent to the server. |
+| Remote root | Isolated directory used by this application. |
+| Encryption passphrase | Optional second-layer AES-256-GCM encryption. Every machine must use the same normalized URL, username, and passphrase. |
+| Skills auto upload | Watches stable managed-skill changes and uploads only changed packages. |
+| Usage data auto sync | Synchronizes the encrypted incremental usage journal every 30 minutes. |
+| Allow optimistic writes | Permits servers that ignore conditional writes; account exclusivity then becomes best-effort. |
+
+Use **Test WebDAV** before Push. Jianguoyun/Nutstore users can use `https://dav.jianguoyun.com/dav/` with an application password.
+
+The encryption passphrase is converted with scrypt and immediately cleared from the staging field. Its deterministic salt is derived from the normalized WebDAV URL and username so another machine can derive the same key.
+Changing an existing passphrase downloads, authenticates, re-encrypts, uploads, and verifies every known encrypted object; local configuration is committed only after the whole remote rotation succeeds, and partial remote writes are rolled back on failure.
+
+If authentication works but decryption fails, the management page can reload local configuration and retry or overwrite the inaccessible cloud root from local data. Overwrite permanently removes cloud-only skills, released accounts, and usage history.
+
+### Usage-data synchronization
+
+Usage synchronization is independent from skill Push:
+
+- It runs every 30 minutes when `usageDataAutoSync` is enabled.
+- It synchronizes delta/cost intervals, quota history, and token-session history.
+- It excludes credentials, skill contents, detailed sample logs, and runtime state.
+- Immutable encrypted chunks, checkpoints, ETags, and tombstones make updates incremental and retry-safe.
+- Downloaded data is stored by origin in `usage_monitor_sync_cache.json`; it never replaces or appends to local recorder files.
+
+Every five minutes, periodic Fetch also checks the authoritative skill index and refreshes the released-account list. Unchanged pointers and matching package hashes avoid unnecessary downloads.
+
+## Data and privacy
+
+The canonical data root is `~/.codex-switch`:
+
+| Path | Contents | Cloud synchronized? |
+| --- | --- | --- |
+| `config.json` | Server settings, plaintext WebDAV login password, cookie secret, password verifier, and derived encryption key | No |
+| `accounts/` | Sensitive Codex account vault and manifest | Only explicit move-only Release/Bind |
+| `skills/` | Private managed skill source | Optional encrypted packages |
+| `usage_monitor_history.jsonl` | Local raw cost/delta intervals | Derived records only |
+| `usage_monitor_quota_history.jsonl` | Local compact quota readings | Derived records only |
+| `usage_monitor_token_sessions.jsonl` | Local per-session token and cost totals | Derived records only |
+| `usage_monitor_samples.jsonl` | Detailed local diagnostic samples | Never |
+| `usage_monitor_state.json` | Runtime baselines and cursors | Never |
+| `usage_monitor_sync_cache.json` | Downloaded records grouped by origin | Never uploaded as a recorder file |
+
+> [!WARNING]
+> Protect the whole `~/.codex-switch` directory. Never commit it, place it in support bundles, log it, or share screenshots of its contents. Losing the encryption passphrase makes encrypted remote data unrecoverable.
+
+Dashboard series and status are intentionally readable from the configured server address. Every account, skill, WebDAV, cloud, server, and configuration mutation requires the control password.
+First-time control-password setup is loopback-only. If you do not need LAN access, change the server host to `127.0.0.1` and restart the monitor; the default `0.0.0.0` listens on all interfaces.
+
+## Command-line reference
+
+```console
+python monitor_codex_usage.py --help
+```
+
+| Option | Description |
+| --- | --- |
+| `--dashboard` | Open the dashboard after the server starts. |
+| `--codex-home PATH` | Use a different Codex home containing `sessions/` and usually `auth.json`. |
+| `--auth PATH` | Override the live authentication file. |
+| `--interval SECONDS` | Set the remote usage polling interval; default is 90 seconds. |
+| `--timeout SECONDS` | Set the per-request timeout; default is 10 seconds. |
+| `--history PATH` | Override local delta-history JSONL. |
+| `--quota-history PATH` | Override per-account quota-history JSONL. |
+| `--token-session-history PATH` | Override per-session token/cost JSONL. |
+| `--sample-log PATH` | Override the detailed diagnostic JSONL. |
+| `--sample-log-max-bytes N` | Compact the sample log after this size; default is 50 MiB with an 80% target. |
+| `--local-only` | Scan local session logs without calling ChatGPT usage endpoints. |
+| `--no-token-scan` | Disable local session token scanning. |
+| `--process-history` | Print valid stored delta cost/percentage pairs and exit. |
+| `--compact-history-days N` | Keep only delta and quota history newer than N days and exit. |
+| `--reencrypt-cloud` | Refresh nonces and verify all encrypted WebDAV payloads using the configured key, then exit. |
+| `--retry-limit N` | Set bounded HTTP/dashboard retries; network outages continue retrying. |
+
+## Troubleshooting
+
+### The VS Code status bar cannot connect
+
+- Confirm `python monitor_codex_usage.py` is still running.
+- Confirm `http://127.0.0.1:8765/api/status` opens locally.
+- Check whether another process owns port `8765`.
+- The extension always connects to `127.0.0.1:8765`, even when the server also listens on the LAN.
+
+### The dashboard is waiting for login
+
+- Complete the normal Codex login in a new or restarted terminal.
+- Confirm the expected `CODEX_HOME/auth.json` exists.
+- Do not manually copy credentials between managed account slots.
+
+### A control password is reported as compromised
+
+A legacy nonempty `passwordHash` without its separate valid `passwordSalt` is rejected. Stop the monitor, remove only `control.passwordHash` from `~/.codex-switch/config.json`, restart, and create a new password locally. Do not reuse `123456`.
+
+### WebDAV authentication works but encrypted data does not open
+
+- Verify the normalized base URL, username, remote root, and passphrase match the other machine.
+- Reload configuration and retry before choosing overwrite.
+- Treat overwrite as destructive to cloud-only data.
+
+### A skill cannot be assigned
+
+- Run **Scan skills** and inspect the reported projection conflict.
+- Move or rename an unrelated existing path yourself; the monitor will not overwrite it.
+- On Windows, ensure the account can create a symlink or native junction at the target.
+
+## Development
+
+Run from the repository root:
+
+```console
+python -m pip install -r requirements.txt
+python -m unittest test_monitor_codex_usage.py
+npm run check
+python monitor_codex_usage.py --help
+```
+
+Build a reproducible deployment bundle:
+
+```console
+python build_release.py
+```
+
+or:
+
+```console
+npm run release
+```
+
+The builder recreates generated files in `release/`, packages the pinned VSCE version, copies the standalone runtime and GPL license, and removes obsolete versioned VSIX files.
+Credentials, local history, caches, tests, reference sources, and development-only material are excluded.
+
+### Repository layout
+
+| Path | Responsibility |
+| --- | --- |
+| `monitor_codex_usage.py` | CLI entry point and monitor startup. |
+| `monitor_dashboard.py` | Polling loops, dashboard/API server, response caches, control authorization, and UI datasets. |
+| `monitor_accounts.py` | Local credential vault, identity-safe switching, and move-only account transfer. |
+| `monitor_cloud.py` | Configuration, WebDAV, encryption, serialized cloud operations, packages, and usage journal. |
+| `monitor_skills.py` | Skill discovery, managed storage, validation, assignments, and projections. |
+| `monitor_tokens.py` | Incremental session-log parsing, token aggregation, Fast attribution, and cost calculation. |
+| `monitor_events.py` / `monitor_quota.py` | Remote usage interpretation, reset handling, and delta validation. |
+| `monitor_history.py` / `monitor_usage_sync.py` | Local persistence, compaction, provenance, synchronized cache, and merged datasets. |
+| `extension.js` / `package.json` | Thin VS Code extension host and manifest. |
+| `dashboard.html` / `management.html` | Local user interfaces. |
+| `build_release.py` | Reproducible VSIX and standalone-runtime builder. |
+
+## License
+
+Codex Usage Monitor is free software licensed under the <a href="./LICENSE">GNU General Public License version 3</a>.
