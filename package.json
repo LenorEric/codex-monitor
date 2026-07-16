@@ -5,6 +5,14 @@
   "version": "1.0.0",
   "publisher": "lenor",
   "author": "Lenor",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/LenorEric/codex-monitor.git"
+  },
+  "homepage": "https://github.com/LenorEric/codex-monitor#readme",
+  "bugs": {
+    "url": "https://github.com/LenorEric/codex-monitor/issues"
+  },
   "engines": {
     "vscode": "^1.96.0"
   },
