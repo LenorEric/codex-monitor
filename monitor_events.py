@@ -3,7 +3,7 @@
 from datetime import datetime
 
 from monitor_common import (
-    LEGACY_EVENT_ACCOUNT_ID, LEGACY_EVENT_ACCOUNT_LABEL, MIN_DELTA_COST_PER_PERCENT_USD, PLAN_MULTIPLIERS, RATIO_DEVIATION_MULTIPLIER, RESET_TIME_JITTER_SECONDS,
+    MIN_DELTA_COST_PER_PERCENT_USD, PLAN_MULTIPLIERS, RATIO_DEVIATION_MULTIPLIER, RESET_TIME_JITTER_SECONDS,
     UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, coerce_float, parse_timestamp,
 )
 from monitor_history import compact_debug_state, compact_sample_for_state, compact_token_usage_for_state, is_delta_event_row
@@ -323,10 +323,7 @@ def event_model(event: dict) -> str:
     return normalize_codex_model(model) if isinstance(model, str) and model else DEFAULT_EVENT_MODEL
 
 def event_account(event: dict) -> dict:
-    return {
-        "accountSlotId": event.get("accountSlotId") or LEGACY_EVENT_ACCOUNT_ID,
-        "accountLabel": event.get("accountLabel") or LEGACY_EVENT_ACCOUNT_LABEL,
-    }
+    return {"accountSlotId": event.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID, "accountLabel": event.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL}
 
 def record_special_event(state: dict, reason: str, sample: dict, label: str, previous: dict, current: dict, extra: dict | None = None) -> None:
     if not (extra or any(previous.get(key) != value for key, value in current.items())):

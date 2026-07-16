@@ -5,7 +5,6 @@ import functools
 import hashlib
 import hmac
 import json
-import socket
 import secrets
 import threading
 import time
@@ -29,7 +28,7 @@ AUTO_PUSH_RETRY_SECONDS = 30
 AUTO_PUSH_MAX_ATTEMPTS = 3
 AUTO_FETCH_INTERVAL_SECONDS = 300
 USAGE_SYNC_INTERVAL_SECONDS = 30 * 60
-PASSPHRASE_SALT = b"codex-switch-passphrase-v1"
+LEGACY_PASSPHRASE_SALT = b"codex-switch-passphrase-v1"
 USAGE_SYNC_RETRY_SECONDS = (60, 5 * 60, 15 * 60)
 USAGE_CHECKPOINT_MIN_CHUNKS = 128
 USAGE_CHUNK_MAX_BYTES = 512 * 1024
@@ -44,11 +43,13 @@ def _serialized_cloud_operation(method):
 
 
 class CloudError(RuntimeError):
-    def __init__(self, message: str, status: int = 400, *, http_status: int | None = None, category: str | None = None):
+    def __init__(self, message: str, status: int = 400, *, http_status: int | None = None, category: str | None = None, details: list[dict] | None = None, decrypt_failed: bool = False):
         super().__init__(message)
         self.status = status
         self.http_status = http_status
         self.category = category
+        self.details = details
+        self.decrypt_failed = decrypt_failed
 
 
 def validate_server_host(host) -> str:
@@ -61,10 +62,10 @@ def load_server_config(config_path: Path) -> dict:
     try:
         config = json.loads(Path(config_path).read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return {"host": "127.0.0.1"}
+        return {"host": "0.0.0.0"}
     except (OSError, json.JSONDecodeError) as exc:
         raise CloudError(f"Cannot read dashboard config: {exc}", 500) from exc
-    server = config.get("server", {"host": "127.0.0.1"}) if isinstance(config, dict) else None
+    server = config.get("server", {"host": "0.0.0.0"}) if isinstance(config, dict) else None
     if not isinstance(server, dict):
         raise CloudError("Unsupported dashboard config", 500)
     return {"host": validate_server_host(server.get("host"))}
@@ -74,18 +75,21 @@ def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def hash_control_password(password: str) -> str:
-    salt = secrets.token_bytes(16)
-    derived = hashlib.scrypt(password.encode("utf-8"), salt=salt, n=1 << 14, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
-    return f"scrypt-v1$16384$8$1${base64.b64encode(salt).decode()}${base64.b64encode(derived).decode()}"
+def new_control_password_salt() -> str:
+    return base64.b64encode(secrets.token_bytes(16)).decode()
 
 
-def control_password_matches(password, verifier: str) -> bool:
+def hash_control_password(password: str, salt: str) -> str:
+    derived = hashlib.scrypt(password.encode("utf-8"), salt=base64.b64decode(salt, validate=True), n=1 << 14, r=8, p=1, dklen=32, maxmem=64 * 1024 * 1024)
+    return f"scrypt-v2$16384$8$1${base64.b64encode(derived).decode()}"
+
+
+def control_password_matches(password, verifier: str, salt: str) -> bool:
     if not isinstance(password, str):
         return False
     try:
-        scheme, n, r, p, salt, expected = verifier.split("$", 5)
-        if scheme != "scrypt-v1":
+        scheme, n, r, p, expected = verifier.split("$", 4)
+        if scheme != "scrypt-v2":
             return False
         derived = hashlib.scrypt(password.encode("utf-8"), salt=base64.b64decode(salt, validate=True), n=int(n), r=int(r), p=int(p), dklen=32, maxmem=64 * 1024 * 1024)
         return hmac.compare_digest(derived, base64.b64decode(expected, validate=True))
@@ -95,24 +99,80 @@ def control_password_matches(password, verifier: str) -> bool:
 
 def valid_control_password_hash(verifier) -> bool:
     try:
-        scheme, n, r, p, salt, expected = verifier.split("$", 5)
-        return scheme == "scrypt-v1" and int(n) == 1 << 14 and int(r) == 8 and int(p) == 1 and len(base64.b64decode(salt, validate=True)) == 16 and len(base64.b64decode(expected, validate=True)) == 32
+        scheme, n, r, p, expected = verifier.split("$", 4)
+        return scheme == "scrypt-v2" and int(n) == 1 << 14 and int(r) == 8 and int(p) == 1 and len(base64.b64decode(expected, validate=True)) == 32
     except (AttributeError, ValueError, TypeError):
         return False
 
 
-def passphrase_hash(passphrase: str) -> str:
-    derived = hashlib.scrypt(passphrase.encode("utf-8"), salt=PASSPHRASE_SALT, n=1 << 15, r=8, p=1, dklen=32, maxmem=128 * 1024 * 1024)
-    return f"scrypt-key-v1$32768$8$1${base64.b64encode(PASSPHRASE_SALT).decode()}${base64.b64encode(derived).decode()}"
+def valid_control_password_salt(salt) -> bool:
+    try:
+        return len(base64.b64decode(salt, validate=True)) == 16
+    except (ValueError, TypeError):
+        return False
+
+
+def control_password_is_configured(control: dict) -> bool:
+    return isinstance(control, dict) and valid_control_password_hash(control.get("passwordHash")) and valid_control_password_salt(control.get("passwordSalt"))
+
+
+def control_password_is_compromised(control: dict) -> bool:
+    return isinstance(control, dict) and bool(control.get("passwordHash")) and not control_password_is_configured(control)
+
+
+def validate_new_control_password(password) -> str:
+    if not isinstance(password, str):
+        raise CloudError("Control password must be text")
+    password = password.strip()
+    if not password:
+        raise CloudError("Control password is required")
+    if password == "123456":
+        raise CloudError("Choose a control password other than 123456")
+    if len(password) > 1024:
+        raise CloudError("Control password is too long")
+    return password
+
+
+def normalized_webdav_identity(base_url: str, username: str) -> str:
+    parsed = urllib.parse.urlsplit(base_url if "://" in base_url else f"//{base_url}")
+    host = (parsed.hostname or "").lower().rstrip(".")
+    port = f":{parsed.port}" if parsed.port and not (parsed.scheme.lower() == "https" and parsed.port == 443 or parsed.scheme.lower() == "http" and parsed.port == 80) else ""
+    path = "/".join(segment for segment in parsed.path.replace("\\", "/").split("/") if segment)
+    return f"{host}{port}{f'/{path}' if path else ''}\n{username.strip()}"
+
+
+def webdav_passphrase_salt(base_url: str, username: str) -> bytes:
+    return hashlib.sha256(f"codex-switch-webdav-passphrase-v2\n{normalized_webdav_identity(base_url, username)}".encode("utf-8")).digest()
+
+
+def passphrase_hash(passphrase: str, base_url: str, username: str) -> str:
+    salt = webdav_passphrase_salt(base_url, username)
+    derived = hashlib.scrypt(passphrase.encode("utf-8"), salt=salt, n=1 << 15, r=8, p=1, dklen=32, maxmem=128 * 1024 * 1024)
+    return f"scrypt-key-v2$32768$8$1${base64.b64encode(salt).decode()}${base64.b64encode(derived).decode()}"
 
 
 def _passphrase_key(verifier: str) -> bytes:
     try:
         scheme, n, r, p, salt, derived = verifier.split("$", 5)
         key = base64.b64decode(derived, validate=True)
-        if scheme != "scrypt-key-v1" or int(n) != 1 << 15 or int(r) != 8 or int(p) != 1 or base64.b64decode(salt, validate=True) != PASSPHRASE_SALT or len(key) != 32:
+        decoded_salt = base64.b64decode(salt, validate=True)
+        if (scheme not in {"scrypt-key-v1", "scrypt-key-v2"} or int(n) != 1 << 15 or int(r) != 8 or int(p) != 1
+                or scheme == "scrypt-key-v1" and decoded_salt != LEGACY_PASSPHRASE_SALT or scheme == "scrypt-key-v2" and len(decoded_salt) != 32 or len(key) != 32):
             raise ValueError
         return key
+    except (AttributeError, ValueError, TypeError) as exc:
+        raise CloudError("Invalid saved encryption passphrase hash") from exc
+
+
+def _passphrase_salt(verifier: str) -> bytes:
+    try:
+        scheme, n, r, p, salt, derived = verifier.split("$", 5)
+        decoded = base64.b64decode(salt, validate=True)
+        if (scheme not in {"scrypt-key-v1", "scrypt-key-v2"} or int(n) != 1 << 15 or int(r) != 8 or int(p) != 1
+                or scheme == "scrypt-key-v1" and decoded != LEGACY_PASSPHRASE_SALT or scheme == "scrypt-key-v2" and len(decoded) != 32
+                or len(base64.b64decode(derived, validate=True)) != 32):
+            raise ValueError
+        return decoded
     except (AttributeError, ValueError, TypeError) as exc:
         raise CloudError("Invalid saved encryption passphrase hash") from exc
 
@@ -125,33 +185,59 @@ def valid_passphrase_hash(verifier) -> bool:
         return False
 
 
+def passphrase_hash_matches_webdav(verifier, base_url: str, username: str) -> bool:
+    try:
+        scheme = verifier.split("$", 1)[0]
+        return valid_passphrase_hash(verifier) and (scheme == "scrypt-key-v1" or _passphrase_salt(verifier) == webdav_passphrase_salt(base_url, username))
+    except (AttributeError, CloudError):
+        return False
+
+
 class CryptoBox:
     def __init__(self, passphrase_hash_value: str, descriptor: dict):
+        if not passphrase_hash_value:
+            if descriptor != {"format": "codex-switch-plain", "version": 1}:
+                raise CloudError("The encryption passphrase does not match this remote root", 409, decrypt_failed=True)
+            self.key = hashlib.sha256(b"codex-switch-plain-webdav-v1").digest()
+            self.plaintext = True
+            return
         self.key = _passphrase_key(passphrase_hash_value)
+        self.plaintext = False
         try:
-            if descriptor.get("format") != "codex-switch-crypto" or descriptor.get("version") != 1 or descriptor.get("kdf") != "scrypt" or base64.b64decode(descriptor["salt"], validate=True) != PASSPHRASE_SALT or int(descriptor["n"]) != 1 << 15 or int(descriptor["r"]) != 8 or int(descriptor["p"]) != 1:
+            expected_version = 1 if passphrase_hash_value.startswith("scrypt-key-v1$") else 2
+            if (descriptor.get("format") != "codex-switch-crypto" or descriptor.get("version") != expected_version or descriptor.get("kdf") != "scrypt"
+                    or base64.b64decode(descriptor["salt"], validate=True) != _passphrase_salt(passphrase_hash_value)
+                    or int(descriptor["n"]) != 1 << 15 or int(descriptor["r"]) != 8 or int(descriptor["p"]) != 1):
                 raise ValueError
         except (AttributeError, KeyError, ValueError, TypeError) as exc:
-            raise CloudError("Invalid remote crypto descriptor") from exc
+            raise CloudError("The encryption passphrase does not match this remote root", 409, decrypt_failed=True) from exc
         verifier = hmac.new(self.key, b"codex-switch-verifier-v1", hashlib.sha256).digest()
         if not hmac.compare_digest(verifier, base64.b64decode(descriptor.get("verifier", ""))):
-            raise CloudError("The encryption passphrase does not match this remote root", 409)
+            raise CloudError("The encryption passphrase does not match this remote root", 409, decrypt_failed=True)
 
     @staticmethod
     def descriptor(passphrase_hash_value: str) -> dict:
+        if not passphrase_hash_value:
+            return {"format": "codex-switch-plain", "version": 1}
         key = _passphrase_key(passphrase_hash_value)
         return {
-            "format": "codex-switch-crypto", "version": 1, "kdf": "scrypt", "salt": base64.b64encode(PASSPHRASE_SALT).decode(), "n": 1 << 15, "r": 8, "p": 1,
+            "format": "codex-switch-crypto", "version": 1 if passphrase_hash_value.startswith("scrypt-key-v1$") else 2, "kdf": "scrypt", "salt": base64.b64encode(_passphrase_salt(passphrase_hash_value)).decode(), "n": 1 << 15, "r": 8, "p": 1,
             "verifier": base64.b64encode(hmac.new(key, b"codex-switch-verifier-v1", hashlib.sha256).digest()).decode(),
         }
 
     def encrypt(self, purpose: str, data: bytes) -> bytes:
+        if self.plaintext:
+            return data
         nonce = secrets.token_bytes(12)
         header = {"format": "codex-switch-encrypted", "version": 1, "purpose": purpose, "size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
         aad = json.dumps(header, sort_keys=True, separators=(",", ":")).encode()
         return json.dumps({"header": header, "nonce": base64.b64encode(nonce).decode(), "ciphertext": base64.b64encode(AESGCM(self.key).encrypt(nonce, data, aad)).decode()}, separators=(",", ":")).encode()
 
     def decrypt(self, purpose: str, payload: bytes, limit: int = 600 * 1024 * 1024) -> bytes:
+        if self.plaintext:
+            if len(payload) > limit:
+                raise CloudError("WebDAV payload is too large", 409)
+            return payload
         try:
             envelope = json.loads(payload)
             header = envelope["header"]
@@ -160,7 +246,7 @@ class CryptoBox:
             aad = json.dumps(header, sort_keys=True, separators=(",", ":")).encode()
             data = AESGCM(self.key).decrypt(base64.b64decode(envelope["nonce"], validate=True), base64.b64decode(envelope["ciphertext"], validate=True), aad)
         except Exception as exc:
-            raise CloudError("Encrypted payload authentication failed", 409) from exc
+            raise CloudError("Encrypted payload authentication failed", 409, decrypt_failed=True) from exc
         if len(data) != header["size"] or hashlib.sha256(data).hexdigest() != header.get("sha256"):
             raise CloudError("Encrypted payload completion check failed", 409)
         return data
@@ -275,7 +361,7 @@ class CloudManager:
         try:
             self._config, self._config_error = self._read_config(), None
         except CloudError as exc:
-            self._config, self._config_error = {"version": 1, "machineName": None, "webdav": {}}, str(exc)
+            self._config, self._config_error = {"version": 1, "webdav": {}}, str(exc)
         self._machine = json.loads(self.machine_path.read_text(encoding="utf-8"))
         self._state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self._observed_skill_revision = None
@@ -296,10 +382,10 @@ class CloudManager:
             atomic_write_json(self.machine_path, {"version": 1, "machineId": uuid.uuid4().hex, "createdAt": _timestamp()})
         if not self.config_path.exists():
             atomic_write_json(self.config_path, {
-                "version": 1, "machineName": socket.gethostname() or "My PC", "control": {"password": "", "passwordHash": hash_control_password("123456"), "cookieSecret": secrets.token_urlsafe(32)},
-                "server": {"host": "127.0.0.1"},
+                "version": 1, "control": {"password": "", "passwordHash": "", "passwordSalt": "", "cookieSecret": secrets.token_urlsafe(32)},
+                "server": {"host": "0.0.0.0"},
                 "webdav": {
-                    "enabled": False, "baseUrl": "https://dav.jianguoyun.com/dav/", "username": "", "password": "", "remoteRoot": "codex-switch-sync", "encryptionPassphraseHash": "",
+                    "enabled": False, "baseUrl": "https://dav.jianguoyun.com/dav/", "username": "", "password": "", "remoteRoot": "codex-switch-sync", "encryptionPassphrase": "", "encryptionPassphraseHash": "",
                     "skillsAutoUpload": True, "usageDataAutoSync": True, "allowOptimisticWrites": True,
                 },
             })
@@ -313,18 +399,29 @@ class CloudManager:
                 if not isinstance(control, dict):
                     config["control"] = control = {}
                 changed = False
+                if "machineName" in config:
+                    del config["machineName"]
+                    changed = True
                 if "server" not in config:
-                    config["server"] = {"host": "127.0.0.1"}
+                    config["server"] = {"host": "0.0.0.0"}
                     changed = True
                 if isinstance(control.get("password"), str) and control["password"]:
-                    control["passwordHash"] = hash_control_password(control["password"])
+                    if control["password"] == "123456":
+                        control["passwordHash"], control["passwordSalt"] = "", ""
+                    else:
+                        control["passwordSalt"] = new_control_password_salt()
+                        control["passwordHash"] = hash_control_password(control["password"], control["passwordSalt"])
                     control["password"] = ""
                     changed = True
                 elif "password" not in control:
                     control["password"] = ""
                     changed = True
-                if not valid_control_password_hash(control.get("passwordHash")):
-                    control["passwordHash"] = hash_control_password("123456")
+                if "passwordHash" not in control:
+                    control["passwordHash"] = ""
+                    control["passwordSalt"] = ""
+                    changed = True
+                if "passwordSalt" not in control:
+                    control["passwordSalt"] = ""
                     changed = True
                 if not isinstance(control.get("cookieSecret"), str) or len(control["cookieSecret"]) < 32:
                     control["cookieSecret"] = secrets.token_urlsafe(32)
@@ -340,12 +437,19 @@ class CloudManager:
                     if "encryptionPassphraseHash" not in webdav:
                         webdav["encryptionPassphraseHash"] = ""
                         changed = True
+                    if "encryptionPassphrase" not in webdav:
+                        webdav["encryptionPassphrase"] = ""
+                        changed = True
+                    if isinstance(webdav.get("encryptionPassphrase"), str) and webdav["encryptionPassphrase"]:
+                        webdav["encryptionPassphraseHash"] = passphrase_hash(webdav["encryptionPassphrase"].strip(), str(webdav.get("baseUrl", "")), str(webdav.get("username", "")))
+                        webdav["encryptionPassphrase"] = ""
+                        changed = True
                 if changed:
                     atomic_write_json(self.config_path, config)
         if not self.state_path.exists():
             atomic_write_json(self.state_path, {
                 "version": 1, "skills": {"indexEtag": None, "indexId": None, "localSha256": {}}, "usage": {"published": {}, "remote": {}, "sequence": 0, "lastSuccessAt": None, "failure": None},
-                "remote": {"accounts": {}, "skills": {}}, "pendingAccountOperation": None, "conditionalWritesVerified": False,
+                "remote": {"accounts": {}, "skills": {}}, "pendingAccountOperation": None, "conditionalWritesVerified": False, "decryptFailure": None,
             })
         else:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
@@ -369,6 +473,9 @@ class CloudManager:
                     if key not in state["usage"]:
                         state["usage"][key] = value
                         changed = True
+            if "decryptFailure" not in state:
+                state["decryptFailure"] = None
+                changed = True
             if changed:
                 atomic_write_json(self.state_path, state)
 
@@ -377,16 +484,24 @@ class CloudManager:
             config = json.loads(self.config_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise CloudError(f"Cannot read WebDAV config: {exc}", 500) from exc
+        return self._validate_config(config)
+
+    @staticmethod
+    def _validate_config(config: dict) -> dict:
+        if not isinstance(config, dict):
+            raise CloudError("Unsupported WebDAV config", 500)
         webdav, control, server = config.get("webdav"), config.get("control"), config.get("server")
-        if config.get("version") != 1 or not isinstance(webdav, dict) or not isinstance(control, dict) or not isinstance(server, dict) or control.get("password") != "" or not valid_control_password_hash(control.get("passwordHash")) or not isinstance(control.get("cookieSecret"), str) or len(control["cookieSecret"]) < 32:
+        if (config.get("version") != 1 or not isinstance(webdav, dict) or not isinstance(control, dict) or not isinstance(server, dict) or control.get("password") != "" or webdav.get("encryptionPassphrase") != ""
+                or not isinstance(control.get("passwordHash"), str) or len(control["passwordHash"]) > 1024 or not isinstance(control.get("passwordSalt"), str)
+                or not isinstance(control.get("cookieSecret"), str) or len(control["cookieSecret"]) < 32):
             raise CloudError("Unsupported WebDAV config", 500)
         validate_server_host(server.get("host"))
         parsed_url = urllib.parse.urlsplit(str(webdav.get("baseUrl", "")))
         secure_url = parsed_url.scheme.lower() == "https" or parsed_url.scheme.lower() == "http" and parsed_url.hostname in {"localhost", "127.0.0.1", "::1"}
-        if webdav.get("encryptionPassphraseHash") and not valid_passphrase_hash(webdav["encryptionPassphraseHash"]):
+        if webdav.get("encryptionPassphraseHash") and not passphrase_hash_matches_webdav(webdav["encryptionPassphraseHash"], str(webdav.get("baseUrl", "")), str(webdav.get("username", ""))):
             raise CloudError("Invalid saved encryption passphrase hash", 500)
-        if webdav.get("enabled") and (not secure_url or not webdav.get("username") or not webdav.get("password") or not webdav.get("encryptionPassphraseHash")):
-            raise CloudError("Enabled WebDAV requires a URL, username, password, and encryption passphrase")
+        if webdav.get("enabled") and (not secure_url or not webdav.get("username") or not webdav.get("password")):
+            raise CloudError("Enabled WebDAV requires a URL, username, and password")
         return config
 
     def config(self) -> dict:
@@ -401,6 +516,111 @@ class CloudManager:
             atomic_write_json(self.config_path, config)
             self._config = config
         return {"host": host, "restartRequired": True}
+
+    def editable_config(self) -> dict:
+        config = self.config()
+        webdav = config["webdav"]
+        return {
+            "server": {"host": config["server"]["host"]},
+            "webdav": {key: webdav.get(key) for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")},
+            "secretsConfigured": {"password": bool(webdav.get("password")), "encryptionPassphrase": bool(webdav.get("encryptionPassphraseHash")), "controlPassword": control_password_is_configured(config["control"])},
+        }
+
+    @_serialized_cloud_operation
+    def reload_config(self) -> dict:
+        try:
+            config = json.loads(self.config_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise CloudError(f"Cannot read WebDAV config: {exc}", 500) from exc
+        webdav = config.get("webdav") if isinstance(config, dict) else None
+        if isinstance(webdav, dict) and isinstance(webdav.get("encryptionPassphrase"), str) and webdav["encryptionPassphrase"]:
+            webdav["encryptionPassphraseHash"] = passphrase_hash(self._config_text(webdav["encryptionPassphrase"], "Encryption passphrase", 4096), str(webdav.get("baseUrl", "")), str(webdav.get("username", "")))
+            webdav["encryptionPassphrase"] = ""
+            atomic_write_json(self.config_path, config)
+        config = self._validate_config(config)
+        self._config, self._config_error = config, None
+        self._usage_hmac_key = None
+        self._usage_account_ids.clear()
+        return {"config": self.editable_config(), "reloaded": True}
+
+    def initialize_control_password(self, password) -> dict:
+        with self._operation_lock:
+            current = self.config()
+            if control_password_is_configured(current["control"]):
+                raise CloudError("Control password is already configured", 409)
+            if current["control"].get("passwordHash"):
+                raise CloudError("Control password compromised. Remove passwordHash from config.json, restart the monitor, and then create a new control password.", 409)
+            salt = new_control_password_salt()
+            config = {**current, "control": {**current["control"], "password": "", "passwordHash": hash_control_password(validate_new_control_password(password), salt), "passwordSalt": salt}}
+            atomic_write_json(self.config_path, config)
+            self._config = config
+        return {"controlPasswordConfigured": True}
+
+    @staticmethod
+    def _config_text(value, label: str, maximum: int, *, required: bool = True) -> str:
+        if not isinstance(value, str):
+            raise CloudError(f"{label} must be text")
+        value = value.strip()
+        if required and not value:
+            raise CloudError(f"{label} is required")
+        if len(value) > maximum:
+            raise CloudError(f"{label} is too long")
+        return value
+
+    def _commit_rotated_config(self, config: dict) -> None:
+        self._state["remote"] = {"accounts": {}, "skills": {}}
+        self._state["skills"]["indexEtag"] = None
+        self._state["usage"]["remote"] = {}
+        self._save_state()
+        atomic_write_json(self.config_path, config)
+
+    @_serialized_cloud_operation
+    def update_config(self, values: dict) -> dict:
+        if not isinstance(values, dict) or not isinstance(values.get("webdav"), dict) or not isinstance(values.get("server"), dict):
+            raise CloudError("Invalid config update")
+        current = self.config()
+        webdav_values = values["webdav"]
+        config = {
+            **current,
+            "server": {"host": validate_server_host(values["server"].get("host"))},
+            "control": {**current["control"], "password": ""},
+            "webdav": {
+                **current["webdav"],
+                "encryptionPassphrase": "",
+                "enabled": webdav_values.get("enabled") is True,
+                "baseUrl": self._config_text(webdav_values.get("baseUrl"), "WebDAV base URL", 2048),
+                "username": self._config_text(webdav_values.get("username"), "WebDAV username", 512, required=False),
+                "remoteRoot": self._config_text(webdav_values.get("remoteRoot"), "WebDAV remote root", 512),
+                "skillsAutoUpload": webdav_values.get("skillsAutoUpload") is True,
+                "usageDataAutoSync": webdav_values.get("usageDataAutoSync") is True,
+                "allowOptimisticWrites": webdav_values.get("allowOptimisticWrites") is True,
+            },
+        }
+        password = webdav_values.get("password")
+        passphrase = webdav_values.get("encryptionPassphrase")
+        control_password = values.get("controlPassword")
+        if password not in (None, ""):
+            config["webdav"]["password"] = self._config_text(password, "New WebDAV password", 4096)
+        if control_password not in (None, ""):
+            config["control"]["passwordSalt"] = new_control_password_salt()
+            config["control"]["passwordHash"] = hash_control_password(validate_new_control_password(control_password), config["control"]["passwordSalt"])
+        new_passphrase_hash = current["webdav"].get("encryptionPassphraseHash")
+        if passphrase not in (None, ""):
+            new_passphrase_hash = passphrase_hash(self._config_text(passphrase, "New encryption passphrase", 4096), config["webdav"]["baseUrl"], config["webdav"]["username"])
+            config["webdav"]["encryptionPassphraseHash"] = new_passphrase_hash
+        elif new_passphrase_hash and not passphrase_hash_matches_webdav(new_passphrase_hash, config["webdav"]["baseUrl"], config["webdav"]["username"]):
+            raise CloudError("Enter the encryption passphrase when changing the WebDAV base URL or username so remote data can be re-encrypted with the new salt", 409)
+        self._validate_config(config)
+        passphrase_changed = bool(current["webdav"].get("encryptionPassphraseHash")) and new_passphrase_hash != current["webdav"].get("encryptionPassphraseHash")
+        if passphrase_changed:
+            self._rotate_remote_passphrase(config["webdav"], new_passphrase_hash, lambda: self._commit_rotated_config(config))
+        else:
+            atomic_write_json(self.config_path, config)
+        self._config, self._config_error = config, None
+        if passphrase_changed:
+            self._usage_hmac_key = None
+            self._usage_account_ids.clear()
+        return {"config": self.editable_config(), "restartRequired": config["server"] != current["server"], "controlPasswordChanged": config["control"]["passwordHash"] != current["control"]["passwordHash"], "passphraseChanged": passphrase_changed}
 
     @property
     def machine_id(self) -> str:
@@ -450,11 +670,18 @@ class CloudManager:
     def _save_state(self) -> None:
         atomic_write_json(self.state_path, self._state)
 
+    def _record_decrypt_failure(self, exc: Exception, operation: str) -> None:
+        if getattr(exc, "decrypt_failed", False):
+            current = self._state.get("decryptFailure") or {}
+            if current.get("message") != str(exc) or current.get("operation") != operation:
+                self._state["decryptFailure"] = {"id": uuid.uuid4().hex, "message": str(exc), "operation": operation, "failedAt": _timestamp()}
+                self._save_state()
+
     def redacted_status(self) -> dict:
         config, error = self._config, self._config_error
         webdav = config.get("webdav", {})
         return {
-            "configPath": str(self.config_path), "machineName": config.get("machineName"), "webdav": {key: webdav.get(key) for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")},
+            "configPath": str(self.config_path), "webdav": {key: webdav.get(key) for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")},
             "secretsConfigured": {"password": bool(webdav.get("password")), "encryptionPassphrase": bool(webdav.get("encryptionPassphraseHash"))},
             "conditionalWritesVerified": bool(self._state.get("conditionalWritesVerified")),
             "optimisticWritesActive": not bool(self._state.get("conditionalWritesVerified")) and bool(webdav.get("allowOptimisticWrites", True)), "skills": self._state.get("skills", {}), "error": error,
@@ -462,6 +689,7 @@ class CloudManager:
                 "pending": bool(self._pending_skill_pushes), "pendingSkills": sorted(self._pending_skill_pushes), "attempts": max((item["attempts"] for item in self._pending_skill_pushes.values()), default=0),
                 "failure": next(reversed(self._auto_push_failures.values()), None),
             },
+            "decryptFailure": self._state.get("decryptFailure"),
             "usageSync": {
                 **{key: self._state.get("usage", {}).get(key) for key in ("lastSuccessAt", "failure")},
                 "nextAttemptInSeconds": max(0, round(self._next_usage_sync_at - time.monotonic())) if self._usage_data is not None else None,
@@ -576,6 +804,7 @@ class CloudManager:
         skills_changed = skills_changed or bool(skill_merge["added"] or skill_merge["updated"] or skill_merge.get("deleted"))
         cached = {"accounts": accounts, "skills": cached_skills, "fetchedAt": _timestamp()}
         local["remote"] = cached
+        local["decryptFailure"] = None
         self._save_state()
         if cached_skills.get("indexId"):
             self._finish_fetch_baseline(time.monotonic())
@@ -647,30 +876,85 @@ class CloudManager:
         return client, CryptoBox(webdav["encryptionPassphraseHash"], parsed)
 
     @_serialized_cloud_operation
+    def overwrite_cloud_from_local(self) -> dict:
+        if self._state.get("pendingAccountOperation"):
+            raise CloudError("Finish the pending account operation before overwriting cloud data", 409)
+        webdav = self.config()["webdav"]
+        if not webdav.get("enabled"):
+            raise CloudError("WebDAV is disabled", 409)
+        client = WebDavClient(webdav)
+        client.delete("")
+        client.ensure_directories("")
+        self._state["remote"] = {"accounts": {}, "skills": {}}
+        self._state["skills"]["indexEtag"] = None
+        self._state["usage"]["remote"] = {}
+        self._state["conditionalWritesVerified"] = False
+        self._state["decryptFailure"] = None
+        self._save_state()
+        result = self.upload_skills()
+        return {"overwritten": True, "skills": result, "encryptionEnabled": bool(webdav.get("encryptionPassphraseHash"))}
+
+    @_serialized_cloud_operation
     def test(self) -> dict:
-        client, _ = self._connection(True)
-        client.ensure_directories("protocol-test")
-        path, first = f"protocol-test/{uuid.uuid4().hex}.bin", secrets.token_bytes(32)
-        etag = client.put(path, first, create=True)
+        checks = []
+
+        def fail(name: str, exc: Exception):
+            checks.append({"name": name, "status": "failed", "detail": str(exc)})
+            if isinstance(exc, CloudError):
+                exc.details = checks
+                raise exc
+            raise CloudError(str(exc), 500, details=checks) from exc
+
+        try:
+            client, box = self._connection(True)
+            checks.append({"name": "Connection and account verification", "status": "passed", "detail": "The WebDAV server accepted the configured URL and credentials."})
+        except Exception as exc:
+            fail("Connection and account verification", exc)
+        try:
+            inventory = self._encrypted_inventory(client)
+            if inventory:
+                path, purpose = inventory[0]
+                box.decrypt(purpose, client.get(path)[0])
+                checks.append({"name": "Encrypted data decryption", "status": "passed", "detail": f"Successfully authenticated and decrypted {path}."})
+            else:
+                checks.append({"name": "Encrypted data decryption", "status": "skipped", "detail": "No encrypted cloud payload exists yet."})
+        except Exception as exc:
+            fail("Encrypted data decryption", exc)
+        try:
+            client.ensure_directories("protocol-test")
+            path, first = f"protocol-test/{uuid.uuid4().hex}.bin", secrets.token_bytes(32)
+            etag = client.put(path, first, create=True)
+            checks.append({"name": "Test object creation", "status": "passed", "detail": "Created a temporary protocol-test object."})
+        except Exception as exc:
+            fail("Test object creation", exc)
         conditional_writes = True
         try:
             client.put(path, b"duplicate", create=True)
             conditional_writes = False
         except CloudError as exc:
             if exc.http_status != 412:
-                raise
+                fail("Conditional create protection", exc)
+        checks.append({"name": "Conditional create protection", "status": "passed" if conditional_writes else "warning", "detail": "The server rejected a duplicate create." if conditional_writes else "The server accepted a duplicate create and cannot reliably prevent create conflicts."})
+        conditional_update = True
         try:
             client.put(path, b"wrong-etag", etag='"codex-switch-intentionally-wrong"')
-            conditional_writes = False
+            conditional_update = False
         except CloudError as exc:
             if exc.http_status != 412:
-                raise
-        etag = client.put(path, b"updated", etag=client.get(path)[1])
-        if client.get(path)[0] != b"updated":
-            raise CloudError("WebDAV read-back verification failed", 409)
+                fail("Conditional update protection", exc)
+        conditional_writes = conditional_writes and conditional_update
+        checks.append({"name": "Conditional update protection", "status": "passed" if conditional_update else "warning", "detail": "The server rejected an update with the wrong ETag." if conditional_update else "The server accepted an update with the wrong ETag and cannot reliably prevent overwrite conflicts."})
+        try:
+            etag = client.put(path, b"updated", etag=client.get(path)[1])
+            if client.get(path)[0] != b"updated":
+                raise CloudError("WebDAV read-back verification failed", 409)
+            checks.append({"name": "Update and read-back verification", "status": "passed", "detail": "Updated the test object with its current ETag and verified the stored bytes."})
+        except Exception as exc:
+            fail("Update and read-back verification", exc)
         self._state["conditionalWritesVerified"] = conditional_writes
+        self._state["decryptFailure"] = None
         self._save_state()
-        return {"ok": True, "strongEtag": etag, "conditionalWrites": conditional_writes, "optimisticWrites": not conditional_writes and bool(self.config()["webdav"].get("allowOptimisticWrites", True)), "warning": None if conditional_writes else "The server ignores conditional writes; conflict prevention is best-effort."}
+        return {"ok": True, "strongEtag": etag, "conditionalWrites": conditional_writes, "encryptedPayloadVerified": bool(inventory), "optimisticWrites": not conditional_writes and bool(self.config()["webdav"].get("allowOptimisticWrites", True)), "warning": None if conditional_writes else "The server ignores conditional writes; conflict prevention is best-effort.", "checks": checks}
 
     @staticmethod
     def _reencrypt_object(client: WebDavClient, box: CryptoBox, path: str, purpose: str) -> None:
@@ -680,6 +964,93 @@ class CloudManager:
         verified, _ = client.get(path)
         if box.decrypt(purpose, verified) != plaintext:
             raise CloudError(f"Cloud re-encryption verification failed for {path}", 409)
+
+    @staticmethod
+    def _optional_remote_list(client: WebDavClient, path: str) -> list[str]:
+        try:
+            return client.list(path)
+        except CloudError as exc:
+            if exc.http_status == 404 or "HTTP 404" in str(exc):
+                return []
+            raise
+
+    def _encrypted_inventory(self, client: WebDavClient) -> list[tuple[str, str]]:
+        inventory = []
+        for package_id in sorted(name[:-4] for name in self._optional_remote_list(client, "skills/packages") if name.endswith(".enc") and "/" not in name and "\\" not in name):
+            inventory.append((f"skills/packages/{package_id}.enc", f"skill-package:{package_id}"))
+        for snapshot_id in sorted(name[:-4] for name in self._optional_remote_list(client, "skills/snapshots") if name.endswith(".enc") and "/" not in name and "\\" not in name):
+            inventory.append((f"skills/snapshots/{snapshot_id}.enc", f"skills-snapshot:{snapshot_id}"))
+        if "current.enc" in self._optional_remote_list(client, "skills"):
+            inventory.append(("skills/current.enc", "skills-pointer"))
+        for key in sorted(name[:-4] for name in self._optional_remote_list(client, "accounts/states") if name.endswith(".enc") and "/" not in name and "\\" not in name):
+            inventory.append((f"accounts/states/{key}.enc", f"account-state:{key}"))
+        for key in sorted(name.strip("/") for name in self._optional_remote_list(client, "accounts/revisions") if name.strip("/") and "/" not in name.strip("/") and "\\" not in name):
+            for revision in sorted(name[:-4] for name in self._optional_remote_list(client, f"accounts/revisions/{key}") if name.endswith(".enc") and "/" not in name and "\\" not in name):
+                inventory.append((f"accounts/revisions/{key}/{revision}.enc", f"account-revision:{key}:{revision}"))
+        for name in sorted(self._optional_remote_list(client, "usage/machines")):
+            if not name.endswith(".enc") or "/" in name or "\\" in name:
+                continue
+            machine_id = name[:-4]
+            inventory.append((self._usage_pointer_path(machine_id), f"usage-pointer:{machine_id}"))
+            for kind in ("chunks", "checkpoints"):
+                for payload_id in sorted(item[:-4] for item in self._optional_remote_list(client, f"usage/{kind}/{machine_id}") if item.endswith(".enc") and "/" not in item and "\\" not in item):
+                    inventory.append((self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"))
+        return inventory
+
+    def _rotate_remote_passphrase(self, webdav: dict, new_passphrase_hash: str, commit) -> dict:
+        if self._state.get("pendingAccountOperation"):
+            raise CloudError("Finish the pending account operation before updating the encryption passphrase", 409)
+        client = WebDavClient(webdav)
+        client.ensure_directories("")
+        descriptor_bytes, descriptor_etag = client.get("crypto.json")
+        try:
+            descriptor = json.loads(descriptor_bytes)
+        except json.JSONDecodeError as exc:
+            raise CloudError("Invalid remote crypto descriptor", 409) from exc
+        old_box = CryptoBox(self.config()["webdav"]["encryptionPassphraseHash"], descriptor)
+        new_descriptor = json.dumps(CryptoBox.descriptor(new_passphrase_hash), separators=(",", ":")).encode()
+        new_box = CryptoBox(new_passphrase_hash, json.loads(new_descriptor))
+        staged = []
+        for path, purpose in self._encrypted_inventory(client):
+            encrypted, etag = client.get(path)
+            staged.append({"path": path, "purpose": purpose, "encrypted": encrypted, "etag": etag, "plaintext": old_box.decrypt(purpose, encrypted)})
+        updated = []
+        descriptor_updated = False
+        try:
+            for item in staged:
+                item["newEtag"] = client.put(item["path"], new_box.encrypt(item["purpose"], item["plaintext"]), etag=item["etag"])
+                updated.append(item)
+                verified, item["newEtag"] = client.get(item["path"])
+                if new_box.decrypt(item["purpose"], verified) != item["plaintext"]:
+                    raise CloudError(f"Passphrase update verification failed for {item['path']}", 409)
+            descriptor_etag = client.put("crypto.json", new_descriptor, etag=descriptor_etag)
+            descriptor_updated = True
+            verified_descriptor, descriptor_etag = client.get("crypto.json")
+            if verified_descriptor != new_descriptor:
+                raise CloudError("Passphrase update verification failed for crypto.json", 409)
+            CryptoBox(new_passphrase_hash, json.loads(verified_descriptor))
+            commit()
+        except Exception as exc:
+            rollback_errors = []
+            if descriptor_updated:
+                try:
+                    client.put("crypto.json", descriptor_bytes, etag=client.get("crypto.json")[1])
+                    if client.get("crypto.json")[0] != descriptor_bytes:
+                        raise CloudError("crypto.json read-back mismatch")
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"crypto.json: {rollback_exc}")
+            for item in reversed(updated):
+                try:
+                    client.put(item["path"], item["encrypted"], etag=client.get(item["path"])[1])
+                    if client.get(item["path"])[0] != item["encrypted"]:
+                        raise CloudError("read-back mismatch")
+                except Exception as rollback_exc:
+                    rollback_errors.append(f"{item['path']}: {rollback_exc}")
+            detail = f"Passphrase update failed: {exc}"
+            if rollback_errors:
+                detail += f". Remote rollback also failed for {'; '.join(rollback_errors)}"
+            raise CloudError(detail, 409) from exc
+        return {"reencrypted": len(staged), "paths": [item["path"] for item in staged], "verifiedAt": _timestamp()}
 
     @_serialized_cloud_operation
     def reencrypt_remote_data(self) -> dict:
@@ -749,6 +1120,8 @@ class CloudManager:
         result = {"skills": self.upload_skills(), "accounts": accounts}
         result["changed"] = bool(result["skills"].get("changed"))
         self._finish_successful_push(time.monotonic())
+        self._state["decryptFailure"] = None
+        self._save_state()
         return result
 
     @_serialized_cloud_operation
@@ -1171,7 +1544,13 @@ class CloudManager:
         if now - self._last_auto_fetch_at < AUTO_FETCH_INTERVAL_SECONDS:
             return False
         self._last_auto_fetch_at = now
-        self.fetch()
+        try:
+            self.fetch()
+        except Exception as exc:
+            self._record_decrypt_failure(exc, "fetch")
+            if getattr(exc, "decrypt_failed", False):
+                return False
+            raise
         return True
 
     def _auto_usage_sync_if_due(self, now: float) -> bool:
@@ -1181,6 +1560,7 @@ class CloudManager:
         try:
             self.sync_usage_data()
         except Exception as exc:
+            self._record_decrypt_failure(exc, "usage sync")
             attempt = int((usage.get("failure") or {}).get("attempt") or 0) + 1
             usage["failure"] = {"message": str(exc), "attempt": attempt, "failedAt": _timestamp()}
             self._next_usage_sync_at = now + (USAGE_SYNC_RETRY_SECONDS[attempt - 1] if attempt <= len(USAGE_SYNC_RETRY_SECONDS) else USAGE_SYNC_INTERVAL_SECONDS)
@@ -1209,6 +1589,7 @@ class CloudManager:
                 self.upload_skills({name})
                 pushed = True
             except Exception as exc:
+                self._record_decrypt_failure(exc, "push")
                 self._observe_skill_content(now)
                 pending = self._pending_skill_pushes.get(name)
                 if not pending or (self._observed_skill_hashes or {}).get(name) != before_hash:

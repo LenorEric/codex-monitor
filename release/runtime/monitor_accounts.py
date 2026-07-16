@@ -191,9 +191,9 @@ class AccountManager:
             atomic_write_bytes(self._account_path("ppl-pro"), live)
         manifest = {
             "version": 2,
-            "activeAccountId": "ppl-pro",
+            "activeAccountId": "ppl-pro" if live is not None else None,
             "cloudBindingEnabled": False,
-            "accounts": [self._new_record("ppl-pro", "Current account", live is not None, live)],
+            "accounts": [self._new_record("ppl-pro", "Current account", True, live)] if live is not None else [],
         }
         atomic_write_json(self.manifest_path, manifest)
         return manifest
@@ -409,25 +409,13 @@ class AccountManager:
             if len(self.manifest["accounts"]) <= 1:
                 raise AccountError("The only saved account cannot be deleted", 409)
             active = self.active_account()
-            fallback = next((account for account in self.manifest["accounts"] if account["id"] != target["id"]), None) if target["id"] == active["id"] else None
-            if target["id"] == active["id"] and fallback is None:
-                raise AccountError("Create another account before deleting the active account", 409)
+            if target["id"] == active["id"]:
+                raise AccountError("The active account cannot be deleted; switch to another account first", 409)
             old_live = self.auth_path.read_bytes() if self.auth_path.exists() else None
             old_manifest = json.loads(json.dumps(self.manifest))
             credential_path = self._account_path(target["id"])
             old_credential = credential_path.read_bytes() if credential_path.exists() else None
             try:
-                if fallback is not None:
-                    if fallback.get("ready"):
-                        fallback_path = self._account_path(fallback["id"])
-                        if not fallback_path.exists():
-                            raise AccountError("Saved credentials for the replacement account are missing", 409)
-                        data = fallback_path.read_bytes()
-                        parse_auth_bytes(data)
-                        atomic_write_bytes(self.auth_path, data)
-                    elif self.auth_path.exists():
-                        self.auth_path.unlink()
-                    self.manifest["activeAccountId"] = fallback["id"]
                 self.manifest["accounts"] = [account for account in self.manifest["accounts"] if account["id"] != target["id"]]
                 if credential_path.exists():
                     credential_path.unlink()
@@ -572,6 +560,10 @@ class AccountManager:
             target = self._find(str(account_id or ""))
             if target is None:
                 raise AccountError("Local account not found", 404)
+            if len(self.manifest["accounts"]) <= 1:
+                raise AccountError("The only saved account cannot be released", 409)
+            if target["id"] == self.manifest.get("activeAccountId"):
+                raise AccountError("The active account cannot be released; switch to another account first", 409)
             stored_identity = target.get("identity") if isinstance(target.get("identity"), dict) else {}
             cloud_binding = target.get("cloud") or {}
             account_key = cloud_binding.get("accountKey")
@@ -600,13 +592,6 @@ class AccountManager:
             except Exception as exc:
                 cloud.clear_account_transition()
                 raise AccountError(f"Account release failed; local credentials were unchanged: {exc}", getattr(exc, "status", 500)) from exc
-            fallback = next((account for account in self.manifest["accounts"] if account["id"] != target["id"]), None)
-            if target["id"] == self.manifest.get("activeAccountId"):
-                self.manifest["activeAccountId"] = fallback["id"] if fallback else None
-                if fallback and fallback.get("ready"):
-                    atomic_write_bytes(self.auth_path, self._account_path(fallback["id"]).read_bytes())
-                elif self.auth_path.exists():
-                    self.auth_path.unlink()
             self.manifest["accounts"] = [account for account in self.manifest["accounts"] if account["id"] != target["id"]]
             shutil.rmtree(credential_path.parent, ignore_errors=True)
             self._save_manifest()

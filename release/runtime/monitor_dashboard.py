@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import http.server
+import ipaddress
 import json
 import os
 import secrets
@@ -19,12 +20,12 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 
 from monitor_accounts import AccountError, AccountManager
-from monitor_cloud import CloudError, CloudManager, control_password_matches, load_server_config
+from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
 from monitor_common import DEFAULT_RETRY_LIMIT, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_events import collect_with_bad_remote_usage_retry, compact_delta_event, derive_history_events, print_ratio_warnings, print_special_events, print_valid_delta_events, process_sample_delta_events, sample_debug_log_row
 from monitor_history import (
     append_capped_jsonl, append_history, append_quota_history_sample, apply_runtime_cost_measurement, collect_usage_sample, compact_history, compact_quota_history, default_quota_history_path, default_token_session_history_path, load_history,
-    fetch_usage_with_percent_arbitration, load_quota_history, load_state, load_token_session_history, make_history_sample, replace_account_label, reset_runtime_baselines, rewrite_account_labels, sync_token_session_history, write_state,
+    fetch_usage_with_percent_arbitration, load_quota_history, load_state, load_token_session_history, make_history_sample, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, rewrite_account_labels, sync_token_session_history, write_state,
 )
 from monitor_skills import SkillError, SkillManager
 from monitor_usage_sync import UsageDataStore, add_record_provenance, default_usage_sync_cache_path
@@ -37,8 +38,15 @@ CONTROL_COOKIE_NAME = "codex_monitor_control"
 CONTROL_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 SENSITIVE_DASHBOARD_FIELDS = {
     "access_token", "account_id", "accountId", "authIdentity", "baseUrl", "boundMachineId", "configPath", "email", "encryptionPassphrase", "fingerprint", "id_token", "identity",
-    "machineName", "password", "privatePath", "rawResponse", "refresh_token", "remoteRoot", "revisionId", "statePath", "target", "tokens", "user_id", "username",
+    "password", "privatePath", "rawResponse", "refresh_token", "remoteRoot", "revisionId", "statePath", "target", "tokens", "user_id", "username",
 }
+
+
+def client_host_is_loopback(host) -> bool:
+    try:
+        return ipaddress.ip_address(host.split("%", 1)[0]).is_loopback
+    except (AttributeError, ValueError):
+        return False
 
 class DashboardHTTPServer(http.server.ThreadingHTTPServer):
     allow_reuse_address = False
@@ -50,11 +58,22 @@ class DashboardHTTPServer(http.server.ThreadingHTTPServer):
 
 class ControlAuth:
     def __init__(self, control: dict):
+        self.update(control)
+
+    def update(self, control: dict) -> None:
         self.password_hash = control["passwordHash"]
+        self.password_salt = control.get("passwordSalt", "")
+        self.compromised = control_password_is_compromised(control)
         self.cookie_secret = hmac.new(control["cookieSecret"].encode("utf-8"), self.password_hash.encode("utf-8"), hashlib.sha256).digest()
 
     def password_matches(self, password) -> bool:
-        return control_password_matches(password, self.password_hash)
+        return control_password_matches(password, self.password_hash, self.password_salt)
+
+    def is_configured(self) -> bool:
+        return bool(self.password_hash) and not self.compromised
+
+    def is_compromised(self) -> bool:
+        return self.compromised
 
     def create_token(self, now: int | None = None) -> str:
         payload = f"{int(time.time()) if now is None else int(now)}:{secrets.token_urlsafe(18)}".encode("ascii")
@@ -273,6 +292,7 @@ class UsageDashboardState:
         self.wake_event = threading.Event()
         self.inactive_account_poll_event = threading.Event()
         self.cloud_maintenance_event = threading.Event()
+        self.cloud_maintenance_connection_failed = False
         self.running = True
         self.last_sample = None
         self.last_error = None
@@ -281,12 +301,47 @@ class UsageDashboardState:
         self._series_cache = {}
         self._series_build_lock = threading.Lock()
         self.runtime_state = reset_runtime_baselines(load_state(args.state))
+        account_status = self.accounts.status()
+        self.account_statuses = {account["id"]: None for account in account_status["items"]}
         if not self.runtime_state.get("activeAccountSlotId"):
-            active_account_id = self.accounts.status()["activeAccountId"]
+            active_account_id = account_status["activeAccountId"]
             self.runtime_state["activeAccountSlotId"] = active_account_id
             if isinstance(self.runtime_state.get("lastSample"), dict) and not self.runtime_state["lastSample"].get("activeAccountSlotId"):
                 self.runtime_state["lastSample"]["activeAccountSlotId"] = active_account_id
             write_state(args.state, self.runtime_state)
+
+    def _update_account_status_locked(self, account_id: str | None, sample: dict) -> bool:
+        if sample.get("rejectedWindows") or sample.get("usingPreviousWindows") or (sample.get("remoteUsage") or {}).get("accepted") is False:
+            return False
+        row = quota_history_row_from_sample(sample)
+        if not account_id or row is None:
+            return False
+        previous = self.account_statuses.get(account_id)
+        if isinstance(previous, dict) and (parse_timestamp(row["checkedAt"]) or 0) < (parse_timestamp(previous.get("percentCheckedAt") or previous.get("checkedAt")) or 0):
+            return False
+        label = sample.get("accountLabel") or row.get("accountLabel") or next((account["label"] for account in self.accounts.status()["items"] if account["id"] == account_id), "Unknown")
+        self.account_statuses[account_id] = sample | {
+            "checkedAt": sample.get("checkedAt") or row["checkedAt"],
+            "percentCheckedAt": row["checkedAt"],
+            "accountSlotId": account_id,
+            "accountLabel": label,
+            "activeAccountSlotId": account_id,
+            "windows": ((previous or {}).get("windows") or {}) | row["windows"],
+        }
+        return True
+
+    def _active_account_status_locked(self, accounts: dict) -> dict | None:
+        if accounts["awaitingLogin"]:
+            return None
+        if not hasattr(self, "account_statuses"):
+            self.account_statuses = {}
+        for account in accounts["items"]:
+            self.account_statuses.setdefault(account["id"], None)
+        active_id = accounts["activeAccountId"]
+        candidate = self.last_sample or getattr(self, "runtime_state", {}).get("lastSample")
+        if self.account_statuses.get(active_id) is None and isinstance(candidate, dict) and candidate.get("activeAccountSlotId") == active_id:
+            self._update_account_status_locked(active_id, candidate)
+        return self.account_statuses.get(active_id)
 
     def _series_revision_locked(self, accounts: dict) -> str:
         return _dashboard_revision({
@@ -299,13 +354,12 @@ class UsageDashboardState:
             accounts = dashboard_account_status(self.accounts.status())
             if not accounts["awaitingLogin"] and self.last_error and self.last_error.startswith("Waiting for Codex login"):
                 self.wake_event.set()
-            last_sample = self.last_sample or self.runtime_state.get("lastSample")
-            if accounts["awaitingLogin"] or not isinstance(last_sample, dict) or last_sample.get("activeAccountSlotId") != accounts["activeAccountId"]:
-                last_sample = None
+            last_sample = self._active_account_status_locked(accounts)
             sample = dashboard_sample(last_sample)
             return {
                 "revision": _dashboard_revision({"sample": sample, "accounts": accounts, "error": self.last_error}),
                 "seriesRevision": self._series_revision_locked(accounts),
+                "controlPasswordConfigured": control_password_is_configured(self.cloud.config()["control"]) if hasattr(self, "cloud") else True,
                 "lastSample": sample,
                 "display": dashboard_display(last_sample),
                 "accounts": accounts,
@@ -329,10 +383,11 @@ class UsageDashboardState:
                 else:
                     history, quota_history, token_sessions = load_history(self.args.history), load_quota_history(self.args.quota_history), load_token_session_history(self.args.token_session_history)
                 current_state = load_state(self.args.state)
-                last_sample = self.last_sample or current_state.get("lastSample")
-                if accounts["awaitingLogin"] or not isinstance(last_sample, dict) or last_sample.get("activeAccountSlotId") != accounts["activeAccountId"]:
-                    last_sample = None
+                last_sample = self._active_account_status_locked(accounts)
+                if last_sample is None:
                     current_state = current_state | {"lastSample": None}
+                else:
+                    current_state = current_state | {"lastSample": last_sample}
             payload = _dashboard_series_from_snapshot(history, quota_history, current_state, token_sessions, last_sample, accounts, revision, view)
             body = json.dumps(dashboard_safe_json(payload), ensure_ascii=False).encode("utf-8")
             with self.lock:
@@ -403,6 +458,7 @@ class UsageDashboardState:
             print_valid_delta_events(events, sample)
             print_ratio_warnings(events)
             self.last_sample = sample
+            self._update_account_status_locked(account_status["activeAccountId"], sample)
             self.last_error = None
             return sample
 
@@ -421,8 +477,10 @@ class UsageDashboardState:
             )
             usage_account_id = self.cloud.usage_account_id(credential["id"])
             output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"], "remoteUsage": debug, "sync": {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": usage_account_id}})
+            sample = make_history_sample(output, None)
             with self.lock:
-                append_quota_history_sample(self.args.quota_history, make_history_sample(output, None))
+                append_quota_history_sample(self.args.quota_history, sample)
+                self._update_account_status_locked(credential["id"], sample)
         finally:
             try:
                 if temp_path.exists():
@@ -478,7 +536,11 @@ class UsageDashboardState:
             try:
                 self.cloud.maintenance_tick()
             except Exception as exc:
-                print(f"Cloud maintenance failed: {exc}", file=sys.stderr, flush=True)
+                if not isinstance(exc, CloudError) or exc.category != "network" or not self.cloud_maintenance_connection_failed:
+                    print(f"Cloud maintenance failed: {exc}", file=sys.stderr, flush=True)
+                self.cloud_maintenance_connection_failed = isinstance(exc, CloudError) and exc.category == "network"
+            else:
+                self.cloud_maintenance_connection_failed = False
             self.cloud_maintenance_event.wait(5)
             self.cloud_maintenance_event.clear()
 
@@ -490,10 +552,13 @@ class UsageDashboardState:
         self.inactive_account_poll_event.set()
 
     def create_account(self, label: str) -> dict:
-        previous_label = self.accounts.active_account()["label"]
+        previous = self.accounts.status()
         result = self.accounts.create_account(label)
         self._account_changed()
-        print(f"Account event: saved {previous_label!r} and prepared {str(label).strip()!r} for sign-in.", flush=True)
+        if previous["activeAccountId"] is None:
+            print(f"Account event: prepared {str(label).strip()!r} for sign-in.", flush=True)
+        else:
+            print(f"Account event: saved {next(account['label'] for account in previous['items'] if account['id'] == previous['activeAccountId'])!r} and prepared {str(label).strip()!r} for sign-in.", flush=True)
         return result
 
     def switch_account(self, account_id: str) -> dict:
@@ -517,6 +582,7 @@ class UsageDashboardState:
             renamed_label = next(item["label"] for item in result["items"] if item["id"] == str(account_id))
             replace_account_label(self.runtime_state, str(account_id), renamed_label)
             replace_account_label(self.last_sample, str(account_id), renamed_label)
+            replace_account_label(self.account_statuses.get(str(account_id)), str(account_id), renamed_label)
         print(f"Account event: renamed {account['label'] if account else None!r} to {str(label).strip()!r}.", flush=True)
         return result
 
@@ -524,6 +590,8 @@ class UsageDashboardState:
         previous_status = self.accounts.status()
         deleted = next((account for account in previous_status["items"] if account["id"] == str(account_id or "")), None)
         result = self.accounts.delete(account_id)
+        with self.lock:
+            self.account_statuses.pop(str(account_id or ""), None)
         if result["activeAccountId"] != previous_status["activeAccountId"]:
             self._account_changed()
         print(f"Account event: deleted {deleted['label']!r}.", flush=True)
@@ -538,6 +606,7 @@ def management_html() -> str:
 def management_payload(state: UsageDashboardState, include_remote: bool = False, refresh_scan: bool = False) -> dict:
     payload = {
         "server": state.cloud.config()["server"],
+        "editableConfig": state.cloud.editable_config(),
         "skills": dashboard_skill_status(state.skills.status()),
         "scan": [{**{key: item.get(key) for key in ("name", "sources", "authoritativeSource", "defaultAssignments")}, **({"error": "Skill scan error"} if item.get("error") else {})} for item in state.skills.scan(refresh_scan)],
         "cloud": dashboard_cloud_status(state.cloud.redacted_status()),
@@ -599,6 +668,7 @@ def dashboard_status_payload(state: UsageDashboardState) -> dict:
     return {
         "revision": _dashboard_revision({"sample": sample, "accounts": accounts}),
         "seriesRevision": None,
+        "controlPasswordConfigured": control_password_is_configured(state.cloud.config()["control"]) if hasattr(state, "cloud") else True,
         "lastSample": sample,
         "display": dashboard_display(last_sample),
         "accounts": accounts,
@@ -630,8 +700,8 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             self.end_headers()
             self.wfile.write(body)
 
-        def send_json(self, status: int, payload: dict, headers: dict | None = None):
-            self.send_json_body(status, json.dumps(dashboard_safe_json(payload), ensure_ascii=False).encode("utf-8"), headers)
+        def send_json(self, status: int, payload: dict, headers: dict | None = None, *, sanitize: bool = True):
+            self.send_json_body(status, json.dumps(dashboard_safe_json(payload) if sanitize else payload, ensure_ascii=False).encode("utf-8"), headers)
 
         def send_not_modified(self, etag: str):
             self.send_response(304)
@@ -650,6 +720,12 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             return control_auth.token_is_valid(self.control_token())
 
         def require_control_auth(self) -> bool:
+            if control_auth.is_compromised():
+                self.send_json(409, {"error": "Control password compromised. Remove passwordHash from config.json, restart the monitor, and then create a new control password.", "controlPasswordCompromised": True})
+                return False
+            if not control_auth.is_configured():
+                self.send_json(428, {"error": "Create a control password to continue", "setupRequired": True})
+                return False
             if self.control_is_authenticated():
                 return True
             self.send_json(401, {"error": "Control password required"})
@@ -710,7 +786,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                     return
                 try:
                     query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                    self.send_json(200, management_payload(state, query.get("remote") == ["1"], query.get("scan") == ["1"]))
+                    self.send_json(200, management_payload(state, query.get("remote") == ["1"], query.get("scan") == ["1"]), sanitize=False)
                 except (AccountError, SkillError, CloudError) as exc:
                     self.send_json(exc.status, {"error": str(exc)})
                 return
@@ -720,9 +796,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
         def handle_post(self):
             path = urllib.parse.urlparse(self.path).path
             allowed = {
-                "/api/control/login",
+                "/api/control/login", "/api/control/setup",
                 "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign",
-                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/push", "/api/manage/cloud/restore", "/api/manage/accounts/bind", "/api/manage/accounts/release", "/api/manage/accounts/delete", "/api/manage/server"
+                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/push", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/release", "/api/manage/accounts/delete", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
             }
             if path not in allowed:
                 self.send_json(404, {"error": "Not found"})
@@ -731,7 +807,21 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                 return
             try:
                 body = self.read_json_body()
+                if path == "/api/control/setup":
+                    if not client_host_is_loopback(self.client_address[0]):
+                        self.send_json(403, {"error": "Control password setup is allowed only from this computer"})
+                        return
+                    result = state.cloud.initialize_control_password(body.get("password"))
+                    control_auth.update(state.cloud.config()["control"])
+                    self.send_json(200, result | {"authenticated": True}, {"Set-Cookie": f"{CONTROL_COOKIE_NAME}={control_auth.create_token()}; HttpOnly; SameSite=Strict; Path=/; Max-Age={CONTROL_COOKIE_MAX_AGE_SECONDS}"})
+                    return
                 if path == "/api/control/login":
+                    if control_auth.is_compromised():
+                        self.send_json(409, {"error": "Control password compromised. Remove passwordHash from config.json, restart the monitor, and then create a new control password.", "controlPasswordCompromised": True})
+                        return
+                    if not control_auth.is_configured():
+                        self.send_json(428, {"error": "Create a control password to continue", "setupRequired": True})
+                        return
                     if not control_auth.password_matches(body.get("password")):
                         self.send_json(401, {"error": "Incorrect control password"})
                         return
@@ -759,6 +849,15 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                 elif path == "/api/manage/server":
                     self.send_json(200, state.cloud.update_server_config(body.get("host")))
                     return
+                elif path == "/api/manage/config":
+                    result = state.cloud.update_config(body)
+                    if result["controlPasswordChanged"]:
+                        control_auth.update(state.cloud.config()["control"])
+                    self.send_json(200, result)
+                    return
+                elif path == "/api/manage/config/reload":
+                    self.send_json(200, state.cloud.reload_config())
+                    return
                 elif path == "/api/manage/cloud/test":
                     self.send_json(200, state.cloud.test())
                     return
@@ -767,6 +866,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                     return
                 elif path == "/api/manage/cloud/push":
                     self.send_json(200, state.cloud.push())
+                    return
+                elif path == "/api/manage/cloud/overwrite":
+                    self.send_json(200, state.cloud.overwrite_cloud_from_local())
                     return
                 elif path == "/api/manage/cloud/restore":
                     self.send_json(200, state.cloud.restore_skills(body.get("snapshotId")))
@@ -782,7 +884,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                     return
                 self.send_json(200, {"accounts": result})
             except (AccountError, SkillError, CloudError) as exc:
-                self.send_json(exc.status, {"error": str(exc)})
+                self.send_json(exc.status, {"error": str(exc), **({"details": exc.details} if getattr(exc, "details", None) else {}), **({"decryptFailed": True} if getattr(exc, "decrypt_failed", False) else {})})
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 self.send_json(400, {"error": "Request body is not valid JSON"})
             except Exception as exc:

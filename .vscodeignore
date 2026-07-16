@@ -1,4 +1,5 @@
 .agents/**
+.codex-history-rewrite-tmp/**
 .git/**
 .gitignore
 .vscodeignore

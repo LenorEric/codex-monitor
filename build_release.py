@@ -23,7 +23,6 @@ RUNTIME_FILES = (
     "monitor_tokens.py",
     "monitor_usage_sync.py",
     "requirements.txt",
-    "watch_auth_json.py",
 )
 
 

@@ -10,7 +10,7 @@ from pathlib import Path
 import urllib.request
 
 from monitor_common import (
-    DEFAULT_RETRY_LIMIT, LEGACY_EVENT_ACCOUNT_ID, LEGACY_EVENT_ACCOUNT_LABEL, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, TARGET_WINDOWS, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
+    DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, TARGET_WINDOWS, UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
     empty_token_totals, first_value, load_json, now_iso, parse_timestamp,
 )
 from monitor_quota import fetch_usage
@@ -52,8 +52,8 @@ def normalize_token_session_row(row: dict) -> dict | None:
         "sessionId": str(row["sessionId"]),
         "startedAt": row.get("startedAt"),
         "updatedAt": row.get("updatedAt") or row.get("startedAt"),
-        "accountSlotId": str(row.get("accountSlotId") or LEGACY_EVENT_ACCOUNT_ID),
-        "accountLabel": str(row.get("accountLabel") or LEGACY_EVENT_ACCOUNT_LABEL),
+        "accountSlotId": str(row.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID),
+        "accountLabel": str(row.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL),
         "tokens": normalize_saved_token_totals(row["tokens"]),
         "cost": calculate_token_costs({"byModel": {model: value["tokens"] for model, value in by_model.items()}, "fastByModel": fast_by_model}) if by_model else row.get("cost") or empty_cost_totals(),
         "byModel": by_model,
@@ -320,8 +320,8 @@ def normalize_quota_history_row(row: dict) -> dict | None:
         return None
     normalized = {
         "checkedAt": row["checkedAt"],
-        "accountSlotId": row.get("accountSlotId") or LEGACY_EVENT_ACCOUNT_ID,
-        "accountLabel": row.get("accountLabel") or LEGACY_EVENT_ACCOUNT_LABEL,
+        "accountSlotId": str(row.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID),
+        "accountLabel": str(row.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL),
         "windows": windows,
     }
     if isinstance(row.get("sync"), dict):
@@ -442,10 +442,7 @@ def is_delta_event_row(row: dict) -> bool:
 def normalize_delta_event_account(row: dict) -> dict:
     if not is_delta_event_row(row):
         return row
-    return row | {
-        "accountSlotId": row.get("accountSlotId") or LEGACY_EVENT_ACCOUNT_ID,
-        "accountLabel": row.get("accountLabel") or LEGACY_EVENT_ACCOUNT_LABEL,
-    }
+    return row | {"accountSlotId": str(row.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID), "accountLabel": str(row.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL)}
 
 def parse_history_rows(text: str) -> list[dict]:
     decoder = json.JSONDecoder()
@@ -519,8 +516,8 @@ def compact_model_delta_events(events: list[dict]) -> dict | None:
         return None
     compact = {
         "checkedAt": events[0].get("checkedAt"),
-        "accountSlotId": events[0].get("accountSlotId") or LEGACY_EVENT_ACCOUNT_ID,
-        "accountLabel": events[0].get("accountLabel") or LEGACY_EVENT_ACCOUNT_LABEL,
+        "accountSlotId": events[0].get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID,
+        "accountLabel": events[0].get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL,
         "deltaPercent": delta_percent,
         "models": [{"model": event["model"], "deltaCostUsd": event["deltaCostUsd"]} for event in events],
         "costPercentRatio": events[0]["costPercentRatio"],
@@ -739,7 +736,7 @@ def compact_sample_for_state(sample: dict | None) -> dict | None:
         compact["activeAccountSlotId"] = sample["activeAccountSlotId"]
     if sample.get("accountSlotId"):
         compact["accountSlotId"] = sample["accountSlotId"]
-        compact["accountLabel"] = sample.get("accountLabel") or LEGACY_EVENT_ACCOUNT_LABEL
+        compact["accountLabel"] = sample.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL
     return compact
 
 def compact_monitor_state(state: dict) -> dict:
@@ -820,7 +817,7 @@ def make_history_sample(output: dict, previous_token_usage: dict | None, previou
     }
     if output.get("accountSlotId"):
         sample["accountSlotId"] = output["accountSlotId"]
-        sample["accountLabel"] = output.get("accountLabel") or LEGACY_EVENT_ACCOUNT_LABEL
+        sample["accountLabel"] = output.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL
     if output.get("remoteUsage"):
         sample["remoteUsage"] = output["remoteUsage"]
     if output.get("tokenUsage"):

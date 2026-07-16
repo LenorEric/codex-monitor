@@ -13,10 +13,12 @@ const ACCOUNT_SWITCH_URL = new URL("http://127.0.0.1:8765/api/accounts/switch");
 const ACCOUNT_RENAME_URL = new URL("http://127.0.0.1:8765/api/accounts/rename");
 const ACCOUNT_DELETE_URL = new URL("http://127.0.0.1:8765/api/accounts/delete");
 const CONTROL_LOGIN_URL = new URL("http://127.0.0.1:8765/api/control/login");
+const CONTROL_SETUP_URL = new URL("http://127.0.0.1:8765/api/control/setup");
 const ACCOUNT_ACTION_TIMEOUT_MS = 300000;
 const PAGE_ALLOWLIST = Object.freeze({ dashboard: { url: DASHBOARD_URL, asset: "dashboard.html", title: "Codex Usage Details" }, manage: { url: MANAGEMENT_URL, asset: "management.html", title: "Codex Monitor Management" } });
 const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/control/login", { url: CONTROL_LOGIN_URL, method: "POST" }],
+    ["/api/control/setup", { url: CONTROL_SETUP_URL, method: "POST" }],
     ["/api/manage/status", { url: new URL("http://127.0.0.1:8765/api/manage/status"), method: "GET" }],
     ["/api/manage/status?scan=1", { url: new URL("http://127.0.0.1:8765/api/manage/status?scan=1"), method: "GET" }],
     ["/api/manage/status?remote=1", { url: new URL("http://127.0.0.1:8765/api/manage/status?remote=1"), method: "GET" }],
@@ -27,10 +29,13 @@ const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/manage/cloud/fetch", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/fetch"), method: "POST" }],
     ["/api/manage/cloud/push", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/push"), method: "POST" }],
     ["/api/manage/cloud/restore", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/restore"), method: "POST" }],
+    ["/api/manage/cloud/overwrite", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/overwrite"), method: "POST" }],
     ["/api/manage/accounts/bind", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/bind"), method: "POST" }],
     ["/api/manage/accounts/release", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/release"), method: "POST" }],
     ["/api/manage/accounts/delete", { url: ACCOUNT_DELETE_URL, method: "POST" }],
     ["/api/manage/server", { url: new URL("http://127.0.0.1:8765/api/manage/server"), method: "POST" }],
+    ["/api/manage/config", { url: new URL("http://127.0.0.1:8765/api/manage/config"), method: "POST" }],
+    ["/api/manage/config/reload", { url: new URL("http://127.0.0.1:8765/api/manage/config/reload"), method: "POST" }],
     ["/api/accounts", { url: ACCOUNT_CREATE_URL, method: "POST" }],
     ["/api/accounts/switch", { url: ACCOUNT_SWITCH_URL, method: "POST" }],
     ["/api/accounts/rename", { url: ACCOUNT_RENAME_URL, method: "POST" }],
@@ -43,7 +48,6 @@ class PythonMonitor {
         this.pendingSeriesRequests = new Map();
         this.pollTimer = null;
         this.lastTooltip = null;
-        this.lastTooltipRevision = null;
     }
 
     start() {
@@ -79,16 +83,14 @@ class PythonMonitor {
         try {
             const display = (await this.getStatus()).display || {};
             this.statusBar.text = `$(pulse) ${display.statusBarText || "Codex usage"}`;
-            const tooltipRevision = JSON.stringify([display.statusBarText, display.percentCheckedAt, display.windows?.["5h"]?.resetAt, display.windows?.["7d"]?.resetAt]);
-            if (tooltipRevision !== this.lastTooltipRevision) {
-                this.lastTooltipRevision = tooltipRevision;
-                this.lastTooltip = stableTooltip(display);
-                this.statusBar.tooltip = this.lastTooltip;
+            const tooltip = stableTooltip(display);
+            if (tooltip !== this.lastTooltip) {
+                this.lastTooltip = tooltip;
+                this.statusBar.tooltip = tooltip;
             }
             this.statusBar.show();
         } catch (error) {
             this.statusBar.text = "$(plug) Codex usage unavailable";
-            this.lastTooltipRevision = null;
             const tooltip = error.message || String(error);
             if (tooltip !== this.lastTooltip) {
                 this.lastTooltip = tooltip;
@@ -149,6 +151,8 @@ function requestJson(url, options = {}) {
                 if (response.statusCode !== 200) {
                     const error = new Error(payload.error || `Python monitor returned HTTP ${response.statusCode}`);
                     error.statusCode = response.statusCode;
+                    error.details = payload.details;
+                    error.decryptFailed = payload.decryptFailed;
                     reject(error);
                 }
                 else resolve(payload);
@@ -237,18 +241,18 @@ function activate(context) {
                         const payload = await controlRequestJson(action.url, { method: action.method, body: action.method === "POST" ? message.body || {} : undefined, timeoutMs: ACCOUNT_ACTION_TIMEOUT_MS });
                         target.webview.postMessage({ type: "codexUsageManageResult", requestId: message.requestId, payload });
                     } catch (error) {
-                        target.webview.postMessage({ type: "codexUsageManageResult", requestId: message.requestId, error: error.message || String(error), status: error.statusCode });
+                        target.webview.postMessage({ type: "codexUsageManageResult", requestId: message.requestId, error: error.message || String(error), details: error.details, decryptFailed: error.decryptFailed, status: error.statusCode });
                     }
                     return;
                 }
                 if (message.type === "codexUsageAccountAction") {
                     try {
-                        const url = { create: ACCOUNT_CREATE_URL, switch: ACCOUNT_SWITCH_URL, rename: ACCOUNT_RENAME_URL, delete: ACCOUNT_DELETE_URL, login: CONTROL_LOGIN_URL }[message.action];
+                        const url = { create: ACCOUNT_CREATE_URL, switch: ACCOUNT_SWITCH_URL, rename: ACCOUNT_RENAME_URL, delete: ACCOUNT_DELETE_URL, login: CONTROL_LOGIN_URL, setup: CONTROL_SETUP_URL }[message.action];
                         if (!url) throw new Error("Unknown account action");
                         const payload = await controlRequestJson(url, { method: "POST", body: message.body || {}, timeoutMs: ACCOUNT_ACTION_TIMEOUT_MS });
                         target.webview.postMessage({ type: "codexUsageAccountAction", requestId: message.requestId, payload });
                     } catch (error) {
-                        target.webview.postMessage({ type: "codexUsageAccountAction", requestId: message.requestId, error: error.message || String(error), status: error.statusCode });
+                        target.webview.postMessage({ type: "codexUsageAccountAction", requestId: message.requestId, error: error.message || String(error), details: error.details, status: error.statusCode });
                     }
                     return;
                 }

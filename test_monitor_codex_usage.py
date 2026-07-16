@@ -22,11 +22,10 @@ import monitor_dashboard
 import monitor_history
 import monitor_quota
 import monitor_tokens
-import watch_auth_json
-from monitor_accounts import AccountError, AccountManager
+from monitor_accounts import AccountError, AccountManager, atomic_write_json
 from monitor_cloud import (
     AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
-    PASSPHRASE_SALT, control_password_matches, hash_control_password, load_server_config, passphrase_hash, valid_passphrase_hash,
+    control_password_matches, hash_control_password, load_server_config, new_control_password_salt, normalized_webdav_identity, passphrase_hash, valid_passphrase_hash, webdav_passphrase_salt,
 )
 from monitor_skills import MANIFEST_FULL_REHASH_SECONDS, SkillError, SkillManager, _safe_name
 from monitor_usage_sync import UsageDataStore, aggregate_cost_intervals, merge_token_rows, record_key, validate_sync_operation
@@ -72,10 +71,15 @@ from monitor_codex_usage import (
 
 
 class MonitorCodexUsageTests(unittest.TestCase):
-    def test_auth_watcher_uses_anonymous_portable_default_path(self):
-        self.assertEqual(watch_auth_json.DEFAULT_AUTH_PATH, Path.home() / ".codex" / "auth.json")
-        self.assertEqual(watch_auth_json.DEFAULT_AUTH_PATH_DISPLAY, "~/.codex/auth.json")
-        self.assertIn("~/.codex/auth.json", watch_auth_json.build_parser().format_help())
+    def test_cloud_maintenance_reports_each_network_outage_once(self):
+        state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
+        state.cloud = SimpleNamespace(maintenance_tick=mock.Mock(side_effect=(CloudError("offline", 502, category="network"), CloudError("offline", 502, category="network"), None, CloudError("offline", 502, category="network"))))
+        state.cloud_maintenance_event = mock.Mock(wait=mock.Mock(side_effect=lambda _: setattr(state, "running", False) if state.cloud.maintenance_tick.call_count == 4 else None), clear=mock.Mock())
+        state.cloud_maintenance_connection_failed = False
+        state.running = True
+        with mock.patch("sys.stderr", new_callable=StringIO) as stderr:
+            state.run_cloud_maintenance()
+        self.assertEqual(stderr.getvalue().count("Cloud maintenance failed: offline"), 2)
 
     def test_proxy_config_uses_urllib_scheme_names_and_all_proxy_fallback(self):
         with self.account_directory() as directory:
@@ -117,11 +121,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertNotIn("access-acct-a", json.dumps(manager.status()))
             self.assertNotIn("acct-a", json.dumps(manager.status()))
 
-    def test_account_manager_bootstraps_pending_when_auth_is_missing(self):
+    def test_account_manager_bootstraps_without_an_account_when_auth_is_missing(self):
         with self.account_directory() as directory:
             manager = AccountManager(directory / "auth.json")
             self.assertTrue(manager.status()["awaitingLogin"])
-            self.assertFalse(manager.status()["items"][0]["ready"])
+            self.assertIsNone(manager.status()["activeAccountId"])
+            self.assertEqual(manager.status()["items"], [])
 
     def test_account_manager_moves_legacy_vault_to_requested_data_root(self):
         with self.account_directory() as directory:
@@ -366,6 +371,15 @@ class MonitorCodexUsageTests(unittest.TestCase):
             rows = monitor_history.load_quota_history(args.quota_history)
             self.assertEqual([(row["accountSlotId"], row["accountLabel"]) for row in rows], [(second_id, "Second"), (second_id, "Second")])
             self.assertEqual(rows[0]["windows"]["5h"]["usedPercent"], 12.0)
+            self.assertEqual(state.account_statuses[second_id]["windows"]["7d"]["usedPercent"], 34.0)
+            with mock.patch("builtins.print"):
+                state.switch_account(second_id)
+            cached_status = state.status_payload()
+            self.assertIsNone(state.last_sample)
+            self.assertEqual(cached_status["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
+            self.assertEqual(cached_status["lastSample"]["windows"]["5h"]["resetAt"], "2030-01-01T00:00:00Z")
+            self.assertEqual(state.cached_series_response()[0]["lastSample"]["windows"]["7d"]["usedPercent"], 34.0)
+            self.assertTrue(state.wake_event.is_set())
             self.assertFalse(any(state.accounts.root.glob(".inactive-usage-*.json")))
 
     def test_inactive_poll_refresh_commit_does_not_overwrite_changed_credentials(self):
@@ -373,7 +387,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
-            manager.create_account("Second")
+            second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
             manager.switch("ppl-pro")
@@ -432,6 +446,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 state.switch_account("ppl-pro")
                 state.switch_account(second_id)
                 state.rename_account(second_id, "Renamed Second")
+                state.switch_account("ppl-pro")
                 state.delete_account(second_id)
             output = "\n".join(call.args[0] for call in printed.call_args_list)
             self.assertIn("Account event: saved 'Current account' and prepared 'Second\\nAccount' for sign-in.", output)
@@ -599,22 +614,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertTrue(next(account for account in status["items"] if account["id"] == "ppl-pro")["ready"])
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8")), signed_out)
 
-    def test_signed_out_account_can_be_released_without_identity_verification(self):
+    def test_signed_out_inactive_account_can_be_released_without_identity_verification(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
             manager.manifest["cloudBindingEnabled"] = True
-            manager.active_account()["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine"}
+            manager._find("ppl-pro")["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine"}
             manager._save_manifest()
             signed_out = {"auth_mode": "chatgpt", "tokens": {}}
             auth_path.write_text(json.dumps(signed_out), encoding="utf-8")
+            second_id = manager.create_account("Second")["activeAccountId"]
             cloud = SimpleNamespace(begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), release_account=mock.Mock(return_value={}))
 
             status = manager.release_cloud_account(cloud, "ppl-pro")
 
-            self.assertIsNone(status["activeAccountId"])
-            self.assertEqual(status["items"], [])
+            self.assertEqual(status["activeAccountId"], second_id)
+            self.assertEqual([account["id"] for account in status["items"]], [second_id])
             self.assertEqual(json.loads(cloud.release_account.call_args.args[1].decode("utf-8")), signed_out)
             cloud.begin_account_transition.assert_called_once_with("release", accountId="ppl-pro", accountKey="key-a", revisionId=hashlib.sha256(json.dumps(signed_out).encode()).hexdigest())
 
@@ -622,21 +638,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             manager = AccountManager(auth_path)
+            first_id = manager.create_account("First")["activeAccountId"]
             second_id = manager.create_account("Second")["activeAccountId"]
             manager.manifest["cloudBindingEnabled"] = True
             manager._save_manifest()
 
-            self.assertEqual(manager.switch("ppl-pro")["activeAccountId"], "ppl-pro")
+            self.assertEqual(manager.switch(first_id)["activeAccountId"], first_id)
             self.assertFalse(auth_path.exists())
-            self.assertEqual(manager.rename("ppl-pro", "First empty")["items"][0]["label"], "First empty")
-            status = manager.delete("ppl-pro")
+            self.assertEqual(manager.rename(first_id, "First empty")["items"][0]["label"], "First empty")
+            self.assertEqual(manager.switch(second_id)["activeAccountId"], second_id)
+            status = manager.delete(first_id)
 
             self.assertEqual(status["activeAccountId"], second_id)
             self.assertEqual([account["id"] for account in status["items"]], [second_id])
             self.assertTrue(status["awaitingLogin"])
             self.assertFalse(auth_path.exists())
 
-    def test_releasing_active_account_activates_new_empty_account(self):
+    def test_releasing_active_account_is_rejected(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -648,11 +666,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
             manager.switch("ppl-pro")
             cloud = SimpleNamespace(begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), release_account=mock.Mock(return_value={}))
 
-            status = manager.release_cloud_account(cloud, "ppl-pro")
+            with self.assertRaises(AccountError) as raised:
+                manager.release_cloud_account(cloud, "ppl-pro")
 
-            self.assertEqual(status["activeAccountId"], empty_id)
-            self.assertTrue(status["awaitingLogin"])
-            self.assertFalse(auth_path.exists())
+            self.assertEqual(raised.exception.status, 409)
+            self.assertEqual(manager.status()["activeAccountId"], "ppl-pro")
+            self.assertTrue(auth_path.exists())
+            cloud.release_account.assert_not_called()
 
     def test_new_empty_account_release_uploads_transferable_placeholder(self):
         with self.account_directory() as directory:
@@ -662,6 +682,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             empty_id = manager.create_account("Empty")["activeAccountId"]
             manager.manifest["cloudBindingEnabled"] = True
             manager._save_manifest()
+            manager.switch("ppl-pro")
 
             cloud = SimpleNamespace(
                 new_placeholder_account_key=mock.Mock(return_value="placeholder-key"), begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(),
@@ -696,7 +717,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
             manager._save_manifest()
             (directory / "auth.json").write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             self.assertTrue(manager.reconcile_pending_login())
+            other_id = manager.create_account("Other")["activeAccountId"]
             release_cloud = SimpleNamespace(begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), release_account=mock.Mock(return_value={}))
+            manager.switch(other_id)
             manager.release_cloud_account(release_cloud, bound["id"])
             self.assertEqual(release_cloud.release_account.call_args.args[0], "placeholder-key")
             self.assertTrue(release_cloud.release_account.call_args.kwargs["ready"])
@@ -743,7 +766,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-new")
             self.assertFalse(manager._find(pending_id)["ready"])
             self.assertEqual(monitor_dashboard.dashboard_account_status(status)["message"], status["message"])
-            self.assertIn('showMessage("Existing account updated"', Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8"))
+            self.assertIn('showMessage("Existing Account Update Completed"', Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8"))
 
     def test_duplicate_pending_login_matches_id_token_when_account_id_is_missing(self):
         with self.account_directory() as directory:
@@ -807,7 +830,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             session_path.write_bytes(b'{"conversation":"shared"}\n')
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
-            manager.create_account("Second")
+            second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
             manager.switch("ppl-pro")
@@ -842,7 +865,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(manager.active_account()["cloud"]["etag"], '"old"')
             cloud.rename_account_state.assert_not_called()
 
-    def test_deleting_active_account_activates_ready_fallback_and_keeps_shared_files(self):
+    def test_deleting_active_account_is_rejected_and_keeps_shared_files(self):
         with self.account_directory() as home:
             auth_path = home / "auth.json"
             config_path = home / "config.toml"
@@ -856,10 +879,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
             manager.switch("ppl-pro")
-            status = manager.delete("ppl-pro")
-            self.assertEqual(status["activeAccountId"], second_id)
-            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-b")
-            self.assertFalse((manager.root / "ppl-pro").exists())
+            with self.assertRaises(AccountError) as raised:
+                manager.delete("ppl-pro")
+            self.assertEqual(raised.exception.status, 409)
+            self.assertEqual(manager.status()["activeAccountId"], "ppl-pro")
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
+            self.assertTrue((manager.root / "ppl-pro").exists())
             self.assertEqual(config_path.read_bytes(), b'model = "universal"\n')
             self.assertEqual(session_path.read_bytes(), b'{"conversation":"shared"}\n')
 
@@ -873,21 +898,36 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(raised.exception.status, 409)
             self.assertTrue(auth_path.exists())
 
+    def test_releasing_only_account_is_rejected(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            cloud = SimpleNamespace(begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), release_account=mock.Mock())
+
+            with self.assertRaises(AccountError) as raised:
+                manager.release_cloud_account(cloud, "ppl-pro")
+
+            self.assertEqual(raised.exception.status, 409)
+            self.assertTrue(auth_path.exists())
+            cloud.release_account.assert_not_called()
+
     def test_account_delete_rolls_back_live_and_vault_when_manifest_save_fails(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
-            manager.create_account("Second")
+            second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
             manager.switch("ppl-pro")
+            manager.switch(second_id)
             with mock.patch.object(manager, "_save_manifest", side_effect=OSError("simulated manifest failure")):
                 with self.assertRaises(AccountError) as raised:
                     manager.delete("ppl-pro")
             self.assertEqual(raised.exception.status, 500)
-            self.assertEqual(manager.status()["activeAccountId"], "ppl-pro")
-            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
+            self.assertEqual(manager.status()["activeAccountId"], second_id)
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-b")
             self.assertTrue((manager.root / "ppl-pro" / "auth.json").exists())
 
     def test_deleting_bound_local_account_never_calls_cloud(self):
@@ -917,8 +957,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
+            second_id = manager.create_account("Second")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
+            manager.status()
             manager.manifest["cloudBindingEnabled"] = True
-            manager.active_account()["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine"}
+            manager._find("ppl-pro")["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine"}
             manager._save_manifest()
             before_live, before_vault, before_manifest = auth_path.read_bytes(), (manager.root / "ppl-pro" / "auth.json").read_bytes(), manager.manifest_path.read_bytes()
             cloud = SimpleNamespace(begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), release_account=mock.Mock(side_effect=CloudError("offline", 502)))
@@ -930,7 +973,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(auth_path.read_bytes(), before_live)
             self.assertEqual((manager.root / "ppl-pro" / "auth.json").read_bytes(), before_vault)
             self.assertEqual(manager.manifest_path.read_bytes(), before_manifest)
-            self.assertEqual(manager.status()["activeAccountId"], "ppl-pro")
+            self.assertEqual(manager.status()["activeAccountId"], second_id)
             cloud.clear_account_transition.assert_called_once_with()
 
     def test_compact_monitor_state_preserves_account_slot_on_state_and_sample(self):
@@ -2465,6 +2508,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = dashboard_html()
 
         self.assertIn("function rebaseDeltaEvents(list)", html)
+        self.assertIn("const events=list.filter(p=>!p.synthetic);", html)
+        self.assertIn("if(!events.length)return [];", html)
+        self.assertIn("for(const p of events){", html)
         self.assertIn('<div class="model-filter"><span class="model-label">Models</span><div class="model-buttons" id="models"></div></div>', html)
         self.assertIn('selectedModels=new Set()', html)
         self.assertIn('function modelDisplayName(model)', html)
@@ -2508,7 +2554,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('button id="prevDate" aria-label="Previous day">&lt;</button>', html)
         self.assertIn('input class="date-range" id="rangeDate" type="date"', html)
         self.assertIn('button id="nextDate" aria-label="Next day">&gt;</button>', html)
-        self.assertIn('<div class="quota"><span id="top5h">5h: -</span><span id="top7d">7d: -</span></div>', html)
+        self.assertIn('<span class="date-selector" id="dateSelector">', html)
+        self.assertIn('<div class="quota"><span id="top5h">5h: N/A</span><span id="top7d">7d: N/A</span></div>', html)
         self.assertIn("function pointFromSample(sample)", html)
         self.assertIn('const window=(sample.windows||{})[label]||{}', html)
         self.assertIn('return {checkedAt:sample.checkedAt,timestamp:eventTimestamp(sample),fiveHour:windowPoint("5h"),sevenDay:windowPoint("7d"),cost:sample.cost||{}}', html)
@@ -2522,6 +2569,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn(".window-progress.weekly .time-fill,.window-progress.weekly .usage-fill{background:var(--green)}", html)
         self.assertIn("function updateWindowTime(id,display,resetAt,durationSeconds)", html)
         self.assertIn("if(Number.isFinite(display?.timePercent))", html)
+        self.assertIn('const fmt=n=>n==null?"N/A"', html)
+        self.assertIn('reset.textContent="Reset: N/A"', html)
         self.assertIn("Math.max(0,Math.min(100,(1-(resetMs-Date.now())/(durationSeconds*1000))*100))", html)
 
     def test_dashboard_token_summary_follows_shared_filters_and_precedes_usage_charts(self):
@@ -2584,6 +2633,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("date.onclick=activateDateInput", html)
         self.assertIn("date.onfocus=activateDateInput", html)
         self.assertIn('date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}setupControls();drawAll(true)}', html)
+        self.assertIn('function datePickerIsOpen(date)', html)
+        self.assertIn('try{return date.matches(":open")}catch{return false}', html)
+        self.assertIn('DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50', html)
+        self.assertIn('function pointInsideDateJudgeArea(rect)', html)
+        self.assertIn('rect.left-DATE_LEAVE_DISTANCE', html)
+        self.assertIn('function virtualDatePickerRect(dateRect)', html)
+        self.assertIn('DATE_PICKER_VIRTUAL_WIDTH=280, DATE_PICKER_VIRTUAL_HEIGHT=360', html)
+        self.assertIn('function pointInsideVirtualDatePicker()', html)
+        self.assertIn('(pickerOpen&&(!dateLeaveIntent.pointerMoved||pointInsideVirtualDatePicker()))||(!pickerOpen&&pointInsideDateJudgeArea(dateLeaveIntent.rect))', html)
+        self.assertIn('if(dateLeaveIntent.outsideAt==null){dateLeaveIntent.outsideAt=now', html)
+        self.assertIn('now-dateLeaveIntent.outsideAt<DATE_LEAVE_DELAY_MS', html)
+        self.assertIn('pickerRect:virtualDatePickerRect(date.getBoundingClientRect())', html)
+        self.assertIn('function cancelDateInputSelection()', html)
+        self.assertIn('document.getElementById("rangeDate").blur();cancelDateLeaveTracking()', html)
+        self.assertIn('document.activeElement!==date&&!datePickerIsOpen(date)', html)
+        self.assertIn('selector.onpointerenter=cancelDateLeaveTracking;selector.onpointerleave=startDateLeaveTracking', html)
+        self.assertIn('addEventListener("pointermove",updateDateLeavePointer,{passive:true})', html)
         self.assertIn('document.getElementById("prevDate").onclick=()=>shiftSelectedDate(-1)', html)
         self.assertIn('document.getElementById("nextDate").onclick=()=>shiftSelectedDate(1)', html)
         self.assertIn("rawKeys:[p.checkedAt]", html)
@@ -2749,15 +2815,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(payload["quotaDataView"], "merged")
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 2)
         self.assertEqual(payload["tokenSessions"][0]["sessionId"], "local")
-        self.assertIn('<div class="card-title"><h2>5h Usage vs Time</h2><span class="rate">Merged</span></div>', dashboard_html())
-        self.assertIn('<div class="card-title"><h2>7d Usage vs Time</h2><span class="rate">Merged</span></div>', dashboard_html())
+        self.assertNotIn("<span class=\"rate\">Merged</span>", dashboard_html())
 
     def test_extension_loads_live_dashboard_with_bundled_fallback(self):
         extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
         html = dashboard_html()
         manifest = json.loads(Path(__file__).with_name("package.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["version"], "0.9.1")
+        self.assertEqual(manifest["version"], "1.0.0")
         self.assertIn('const DASHBOARD_URL = new URL("http://127.0.0.1:8765/")', extension)
         self.assertIn("PAGE_ALLOWLIST", extension)
         self.assertIn('asset: "dashboard.html"', extension)
@@ -2781,20 +2846,24 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("setInterval(load,5000)", html)
 
         self.assertNotIn("RELATIVE_TIME_UPDATE_INTERVAL_MS", extension)
-        self.assertIn('const tooltipRevision = JSON.stringify([display.statusBarText, display.percentCheckedAt, display.windows?.["5h"]?.resetAt, display.windows?.["7d"]?.resetAt])', extension)
-        self.assertIn("if (tooltipRevision !== this.lastTooltipRevision)", extension)
+        self.assertNotIn("lastTooltipRevision", extension)
+        self.assertIn("const tooltip = stableTooltip(display)", extension)
+        self.assertIn("if (tooltip !== this.lastTooltip)", extension)
         self.assertIn('`Last update ${secondsAgo(display.percentCheckedAt)}`', extension)
 
     def test_dashboard_and_management_pages_expose_stacked_pop_messages(self):
         for html in (dashboard_html(), Path(__file__).with_name("management.html").read_text(encoding="utf-8")):
             self.assertIn('class="message-stack" id="messageStack"', html)
-            self.assertIn('function showMessage(title,shortDetail,details=shortDetail,type="info")', html)
+            self.assertIn('function showMessage(title,summary,details=summary,type="info")', html)
             self.assertIn('message.ondblclick=showDetails', html)
             self.assertIn('setTimeout(dismiss,10000)', html)
             self.assertIn('message.dismiss=dismiss', html)
             self.assertIn('close.setAttribute("aria-label",`Dismiss ${title}`)', html)
             self.assertIn('document.getElementById("messageStack").appendChild(message)', html)
             self.assertIn('id="messageDetailModal" role="dialog"', html)
+            self.assertIn('id="messageDetailSummary"', html)
+            self.assertIn('document.getElementById("messageDetailSummary").textContent=summary', html)
+            self.assertIn('className="pop-message-summary"', html)
 
     def test_dashboard_uses_text_nodes_instead_of_html_injection_sinks(self):
         html = dashboard_html()
@@ -2818,14 +2887,20 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_skill_link_messages_use_specific_titles_and_skill_name_detail(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn('if(path.endsWith("/skills/assign"))showMessage(body.enabled?"Skills linked":"Skills unlinked",body.name,body.name,"success")', html)
+        self.assertIn('showMessage(`Skill ${body.enabled?"Link":"Unlink"} Completed`', html)
+        self.assertIn('`${body.name} was ${body.enabled?"linked to":"unlinked from"} ${body.app}.`', html)
+        self.assertIn('{name:"Managed skill validation",status:"passed"', html)
+        self.assertIn('{name:`${body.app} projection`,status:"passed"', html)
 
-    def test_cloud_operation_messages_cover_started_finished_and_error(self):
+    def test_cloud_operation_messages_cover_started_completion_and_error(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn('showMessage(`${cloudOperation.name} Started`,cloudOperation.short,`${cloudOperation.detail} started.`,"progress")', html)
-        self.assertIn('showMessage(`${cloudOperation.name} Finished`,cloudOperation.short,`${cloudOperation.detail} finished successfully.`,"success")', html)
-        self.assertIn('showMessage(cloudOperation?`${cloudOperation.name} Error`:"Action failed",cloudOperation?.short||title,detail,"error")', html)
+        self.assertIn('showMessage(`${startOperation.name} Started`,startOperation.message,detailReport(startOperation.name,"In progress"', html)
+        self.assertIn('function showCloudResult(operation,result,body)', html)
+        self.assertIn('showMessage(`${operation.name} Completed`', html)
+        self.assertIn('showMessage(`${operation} Failed`,report.message,report.details,"error")', html)
+        self.assertIn('function errorReport(operation,error)', html)
+        self.assertIn('failed?`${failed.name} failed: ${failed.detail}`', html)
         self.assertIn('message.dismissTimer=type==="progress"?null:setTimeout(dismiss,10000)', html)
         self.assertIn('startMessage?.dismiss()', html)
 
@@ -2838,10 +2913,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_bind_messages_explicitly_cover_start_finished_and_error(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn('path.endsWith("/accounts/bind")?{name:"Bind",short:"Cloud account",detail:"Cloud account bind"}', html)
-        self.assertIn('`${cloudOperation.name} Started`', html)
-        self.assertIn('`${cloudOperation.name} Finished`', html)
-        self.assertIn('`${cloudOperation.name} Error`', html)
+        self.assertIn('path.endsWith("/accounts/bind")?{name:"Bind",message:"Moving the selected cloud account to this machine."', html)
+        self.assertIn('`${startOperation.name} Started`', html)
+        self.assertIn('"WebDAV Test Passed"', html)
+        self.assertIn('`${operation.name} Completed`', html)
+        self.assertIn('`${operation} Failed`', html)
+        for step in ("Cloud account download and decryption", "Account identity validation", "Local vault commit", "Cloud payload removal"):
+            self.assertIn(step, html)
 
     def test_bind_and_release_start_without_browser_confirmation(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
@@ -2854,12 +2932,15 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_manual_push_reports_noop_and_lists_changed_items_in_detail(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn('showMessage("Push Finished","Cloud is already current.","Local managed skills already match the cloud. Accounts are uploaded only by Release.","success")', html)
-        self.assertIn('`Skills added:\\n${added.map(name=>`- ${name}`).join("\\n")}`', html)
-        self.assertIn('`Skills updated:\\n${updated.map(name=>`- ${name}`).join("\\n")}`', html)
-        self.assertIn('`Skills deleted:\\n${deleted.map(name=>`- ${name}`).join("\\n")}`', html)
+        self.assertIn('showMessage("Push Completed"', html)
+        self.assertIn('"Cloud skills were already current."', html)
+        self.assertIn('`Added skills:\\n${added.map(name=>`- ${name}`).join("\\n")}`', html)
+        self.assertIn('`Updated skills:\\n${updated.map(name=>`- ${name}`).join("\\n")}`', html)
+        self.assertIn('`Deleted skills:\\n${deleted.map(name=>`- ${name}`).join("\\n")}`', html)
+        self.assertIn('{name:"Local skill packaging",status:"passed"', html)
+        self.assertIn('{name:"Cloud skill index",status:"passed"', html)
+        self.assertIn('{name:"Account payloads",status:"skipped"', html)
         self.assertNotIn('Accounts updated:', html)
-        self.assertIn('showMessage("Push Finished",summary.join(" · "),details.join("\\n\\n"),"success")', html)
 
     def test_management_page_scans_skills_silently_on_entry_and_every_five_seconds(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
@@ -2881,14 +2962,15 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('id="newAccountModal"', html)
         self.assertIn('Run Codex login in a new or restarted terminal', html)
         self.assertIn('did not respond within five minutes', html)
-        self.assertIn('Saving the current account and preparing sign-in', html)
-        self.assertIn('Switching accounts', html)
+        self.assertIn('Saving the current account and preparing a new sign-in slot', html)
+        self.assertIn('Saving the outgoing account and activating the selected account', html)
         self.assertNotIn('Waiting for the current usage refresh', html)
         account_action_source = html[html.index('async function performAccountAction'):html.index('function setupAccountControls')]
         self.assertNotIn('await load()', account_action_source)
-        self.assertIn('showMessage("Account action in progress",workingDetail', account_action_source)
+        self.assertIn('showMessage(`${actionName} Started`,workingDetail', account_action_source)
+        self.assertIn('messageDetailReport(actionName,"In progress"', account_action_source)
         self.assertIn('finally{workingMessage.dismiss();actionBusy=false;renderAccounts(payload.accounts)}', account_action_source)
-        self.assertIn('showMessage("Codex login required","Usage polling is paused until login completes."', html)
+        self.assertIn('showMessage("Codex Login Required","Account preparation completed, but usage polling is paused until sign-in."', html)
         self.assertNotIn('if(actionBusy){banner.textContent=', html)
         self.assertNotIn('else if(accounts.error){banner.textContent=', html)
         self.assertIn('"/api/accounts/switch"', source)
@@ -2919,7 +3001,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(monitor_dashboard.serve_dashboard(SimpleNamespace(data_home=directory), None), 1)
 
         state_class.assert_not_called()
-        self.assertIn("127.0.0.1:8765 is unavailable", stderr.getvalue())
+        self.assertIn("0.0.0.0:8765 is unavailable", stderr.getvalue())
 
     def test_dashboard_server_binds_configured_all_interfaces_ip(self):
         with self.account_directory() as directory:
@@ -2932,7 +3014,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_dashboard_server_config_keeps_fixed_port_and_validates_ip(self):
         with self.account_directory() as directory:
             config_path = directory / "config.json"
-            self.assertEqual(load_server_config(config_path), {"host": "127.0.0.1"})
+            self.assertEqual(load_server_config(config_path), {"host": "0.0.0.0"})
             config_path.write_text(json.dumps({"server": {"host": "0.0.0.0"}}), encoding="utf-8")
             self.assertEqual(load_server_config(config_path), {"host": "0.0.0.0"})
             config_path.write_text(json.dumps({"server": {"host": "localhost"}}), encoding="utf-8")
@@ -2949,13 +3031,16 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_management_page_exposes_fixed_port_ip_config_tab(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn('data-tab="config">Config file</button>', html)
+        self.assertIn('data-tab="config">Config</button>', html)
         self.assertIn('<option value="127.0.0.1">', html)
         self.assertIn('<option value="0.0.0.0">', html)
         self.assertIn("Port 8765 is fixed.", html)
         self.assertNotIn('id="serverPort"', html)
-        self.assertIn('run("/api/manage/server",{host:document.getElementById("serverHost").value})', html)
-        self.assertIn('showMessage("Server config saved","Restart the Python monitor."', html)
+        self.assertNotIn('id="machineName"', html)
+        for field in ("webdavBaseUrl", "webdavUsername", "webdavPassword", "webdavRemoteRoot", "encryptionPassphrase", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites", "newControlPassword"):
+            self.assertIn(f'id="{field}"', html)
+        self.assertIn('run("/api/manage/config"', html)
+        self.assertIn("Leave the passphrase and its saved hash empty to disable second-layer encryption.", html)
 
     def test_dashboard_display_formats_usage_and_remaining_time_for_extension(self):
         now = datetime.fromisoformat("2030-01-01T00:00:00+00:00").timestamp()
@@ -3165,18 +3250,20 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_management_payload_exposes_only_non_sensitive_status_fields(self):
         state = SimpleNamespace(
             skills=SimpleNamespace(status=lambda: {"version": 1, "privatePath": "C:/private", "items": [{"name": "alpha", "assignments": {"codex": True}, "projections": {"codex": {"state": "linked", "target": "C:/private/alpha"}}, "errors": {}}]}, scan=lambda _refresh: []),
-            cloud=SimpleNamespace(config=lambda: {"server": {"host": "127.0.0.1"}}, redacted_status=lambda: {"configPath": "C:/private/config.json", "machineName": "Private PC", "webdav": {"enabled": True, "baseUrl": "https://private.example.test", "username": "private-user"}, "secretsConfigured": {"password": True}, "autoSync": {}}, cached_remote_accounts=lambda: [{"accountKey": "opaque-key", "accountId": "acct-secret", "email": "private@example.test", "label": "Cloud A", "revisionId": "revision-secret"}]),
+            cloud=SimpleNamespace(config=lambda: {"server": {"host": "127.0.0.1"}}, editable_config=lambda: {"server": {"host": "127.0.0.1"}, "webdav": {"enabled": True, "baseUrl": "https://private.example.test", "username": "private-user", "remoteRoot": "private-root"}, "secretsConfigured": {"password": True, "encryptionPassphrase": True, "controlPassword": True}}, redacted_status=lambda: {"configPath": "C:/private/config.json", "webdav": {"enabled": True, "baseUrl": "https://private.example.test", "username": "private-user"}, "secretsConfigured": {"password": True}, "autoSync": {}}, cached_remote_accounts=lambda: [{"accountKey": "opaque-key", "accountId": "acct-secret", "email": "private@example.test", "label": "Cloud A", "revisionId": "revision-secret"}]),
             accounts=SimpleNamespace(status=lambda: {"activeAccountId": "local-a", "awaitingLogin": False, "items": [{"id": "local-a", "label": "Account A", "email": "private@example.test", "ready": True, "active": True, "accountKey": "opaque-key"}]}), projection_errors=[],
         )
 
-        serialized = json.dumps(monitor_dashboard.dashboard_safe_json(monitor_dashboard.management_payload(state)))
+        serialized = json.dumps(monitor_dashboard.management_payload(state))
 
         for expected in ("Account A", "Cloud A", "alpha", "opaque-key"):
             self.assertIn(expected, serialized)
-        for sensitive in ("private@example.test", "acct-secret", "revision-secret", "C:/private", "https://private.example.test", "private-user", "Private PC"):
+        for expected in ("https://private.example.test", "private-user", "private-root"):
+            self.assertIn(expected, serialized)
+        for sensitive in ("private@example.test", "acct-secret", "revision-secret", "C:/private", "passwordHash", "cookieSecret"):
             self.assertNotIn(sensitive, serialized)
 
-    def test_dashboard_exposes_account_filtered_usage_time_curves_without_nodes(self):
+    def test_dashboard_exposes_account_filtered_usage_time_curves_with_nodes(self):
         html = dashboard_html()
 
         self.assertIn('<canvas class="chart" id="usageTime5h"></canvas>', html)
@@ -3187,13 +3274,18 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('function drawUsageTimeChart(id,label,points,animate=false)', html)
         self.assertIn('function accountCurveColor(accountId)', html)
         self.assertIn('function renderUsageLegend(id,groups)', html)
-        self.assertIn('function usageTimeFoldMetrics(gaps,x0,x1,left,right)', html)
+        self.assertIn('function usageTimeRenderedValues(points,valueOf)', html)
+        self.assertIn('if(previous!==null&&raw<previous)descending++;else{descending=0;anchor=raw}', html)
+        self.assertIn('descending>0&&descending<=2&&anchor-raw<=2?anchor:raw', html)
+        self.assertIn('function usageTimeFoldMetrics(gaps,x0,x1,left,right,charWidth)', html)
+        self.assertIn('const minWidth=charWidth*4.5', html)
         self.assertIn('base=Math.min(10,Math.max(2,', html)
-        self.assertIn('naturalAmplifier=Math.min(10,Math.max(4,', html)
-        self.assertIn('amplifier=Math.min(naturalAmplifier,', html)
-        self.assertIn('Math.log1p(gap.duration/referenceGap)/Math.log(base)', html)
+        self.assertIn('const amplifier=Math.min(10,Math.max(4,', html)
+        self.assertIn('plotWidth*.012', html)
+        self.assertNotIn('maxWidth=', html)
+        self.assertIn('const calculatedWidth=amplifier*Math.log1p(gap.duration/referenceGap)/Math.log(base);return {...gap,width:Math.max(minWidth,calculatedWidth)}', html)
         self.assertIn('function usageTimeGapIsDiscontinuous(groups,gap,label,valueOf)', html)
-        self.assertIn('function usageTimeFolds(groups,label,valueOf,x0,x1,left,right)', html)
+        self.assertIn('function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth)', html)
         self.assertIn('usageTimeGapIsDiscontinuous(groups,gap,label,valueOf)', html)
         self.assertIn('timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*2', html)
         self.assertIn('if(!additions.length)return folds', html)
@@ -3204,7 +3296,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn('h gap`', html)
         self.assertNotIn('ctx.fillRect(center-labelWidth/2-3,top+3,labelWidth+6,13)', html)
         self.assertIn('const renderGapLabelLayer=(folds,layer=document.createElement("canvas"))=>', html)
-        self.assertIn('timeScale=usageTimeScale(x0,x1,usageTimeFolds(groups,label,valueOf,x0,x1,m.l,w-m.r),m.l,w-m.r)', html)
+        self.assertIn('ctx.font="11px system-ui"', html)
+        self.assertIn('usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width)', html)
         self.assertIn('drawUsageTimeFolds(layerContext,folds,m.t,h-m.b,"labels")', html)
         self.assertIn('drawUsageTimeFolds(layerContext,folds,m.t,h-m.b,"geometry")', html)
         self.assertIn('gapTransitions=currentFolds.map', html)
@@ -3217,18 +3310,30 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('drawLayer(previousLabelLayer,transitioning?1-progress:0,liveLabelContext)', html)
         self.assertIn('drawLayer(labelLayer,transitioning?progress:1,liveLabelContext)', html)
         self.assertIn('(x,index,labelCount)=>{const timestamp=timeScale.timestampAt(x)', html)
-        self.assertIn('values=valid.map(point=>Math.max(0,Math.min(100,valueOf(point))))', html)
+        self.assertIn('values=valid.map(point=>Math.max(0,Math.min(100,renderedValueOf(point))))', html)
         self.assertIn('xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1]', html)
+        self.assertIn('Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b)', html)
         self.assertIn('if(x0===x1)return {x:()=>left+(right-left)/2,timestampAt:()=>x0,folds:[]}', html)
-        self.assertIn('layerContext.rect(m.l-layerContext.lineWidth/2,m.t-layerContext.lineWidth/2,w-m.l-m.r+layerContext.lineWidth,h-m.t-m.b+layerContext.lineWidth);layerContext.clip()', html)
+        self.assertIn('const groups=[...grouped].filter(([,accountPoints])=>accountPoints.length)', html)
+        self.assertIn('layerContext.rect(m.l-layerContext.lineWidth,m.t-layerContext.lineWidth,w-m.l-m.r+layerContext.lineWidth*2,h-m.t-m.b+layerContext.lineWidth*2);layerContext.clip()', html)
+        self.assertIn('for(const item of series){if(!item.points.length||item.alpha===0)continue;layerContext.globalAlpha=item.alpha??1;layerContext.strokeStyle=item.color;', html)
+        self.assertIn('for(const point of item.points){if(!paths.length||point.breakBefore)paths.push([]);paths[paths.length-1].push(point)}', html)
+        self.assertIn('const curveLength=path.slice(1).reduce((length,point,index)=>length+Math.hypot(point.x-path[index].x,point.y-path[index].y),0), pointDiameter=layerContext.lineWidth*2;', html)
+        self.assertIn('if(curveLength>=pointDiameter)continue;', html)
+        self.assertIn('layerContext.arc(center[0],center[1],layerContext.lineWidth,0,Math.PI*2)', html)
+        self.assertNotIn('visiblePoints.some', html)
         self.assertIn('points.length?"Not enough data for the selected scope":"No data for this range"', html)
         self.assertNotIn("Not enough data for the selected accounts", html)
         self.assertIn('function plusEquivalentUsage(point,label,valueOf)', html)
         self.assertIn('{plus:1,pro_lite:5,pro:20}[point[label]?.plan]||1', html)
         self.assertIn('function breakUsageCurve(previous,current,label,valueOf)', html)
         self.assertIn('if(gap>4*3600)return true', html)
-        self.assertIn('gap>60*60&&Math.abs(plusEquivalentUsage(current,label,valueOf)-plusEquivalentUsage(previous,label,valueOf))/(gap/60)>=(label==="fiveHour"?.5:.1)', html)
-        self.assertIn('breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,valueOf)', html)
+        self.assertIn('if(gap<=30*60)return false', html)
+        self.assertIn('const previousUsage=plusEquivalentUsage(previous,label,valueOf), currentUsage=plusEquivalentUsage(current,label,valueOf)', html)
+        self.assertIn('if(previousUsage-currentUsage>=3)return true', html)
+        self.assertIn('Math.abs(currentUsage-previousUsage)/(gap/60)>=(label==="fiveHour"?.5:.1)', html)
+        self.assertIn('breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,renderedValueOf)', html)
+        self.assertIn('`${label==="fiveHour"?"5h":"7d"} usage ${Number(nearest.value).toFixed(1)}%`', html)
         self.assertIn('drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)', html)
         self.assertIn('drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)', html)
         self.assertIn('const previousSeries=previous?.series||[]', html)
@@ -3241,12 +3346,15 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('const currentSegments=new Map', html)
         self.assertIn('point.breakBefore||currentSegments.get(series.accountId)?.has', html)
         self.assertIn('drawLayer(leavingCurve,transitioning?1-progress:0,liveContext)', html)
+        self.assertIn('drawLayer(baseLayer);drawLayer(liveLabels);drawLayer(liveGap);drawLayer(liveGapLabels);drawLayer(liveCurve)', html)
+        self.assertIn('drawLayer(baseLayer);drawLayer(labelLayer);drawLayer(gapLayer);drawLayer(gapLabelLayer);drawLayer(curveLayer)', html)
         self.assertNotIn('drawLayer(previousCurve', html)
         self.assertIn('const started=performance.now(), duration=820', html)
         self.assertIn('if(!animate||!previousLabelLayer||matchMedia("(prefers-reduced-motion: reduce)").matches){finish();return}', html)
         self.assertIn('state.series=animatedSeries', html)
         self.assertLess(html.index("5h Reset Time vs Usage"), html.index("5h Usage vs Time"))
         self.assertLess(html.index("5h Usage vs Time"), html.index("5h Cost vs Usage"))
+        self.assertNotIn("Current active account", html)
         self.assertNotIn("Delta Cost vs Delta Usage", html)
 
     def test_write_history_groups_delta_events_by_window(self):
@@ -3260,12 +3368,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
 
             self.assertIn('{\n  "window": "5h",\n  "delta": [', text)
-            self.assertIn('"accountSlotId":"legacy-nomei-plus","accountLabel":"Nomei Plus"', text)
+            self.assertIn('"accountSlotId":"unknown","accountLabel":"Unknown"', text)
             self.assertIn('{\n  "window": "7d",\n  "delta": [', text)
-            self.assertEqual(text.count('"accountSlotId":"legacy-nomei-plus"'), 2)
+            self.assertEqual(text.count('"accountSlotId":"unknown"'), 2)
             self.assertEqual(load_history(path), [
-                {"checkedAt": "2030-01-01T00:00:00Z", "deltaPercent": 1, "deltaCostUsd": 2, "accountSlotId": "legacy-nomei-plus", "accountLabel": "Nomei Plus", "window": "5h"},
-                {"checkedAt": "2030-01-01T01:00:00Z", "deltaPercent": 3, "deltaCostUsd": 4, "accountSlotId": "legacy-nomei-plus", "accountLabel": "Nomei Plus", "window": "7d"},
+                {"checkedAt": "2030-01-01T00:00:00Z", "deltaPercent": 1, "deltaCostUsd": 2, "accountSlotId": "unknown", "accountLabel": "Unknown", "window": "5h"},
+                {"checkedAt": "2030-01-01T01:00:00Z", "deltaPercent": 3, "deltaCostUsd": 4, "accountSlotId": "unknown", "accountLabel": "Unknown", "window": "7d"},
             ])
         finally:
             if path.exists():
@@ -3283,9 +3391,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
 
             self.assertIn('{\n  "window": "5h",\n  "delta": [', text)
-            self.assertIn('"accountSlotId":"legacy-nomei-plus","accountLabel":"Nomei Plus"', text)
+            self.assertIn('"accountSlotId":"unknown","accountLabel":"Unknown"', text)
             self.assertIn('{\n  "window": "7d",\n  "delta": [', text)
-            self.assertEqual(text.count('"accountSlotId":"legacy-nomei-plus"'), 2)
+            self.assertEqual(text.count('"accountSlotId":"unknown"'), 2)
             self.assertEqual(load_history(path)[-1]["window"], "7d")
         finally:
             if path.exists():
@@ -3302,7 +3410,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             text = path.read_text(encoding="utf-8")
             rows = load_history(path)
 
-            self.assertIn('"accountSlotId":"legacy-nomei-plus","accountLabel":"Nomei Plus","deltaPercent":2.0,"models":[{"model":"gpt-5.5","deltaCostUsd":2},{"model":"gpt-5.6-sol","deltaCostUsd":6}]', text)
+            self.assertIn('"accountSlotId":"unknown","accountLabel":"Unknown","deltaPercent":2.0,"models":[{"model":"gpt-5.5","deltaCostUsd":2},{"model":"gpt-5.6-sol","deltaCostUsd":6}]', text)
             self.assertEqual([row["model"] for row in rows], ["gpt-5.5", "gpt-5.6-sol"])
             self.assertEqual([row["deltaPercent"] for row in rows], [0.5, 1.5])
             self.assertEqual([row["costPercentRatio"] for row in rows], [4, 4])
@@ -3330,7 +3438,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             rows = load_history(path)
 
-            self.assertEqual(rows, [{"checkedAt": "2030-01-01T00:00:00Z", "deltaPercent": 1, "deltaCostUsd": 2, "window": "5h", "accountSlotId": "legacy-nomei-plus", "accountLabel": "Nomei Plus"}])
+            self.assertEqual(rows, [{"checkedAt": "2030-01-01T00:00:00Z", "deltaPercent": 1, "deltaCostUsd": 2, "window": "5h", "accountSlotId": "unknown", "accountLabel": "Unknown"}])
             self.assertEqual(derive_history_events(rows)["fiveHour"][1]["model"], "gpt-5.5")
         finally:
             if path.exists():
@@ -3349,9 +3457,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
             events = derive_history_events(load_history(path))
 
             self.assertIn('{\n  "window": "5h",\n  "delta": [', text)
-            self.assertIn('"accountSlotId":"legacy-nomei-plus","accountLabel":"Nomei Plus"', text)
+            self.assertIn('"accountSlotId":"unknown","accountLabel":"Unknown"', text)
             self.assertIn('{\n  "window": "7d",\n  "delta": [', text)
-            self.assertEqual(text.count('"accountSlotId":"legacy-nomei-plus"'), 2)
+            self.assertEqual(text.count('"accountSlotId":"unknown"'), 2)
             self.assertEqual(events["fiveHour"][1]["deltaPercent"], 1)
             self.assertEqual(events["sevenDay"][1]["deltaPercent"], 3)
         finally:
@@ -3865,14 +3973,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(raised.exception.status, 409)
 
     def test_crypto_box_authenticates_purpose_passphrase_and_completion(self):
-        correct_hash = passphrase_hash("correct horse")
+        correct_hash = passphrase_hash("correct horse", "https://dav.example/", "user")
         descriptor = CryptoBox.descriptor(correct_hash)
         box = CryptoBox(correct_hash, descriptor)
         payload = box.encrypt("skills", b"private content")
 
         self.assertEqual(box.decrypt("skills", payload), b"private content")
         with self.assertRaises(CloudError):
-            CryptoBox(passphrase_hash("wrong"), descriptor)
+            CryptoBox(passphrase_hash("wrong", "https://dav.example/", "user"), descriptor)
         with self.assertRaises(CloudError):
             box.decrypt("accounts", payload)
         with self.assertRaises(CloudError):
@@ -3933,7 +4041,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_cloud_crypto_initialization_requires_exact_http_404(self):
         manager = object.__new__(CloudManager)
-        manager.config = mock.Mock(return_value={"webdav": {"enabled": True, "baseUrl": "https://dav.example/", "username": "user", "password": "secret", "encryptionPassphraseHash": passphrase_hash("passphrase")}})
+        manager.config = mock.Mock(return_value={"webdav": {"enabled": True, "baseUrl": "https://dav.example/", "username": "user", "password": "secret", "encryptionPassphraseHash": passphrase_hash("passphrase", "https://dav.example/", "user")}})
         failures = (
             CloudError("network", 502, category="network"),
             CloudError("unauthorized", 502, http_status=401, category="http"),
@@ -3948,7 +4056,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_cloud_crypto_initialization_verifies_readback_and_conditional_create(self):
         manager = object.__new__(CloudManager)
-        manager.config = mock.Mock(return_value={"webdav": {"enabled": True, "baseUrl": "https://dav.example/", "username": "user", "password": "secret", "encryptionPassphraseHash": passphrase_hash("passphrase")}})
+        manager.config = mock.Mock(return_value={"webdav": {"enabled": True, "baseUrl": "https://dav.example/", "username": "user", "password": "secret", "encryptionPassphraseHash": passphrase_hash("passphrase", "https://dav.example/", "user")}})
 
         class Client:
             def __init__(self, enforce_condition=True):
@@ -3984,6 +4092,55 @@ class MonitorCodexUsageTests(unittest.TestCase):
             crypto.descriptor.return_value = {"version": 1}
             with self.assertRaisesRegex(CloudError, "ignored conditional"):
                 manager._connection(True)
+
+    def test_webdav_test_decrypts_existing_payload_before_protocol_writes(self):
+        manager = object.__new__(CloudManager)
+        manager._operation_lock = threading.RLock()
+        manager._state = {"conditionalWritesVerified": False}
+        manager._save_state = mock.Mock()
+        manager.config = mock.Mock(return_value={"webdav": {"allowOptimisticWrites": True}})
+        client = mock.Mock()
+        client.get.side_effect = [(b"encrypted", '"payload-etag"'), (b"first", '"first-etag"'), (b"updated", '"updated-etag"')]
+        client.put.side_effect = ['"first-etag"', CloudError("exists", 409, http_status=412, category="http"), CloudError("mismatch", 409, http_status=412, category="http"), '"updated-etag"']
+        box = mock.Mock()
+        with mock.patch.object(manager, "_connection", return_value=(client, box)), mock.patch.object(manager, "_encrypted_inventory", return_value=[("skills/packages/package.enc", "skill-package:package")]):
+            result = manager.test()
+
+        box.decrypt.assert_called_once_with("skill-package:package", b"encrypted")
+        self.assertTrue(result["encryptedPayloadVerified"])
+        self.assertEqual([check["status"] for check in result["checks"]], ["passed", "passed", "passed", "passed", "passed", "passed"])
+        self.assertEqual(result["checks"][0]["name"], "Connection and account verification")
+        self.assertEqual(result["checks"][1]["name"], "Encrypted data decryption")
+        manager._save_state.assert_called_once_with()
+
+    def test_webdav_test_rejects_existing_payload_that_cannot_be_decrypted(self):
+        manager = object.__new__(CloudManager)
+        manager._operation_lock = threading.RLock()
+        client, box = mock.Mock(), mock.Mock()
+        client.get.return_value = b"encrypted", '"payload-etag"'
+        box.decrypt.side_effect = CloudError("Encrypted payload authentication failed", 409)
+        with mock.patch.object(manager, "_connection", return_value=(client, box)), mock.patch.object(manager, "_encrypted_inventory", return_value=[("skills/packages/package.enc", "skill-package:package")]), self.assertRaisesRegex(CloudError, "authentication failed") as caught:
+            manager.test()
+
+        client.put.assert_not_called()
+        self.assertEqual(caught.exception.details[-1]["name"], "Encrypted data decryption")
+        self.assertEqual(caught.exception.details[-1]["status"], "failed")
+
+    def test_webdav_test_allows_empty_encrypted_inventory(self):
+        manager = object.__new__(CloudManager)
+        manager._operation_lock = threading.RLock()
+        manager._state = {"conditionalWritesVerified": False}
+        manager._save_state = mock.Mock()
+        manager.config = mock.Mock(return_value={"webdav": {"allowOptimisticWrites": True}})
+        client, box = mock.Mock(), mock.Mock()
+        client.get.side_effect = [(b"first", '"first-etag"'), (b"updated", '"updated-etag"')]
+        client.put.side_effect = ['"first-etag"', CloudError("exists", 409, http_status=412, category="http"), CloudError("mismatch", 409, http_status=412, category="http"), '"updated-etag"']
+        with mock.patch.object(manager, "_connection", return_value=(client, box)), mock.patch.object(manager, "_encrypted_inventory", return_value=[]):
+            result = manager.test()
+
+        box.decrypt.assert_not_called()
+        self.assertFalse(result["encryptedPayloadVerified"])
+        self.assertEqual(result["checks"][1], {"name": "Encrypted data decryption", "status": "skipped", "detail": "No encrypted cloud payload exists yet."})
 
     def test_sync_operations_reject_unbounded_or_inconsistent_remote_records(self):
         row = {"sessionId": "session", "tokens": {}, "byModel": {"<img src=x onerror=alert(1)>": {}}, "sync": {"recordId": "record", "originMachineId": "machine", "accountId": "account"}}
@@ -4470,7 +4627,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('<button data-action="cloud-fetch">Fetch</button>', html)
         self.assertIn('<button id="pushButton" data-action="cloud-push" class="primary">Push</button>', html)
         self.assertIn('pushWarning?"Push (!)":"Push"', html)
-        self.assertIn('showMessage("Auto Push Failed","WebDAV",failure.message,"error")', html)
+        self.assertIn('showMessage("Automatic Push Failed",`Automatic skill upload failed: ${failure.message}`', html)
+        self.assertIn('{name:"Cloud upload",status:"failed",detail:failure.message}', html)
         self.assertNotIn('Auto Push Success', html)
         self.assertLess(html.index('data-action="cloud-push"'), html.index('data-action="cloud-fetch"'))
         self.assertLess(html.index('data-action="cloud-fetch"'), html.index('data-action="cloud-test"'))
@@ -4506,26 +4664,27 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertFalse(hasattr(CloudManager, "preview_skills"))
         self.assertFalse(hasattr(SkillManager, "preview_restore"))
 
-    def test_cloud_config_adds_initial_control_password_and_cookie_secret(self):
+    def test_cloud_config_starts_without_control_password_and_adds_cookie_secret(self):
         with self.account_directory() as directory:
             private = directory / "private"
             private.mkdir()
-            (private / "config.json").write_text(json.dumps({"version": 1, "machineName": "Test", "webdav": {"enabled": False}}), encoding="utf-8")
+            (private / "config.json").write_text(json.dumps({"version": 1, "machineName": "Legacy name", "webdav": {"enabled": False}}), encoding="utf-8")
 
             CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
 
             control = json.loads((private / "config.json").read_text(encoding="utf-8"))["control"]
+            self.assertNotIn("machineName", json.loads((private / "config.json").read_text(encoding="utf-8")))
             self.assertEqual(control["password"], "")
-            self.assertTrue(control_password_matches("123456", control["passwordHash"]))
+            self.assertEqual(control["passwordHash"], "")
             self.assertGreaterEqual(len(control["cookieSecret"]), 32)
 
     def test_cloud_config_uses_offline_passphrase_hash_without_adaptation_fields(self):
         with self.account_directory() as directory:
             private = directory / "private"
             private.mkdir()
-            encryption_hash = passphrase_hash("cloud-secret")
+            encryption_hash = passphrase_hash("cloud-secret", "https://example.test", "user")
             (private / "config.json").write_text(json.dumps({
-                "version": 1, "machineName": "Test", "control": {"password": "123456", "cookieSecret": "c" * 32},
+                "version": 1, "control": {"password": "123456", "cookieSecret": "c" * 32},
                 "webdav": {"enabled": True, "baseUrl": "https://example.test", "username": "user", "password": "webdav-secret", "remoteRoot": "root", "encryptionPassphraseHash": encryption_hash},
             }), encoding="utf-8")
 
@@ -4534,26 +4693,204 @@ class MonitorCodexUsageTests(unittest.TestCase):
             saved = json.loads(cloud.config_path.read_text(encoding="utf-8"))
             webdav, control = saved["webdav"], saved["control"]
             self.assertEqual(control["password"], "")
-            self.assertTrue(control_password_matches("123456", control["passwordHash"]))
+            self.assertEqual(control["passwordHash"], "")
             self.assertEqual(webdav["password"], "webdav-secret")
             self.assertNotIn("cloud-secret", json.dumps(webdav))
             self.assertEqual(webdav["encryptionPassphraseHash"], encryption_hash)
+            self.assertEqual(webdav["encryptionPassphrase"], "")
             self.assertFalse(any("PassphraseProtected" in key or key.startswith("pendingEncryption") for key in webdav))
             self.assertTrue(webdav["usageDataAutoSync"])
 
-    def test_passphrase_hash_uses_fixed_salt_and_is_offline_reproducible(self):
-        first, second = passphrase_hash("cloud-secret"), passphrase_hash("cloud-secret")
+    def test_empty_passphrase_disables_webdav_payload_encryption(self):
+        box = CryptoBox("", CryptoBox.descriptor(""))
+
+        self.assertEqual(box.encrypt("skills", b"plain cloud data"), b"plain cloud data")
+        self.assertEqual(box.decrypt("skills", b"plain cloud data"), b"plain cloud data")
+        with self.assertRaises(CloudError) as caught:
+            CryptoBox("", CryptoBox.descriptor(passphrase_hash("secret", "https://example.test", "user")))
+        self.assertTrue(caught.exception.decrypt_failed)
+
+    def test_config_reload_consumes_raw_passphrase_and_clears_staging_field(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            config = json.loads(cloud.config_path.read_text(encoding="utf-8"))
+            config["webdav"].update({"baseUrl": "https://example.test", "username": "user", "encryptionPassphrase": "edited outside the monitor"})
+            cloud.config_path.write_text(json.dumps(config), encoding="utf-8")
+
+            cloud.reload_config()
+
+            saved = json.loads(cloud.config_path.read_text(encoding="utf-8"))["webdav"]
+            self.assertEqual(saved["encryptionPassphrase"], "")
+            self.assertEqual(saved["encryptionPassphraseHash"], passphrase_hash("edited outside the monitor", "https://example.test", "user"))
+
+    def test_enabled_webdav_accepts_empty_passphrase_and_hash(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+
+            cloud.update_config({
+                "server": {"host": "127.0.0.1"},
+                "webdav": {"enabled": True, "baseUrl": "https://example.test", "username": "user", "password": "password", "remoteRoot": "root", "encryptionPassphrase": "", "skillsAutoUpload": True, "usageDataAutoSync": True, "allowOptimisticWrites": True},
+            })
+
+            self.assertEqual(cloud.config()["webdav"]["encryptionPassphrase"], "")
+            self.assertEqual(cloud.config()["webdav"]["encryptionPassphraseHash"], "")
+
+    def test_cloud_overwrite_removes_remote_root_and_uploads_local_skills(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            cloud.update_config({"server": {"host": "127.0.0.1"}, "webdav": {"enabled": True, "baseUrl": "https://example.test", "username": "user", "password": "password", "remoteRoot": "root", "encryptionPassphrase": "", "skillsAutoUpload": True, "usageDataAutoSync": True, "allowOptimisticWrites": True}})
+            client = mock.Mock()
+
+            with mock.patch("monitor_cloud.WebDavClient", return_value=client), mock.patch.object(cloud, "upload_skills", return_value={"changed": True}) as upload:
+                result = cloud.overwrite_cloud_from_local()
+
+            client.delete.assert_called_once_with("")
+            client.ensure_directories.assert_called_once_with("")
+            upload.assert_called_once_with()
+            self.assertTrue(result["overwritten"])
+            self.assertFalse(result["encryptionEnabled"])
+
+    def test_initial_control_password_rejects_old_default_and_can_only_be_set_once(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+
+            with self.assertRaisesRegex(CloudError, "other than 123456"):
+                cloud.initialize_control_password("123456")
+            self.assertEqual(cloud.config()["control"]["passwordHash"], "")
+
+            result = cloud.initialize_control_password("a unique control password")
+
+            self.assertTrue(result["controlPasswordConfigured"])
+            self.assertTrue(control_password_matches("a unique control password", cloud.config()["control"]["passwordHash"], cloud.config()["control"]["passwordSalt"]))
+            with self.assertRaisesRegex(CloudError, "already configured"):
+                cloud.initialize_control_password("another password")
+
+    def test_control_password_hash_without_separate_salt_is_marked_compromised(self):
+        with self.account_directory() as directory:
+            private = directory / "private"
+            private.mkdir()
+            legacy_salt = new_control_password_salt()
+            (private / "config.json").write_text(json.dumps({
+                "version": 1, "control": {"password": "", "passwordHash": hash_control_password("old password", legacy_salt), "cookieSecret": "c" * 32},
+                "server": {"host": "127.0.0.1"}, "webdav": {"enabled": False},
+            }), encoding="utf-8")
+
+            cloud = CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
+
+            self.assertNotEqual(cloud.config()["control"]["passwordHash"], "")
+            self.assertEqual(cloud.config()["control"]["passwordSalt"], "")
+            with self.assertRaisesRegex(CloudError, "Control password compromised"):
+                cloud.initialize_control_password("replacement password")
+
+    def test_passphrase_hash_uses_normalized_webdav_identity_salt(self):
+        first = passphrase_hash("cloud-secret", "https://dav.jianguoyun.com/dav/", "user")
+        second = passphrase_hash("cloud-secret", "dav.jianguoyun.com/dav", "user")
         descriptor = CryptoBox.descriptor(first)
 
         self.assertEqual(first, second)
         self.assertTrue(valid_passphrase_hash(first))
-        self.assertEqual(base64.b64decode(descriptor["salt"]), PASSPHRASE_SALT)
+        self.assertEqual(normalized_webdav_identity("https://dav.jianguoyun.com/dav/", "user"), "dav.jianguoyun.com/dav\nuser")
+        self.assertEqual(base64.b64decode(descriptor["salt"]), webdav_passphrase_salt("dav.jianguoyun.com/dav", "user"))
         self.assertEqual(CryptoBox(first, descriptor).key, CryptoBox(second, descriptor).key)
+
+    def test_config_update_applies_secrets_immediately_and_rotates_remote_passphrase(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            legacy_salt = b"codex-switch-passphrase-v1"
+            legacy_key = hashlib.scrypt(b"old passphrase", salt=legacy_salt, n=1 << 15, r=8, p=1, dklen=32, maxmem=128 * 1024 * 1024)
+            old_hash = f"scrypt-key-v1$32768$8$1${base64.b64encode(legacy_salt).decode()}${base64.b64encode(legacy_key).decode()}"
+            new_hash = passphrase_hash("new passphrase", "https://new.example.test", "new-user")
+            old_box = CryptoBox(old_hash, CryptoBox.descriptor(old_hash))
+            stored = {
+                "crypto.json": json.dumps(CryptoBox.descriptor(old_hash), separators=(",", ":")).encode(),
+                "skills/packages/package.enc": old_box.encrypt("skill-package:package", b"skill data"),
+                "accounts/states/account.enc": old_box.encrypt("account-state:account", b"account data"),
+            }
+
+            class Client:
+                def ensure_directories(self, _path):
+                    pass
+
+                def get(self, path):
+                    return stored[path], f'"{hashlib.sha256(stored[path]).hexdigest()}"'
+
+                def put(self, path, data, etag=None):
+                    self.assertEqual(etag, self.get(path)[1])
+                    stored[path] = data
+                    return self.get(path)[1]
+
+                def list(self, path):
+                    return {"skills": ["packages"], "skills/packages": ["package.enc"], "accounts/states": ["account.enc"]}.get(path, [])
+
+                assertEqual = self.assertEqual
+
+            cloud._config["webdav"].update({"enabled": True, "baseUrl": "https://old.example.test", "username": "old-user", "password": "old-password", "encryptionPassphraseHash": old_hash})
+            atomic_write_json(cloud.config_path, cloud._config)
+            values = {
+                "server": {"host": "127.0.0.1"}, "controlPassword": "new-control-password",
+                "webdav": {"enabled": True, "baseUrl": "https://new.example.test", "username": "new-user", "password": "new-webdav-password", "remoteRoot": "new-root", "encryptionPassphrase": "new passphrase", "skillsAutoUpload": False, "usageDataAutoSync": False, "allowOptimisticWrites": False},
+            }
+            with mock.patch("monitor_cloud.WebDavClient", return_value=Client()):
+                result = cloud.update_config(values)
+
+            saved = json.loads(cloud.config_path.read_text(encoding="utf-8"))
+            self.assertTrue(result["passphraseChanged"])
+            self.assertTrue(result["controlPasswordChanged"])
+            self.assertTrue(result["restartRequired"])
+            self.assertNotIn("machineName", saved)
+            self.assertEqual(saved["webdav"]["password"], "new-webdav-password")
+            self.assertEqual(saved["webdav"]["encryptionPassphraseHash"], new_hash)
+            self.assertTrue(control_password_matches("new-control-password", saved["control"]["passwordHash"], saved["control"]["passwordSalt"]))
+            self.assertNotIn("new passphrase", cloud.config_path.read_text(encoding="utf-8"))
+            new_box = CryptoBox(new_hash, json.loads(stored["crypto.json"]))
+            self.assertEqual(new_box.decrypt("skill-package:package", stored["skills/packages/package.enc"]), b"skill data")
+            self.assertEqual(new_box.decrypt("account-state:account", stored["accounts/states/account.enc"]), b"account data")
+
+    def test_failed_passphrase_rotation_restores_remote_payloads_and_rejects_config(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            old_hash = passphrase_hash("old passphrase", "https://example.test", "user")
+            old_box = CryptoBox(old_hash, CryptoBox.descriptor(old_hash))
+            stored = {"crypto.json": json.dumps(CryptoBox.descriptor(old_hash), separators=(",", ":")).encode()}
+            for name in ("first", "second"):
+                stored[f"skills/packages/{name}.enc"] = old_box.encrypt(f"skill-package:{name}", name.encode())
+            original = dict(stored)
+
+            class Client:
+                failed = False
+
+                def ensure_directories(self, _path):
+                    pass
+
+                def get(self, path):
+                    return stored[path], f'"{hashlib.sha256(stored[path]).hexdigest()}"'
+
+                def put(self, path, data, etag=None):
+                    if path.endswith("second.enc") and not self.failed:
+                        self.failed = True
+                        raise CloudError("simulated upload failure", 502)
+                    stored[path] = data
+                    return self.get(path)[1]
+
+                def list(self, path):
+                    return {"skills/packages": ["first.enc", "second.enc"]}.get(path, [])
+
+            cloud._config["webdav"].update({"enabled": True, "baseUrl": "https://example.test", "username": "user", "password": "password", "encryptionPassphraseHash": old_hash})
+            atomic_write_json(cloud.config_path, cloud._config)
+            values = {
+                "server": cloud._config["server"], "controlPassword": "",
+                "webdav": {**{key: cloud._config["webdav"][key] for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")}, "password": "", "encryptionPassphrase": "new passphrase"},
+            }
+            with mock.patch("monitor_cloud.WebDavClient", return_value=Client()), self.assertRaisesRegex(CloudError, "Passphrase update failed"):
+                cloud.update_config(values)
+
+            self.assertEqual(stored, original)
+            self.assertEqual(json.loads(cloud.config_path.read_text(encoding="utf-8"))["webdav"]["encryptionPassphraseHash"], old_hash)
 
     def test_cloud_reencrypt_refreshes_and_verifies_every_payload_type(self):
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
-            encryption_hash = passphrase_hash("passphrase")
+            encryption_hash = passphrase_hash("passphrase", "https://example.test", "user")
             box = CryptoBox(encryption_hash, CryptoBox.descriptor(encryption_hash))
             purposes = {
                 "skills/packages/package.enc": "skill-package:package", "skills/snapshots/snapshot.enc": "skills-snapshot:snapshot", "skills/current.enc": "skills-pointer",
@@ -4589,7 +4926,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 self.assertEqual(box.decrypt(purpose, stored[path]), path.encode())
 
     def test_control_auth_rejects_wrong_password_tampering_and_expired_cookie(self):
-        auth = monitor_dashboard.ControlAuth({"passwordHash": hash_control_password("123456"), "cookieSecret": "a" * 32})
+        salt = new_control_password_salt()
+        auth = monitor_dashboard.ControlAuth({"passwordHash": hash_control_password("123456", salt), "passwordSalt": salt, "cookieSecret": "a" * 32})
         token = auth.create_token(now=100)
 
         self.assertTrue(auth.password_matches("123456"))
@@ -4597,7 +4935,15 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertTrue(auth.token_is_valid(token, now=100 + monitor_dashboard.CONTROL_COOKIE_MAX_AGE_SECONDS))
         self.assertFalse(auth.token_is_valid(token + "x", now=101))
         self.assertFalse(auth.token_is_valid(token, now=101 + monitor_dashboard.CONTROL_COOKIE_MAX_AGE_SECONDS))
-        self.assertFalse(monitor_dashboard.ControlAuth({"passwordHash": hash_control_password("changed"), "cookieSecret": "a" * 32}).token_is_valid(token, now=101))
+        changed_salt = new_control_password_salt()
+        self.assertFalse(monitor_dashboard.ControlAuth({"passwordHash": hash_control_password("changed", changed_salt), "passwordSalt": changed_salt, "cookieSecret": "a" * 32}).token_is_valid(token, now=101))
+        auth.update({"passwordHash": hash_control_password("changed", changed_salt), "passwordSalt": changed_salt, "cookieSecret": "a" * 32})
+        self.assertTrue(auth.password_matches("changed"))
+        self.assertFalse(auth.token_is_valid(token, now=101))
+
+        compromised = monitor_dashboard.ControlAuth({"passwordHash": hash_control_password("legacy", new_control_password_salt()), "cookieSecret": "a" * 32})
+        self.assertTrue(compromised.is_compromised())
+        self.assertFalse(compromised.is_configured())
 
     def test_control_auth_is_required_by_management_and_account_api_clients(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
@@ -4606,13 +4952,34 @@ class MonitorCodexUsageTests(unittest.TestCase):
         source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
 
         self.assertIn('id="controlLoginModal"', html)
-        self.assertIn('api("/api/control/login",{password:input.value})', html)
+        self.assertIn('showMessage("Control password compromised"', html)
+        self.assertIn('Remove passwordHash from config.json', source)
+        self.assertIn('setup?"/api/control/setup":"/api/control/login"', html)
         self.assertIn('if not self.require_control_auth():', source)
         self.assertIn('"/api/control/login"', source)
+        self.assertIn('"/api/control/setup"', source)
         self.assertIn('HttpOnly; SameSite=Strict; Path=/; Max-Age=', source)
         self.assertIn('["/api/control/login", { url: CONTROL_LOGIN_URL, method: "POST" }]', extension)
+        self.assertIn('["/api/control/setup", { url: CONTROL_SETUP_URL, method: "POST" }]', extension)
         self.assertIn('cookie: controlCookie', extension)
         self.assertIn('authenticatedAccountAction(action,body)', dashboard)
+        self.assertIn('id="dashboardControlPassword" type="password"', dashboard)
+        self.assertIn('id="dashboardControlPasswordConfirmation" type="password"', dashboard)
+        self.assertIn('id="controlPasswordMatchStatus" aria-live="polite"', dashboard)
+        self.assertIn('"✓ Passwords match":"✕ Passwords do not match"', dashboard)
+        self.assertIn('password.oninput=confirmation.oninput=setup?updateMatchStatus:null', dashboard)
+        self.assertIn('await requestControlPassword(true)', dashboard)
+        self.assertIn('await requestControlPassword()', dashboard)
+        self.assertNotIn('prompt("Control password")', dashboard)
+        self.assertIn('load(true);pollStatus(true);setInterval(pollStatus,5000)', dashboard)
+
+    def test_initial_control_password_setup_is_loopback_only(self):
+        self.assertTrue(monitor_dashboard.client_host_is_loopback("127.0.0.1"))
+        self.assertTrue(monitor_dashboard.client_host_is_loopback("::1"))
+        self.assertFalse(monitor_dashboard.client_host_is_loopback("192.168.1.2"))
+        self.assertFalse(monitor_dashboard.client_host_is_loopback("invalid"))
+        source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
+        self.assertIn('if not client_host_is_loopback(self.client_address[0]):', source)
 
     def test_cloud_write_gate_allows_explicit_optimistic_mode(self):
         with self.account_directory() as directory:
@@ -4890,7 +5257,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
-            manager.active_account()["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine"}
+            second_id = manager.create_account("Second")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
+            manager.status()
+            manager._find("ppl-pro")["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine"}
             manager.manifest["cloudBindingEnabled"] = True
             manager._save_manifest()
 
@@ -4901,10 +5271,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             cloud = SimpleNamespace(begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), release_account=mock.Mock(side_effect=release_while_local_exists))
 
-            status = manager.release_cloud_account(cloud, manager.manifest["activeAccountId"])
+            status = manager.release_cloud_account(cloud, "ppl-pro")
 
-            self.assertEqual(status["items"], [])
-            self.assertFalse(auth_path.exists())
+            self.assertEqual([account["id"] for account in status["items"]], [second_id])
+            self.assertTrue(auth_path.exists())
 
     def test_account_manifest_v1_migrates_to_v2_without_rewriting_credentials(self):
         with self.account_directory() as directory:
@@ -5217,7 +5587,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 return []
 
         with self.account_directory() as directory:
-            encryption_hash = passphrase_hash("passphrase")
+            encryption_hash = passphrase_hash("passphrase", "https://example.test", "user")
             client, box, clouds = Client(), CryptoBox(encryption_hash, CryptoBox.descriptor(encryption_hash)), []
             for name in ("a", "b"):
                 root = directory / name
