@@ -4,7 +4,7 @@
 
 **一个本地优先的 Codex 配额、Token、成本、账号、技能与加密同步仪表盘，并提供 VS Code 集成。**
 
-[![Version](https://img.shields.io/badge/version-1.0.0-4f8cff)](#快速开始)
+[![Version](https://img.shields.io/badge/version-1.1.0-4f8cff)](#快速开始)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#运行要求)
@@ -76,7 +76,7 @@ python monitor_codex_usage.py
 
 ### 2. 安装 VS Code 扩展
 
-在 VS Code 中安装 `release/codex-usage-monitor-1.0.0.vsix`：
+在 VS Code 中安装 `release/codex-usage-monitor-1.1.0.vsix`：
 
 1. 打开 **扩展**。
 2. 选择 **视图和更多操作 (…) → 从 VSIX 安装…**。
@@ -85,7 +85,7 @@ python monitor_codex_usage.py
 也可以使用命令行：
 
 ```console
-code --install-extension release/codex-usage-monitor-1.0.0.vsix
+code --install-extension release/codex-usage-monitor-1.1.0.vsix
 ```
 
 ### 3. 完成首次设置
@@ -104,17 +104,21 @@ code --install-extension release/codex-usage-monitor-1.0.0.vsix
 - **Date / 5h / 24h / 7d / 30d / All** 时间范围。
 - 用于 Token 与成本分析的模型筛选。
 - 由额度、Token 和成本视图共享的账号筛选。
-- **Local** 与 **Merged** Token/成本数据集。
+- **Local** 与 **Merged** 额度、Token 和成本数据集。
 - 每个选中账号独立着色的额度曲线。
 - 新鲜输入、缓存输入、输出、缓存写入、缓存命中率和预估成本。
 
-Local/Merged 选择器控制 Token 与成本数据。额度曲线始终使用合并后的额度历史，因为服务端额度百分比由多台机器共享，不应显示成某一台机器独占的消耗。
+**Local** 仅显示本机记录的额度、Token 与成本数据。**Merged** 只使用具有相同私有账号标识的同步记录扩展本地账号。
+尚未匹配本地账号的同步记录仍保留在同步缓存中，只是暂时不显示；创建或绑定对应账号后会自动纳入。
+合并数据集会在本地数据、同步数据或账号身份变化时预先生成，因此切换视图只会选择已有数据集。
 
 扩展提供 **Codex Usage Monitor: Show Details** 命令。打开时会获取当前仪表盘，再次执行会刷新同一个视图；Webview 的状态与历史请求会分别去重。
 
 ## 管理 Codex 账号
 
 账号保险库位于 `~/.codex-switch/accounts`。第一次启动时，当前有效的 `auth.json` 会保存为 **Current account**。
+
+当前账号的刷新令牌只由 Codex 轮换。监控服务会在轮询前重新加载并镜像 Codex 的实时 `auth.json`，在访问令牌有效时使用它；如果 Codex 尚未刷新即将过期的令牌，则暂停远程配额轮询。已就绪的非当前账号与 Codex 隔离并每十分钟轮询一次；监控服务可以轮换这些账号的凭据，会在账号选择器中标记轮询失败，并且不会重试结果不明确的刷新令牌轮换请求。
 
 ### 创建并登录另一个账号
 
@@ -154,7 +158,7 @@ Bind 或 Release 失败时会至少保留一份已验证副本。等待登录的
 3. 选中技能并执行 **Manage selected**。
 4. 将每个托管技能分配给 Codex、Gemini 或两者。
 
-托管内容会移动到 `~/.codex-switch/skills`。监控服务优先创建严格的逐技能符号链接；Windows 无法创建符号链接时使用原生目录联接，非 Windows 平台则使用带所有权标记的托管副本作为回退。无关的已有路径会作为冲突保留。
+托管内容会移动到 `~/.codex-switch/skills`。监控服务优先创建严格的逐技能符号链接；Windows 无法创建符号链接时使用原生目录联接，非 Windows 平台则使用带所有权标记的托管副本作为回退。扫描时会将目标中已有的同名路径保留为未分配冲突；显式选中 **link to** 时才会用托管投影替换冲突路径。
 
 云端行为按技能名称合并：
 
@@ -182,19 +186,24 @@ Bind 或 Release 失败时会至少保留一份已验证副本。等待登录的
 
 Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.jianguoyun.com/dav/` 与应用密码。
 
+手动 **Push** 始终发布托管技能变更和本机记录的使用数据。手动 **Fetch** 始终刷新已释放账号的元数据、合并托管技能变更，并下载其他机器记录的使用数据；即使关闭对应的自动选项，这些手动传输仍会执行。账号凭据继续采用仅移动模型，只能通过显式 **Release** 和 **Bind** 操作传输。
+
 加密口令会通过 scrypt 转换，并立即从暂存字段清除。确定性盐由规范化后的 WebDAV URL 和用户名生成，使另一台机器能够派生同一个密钥。修改已有口令时，程序会下载、认证、重新加密、上传并验证所有已知加密对象；只有整个远端轮换成功后才提交本地配置，失败时会回滚已经写入的远端对象。
 
 如果 WebDAV 认证成功但解密失败，管理页可以重新加载本地配置并重试，也可以用本地数据覆盖无法访问的云端根目录。覆盖会永久删除仅存在于云端的技能、已释放账号和使用历史。
 
 ### 使用数据同步
 
-使用数据同步与技能 Push 相互独立：
+自动使用数据同步是定向手动 Push 和 Fetch 操作之外的补充：
 
 - 启用 `usageDataAutoSync` 后每 30 分钟执行一次。
 - 同步成本/百分比区间、额度历史和 Token 会话历史。
+- 本地额度历史会保留每次被接受的轮询。云端同步只删除额度不变区间中的冗余中间样本，并在保留的端点上标记其覆盖范围；超过四小时的间隔会保持分离且不添加标记，使图表能够区分数据压缩与真正的监控中断。
 - 不同步凭据、技能内容、详细样本日志和运行状态。
-- 使用不可变加密块、检查点、ETag 与墓碑实现增量和可重试更新。
-- 下载的数据按来源保存到 `usage_monitor_sync_cache.json`，绝不替换或追加到本地记录文件。
+- 每台机器都会发布包含全部逻辑使用数据包 ID 与内容哈希的加密清单。Fetch 将完整清单与 `usage_monitor_sync_cache.json` 比较，因此不会因为某个靠后的数据包已存在而跳过更早或缺失的数据包。
+- 记录先按稳定的键哈希分桶，再按 64 KiB 压缩数据上限拆包。更新活跃记录通常只替换其所在的小数据包，不会重写时间序列或大型检查点。
+- Fetch 会重建发现的每个旧版检查点/分块流，上传并验证版本 2 数据包，以条件写入替换清单，并且只在验证成功后删除旧版数据。
+- 下载的记录及其按机器保存的数据包哈希会原子写入 `usage_monitor_sync_cache.json`，绝不替换或追加到本地记录文件。
 
 每五分钟的周期 Fetch 还会检查权威技能索引并刷新已释放账号列表。指针未变化且包哈希一致时不会重复下载。
 
@@ -208,16 +217,16 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 | `accounts/` | 敏感 Codex 账号保险库与清单 | 仅通过显式 Release/Bind 移动 |
 | `skills/` | 私有托管技能源 | 可选的加密技能包 |
 | `usage_monitor_history.jsonl` | 本地原始成本/百分比区间 | 仅同步派生记录 |
-| `usage_monitor_quota_history.jsonl` | 本地压缩额度读数 | 仅同步派生记录 |
+| `usage_monitor_quota_history.jsonl` | 完整的本地已接受额度读数 | 仅同步压缩后的派生记录 |
 | `usage_monitor_token_sessions.jsonl` | 本地逐会话 Token 与成本 | 仅同步派生记录 |
 | `usage_monitor_samples.jsonl` | 本地详细诊断样本 | 永不 |
 | `usage_monitor_state.json` | 运行基线和游标 | 永不 |
-| `usage_monitor_sync_cache.json` | 按来源保存的下载记录 | 不作为记录文件上传 |
+| `usage_monitor_sync_cache.json` | 下载记录和每台机器的完整数据包哈希清单 | 不作为记录文件上传 |
 
 > [!WARNING]
 > 请保护整个 `~/.codex-switch`。不要提交到仓库、放入支持包、写入日志或分享其内容截图。丢失加密口令后，远端加密数据将无法恢复。
 
-仪表盘序列与状态按配置的服务器地址开放读取。所有账号、技能、WebDAV、云端、服务器与配置修改都必须通过控制密码认证；首次设置控制密码只允许本机。如果不需要局域网访问，请将服务器地址改为 `127.0.0.1` 并重启；默认 `0.0.0.0` 会监听所有网络接口。
+仪表盘序列与状态按配置的服务器地址开放读取。所有账号、技能、WebDAV、云端、服务器与配置修改都必须通过控制密码认证。控制请求不受来源限制，以便通过公网地址或反向代理部署时能够使用全部仪表盘功能。首次设置控制密码只允许本机。如果不需要局域网或广域网访问，请将服务器地址改为 `127.0.0.1` 并重启。默认 `0.0.0.0` 会监听所有网络接口；当网络将 8765 端口路由至监控程序时，可以通过请求中的局域网或公网 IP 完整使用受控制密码保护的仪表盘。
 
 ## 命令行参考
 
@@ -271,8 +280,8 @@ python monitor_codex_usage.py --help
 
 ### 技能无法分配
 
-- 执行 **Scan skills** 并检查报告的投影冲突。
-- 自行移动或重命名无关的已有路径；监控服务不会覆盖它。
+- 检查目标应用的技能目录和技能管理中显示的投影状态。
+- 选中 **link to** 会替换目标中任何同名技能；仅扫描时只会报告冲突，不会替换它，也不会记录投影错误。
 - Windows 上请确认当前账号能够在目标位置创建符号链接或原生目录联接。
 
 ## 开发

@@ -328,13 +328,18 @@ def event_account(event: dict) -> dict:
 def record_special_event(state: dict, reason: str, sample: dict, label: str, previous: dict, current: dict, extra: dict | None = None) -> None:
     if not (extra or any(previous.get(key) != value for key, value in current.items())):
         return
+    event_extra = dict(extra or {})
+    state.setdefault("_lastSpecialEventReasonByWindow", {})
+    if reason == "reset-time-moved-forward":
+        event_extra["suppressConsole"] = state["_lastSpecialEventReasonByWindow"].get(label) == reason
+    state["_lastSpecialEventReasonByWindow"][label] = reason
     state.setdefault("_specialEvents", []).append({
         "checkedAt": sample["checkedAt"],
         "window": label,
         "reason": reason,
         "previous": {key: previous.get(key) for key in ("baselinePercent", "baselineCostUsd", "baselineResetAt", "baselinePlan", "baselineMultiplier")},
         "current": current,
-        "extra": extra or {},
+        "extra": event_extra,
     })
 
 def build_delta_event_series(history: list[dict], label: str) -> list[dict]:

@@ -186,14 +186,18 @@ class AccountManager:
             return manifest
 
         live = self.auth_path.read_bytes() if self.auth_path.exists() else None
+        ready = False
         if live is not None:
-            parse_auth_bytes(live)
+            auth = parse_auth_bytes(live)
+            tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+            ready = isinstance(tokens.get("refresh_token"), str) and bool(tokens["refresh_token"].strip())
+        if ready:
             atomic_write_bytes(self._account_path("ppl-pro"), live)
         manifest = {
             "version": 2,
             "activeAccountId": "ppl-pro" if live is not None else None,
             "cloudBindingEnabled": False,
-            "accounts": [self._new_record("ppl-pro", "Current account", True, live)] if live is not None else [],
+            "accounts": [self._new_record("ppl-pro", "Current account", ready, live if ready else None)] if live is not None else [],
         }
         atomic_write_json(self.manifest_path, manifest)
         return manifest
@@ -234,10 +238,10 @@ class AccountManager:
         if not isinstance(live_tokens.get("refresh_token"), str) or not live_tokens["refresh_token"].strip():
             return
         saved_tokens = saved_auth.get("tokens") if isinstance(saved_auth.get("tokens"), dict) else {}
-        missing = [field for field in ("id_token", "account_id") if not live_tokens.get(field) or not saved_tokens.get(field)]
+        missing = [field for field in ("account_id",) if not live_tokens.get(field) or not saved_tokens.get(field)]
         if missing:
             raise AccountError(f"Account change refused: cannot verify {account['label']} because {', '.join(missing)} is missing from current or saved auth.json", 409)
-        mismatched = [field for field in ("id_token", "account_id") if live_tokens[field] != saved_tokens[field]]
+        mismatched = [field for field in ("account_id",) if live_tokens[field] != saved_tokens[field]]
         if mismatched:
             raise AccountError(f"Account change refused: current auth.json does not match saved account {account['label']} ({' and '.join(mismatched)} differ)", 409)
 
@@ -248,6 +252,9 @@ class AccountManager:
             return False
         data = self.auth_path.read_bytes()
         auth = parse_auth_bytes(data)
+        tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+        if account.get("ready") and tokens and (not isinstance(tokens.get("refresh_token"), str) or not tokens["refresh_token"].strip()):
+            return False
         if require_saved_match:
             self._validate_live_matches_saved(account, auth)
         identity = auth_identity(auth)
@@ -256,8 +263,11 @@ class AccountManager:
             raise AccountError("Live auth.json belongs to a different account; use New account before replacing the current login", 409)
         if duplicate := self._find_identity(identity, account["id"]):
             raise AccountError(f"Account change refused: this login is already managed as {duplicate['label']}", 409)
+        fingerprint = auth_fingerprint(data)
+        if account.get("ready") and account.get("fingerprint") == fingerprint and self._account_path(account["id"]).exists():
+            return False
         atomic_write_bytes(self._account_path(account["id"]), data)
-        account.update({"ready": True, "updatedAt": timestamp(), "identity": identity, "fingerprint": auth_fingerprint(data)})
+        account.update({"ready": True, "updatedAt": timestamp(), "identity": identity, "fingerprint": fingerprint})
         self._save_manifest()
         return True
 

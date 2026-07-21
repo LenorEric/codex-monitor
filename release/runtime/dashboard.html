@@ -9,13 +9,19 @@
 *{box-sizing:border-box}
 body{margin:0;background:var(--bg);color:var(--text);font:13px/1.45 system-ui,-apple-system,Segoe UI,Arial,sans-serif}
 header{position:sticky;top:0;z-index:5;background:rgba(15,17,21,.94);border-bottom:1px solid var(--border);backdrop-filter:blur(10px)}
-.bar{display:flex;gap:12px;align-items:center;justify-content:space-between;padding:14px 18px}
-.title{font-size:17px;font-weight:650}
-.controls,.range-buttons,.data-view-buttons,.date-selector,.quota,.model-filter,.model-buttons,.account-filter,.account-buttons,.account-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.bar{display:grid;grid-template-columns:max-content max-content minmax(320px,1fr);gap:12px 24px;align-items:center;padding:14px 18px 12px}
+.title{font-size:17px;font-weight:650;white-space:nowrap}
+.controls,.range-buttons,.data-view-buttons,.fold-buttons,.date-selector,.quota,.model-filter,.model-buttons,.account-filter,.account-buttons,.account-controls{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.account-controls{min-width:0}.quota{justify-self:start}
+.toolbar{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;padding:0 18px 12px}
+.control-group{display:flex;gap:8px;align-items:center;width:fit-content;max-width:100%;min-height:40px;padding:4px 6px 4px 10px;border:1px solid var(--border);background:var(--panel);border-radius:9px}
+.control-label{color:var(--muted);font-size:11px;font-weight:650;letter-spacing:.02em;white-space:nowrap}
+.time-range-group{flex:0 1 auto}.time-range-group .controls{flex-wrap:wrap}.data-view-buttons,.fold-buttons,.range-buttons{gap:4px}
 .date-selector{flex-wrap:nowrap}
 .quota{font-variant-numeric:tabular-nums}.quota span{border:1px solid var(--border);background:var(--panel2);border-radius:7px;padding:5px 9px;white-space:nowrap}
 button,.date-range,select,input[type="text"],input[type="password"]{height:30px;border:1px solid var(--border);background:var(--panel2);color:var(--text);border-radius:7px;padding:0 10px}
 button{cursor:pointer}
+button:focus-visible,.date-range:focus-visible,select:focus-visible,input:focus-visible{outline:2px solid var(--blue);outline-offset:2px}
 button:disabled,select:disabled{cursor:wait;opacity:.6}
 .account-controls label{color:var(--muted);font-size:12px}.account-controls select{min-width:170px}.account-detail{color:var(--muted);font-size:11px;max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .account-banner{display:none;margin:0 18px 12px;padding:10px 12px;border:1px solid #72551e;background:#2b2416;border-radius:7px;color:#ffd889}.account-banner.error{border-color:#743535;background:#2d191b;color:#ffb3b3}
@@ -42,7 +48,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 .tooltip{position:fixed;display:none;pointer-events:none;background:#101318;border:1px solid var(--border);border-radius:7px;padding:9px;box-shadow:0 12px 32px rgba(0,0,0,.35)}
 .tooltip{max-width:360px;z-index:20;color:var(--text)}
 .legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
-.model-filter,.account-filter{padding:0 18px 10px}.model-label,.account-label{color:var(--muted);font-size:12px}.model-buttons button,.account-buttons button{height:26px}
+.filter-bar{display:grid;gap:8px;padding:0 18px 10px}.model-filter,.account-filter{width:100%;padding:0;align-items:flex-start}.model-label,.account-label{width:58px;padding-top:4px;color:var(--muted);font-size:12px}.model-buttons,.account-buttons{flex:1}.model-buttons button,.account-buttons button{height:26px}
 .status{padding:0 18px 14px;color:var(--muted)}
 .message-stack{position:fixed;left:16px;bottom:16px;z-index:80;display:flex;flex-direction:column;gap:10px;width:min(360px,calc(100vw - 32px));max-height:calc(100vh - 32px);pointer-events:none}
 .pop-message{position:relative;flex:none;padding:12px 38px 12px 14px;border:1px solid #3c4656;border-left:4px solid var(--blue);background:#1b2029;border-radius:9px;box-shadow:0 12px 34px rgba(0,0,0,.45);cursor:default;pointer-events:auto;animation:message-in .18s ease-out}
@@ -50,23 +56,32 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 .pop-message-title{font-weight:650;margin-bottom:3px}.pop-message-summary{color:var(--muted);overflow-wrap:anywhere}.pop-message-close{position:absolute;right:6px;top:5px;width:27px;height:27px;padding:0;border:0;background:transparent;font-size:18px;color:var(--muted)}.pop-message-close:hover{color:var(--text)}
 .message-detail-summary{margin-bottom:14px;color:var(--text);font-weight:600;overflow-wrap:anywhere}.message-detail{white-space:pre-wrap;overflow-wrap:anywhere;max-height:min(60vh,520px);overflow:auto;color:var(--muted)}.message-detail+.modal-actions{margin-top:14px}
 @keyframes message-in{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:none}}
-@media(max-width:900px){.grid{grid-template-columns:1fr}.bar{align-items:flex-start;flex-direction:column}.chart{height:250px}.token-metrics{grid-template-columns:repeat(2,minmax(110px,1fr))}}
+@media(max-width:1100px){.bar{grid-template-columns:max-content minmax(0,1fr)}.title{grid-column:1/-1}}
+@media(max-width:900px){.grid{grid-template-columns:1fr}.chart{height:250px}.token-metrics{grid-template-columns:repeat(2,minmax(110px,1fr))}}
+@media(max-width:640px){.bar{display:flex;align-items:flex-start;gap:10px;padding:12px}.account-controls{width:100%}.account-controls select{flex:1;min-width:150px}.quota{align-self:stretch}.toolbar{gap:8px;padding:0 12px 10px}.control-group{align-items:flex-start;padding:7px 8px}.control-label{width:76px;padding-top:7px}.time-range-group .controls{flex:1}.filter-bar{gap:8px;padding:0 12px 10px}.model-filter,.account-filter{align-items:flex-start}.model-label,.account-label{width:58px;padding-top:4px}.status{padding:0 12px 12px}.account-banner{margin:0 12px 10px}.grid{padding:12px}.date-range{width:132px}}
+@media(max-width:420px){.account-controls label{width:100%}.account-controls select,#managePage{width:100%}.quota{gap:6px}.quota span{flex:1;text-align:center}}
 </style>
 </head>
 <body>
 <header>
 <div class="bar">
 <div class="title">Codex Usage Monitor</div>
+<div class="quota"><span id="top5h">5h: N/A</span><span id="top7d">7d: N/A</span></div>
 <div class="account-controls"><label for="accountSelect">Account</label><select id="accountSelect" aria-label="Active Codex account"></select>
 <button id="newAccount" hidden>New account</button><button id="renameAccount" hidden>Rename</button><button id="deleteAccount" hidden>Delete</button><button id="managePage">Manage skills &amp; accounts</button>
 <span class="account-detail" id="accountDetail"></span></div>
-<div class="quota"><span id="top5h">5h: N/A</span><span id="top7d">7d: N/A</span></div>
-<div class="controls"><div class="data-view-buttons" aria-label="Data view"><button data-data-view="local">Local</button><button data-data-view="merged">Merged</button></div><div class="range-buttons" id="ranges"></div><span class="date-selector" id="dateSelector"><button id="prevDate" aria-label="Previous day">&lt;</button>
-<input class="date-range" id="rangeDate" type="date" aria-label="Calendar day"><button id="nextDate" aria-label="Next day">&gt;</button></span></div>
+</div>
+<div class="toolbar">
+<div class="control-group time-range-group"><span class="control-label">Time range</span><div class="controls"><div class="range-buttons" id="ranges"></div><span class="date-selector" id="dateSelector"><button id="prevDate" aria-label="Previous day">&lt;</button>
+<input class="date-range" id="rangeDate" type="date" aria-label="Calendar day"><button id="nextDate" aria-label="Next day">&gt;</button></span></div></div>
+<div class="control-group"><span class="control-label">Data source</span><div class="data-view-buttons" aria-label="Data source"><button data-data-view="local">Local</button><button data-data-view="merged">Merged</button></div></div>
+<div class="control-group"><span class="control-label">Chart display</span><div class="fold-buttons" aria-label="Usage chart collapse options"><button id="collapseUsageGaps" type="button">Collapse gaps</button><button id="collapseUsageFlat" type="button">Collapse flat</button></div></div>
 </div>
 <div class="account-banner" id="accountBanner" role="status"></div>
+<div class="filter-bar">
 <div class="model-filter"><span class="model-label">Models</span><div class="model-buttons" id="models"></div></div>
 <div class="account-filter"><span class="account-label">Accounts</span><div class="account-buttons" id="eventAccounts"></div></div>
+</div>
 <div class="status" id="status"></div>
 </header>
 <main class="grid compact-grid">
@@ -145,7 +160,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <script>
 const ranges=[["5h",5*3600],["24h",24*3600],["7d",7*24*3600],["30d",30*24*3600],["All",0]];
 const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null;
-let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="local", payload={points:[],quotaPoints:[],tokenSessions:[],events:{fiveHour:[],sevenDay:[]}};
+let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, payload={points:[],quotaPoints:[],tokenSessions:[],events:{fiveHour:[],sevenDay:[]}};
 let pendingStatusRequest=null, pendingSeriesRequests=new Map(), currentSeriesRevision=null, actionBusy=false, accountLabelMode="create", actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
@@ -395,6 +410,12 @@ function setupControls(){
   document.getElementById("prevDate").onclick=()=>shiftSelectedDate(-1);
   document.getElementById("nextDate").onclick=()=>shiftSelectedDate(1);
 }
+function setupUsageFoldControls(){
+  [["collapseUsageGaps",()=>collapseUsageGaps,value=>collapseUsageGaps=value],["collapseUsageFlat",()=>collapseUsageFlat,value=>collapseUsageFlat=value]].forEach(([id,getValue,setValue])=>{
+    const button=document.getElementById(id), sync=()=>{button.classList.toggle("active",getValue());button.setAttribute("aria-pressed",String(getValue()))};
+    sync();button.onclick=()=>{setValue(!getValue());sync();drawAll(true)};
+  });
+}
 addEventListener("pointermove",updateDateLeavePointer,{passive:true});
 function requestSeries(view=dataView){
   if(pendingSeriesRequests.has(view))return pendingSeriesRequests.get(view);
@@ -448,7 +469,7 @@ function accountAction(action,body){
 function requestControlPassword(setup=false){
   const modal=document.getElementById("controlPasswordModal"),form=document.getElementById("controlPasswordForm"),password=document.getElementById("dashboardControlPassword"),confirmation=document.getElementById("dashboardControlPasswordConfirmation"),matchStatus=document.getElementById("controlPasswordMatchStatus"),error=document.getElementById("controlPasswordError");
   document.getElementById("controlPasswordTitle").textContent=setup?"Create control password":"Control password";
-  document.getElementById("controlPasswordPrompt").textContent=setup?"Create a control password for the dashboard management page.":"Enter your control password to continue.";
+  document.getElementById("controlPasswordPrompt").textContent=setup?"Create a control password for dashboard controls, including account switching and management.":"Enter your control password to continue.";
   const updateMatchStatus=()=>{const visible=Boolean(confirmation.value),matches=password.value===confirmation.value;matchStatus.textContent=visible?(matches?"✓ Passwords match":"✕ Passwords do not match"):"";matchStatus.className=`password-match-status${visible?(matches?" match":" mismatch"):""}`};
   document.getElementById("controlPasswordConfirmationRow").hidden=!setup;document.getElementById("submitControlPassword").textContent=setup?"Create password":"Unlock";password.autocomplete=setup?"new-password":"current-password";password.value=confirmation.value=error.textContent=matchStatus.textContent="";matchStatus.className="password-match-status";password.oninput=confirmation.oninput=setup?updateMatchStatus:null;modal.classList.add("open");setTimeout(()=>password.focus(),0);
   return new Promise(resolve=>{
@@ -468,11 +489,19 @@ async function ensureControlPassword(status){
     status.controlPasswordConfigured=true;
   }catch(error){controlPasswordSetupAsked=false;alert(error.message||String(error))}finally{controlPasswordSetupPending=false}
 }
-async function authenticatedAccountAction(action,body){try{return await accountAction(action,body)}catch(error){if(error.status!==401)throw error;const password=await requestControlPassword();if(password===null)throw error;await accountAction("login",{password});return accountAction(action,body)}}
+async function authenticatedAccountAction(action,body){
+  try{return await accountAction(action,body)}catch(error){
+    if(error.status!==401&&error.status!==428)throw error;
+    const setup=error.status===428,password=await requestControlPassword(setup);
+    if(password===null)throw error;
+    await accountAction(setup?"setup":"login",{password});
+    return accountAction(action,body);
+  }
+}
 function renderAccounts(accounts){
   accounts=accounts||{items:[]};
   const select=document.getElementById("accountSelect");
-  select.replaceChildren(...(accounts.items||[]).map(account=>{const option=document.createElement("option");option.value=account.id;option.textContent=`${account.label}${account.ready?"":" (sign in required)"}`;return option}));
+  select.replaceChildren(...(accounts.items||[]).map(account=>{const option=document.createElement("option");option.value=account.id;option.textContent=`${account.label}${account.ready?account.pollError?" (poll failed)":"":" (sign in required)"}`;return option}));
   select.value=accounts.activeAccountId||"";
   const active=(accounts.items||[]).find(account=>account.id===accounts.activeAccountId), detail=document.getElementById("accountDetail"), banner=document.getElementById("accountBanner");
   detail.textContent="";
@@ -821,7 +850,12 @@ function drawXAxisTickLabels(ctx,labels,start,pixels,y){
   labels.forEach((label,index)=>{ctx.textAlign=labels.length===1?"center":index===0?"left":index===labels.length-1?"right":"center";ctx.fillText(label,axisTickPosition(start,pixels,index,labels.length),y)});
 }
 function plusEquivalentUsage(point,label,valueOf){return valueOf(point)*({plus:1,pro_lite:5,pro:20}[point[label]?.plan]||1)}
+function compactedUsageGap(previous,current){
+  const from=current.compactedFrom, previousAt=eventTimestamp(previous), currentAt=eventTimestamp(current);
+  return Number.isFinite(from)&&Number.isFinite(previousAt)&&Number.isFinite(currentAt)&&from<=previousAt&&previousAt<currentAt;
+}
 function breakUsageCurve(previous,current,label,valueOf){
+  if(compactedUsageGap(previous,current))return false;
   const gap=eventTimestamp(current)-eventTimestamp(previous);
   if(gap>4*3600)return true;
   if(gap<=30*60)return false;
@@ -836,18 +870,58 @@ function usageTimeFoldMetrics(gaps,x0,x1,left,right,charWidth){
   const amplifier=Math.min(10,Math.max(4,plotWidth*.012*(.75+gapShare+Math.min(1,spread/8))));
   return gaps.map(gap=>{const calculatedWidth=amplifier*Math.log1p(gap.duration/referenceGap)/Math.log(base);return {...gap,width:Math.max(minWidth,calculatedWidth)}});
 }
-function usageTimeGapIsDiscontinuous(groups,gap,label,valueOf){
-  return groups.every(([,points])=>{
-    const endIndex=points.findIndex(point=>eventTimestamp(point)>=gap.end);
-    return endIndex<=0||eventTimestamp(points[endIndex-1])>gap.start||breakUsageCurve(points[endIndex-1],points[endIndex],label,valueOf);
-  });
+function usageTimeAccountFoldRanges(points,label,valueOf,x0,x1){
+  const ranges=[], valid=points.filter(point=>Number.isFinite(eventTimestamp(point))), add=(start,end,kind)=>{
+    start=Math.max(x0,start);end=Math.min(x1,end);
+    if(!(start<end))return;
+    const previous=ranges[ranges.length-1];
+    if(previous&&previous.end===start&&previous.kind===kind)previous.end=end;
+    else ranges.push({start,end,kind});
+  };
+  if(!valid.length){add(x0,x1,"gap");return ranges}
+  add(x0,eventTimestamp(valid[0]),"gap");
+  for(let index=1;index<valid.length;index++){
+    const previous=valid[index-1], current=valid[index], start=eventTimestamp(previous), end=eventTimestamp(current);
+    if(end<=start)continue;
+    if(breakUsageCurve(previous,current,label,valueOf))add(start,end,"gap");
+    else if(valueOf(previous)===valueOf(current))add(start,end,"flat");
+  }
+  add(eventTimestamp(valid[valid.length-1]),x1,"gap");
+  return ranges;
 }
-function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth){
-  const timestamps=[...new Set(groups.flatMap(([,points])=>points.map(eventTimestamp).filter(Number.isFinite)))].sort((a,b)=>a-b), folds=[];
-  const candidates=usageTimeFoldMetrics(timestamps.slice(1).map((end,index)=>({start:timestamps[index],end,duration:end-timestamps[index]})).filter(gap=>gap.start>x0&&gap.end<x1&&usageTimeGapIsDiscontinuous(groups,gap,label,valueOf)),x0,x1,left,right,charWidth);
+function usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat){
+  const accountRanges=groups.map(([,points])=>usageTimeAccountFoldRanges(points,label,valueOf,x0,x1)), boundaries=[...new Set([x0,x1,...accountRanges.flatMap(ranges=>ranges.flatMap(range=>[range.start,range.end]))])].sort((a,b)=>a-b);
+  const indexes=accountRanges.map(()=>0), candidates=[];
+  for(let boundaryIndex=1;boundaryIndex<boundaries.length;boundaryIndex++){
+    const start=boundaries[boundaryIndex-1], end=boundaries[boundaryIndex], states=accountRanges.map((ranges,accountIndex)=>{
+      while(indexes[accountIndex]<ranges.length&&ranges[indexes[accountIndex]].end<=start)indexes[accountIndex]++;
+      const range=ranges[indexes[accountIndex]];
+      return range&&range.start<=start&&range.end>=end?range.kind:null;
+    });
+    if(!states.every(kind=>kind==="gap"?collapseGaps:kind==="flat"&&collapseFlat))continue;
+    const hasGap=states.includes("gap"), hasFlat=states.includes("flat"), previous=candidates[candidates.length-1];
+    if(previous&&previous.end===start){previous.end=end;previous.duration=end-previous.start;previous.hasGap||=hasGap;previous.hasFlat||=hasFlat;previous.kind=previous.hasGap&&previous.hasFlat?"mixed":previous.hasGap?"gap":"unchanged"}
+    else candidates.push({start,end,duration:end-start,kind:hasGap&&hasFlat?"mixed":hasGap?"gap":"unchanged",hasGap,hasFlat});
+  }
+  return candidates;
+}
+function usageTimeEdgeFoldRange(range,x0,x1,left,right){
+  const leadingMargin=range.start===x0?10:0, trailingMargin=range.end===x1?10:0, edgeDuration=(x1-x0)/(right-left), start=range.start+leadingMargin*edgeDuration, end=range.end-trailingMargin*edgeDuration;
+  return start<end?{...range,start,end,duration:end-start,sourceStart:range.start,sourceEnd:range.end,leadingMargin,trailingMargin}:null;
+}
+function usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right){
+  const marginWidth=folds.reduce((sum,fold)=>sum+fold.leadingMargin+fold.trailingMargin,0);
+  if(!marginWidth)return folds;
+  const unfoldedDuration=x1-x0-folds.reduce((sum,fold)=>sum+fold.sourceEnd-fold.sourceStart,0), flexibleWidth=right-left-folds.reduce((sum,fold)=>sum+fold.width,0)-marginWidth;
+  if(unfoldedDuration<=0||flexibleWidth<=0)return [];
+  const secondsPerPixel=unfoldedDuration/flexibleWidth;
+  return folds.map(fold=>{const start=fold.sourceStart+fold.leadingMargin*secondsPerPixel, end=fold.sourceEnd-fold.trailingMargin*secondsPerPixel;return {...fold,start,end,duration:end-start}});
+}
+function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth,collapseGaps=true,collapseFlat=true){
+  const folds=[], candidates=usageTimeFoldMetrics(usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat).map(range=>usageTimeEdgeFoldRange(range,x0,x1,left,right)).filter(Boolean),x0,x1,left,right,charWidth);
   while(true){
-    const timeScale=usageTimeScale(x0,x1,folds,left,right), additions=candidates.filter(gap=>!folds.includes(gap)&&timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*2);
-    if(!additions.length)return folds;
+    const timeScale=usageTimeScale(x0,x1,folds,left,right), additions=candidates.filter(gap=>!folds.includes(gap)&&timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?2:4));
+    if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right);
     folds.push(...additions);folds.sort((a,b)=>a.start-b.start);
   }
 }
@@ -896,7 +970,7 @@ function drawUsageTimeFolds(ctx,folds,top,bottom,part="all"){
   ctx.globalAlpha=1;ctx.restore();
 }
 function accountCurveColor(accountId){
-  const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], accountIds=[...new Set((payload.quotaPoints||[]).map(point=>point.accountSlotId||"unknown"))].sort();
+  const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], points=payload.quotaPoints||[], accountIds=[...new Set(points.map(point=>point.accountSlotId||"unknown"))].sort((a,b)=>accountDisplayName(a,points.find(point=>(point.accountSlotId||"unknown")===a)?.accountLabel).localeCompare(accountDisplayName(b,points.find(point=>(point.accountSlotId||"unknown")===b)?.accountLabel),undefined,{numeric:true})||a.localeCompare(b));
   return palette[Math.max(0,accountIds.indexOf(accountId))%palette.length];
 }
 function renderUsageLegend(id,groups){
@@ -904,17 +978,13 @@ function renderUsageLegend(id,groups){
     const item=document.createElement("span"), dot=document.createElement("span");dot.className="dot";dot.style.background=accountCurveColor(accountId);item.append(dot,accountDisplayName(accountId,points[0]?.accountLabel));return item;
   }));
 }
-function usageTimeRenderedValues(points,valueOf){
-  let previous=null, anchor=null, descending=0;
-  return new Map(points.map(point=>{const raw=valueOf(point);if(previous!==null&&raw<previous)descending++;else{descending=0;anchor=raw}const value=descending>0&&descending<=2&&anchor-raw<=2?anchor:raw;previous=raw;return [point,value]}));
-}
 function drawUsageTimeChart(id,label,points,animate=false){
   const c=document.getElementById(id), ctx=c.getContext("2d"), previous=usageTimeChartStates[id];
   if(previous?.frame)cancelAnimationFrame(previous.frame);
   const previousSeries=previous?.series||[], previousFolds=previous?.folds||[], previousLabelLayer=previous?.labelLayer;
   const dpr=devicePixelRatio||1, rect=c.getBoundingClientRect(), m=CHART_MARGINS;
   c.width=rect.width*dpr;c.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,rect.width,rect.height);
-  const w=rect.width,h=rect.height, windowOf=point=>point[label], valueOf=point=>windowOf(point)?.raw, grouped=new Map();
+  const w=rect.width,h=rect.height, windowOf=point=>point[label], valueOf=point=>windowOf(point)?.continuous, grouped=new Map();
   points.filter(point=>Number.isFinite(valueOf(point))).forEach(point=>{const accountId=point.accountSlotId||"unknown";if(!grouped.has(accountId))grouped.set(accountId,[]);grouped.get(accountId).push(point)});
   const groups=[...grouped].filter(([,accountPoints])=>accountPoints.length), valid=groups.flatMap(([,accountPoints])=>accountPoints);
   renderUsageLegend(id,groups);
@@ -923,9 +993,9 @@ function drawUsageTimeChart(id,label,points,animate=false){
   if(!valid.length){labelContext.fillStyle=css("--muted");labelContext.textAlign="center";labelContext.fillText(points.length?"Not enough data for the selected scope":"No data for this range",w/2,h/2)}
   else{
     groups.forEach(([,accountPoints])=>accountPoints.sort((a,b)=>eventTimestamp(a)-eventTimestamp(b)));
-    const renderedValues=new Map(groups.flatMap(([,accountPoints])=>[...usageTimeRenderedValues(accountPoints,valueOf)])), renderedValueOf=point=>renderedValues.get(point)??valueOf(point);
+    const renderedValueOf=valueOf;
     ctx.font="11px system-ui";
-    const timestamps=valid.map(eventTimestamp), values=valid.map(point=>Math.max(0,Math.min(100,renderedValueOf(point)))), xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1], dateOnly=x1-x0>=7*24*3600, crossesDate=!sameLocalDate(x0,x1), timeScale=usageTimeScale(x0,x1,usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width),m.l,w-m.r), X=timeScale.x, Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
+    const timestamps=valid.map(eventTimestamp), values=valid.map(point=>Math.max(0,Math.min(100,renderedValueOf(point)))), xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1], dateOnly=x1-x0>=7*24*3600, crossesDate=!sameLocalDate(x0,x1), timeScale=usageTimeScale(x0,x1,usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width,collapseUsageGaps,collapseUsageFlat),m.l,w-m.r), X=timeScale.x, Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
     currentFolds=timeScale.folds;
     ctx.strokeStyle=css("--border");ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(m.l,m.t);ctx.lineTo(m.l,h-m.b);ctx.lineTo(w-m.r,h-m.b);ctx.stroke();
     ctx.strokeStyle="rgba(255,255,255,.06)";ctx.font="11px system-ui";labelContext.fillStyle=css("--muted");labelContext.font="11px system-ui";labelContext.textAlign="right";
@@ -958,7 +1028,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
       const paths=[];
       for(const point of item.points){if(!paths.length||point.breakBefore)paths.push([]);paths[paths.length-1].push(point)}
       for(const path of paths){
-        const curveLength=path.slice(1).reduce((length,point,index)=>length+Math.hypot(point.x-path[index].x,point.y-path[index].y),0), pointDiameter=layerContext.lineWidth*2;
+        const curveLength=path.slice(1).reduce((length,point,index)=>length+Math.hypot((point.markerX??point.x)-(path[index].markerX??path[index].x),(point.markerY??point.y)-(path[index].markerY??path[index].y)),0), pointDiameter=layerContext.lineWidth*2;
         if(curveLength>=pointDiameter)continue;
         const center=path.reduce((sum,point)=>[sum[0]+point.x/path.length,sum[1]+point.y/path.length],[0,0]);
         layerContext.beginPath();layerContext.arc(center[0],center[1],layerContext.lineWidth,0,Math.PI*2);layerContext.fill();
@@ -979,7 +1049,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
   const curveLayer=renderCurveLayer(currentSeries), previousByAccount=new Map(previousSeries.map(series=>[series.accountId,series]));
   const transitions=currentSeries.map(series=>{
     const oldPoints=previousByAccount.get(series.accountId)?.points||[], oldOwners=new Map(oldPoints.map(point=>[point.key,point])), hasOverlap=series.points.some(point=>oldOwners.has(point.key));
-    return {...series,hasOverlap,points:series.points.map(point=>{const oldPoint=oldOwners.get(point.key)||hasOverlap&&oldPoints.reduce((nearest,candidate)=>!nearest||Math.abs(candidate.timestamp-point.timestamp)<Math.abs(nearest.timestamp-point.timestamp)?candidate:nearest,null);return {...point,startX:oldPoint?.x??point.x,startY:oldPoint?.y??point.y}})};
+    return {...series,hasOverlap,points:series.points.map(point=>{const oldPoint=oldOwners.get(point.key)||hasOverlap&&oldPoints.reduce((nearest,candidate)=>!nearest||Math.abs(candidate.timestamp-point.timestamp)<Math.abs(nearest.timestamp-point.timestamp)?candidate:nearest,null);return {...point,startX:oldPoint?.x??point.x,startY:oldPoint?.y??point.y,markerX:point.x,markerY:point.y}})};
   });
   const currentSegments=new Map(currentSeries.map(series=>[series.accountId,new Set(series.points.slice(1).flatMap((point,index)=>point.breakBefore?[]:[`${series.points[index].key}->${point.key}`]))]));
   const leavingSeries=previousSeries.flatMap(series=>series.points.slice(1).flatMap((point,index)=>{
@@ -1022,7 +1092,7 @@ function drawAll(animate=false){
   drawUsageTimeChart("usageTime5h","fiveHour",quota,animate);
   drawUsageTimeChart("usageTime7d","sevenDay",quota,animate);
 }
-setupControls();setupDataView();setupAccountControls();load(true);pollStatus(true);setInterval(pollStatus,5000);setInterval(updateLastUpdateAge,1000);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}});addEventListener("resize",drawAll);
+setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();load(true);pollStatus(true);setInterval(pollStatus,5000);setInterval(updateLastUpdateAge,1000);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}});addEventListener("resize",drawAll);
 </script>
 </body>
 </html>

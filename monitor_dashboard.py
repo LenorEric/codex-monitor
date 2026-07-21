@@ -33,9 +33,15 @@ from monitor_usage_sync import UsageDataStore, add_record_provenance, default_us
 DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
 MANAGEMENT_HTML_PATH = Path(__file__).with_name("management.html")
 DASHBOARD_PORT = 8765
+DASHBOARD_INSTANCE_NAME = f"CodexUsageMonitorDashboard-{DASHBOARD_PORT}"
 INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS = 10 * 60
 CONTROL_COOKIE_NAME = "codex_monitor_control"
 CONTROL_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
+USAGE_TIME_WINDOWS = {"fiveHour": 5 * 60 * 60, "sevenDay": 7 * 24 * 60 * 60}
+USAGE_TIME_RATE_FLOORS = {"fiveHour": 5.0, "sevenDay": 1.0}
+USAGE_TIME_ROUNDING_ALLOWANCE = 2.0
+USAGE_TIME_RESET_JITTER_SECONDS = 2 * 60
+USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS = 30 * 60
 SENSITIVE_DASHBOARD_FIELDS = {
     "access_token", "account_id", "accountId", "authIdentity", "baseUrl", "boundMachineId", "configPath", "email", "encryptionPassphrase", "fingerprint", "id_token", "identity",
     "password", "privatePath", "rawResponse", "refresh_token", "remoteRoot", "revisionId", "statePath", "target", "tokens", "user_id", "username",
@@ -49,12 +55,57 @@ def client_host_is_loopback(host) -> bool:
         return False
 
 class DashboardHTTPServer(http.server.ThreadingHTTPServer):
-    allow_reuse_address = False
+    allow_reuse_address = True
 
     def handle_error(self, request, client_address):
         if is_client_disconnect(sys.exc_info()[1]):
             return
         super().handle_error(request, client_address)
+
+class DashboardInstanceLock:
+    def __init__(self):
+        self.handle = None
+
+    def acquire(self) -> bool:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
+
+            kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            kernel32.CreateMutexW.argtypes = (wintypes.LPVOID, wintypes.BOOL, wintypes.LPCWSTR)
+            kernel32.CreateMutexW.restype = wintypes.HANDLE
+            kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+            kernel32.CloseHandle.restype = wintypes.BOOL
+            self.handle = kernel32.CreateMutexW(None, False, f"Local\\{DASHBOARD_INSTANCE_NAME}")
+            if not self.handle:
+                raise OSError(ctypes.get_last_error(), "Cannot create the dashboard instance mutex")
+            if ctypes.get_last_error() == 183:
+                kernel32.CloseHandle(self.handle)
+                self.handle = None
+                return False
+            return True
+
+        import fcntl
+
+        self.handle = os.open(Path(tempfile.gettempdir()) / f"{DASHBOARD_INSTANCE_NAME}-{os.getuid()}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            fcntl.flock(self.handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            os.close(self.handle)
+            self.handle = None
+            return False
+        return True
+
+    def release(self) -> None:
+        if self.handle is None:
+            return
+        if os.name == "nt":
+            import ctypes
+
+            ctypes.WinDLL("kernel32", use_last_error=True).CloseHandle(self.handle)
+        else:
+            os.close(self.handle)
+        self.handle = None
 
 class ControlAuth:
     def __init__(self, control: dict):
@@ -118,7 +169,7 @@ def dashboard_account_status(status: dict) -> dict:
         "cloudBindingEnabled": bool(status.get("cloudBindingEnabled")),
         "error": "Account operation failed" if status.get("error") else None,
         "message": status.get("message"),
-        "items": [{key: account.get(key) for key in ("id", "label", "ready", "active", "cloudState")} for account in status.get("items", [])],
+        "items": [{key: account.get(key) for key in ("id", "label", "ready", "active", "cloudState", "pollError", "pollErrorAt", "stale")} for account in status.get("items", [])],
     }
 
 def dashboard_skill_status(status: dict) -> dict:
@@ -169,14 +220,95 @@ def dashboard_points_from_state(state: dict) -> list[dict]:
     }]
 
 def dashboard_quota_point(row: dict) -> dict:
+    compaction = row.get("compaction") or {}
     return {
         "checkedAt": row.get("checkedAt"),
         "timestamp": parse_timestamp(row.get("checkedAt")),
+        "compactedFrom": parse_timestamp(compaction.get("continuousFrom")),
         "accountSlotId": row.get("accountSlotId"),
         "accountLabel": row.get("accountLabel"),
         "fiveHour": window_point(row, "5h"),
         "sevenDay": window_point(row, "7d"),
     }
+
+def _usage_time_rate_limit(records: list[dict], label: str) -> float:
+    rates = sorted(
+        max(0.0, current["raw"] - previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE) / ((current["timestamp"] - previous["timestamp"]) / 60)
+        for previous, current in zip(records, records[1:])
+        if current["timestamp"] > previous["timestamp"] and current["raw"] > previous["raw"]
+    )
+    floor = USAGE_TIME_RATE_FLOORS[label]
+    if len(rates) < 10:
+        return floor
+    return max(floor, min(floor * 3, rates[int((len(rates) - 1) * .9)] * 2.5))
+
+def _usage_time_new_reset_is_supported(records: list[dict], index: int, previous: dict, duration: int) -> bool:
+    current = records[index]
+    if current["resetAt"] is None or not previous["timestamp"] - USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS <= current["resetAt"] - duration <= current["timestamp"] + USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS:
+        return False
+    if previous["resetAt"] is not None and current["resetAt"] <= previous["resetAt"] + USAGE_TIME_RESET_JITTER_SECONDS:
+        return False
+    support = []
+    for candidate in records[index:index + 64]:
+        if candidate["timestamp"] - current["timestamp"] > 2 * 60 * 60:
+            break
+        if previous["resetAt"] is not None and candidate["raw"] >= previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE and candidate["resetAt"] is not None and abs(candidate["resetAt"] - previous["resetAt"]) <= USAGE_TIME_RESET_JITTER_SECONDS:
+            return False
+        if (
+            candidate["raw"] < previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE and candidate["resetAt"] is not None
+            and current["resetAt"] - duration - USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS <= candidate["resetAt"] - duration <= candidate["timestamp"] + USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS
+        ):
+            support.append(candidate)
+    return len(support) >= 4
+
+def _usage_time_reset_is_credible(records: list[dict], index: int, previous: dict, duration: int) -> bool:
+    current = records[index]
+    if previous["resetAt"] is not None and current["timestamp"] >= previous["resetAt"] - USAGE_TIME_RESET_JITTER_SECONDS:
+        return True
+    if current["timestamp"] - previous["timestamp"] >= duration:
+        return True
+    return _usage_time_new_reset_is_supported(records, index, previous, duration)
+
+def _usage_time_continuous_values(records: list[dict], label: str) -> None:
+    if not records:
+        return
+    rate_limit = _usage_time_rate_limit(records, label)
+    previous = None
+    for index, current in enumerate(records):
+        if not 0 <= current["raw"] <= 100:
+            current["window"]["continuous"] = None
+            continue
+        if previous is None:
+            previous = current
+            continue
+        if current["raw"] < previous["raw"]:
+            if _usage_time_reset_is_credible(records, index, previous, USAGE_TIME_WINDOWS[label]):
+                previous = current
+            else:
+                current["window"]["continuous"] = None
+            continue
+        elapsed_minutes = (current["timestamp"] - previous["timestamp"]) / 60
+        if elapsed_minutes < 0 or current["raw"] - previous["raw"] > USAGE_TIME_ROUNDING_ALLOWANCE + rate_limit * elapsed_minutes:
+            current["window"]["continuous"] = None
+            continue
+        previous = current
+
+def dashboard_quota_points(rows: list[dict]) -> list[dict]:
+    points = [dashboard_quota_point(row) for row in rows]
+    for label in USAGE_TIME_WINDOWS:
+        groups = {}
+        for point in points:
+            window = point[label]
+            if point["timestamp"] is None or window["raw"] is None:
+                window["continuous"] = None
+                continue
+            groups.setdefault(point.get("accountSlotId") or point.get("accountLabel") or "unknown", []).append({
+                "timestamp": point["timestamp"], "raw": window["raw"], "resetAt": parse_timestamp(window.get("resetAt")), "window": window,
+            })
+        for records in groups.values():
+            records.sort(key=lambda record: record["timestamp"])
+            _usage_time_continuous_values(records, label)
+    return points
 
 def dashboard_token_session(row: dict) -> dict:
     return {
@@ -270,7 +402,8 @@ class UsageDashboardState:
         self.cloud = CloudManager(self.skills.private_root, self.skills, self.accounts)
         self.accounts.cloud = self.cloud
         self.usage_data = UsageDataStore(
-            self.args.history, self.args.quota_history, self.args.token_session_history, self.cloud.machine_id, self.cloud.usage_account_id, self.lock, self.cloud.local_usage_account, getattr(self.args, "usage_sync_cache", None),
+            self.args.history, self.args.quota_history, self.args.token_session_history, self.cloud.machine_id, self.cloud.usage_account_id, self.lock, self.cloud.local_usage_account,
+            getattr(self.args, "usage_sync_cache", None), self.cloud.usage_account_revision,
         )
         self.args.usage_sync_cache = self.usage_data.cache_path
         self.usage_data.normalize_local()
@@ -287,7 +420,7 @@ class UsageDashboardState:
         self.skills.status()
         self.skills.scan(refresh=True)
         self.args.auth_lock = self.accounts.lock
-        self.args.auth_refreshed_callback = self.accounts.sync_active_from_live
+        self.args.auth_refreshed_callback = self.sync_active_account_from_live
         self.args.account_attribution_callback = self.accounts.attribution_for_auth
         self.wake_event = threading.Event()
         self.inactive_account_poll_event = threading.Event()
@@ -298,6 +431,7 @@ class UsageDashboardState:
         self.last_error = None
         self.last_acquire_started_at = None
         self.inactive_account_poll_started_at = {}
+        self.inactive_account_poll_errors = {}
         self._series_cache = {}
         self._series_build_lock = threading.Lock()
         self.runtime_state = reset_runtime_baselines(load_state(args.state))
@@ -343,6 +477,13 @@ class UsageDashboardState:
             self._update_account_status_locked(active_id, candidate)
         return self.account_statuses.get(active_id)
 
+    def _dashboard_accounts_locked(self) -> dict:
+        status = self.accounts.status()
+        for account in status["items"]:
+            if error := getattr(self, "inactive_account_poll_errors", {}).get(account["id"]):
+                account.update({"pollError": True, "pollErrorAt": error["at"], "stale": True})
+        return dashboard_account_status(status)
+
     def _series_revision_locked(self, accounts: dict) -> str:
         return _dashboard_revision({
             "files": [_path_revision(path) for path in (self.args.history, self.args.quota_history, self.args.token_session_history, self.args.state, getattr(self.args, "usage_sync_cache", default_usage_sync_cache_path(self.args.history)))],
@@ -351,7 +492,7 @@ class UsageDashboardState:
 
     def status_payload(self) -> dict:
         with self.lock:
-            accounts = dashboard_account_status(self.accounts.status())
+            accounts = self._dashboard_accounts_locked()
             if not accounts["awaitingLogin"] and self.last_error and self.last_error.startswith("Waiting for Codex login"):
                 self.wake_event.set()
             last_sample = self._active_account_status_locked(accounts)
@@ -369,7 +510,7 @@ class UsageDashboardState:
         view = "merged" if view == "merged" else "local"
         with self._series_build_lock:
             with self.lock:
-                accounts = dashboard_account_status(self.accounts.status())
+                accounts = self._dashboard_accounts_locked()
                 if not accounts["awaitingLogin"] and self.last_error and self.last_error.startswith("Waiting for Codex login"):
                     self.wake_event.set()
                 revision = self._series_revision_locked(accounts)
@@ -378,8 +519,6 @@ class UsageDashboardState:
                     return cache[view][1], cache[view][2], revision
                 if hasattr(self, "usage_data"):
                     history, quota_history, token_sessions = self.usage_data.datasets(view)
-                    if view == "local":
-                        quota_history = self.usage_data.datasets("merged")[1]
                 else:
                     history, quota_history, token_sessions = load_history(self.args.history), load_quota_history(self.args.quota_history), load_token_session_history(self.args.token_session_history)
                 current_state = load_state(self.args.state)
@@ -418,6 +557,8 @@ class UsageDashboardState:
                 self.last_error = account_status["error"] or "Waiting for Codex login to create auth.json"
                 self.last_acquire_started_at = time.monotonic()
             return {}
+        self.sync_active_account_from_live()
+        account_status = self.accounts.status()
         with self.lock:
             history = load_history(self.args.history)
             self.last_acquire_started_at = time.monotonic()
@@ -454,6 +595,7 @@ class UsageDashboardState:
             write_state(self.args.state, self.runtime_state)
             compact_history(self.args.history, self.args.compact_history_days)
             compact_quota_history(self.args.quota_history, self.args.compact_history_days)
+            self.usage_data.normalize_local()
             print_special_events(self.runtime_state.get("_specialEvents") or [])
             print_valid_delta_events(events, sample)
             print_ratio_warnings(events)
@@ -499,12 +641,17 @@ class UsageDashboardState:
             self.inactive_account_poll_started_at[credential["id"]] = now
             try:
                 self._poll_inactive_account(credential)
+                with self.lock:
+                    self.inactive_account_poll_errors.pop(credential["id"], None)
                 polled += 1
             except Exception as exc:
+                with self.lock:
+                    self.inactive_account_poll_errors[credential["id"]] = {"at": now_iso(), "error": str(exc)}
                 print(f"Inactive account usage polling failed for {credential['label']!r}: {exc}", file=sys.stderr, flush=True)
         if polled:
             with self.lock:
                 compact_quota_history(self.args.quota_history, self.args.compact_history_days)
+                self.usage_data.normalize_local()
         return polled
 
     def inactive_account_poll_wait_seconds(self, now: float | None = None) -> float:
@@ -548,8 +695,16 @@ class UsageDashboardState:
         with self.lock:
             self.last_sample = None
             self.last_error = None
+            self.inactive_account_poll_errors.pop(self.accounts.status()["activeAccountId"], None)
+            self.usage_data.refresh_accounts()
         self.wake_event.set()
         self.inactive_account_poll_event.set()
+
+    def sync_active_account_from_live(self) -> bool:
+        changed = self.accounts.sync_active_from_live()
+        if changed:
+            self.usage_data.refresh_accounts()
+        return changed
 
     def create_account(self, label: str) -> dict:
         previous = self.accounts.status()
@@ -583,6 +738,7 @@ class UsageDashboardState:
             replace_account_label(self.runtime_state, str(account_id), renamed_label)
             replace_account_label(self.last_sample, str(account_id), renamed_label)
             replace_account_label(self.account_statuses.get(str(account_id)), str(account_id), renamed_label)
+            self.usage_data.refresh_accounts()
         print(f"Account event: renamed {account['label'] if account else None!r} to {str(label).strip()!r}.", flush=True)
         return result
 
@@ -592,6 +748,7 @@ class UsageDashboardState:
         result = self.accounts.delete(account_id)
         with self.lock:
             self.account_statuses.pop(str(account_id or ""), None)
+            self.usage_data.refresh_accounts()
         if result["activeAccountId"] != previous_status["activeAccountId"]:
             self._account_changed()
         print(f"Account event: deleted {deleted['label']!r}.", flush=True)
@@ -613,7 +770,7 @@ def management_payload(state: UsageDashboardState, include_remote: bool = False,
         "accounts": dashboard_account_status(state.accounts.status()),
     }
     if include_remote and payload["cloud"]["webdav"].get("enabled"):
-        state.cloud.fetch()
+        state.cloud.fetch(include_usage=False)
     payload["remoteAccounts"] = [{"accountKey": item.get("accountKey"), "label": item.get("label"), "bindingState": "released"} for item in state.cloud.cached_remote_accounts()]
     return payload
 
@@ -622,9 +779,9 @@ def _dashboard_series_from_snapshot(history: list[dict], quota_history: list[dic
     return {
         "seriesRevision": revision,
         "dataView": view,
-        "quotaDataView": "merged",
+        "quotaDataView": view,
         "points": dashboard_points_from_state(current_state),
-        "quotaPoints": [dashboard_quota_point(row) for row in quota_history],
+        "quotaPoints": dashboard_quota_points(quota_history),
         "tokenSessions": [dashboard_token_session(row) for row in token_sessions],
         "events": events,
         "historyStats": {
@@ -644,8 +801,6 @@ def dashboard_series_payload(args, state: UsageDashboardState, view: str = "loca
         return state.cached_series_response(view)[0]
     if hasattr(state, "usage_data"):
         history, quota_history, token_sessions = state.usage_data.datasets(view)
-        if view == "local":
-            quota_history = state.usage_data.datasets("merged")[1]
     else:
         history, quota_history = state.history(), state.quota_history()
         token_sessions = state.token_session_history() if hasattr(state, "token_session_history") else load_token_session_history(getattr(args, "token_session_history", default_token_session_history_path(args.history)))
@@ -681,6 +836,15 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
         print(f"Cannot start dashboard: {exc}.", file=sys.stderr, flush=True)
         return 1
     server_host = server_config["host"]
+    instance_lock = DashboardInstanceLock()
+    try:
+        instance_acquired = instance_lock.acquire()
+    except OSError as exc:
+        print(f"Cannot start dashboard instance lock: {exc}.", file=sys.stderr, flush=True)
+        return 1
+    if not instance_acquired:
+        print("Cannot start dashboard: another monitor instance is already running.", file=sys.stderr, flush=True)
+        return 1
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
@@ -729,13 +893,6 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             if self.control_is_authenticated():
                 return True
             self.send_json(401, {"error": "Control password required"})
-            return False
-
-        def origin_is_allowed(self) -> bool:
-            origin = self.headers.get("Origin")
-            if not origin or origin in {f"http://127.0.0.1:{DASHBOARD_PORT}", f"http://localhost:{DASHBOARD_PORT}"}:
-                return True
-            self.send_json(403, {"error": "Cross-site control requests are not allowed"})
             return False
 
         def read_json_body(self) -> dict:
@@ -803,8 +960,6 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             if path not in allowed:
                 self.send_json(404, {"error": "Not found"})
                 return
-            if not self.origin_is_allowed():
-                return
             try:
                 body = self.read_json_body()
                 if path == "/api/control/setup":
@@ -862,10 +1017,10 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                     self.send_json(200, state.cloud.test())
                     return
                 elif path == "/api/manage/cloud/fetch":
-                    self.send_json(200, state.cloud.fetch())
+                    self.send_json(200, state.cloud.fetch(include_usage=True, force_full=True))
                     return
                 elif path == "/api/manage/cloud/push":
-                    self.send_json(200, state.cloud.push())
+                    self.send_json(200, state.cloud.push(force_full=True))
                     return
                 elif path == "/api/manage/cloud/overwrite":
                     self.send_json(200, state.cloud.overwrite_cloud_from_local())
@@ -896,12 +1051,14 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
     try:
         server = DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)
     except OSError as exc:
+        instance_lock.release()
         print(f"Cannot start dashboard: {server_host}:{DASHBOARD_PORT} is unavailable ({exc}).", file=sys.stderr, flush=True)
         return 1
     try:
         state = UsageDashboardState(args, opener)
     except Exception:
         server.server_close()
+        instance_lock.release()
         raise
     control_auth = ControlAuth(state.cloud.config()["control"])
     thread = threading.Thread(target=state.run, daemon=True)
@@ -924,4 +1081,5 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
         state.inactive_account_poll_event.set()
         state.cloud_maintenance_event.set()
         server.server_close()
+        instance_lock.release()
     return 0

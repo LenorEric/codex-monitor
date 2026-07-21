@@ -4,6 +4,7 @@ const path = require("path");
 const vscode = require("vscode");
 
 const API_POLL_INTERVAL_MS = 5000;
+const TOOLTIP_HOVER_DELAY_SECONDS = 3;
 const DASHBOARD_URL = new URL("http://127.0.0.1:8765/");
 const MANAGEMENT_URL = new URL("http://127.0.0.1:8765/manage");
 const STATUS_API_URL = new URL("http://127.0.0.1:8765/api/status");
@@ -107,7 +108,7 @@ class PythonMonitor {
 
 function secondsAgo(value) {
     const timestamp = Date.parse(value || "");
-    return Number.isFinite(timestamp) ? `${Math.max(0, Math.floor((Date.now() - timestamp) / 1000))}s ago` : "-";
+    return Number.isFinite(timestamp) ? `${Math.max(0, Math.floor((Date.now() - timestamp) / 1000) + TOOLTIP_HOVER_DELAY_SECONDS)}s ago` : "-";
 }
 
 function stableTooltip(display) {

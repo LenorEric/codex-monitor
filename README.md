@@ -4,7 +4,7 @@
 
 **A local-first Codex quota, token, cost, account, skill, and encrypted-sync dashboard for VS Code.**
 
-[![Version](https://img.shields.io/badge/version-1.0.0-4f8cff)](#quick-start)
+[![Version](https://img.shields.io/badge/version-1.1.0-4f8cff)](#quick-start)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#requirements)
@@ -77,7 +77,7 @@ python monitor_codex_usage.py
 
 ### 2. Install the VS Code extension
 
-Install `release/codex-usage-monitor-1.0.0.vsix` from VS Code:
+Install `release/codex-usage-monitor-1.1.0.vsix` from VS Code:
 
 1. Open **Extensions**.
 2. Select **Views and More Actions (…) → Install from VSIX…**.
@@ -86,7 +86,7 @@ Install `release/codex-usage-monitor-1.0.0.vsix` from VS Code:
 The command line is also supported:
 
 ```console
-code --install-extension release/codex-usage-monitor-1.0.0.vsix
+code --install-extension release/codex-usage-monitor-1.1.0.vsix
 ```
 
 ### 3. Complete first-run setup
@@ -105,17 +105,21 @@ The top cards show the latest 5-hour and 7-day usage, reset times, plan, and act
 - **Date / 5h / 24h / 7d / 30d / All** time ranges.
 - Model filters for token and cost analysis.
 - Account filters shared by quota, token, and cost views.
-- **Local** and **Merged** token/cost datasets.
+- **Local** and **Merged** quota, token, and cost datasets.
 - Separate colored quota curves per selected account.
 - Fresh input, cached input, output, cache write, cache-hit rate, and estimated cost.
 
-The Local/Merged selector controls token and cost data. Quota curves always use merged quota history because the service percentage is shared across machines and should not be presented as machine-local consumption.
+**Local** shows only quota, token, and cost data recorded by this machine. **Merged** extends each local account with synchronized records carrying the same private account identity.
+Synchronized records that do not yet match a local account remain in the sync cache but are temporarily excluded; they are included automatically when the corresponding account is created or bound locally.
+Merged datasets are materialized when local, synchronized, or account-identity data changes, so switching views only selects an existing dataset.
 
 The extension contributes **Codex Usage Monitor: Show Details**. Opening it fetches the current dashboard, and invoking it again refreshes the same view. Webview status and history requests are independently deduplicated.
 
 ## Managing Codex accounts
 
 The account vault lives in `~/.codex-switch/accounts`. On first startup, the current valid `auth.json` becomes **Current account**.
+
+Codex exclusively owns refresh-token rotation for the active account. The monitor reloads and mirrors Codex's live `auth.json` before polling, uses its access token while valid, and pauses remote quota polling if Codex has not refreshed an expiring token yet. Ready inactive accounts are isolated from Codex and are polled every ten minutes; the monitor may rotate those credentials, reports failed inactive polls in the account selector, and never retries an ambiguous rotating-token exchange.
 
 ### Create and sign in to another account
 
@@ -156,7 +160,7 @@ The backend scans `CODEX_HOME/skills` and `~/.gemini/config/skills` for director
 4. Assign each managed skill to Codex, Gemini, or both.
 
 Managed content is moved into `~/.codex-switch/skills`.
-The monitor creates strict per-skill symbolic links; Windows uses native directory junctions when symlinks are unavailable, while non-Windows systems use an ownership-marked managed copy as a fallback. Existing unrelated paths are preserved as conflicts.
+The monitor creates strict per-skill symbolic links; Windows uses native directory junctions when symlinks are unavailable, while non-Windows systems use an ownership-marked managed copy as a fallback. Scanning preserves existing same-name target paths as unassigned conflicts; explicitly selecting **link to** replaces the conflicting path with the managed projection.
 
 Cloud behavior is name-based:
 
@@ -185,6 +189,8 @@ Open **Manage skills & accounts → Config file**. Configure the remote without 
 
 Use **Test WebDAV** before Push. Jianguoyun/Nutstore users can use `https://dav.jianguoyun.com/dav/` with an application password.
 
+Manual **Push** always publishes managed-skill changes and local recorded usage data. Manual **Fetch** always refreshes released-account metadata, merges managed-skill changes, and downloads recorded usage data from other machines. These manual transfers run even when their automatic options are disabled. Account credentials remain move-only and are transferred exclusively through explicit **Release** and **Bind** actions.
+
 The encryption passphrase is converted with scrypt and immediately cleared from the staging field. Its deterministic salt is derived from the normalized WebDAV URL and username so another machine can derive the same key.
 Changing an existing passphrase downloads, authenticates, re-encrypts, uploads, and verifies every known encrypted object; local configuration is committed only after the whole remote rotation succeeds, and partial remote writes are rolled back on failure.
 
@@ -192,13 +198,16 @@ If authentication works but decryption fails, the management page can reload loc
 
 ### Usage-data synchronization
 
-Usage synchronization is independent from skill Push:
+Automatic usage synchronization supplements the directional manual Push and Fetch actions:
 
 - It runs every 30 minutes when `usageDataAutoSync` is enabled.
 - It synchronizes delta/cost intervals, quota history, and token-session history.
+- Local quota history keeps every accepted poll. Cloud synchronization removes only redundant interior samples from unchanged quota plateaus and marks the retained endpoint with the covered range; gaps over four hours remain separate and unmarked so charts can distinguish compaction from a real monitoring outage.
 - It excludes credentials, skill contents, detailed sample logs, and runtime state.
-- Immutable encrypted chunks, checkpoints, ETags, and tombstones make updates incremental and retry-safe.
-- Downloaded data is stored by origin in `usage_monitor_sync_cache.json`; it never replaces or appends to local recorder files.
+- Each machine publishes an encrypted manifest containing every logical usage-pack ID and content hash. Fetch compares that complete inventory with `usage_monitor_sync_cache.json`, so one known pack can never cause earlier or missing packs to be skipped.
+- Records are assigned to stable key-hash buckets, then split at 64 KiB of compressed data. Updating an active record normally replaces only its small bucket pack instead of rewriting a time sequence or a large checkpoint.
+- Fetch reconstructs every legacy checkpoint/chunk stream it finds, uploads verified version-2 packs, conditionally replaces the manifest, and deletes the legacy payloads only after verification.
+- Downloaded records and their per-machine pack hashes are stored atomically by origin in `usage_monitor_sync_cache.json`; they never replace or append to local recorder files.
 
 Every five minutes, periodic Fetch also checks the authoritative skill index and refreshes the released-account list. Unchanged pointers and matching package hashes avoid unnecessary downloads.
 
@@ -212,17 +221,21 @@ The canonical data root is `~/.codex-switch`:
 | `accounts/` | Sensitive Codex account vault and manifest | Only explicit move-only Release/Bind |
 | `skills/` | Private managed skill source | Optional encrypted packages |
 | `usage_monitor_history.jsonl` | Local raw cost/delta intervals | Derived records only |
-| `usage_monitor_quota_history.jsonl` | Local compact quota readings | Derived records only |
+| `usage_monitor_quota_history.jsonl` | Complete local accepted quota readings | Compacted derived records only |
 | `usage_monitor_token_sessions.jsonl` | Local per-session token and cost totals | Derived records only |
 | `usage_monitor_samples.jsonl` | Detailed local diagnostic samples | Never |
 | `usage_monitor_state.json` | Runtime baselines and cursors | Never |
-| `usage_monitor_sync_cache.json` | Downloaded records grouped by origin | Never uploaded as a recorder file |
+| `usage_monitor_sync_cache.json` | Downloaded records and complete per-machine pack-hash inventories | Never uploaded as a recorder file |
 
 > [!WARNING]
 > Protect the whole `~/.codex-switch` directory. Never commit it, place it in support bundles, log it, or share screenshots of its contents. Losing the encryption passphrase makes encrypted remote data unrecoverable.
 
 Dashboard series and status are intentionally readable from the configured server address. Every account, skill, WebDAV, cloud, server, and configuration mutation requires the control password.
-First-time control-password setup is loopback-only. If you do not need LAN access, change the server host to `127.0.0.1` and restart the monitor; the default `0.0.0.0` listens on all interfaces.
+Control requests are accepted through public addresses and reverse proxies without an origin restriction so cloud deployments retain all dashboard features.
+
+First-time control-password setup is loopback-only. If you do not need LAN or WAN access, change the server host to `127.0.0.1` and restart the monitor.
+The default `0.0.0.0` listens on all interfaces and permits full password-protected dashboard use through the request's LAN or public IP address when the network routes port 8765 to the monitor.
+Direct public-IP access uses unencrypted HTTP, so prefer a trusted VPN or an HTTPS reverse proxy rather than exposing port 8765 directly to the Internet.
 
 ## Command-line reference
 
@@ -276,8 +289,8 @@ A legacy nonempty `passwordHash` without its separate valid `passwordSalt` is re
 
 ### A skill cannot be assigned
 
-- Run **Scan skills** and inspect the reported projection conflict.
-- Move or rename an unrelated existing path yourself; the monitor will not overwrite it.
+- Inspect the target application's skill folder and the projection state shown in skill management.
+- Selecting **link to** replaces any existing same-name target skill; scanning alone reports the conflict without replacing it or recording a projection error.
 - On Windows, ensure the account can create a symlink or native junction at the target.
 
 ## Development
