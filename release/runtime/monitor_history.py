@@ -18,6 +18,7 @@ from monitor_tokens import calculate_token_costs, calculate_token_costs_by_model
 
 MAX_PERCENT_ARBITRATION_RESPONSES = 5
 SAMPLE_LOG_COMPACT_RATIO = 0.8
+QUOTA_HISTORY_DISCONTINUITY_SECONDS = 4 * 60 * 60
 JSONL_COPY_CHUNK_BYTES = 1024 * 1024
 DEFAULT_DATA_FILES = ("usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_sessions.jsonl", "usage_monitor_samples.jsonl", "usage_monitor_state.json")
 
@@ -257,8 +258,8 @@ def consecutive_percent_stable(newer: dict, older: dict) -> bool:
             return False
     return True
 
-def fetch_usage_with_percent_arbitration(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, debug: dict, retries: int, state: dict | None = None, auth_lock=None, refreshed_callback=None) -> dict:
-    output = fetch_usage(auth, opener, auth_path, timeout, debug, retries, auth_lock, refreshed_callback)
+def fetch_usage_with_percent_arbitration(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, debug: dict, retries: int, state: dict | None = None, auth_lock=None, refreshed_callback=None, allow_token_refresh: bool = True) -> dict:
+    output = fetch_usage(auth, opener, auth_path, timeout, debug, retries, auth_lock, refreshed_callback, allow_token_refresh)
     output["remoteUsage"] = debug
     weird = weird_percent_response(output, state)
     if not weird:
@@ -267,7 +268,7 @@ def fetch_usage_with_percent_arbitration(auth: dict, opener: urllib.request.Open
     previous = output
     for response_index in range(2, MAX_PERCENT_ARBITRATION_RESPONSES + 1):
         attempt_debug = {}
-        output = fetch_usage(auth, opener, auth_path, timeout, attempt_debug, retries, auth_lock, refreshed_callback)
+        output = fetch_usage(auth, opener, auth_path, timeout, attempt_debug, retries, auth_lock, refreshed_callback, allow_token_refresh)
         output["remoteUsage"] = attempt_debug
         stable = consecutive_percent_stable(output, previous)
         debug["percentArbitration"]["attempts"].append({
@@ -326,6 +327,9 @@ def normalize_quota_history_row(row: dict) -> dict | None:
     }
     if isinstance(row.get("sync"), dict):
         normalized["sync"] = row["sync"]
+    compaction = row.get("compaction")
+    if isinstance(compaction, dict) and compaction.get("continuousFrom") and isinstance(compaction.get("omittedSamples"), int) and compaction["omittedSamples"] > 0:
+        normalized["compaction"] = {"continuousFrom": compaction["continuousFrom"], "omittedSamples": compaction["omittedSamples"]}
     return normalized
 
 def quota_history_row_from_sample(sample: dict) -> dict | None:
@@ -365,29 +369,41 @@ def same_quota_history_state(left: dict, right: dict) -> bool:
             return False
     return True
 
+def quota_history_samples_are_continuous(left: dict, right: dict) -> bool:
+    left_at, right_at = parse_timestamp(left.get("checkedAt")), parse_timestamp(right.get("checkedAt"))
+    return left_at is not None and right_at is not None and 0 <= right_at - left_at <= QUOTA_HISTORY_DISCONTINUITY_SECONDS
+
 def compact_quota_history_rows(rows: list[dict]) -> list[dict]:
     normalized = [value for row in rows if (value := normalize_quota_history_row(row)) is not None]
     normalized.sort(key=lambda row: (parse_timestamp(row["checkedAt"]) is None, parse_timestamp(row["checkedAt"]) or 0, row["checkedAt"], row["accountSlotId"]))
-    keep, runs = [False] * len(normalized), {}
-    for index, row in enumerate(normalized):
+    by_account = {}
+    for row in normalized:
         account_key = (row.get("sync") or {}).get("accountId") or f"local:{row['accountSlotId']}"
-        run = runs.get(account_key)
-        if run is None or not same_quota_history_state(normalized[run[1]], row):
-            keep[index] = True
-            runs[account_key] = (index, index)
-            continue
-        if run[1] != run[0]:
-            keep[run[1]] = False
-        keep[index] = True
-        runs[account_key] = (run[0], index)
-    return [row for index, row in enumerate(normalized) if keep[index]]
+        by_account.setdefault(account_key, []).append(row)
+    compacted = []
+    for account_rows in by_account.values():
+        start = 0
+        while start < len(account_rows):
+            end = start + 1
+            while end < len(account_rows) and same_quota_history_state(account_rows[start], account_rows[end]) and quota_history_samples_are_continuous(account_rows[end - 1], account_rows[end]):
+                end += 1
+            compacted.append(account_rows[start])
+            if end - start > 1:
+                last = account_rows[end - 1]
+                if end - start > 2:
+                    last = last | {"compaction": {"continuousFrom": account_rows[start]["checkedAt"], "omittedSamples": end - start - 2}}
+                compacted.append(last)
+            start = end
+    return sorted(compacted, key=lambda row: (parse_timestamp(row["checkedAt"]) is None, parse_timestamp(row["checkedAt"]) or 0, row["checkedAt"], row["accountSlotId"]))
 
 def write_quota_history(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            for row in compact_quota_history_rows(rows):
+            normalized = [value for row in rows if (value := normalize_quota_history_row(row)) is not None]
+            normalized.sort(key=lambda row: (parse_timestamp(row["checkedAt"]) is None, parse_timestamp(row["checkedAt"]) or 0, row["checkedAt"], row["accountSlotId"]))
+            for row in normalized:
                 f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
                 f.write("\n")
             f.flush()
@@ -878,7 +894,7 @@ def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, pre
             output.update(args.account_attribution_callback(auth))
         output.update(fetch_usage_with_percent_arbitration(
             auth, opener, args.auth, max(args.timeout, 1), output["remoteUsage"], getattr(args, "retry_limit", DEFAULT_RETRY_LIMIT), runtime_state,
-            getattr(args, "auth_lock", None), getattr(args, "auth_refreshed_callback", None),
+            getattr(args, "auth_lock", None), getattr(args, "auth_refreshed_callback", None), False,
         ))
     if not args.no_token_scan:
         output["tokenUsage"] = scan_codex_token_usage(args.codex_home)

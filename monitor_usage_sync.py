@@ -9,7 +9,7 @@ import tempfile
 from pathlib import Path
 
 from monitor_common import MIN_DELTA_COST_PER_PERCENT_USD, RESET_TIME_JITTER_SECONDS, coerce_float, parse_timestamp
-from monitor_history import same_quota_history_state
+from monitor_history import compact_quota_history_rows
 from monitor_tokens import normalize_codex_model
 
 
@@ -19,7 +19,7 @@ MAX_SYNC_RECORD_BYTES = 256 * 1024
 MAX_SYNC_STRING_LENGTH = 4096
 MAX_SYNC_COLLECTION_ITEMS = 4096
 MAX_SYNC_NESTING_DEPTH = 12
-CACHE_VERSION = 1
+CACHE_VERSION = 2
 
 
 def canonical_json(value) -> bytes:
@@ -122,6 +122,8 @@ def merge_quota_rows(rows: list[dict]) -> list[dict]:
         if key in merged:
             previous = merged[key]
             row = previous | row | {"windows": (previous.get("windows") or {}) | (row.get("windows") or {})}
+            if previous.get("compaction") and not row.get("compaction"):
+                row["compaction"] = previous["compaction"]
             if sync_meta(previous).get("originMachineId") and not sync_meta(row).get("originMachineId"):
                 row[SYNC_META_KEY] = previous[SYNC_META_KEY]
         merged[key] = row
@@ -166,23 +168,10 @@ def merge_cost_rows(rows: list[dict]) -> list[dict]:
 
 
 def quota_sync_boundary_rows(rows: list[dict], machine_id: str) -> list[dict]:
-    by_account = {}
-    for row in rows:
-        if syncable_record("quota", row, machine_id):
-            by_account.setdefault(record_account_key(row), []).append(row)
-    selected = []
-    for account_rows in by_account.values():
-        account_rows.sort(key=lambda row: (parse_timestamp(row.get("checkedAt")) or 0, row.get("checkedAt") or "", record_key("quota", row)))
-        start = 0
-        while start < len(account_rows):
-            end = start + 1
-            while end < len(account_rows) and same_quota_history_state(account_rows[start], account_rows[end]):
-                end += 1
-            selected.append(account_rows[start])
-            if end - start > 1:
-                selected.append(account_rows[end - 1])
-            start = end
-    return selected
+    syncable = [row for row in rows if syncable_record("quota", row, machine_id)]
+    compacted = compact_quota_history_rows(syncable)
+    account_order = list(dict.fromkeys(record_account_key(row) for row in syncable))
+    return [row for account_id in account_order for row in compacted if record_account_key(row) == account_id]
 
 
 def _cycle_key(row: dict) -> tuple:
@@ -287,9 +276,9 @@ def aggregate_cost_intervals(rows: list[dict]) -> list[dict]:
     return sorted(aggregated, key=lambda row: (row.get("checkedAt") or "", row.get("window") or "", row.get("model") or ""))
 
 
-def active_records(history: list[dict], quota: list[dict], tokens: list[dict], machine_id: str) -> dict[str, dict]:
+def active_records(history: list[dict], quota: list[dict], tokens: list[dict], machine_id: str, necessary_only: bool = True) -> dict[str, dict]:
     records = {}
-    for kind, rows in (("cost", history), ("quota", quota_sync_boundary_rows(quota, machine_id)), ("token", tokens)):
+    for kind, rows in (("cost", history), ("quota", quota_sync_boundary_rows(quota, machine_id) if necessary_only else quota), ("token", tokens)):
         for row in rows:
             if syncable_record(kind, row, machine_id):
                 records[record_key(kind, row)] = {"kind": kind, "row": {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}}
@@ -348,12 +337,17 @@ def transactional_replace(paths_and_data: list[tuple[Path, bytes]]) -> None:
 
 
 class UsageDataStore:
-    def __init__(self, history_path: Path, quota_path: Path, token_path: Path, machine_id: str, account_id_resolver, lock, account_mapper=None, cache_path: Path | None = None):
+    def __init__(self, history_path: Path, quota_path: Path, token_path: Path, machine_id: str, account_id_resolver, lock, account_mapper=None, cache_path: Path | None = None, account_revision_resolver=None):
         self.history_path, self.quota_path, self.token_path = Path(history_path), Path(quota_path), Path(token_path)
         self.cache_path = Path(cache_path) if cache_path is not None else default_usage_sync_cache_path(self.history_path)
         self.machine_id, self.account_id_resolver, self.lock, self.account_mapper = machine_id, account_id_resolver, lock, account_mapper
+        self.account_revision_resolver = account_revision_resolver
         self.conflicts = []
         self.needs_remote_rebuild = not self.cache_path.exists()
+        self._local_datasets_cache = None
+        self._merged_datasets_cache = None
+        self._account_revision = None
+        self._cache_repair_needed = False
 
     def _account_id(self, row: dict) -> str:
         return sync_meta(row).get("accountId") or self.account_id_resolver(row.get("accountSlotId"))
@@ -378,15 +372,30 @@ class UsageDataStore:
         from monitor_history import load_history, load_quota_history, load_token_session_history
         return load_history(self.history_path), load_quota_history(self.quota_path), load_token_session_history(self.token_path)
 
-    def _load_cache(self) -> dict[tuple[str, str], dict]:
+    def _load_cache(self) -> tuple[dict[tuple[str, str], dict], dict[str, dict[str, str]]]:
         try:
             payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
-            return {}
+            return {}, {}
         except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ValueError(f"Cannot read synchronized usage cache: {exc}") from exc
-        if not isinstance(payload, dict) or payload.get("version") != CACHE_VERSION or not isinstance(payload.get("records"), list):
+        if not isinstance(payload, dict) or payload.get("version") not in {1, CACHE_VERSION} or not isinstance(payload.get("records"), list):
             raise ValueError("Unsupported or invalid synchronized usage cache")
+        if payload.get("version") == 1:
+            self.needs_remote_rebuild = True
+            self._cache_repair_needed = True
+        raw_packs = payload.get("packs", {}) if payload.get("version") == CACHE_VERSION else {}
+        if not isinstance(raw_packs, dict):
+            raise ValueError("Invalid synchronized usage pack inventory")
+        packs = {}
+        for machine_id, inventory in raw_packs.items():
+            if not isinstance(machine_id, str) or not machine_id or not isinstance(inventory, dict):
+                raise ValueError("Invalid synchronized usage pack inventory")
+            packs[machine_id] = {}
+            for pack_id, pack_hash in inventory.items():
+                if not isinstance(pack_id, str) or not pack_id or len(pack_id) > 128 or not isinstance(pack_hash, str) or len(pack_hash) != 64 or any(character not in "0123456789abcdef" for character in pack_hash):
+                    raise ValueError("Invalid synchronized usage pack hash")
+                packs[machine_id][pack_id] = pack_hash
         records = {}
         for entry in payload["records"]:
             if not isinstance(entry, dict) or not isinstance(entry.get("sourceMachineId"), str) or not entry["sourceMachineId"] or not isinstance(entry.get("key"), str):
@@ -394,31 +403,59 @@ class UsageDataStore:
             validate_sync_operation({"action": "upsert", "key": entry["key"], "record": entry.get("record")})
             if sync_meta(entry["record"]["row"]).get("originMachineId") != entry["sourceMachineId"]:
                 raise ValueError("Synchronized usage cache origin does not match its record")
+            pack_id, pack_hash = entry.get("sourcePackId"), entry.get("sourcePackHash")
+            if (pack_id is None) != (pack_hash is None) or pack_id is not None and packs.get(entry["sourceMachineId"], {}).get(pack_id) != pack_hash:
+                self.needs_remote_rebuild = True
+                self._cache_repair_needed = True
+                continue
             records[(entry["sourceMachineId"], entry["key"])] = entry
-        return records
+        represented = {(entry["sourceMachineId"], entry.get("sourcePackId")) for entry in records.values() if entry.get("sourcePackId") is not None}
+        for machine_id, inventory in list(packs.items()):
+            for pack_id in list(inventory):
+                if (machine_id, pack_id) not in represented:
+                    del inventory[pack_id]
+                    self.needs_remote_rebuild = True
+                    self._cache_repair_needed = True
+            if not inventory:
+                packs.pop(machine_id)
+        return records, packs
 
     @staticmethod
-    def _cache_bytes(records: dict[tuple[str, str], dict]) -> bytes:
-        return canonical_json({"version": CACHE_VERSION, "records": [records[key] for key in sorted(records)]}) + b"\n"
+    def _cache_bytes(records: dict[tuple[str, str], dict], packs: dict[str, dict[str, str]]) -> bytes:
+        return canonical_json({"version": CACHE_VERSION, "packs": {machine_id: packs[machine_id] for machine_id in sorted(packs)}, "records": [records[key] for key in sorted(records)]}) + b"\n"
 
-    def _map_account(self, row: dict) -> dict:
+    def _map_account(self, row: dict) -> dict | None:
         account_id = sync_meta(row).get("accountId")
         if not account_id or self.account_mapper is None:
-            return row
-        slot_id, label = self.account_mapper(account_id, row.get("accountSlotId"), row.get("accountLabel"))
+            return None
+        mapped = self.account_mapper(account_id, row.get("accountSlotId"), row.get("accountLabel"))
+        if mapped is None:
+            return None
+        slot_id, label = mapped
         return row | {"accountSlotId": slot_id, "accountLabel": label}
+
+    def _materialize_datasets(self, local: tuple[list[dict], list[dict], list[dict]], cache: dict[tuple[str, str], dict]) -> None:
+        mapped = [(record["kind"], row) for entry in cache.values() if (record := entry["record"]) and (row := self._map_account(record["row"])) is not None]
+        tokens, self.conflicts = merge_token_rows(local[2] + [row for kind, row in mapped if kind == "token"])
+        self._local_datasets_cache = local
+        self._merged_datasets_cache = (
+            merge_cost_rows(local[0] + [row for kind, row in mapped if kind == "cost"]),
+            merge_quota_rows(local[1] + [row for kind, row in mapped if kind == "quota"]),
+            tokens,
+        )
+        self._account_revision = self.account_revision_resolver() if self.account_revision_resolver is not None else None
 
     @staticmethod
     def _transport_record(kind: str, row: dict) -> dict:
         return {"kind": kind, "row": {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}}
 
-    def _write(self, history: list[dict], quota: list[dict], tokens: list[dict], cache: dict[tuple[str, str], dict]) -> None:
-        transactional_replace([(self.history_path, self._history_bytes(history)), (self.quota_path, self._quota_bytes(quota)), (self.token_path, self._token_bytes(tokens)), (self.cache_path, self._cache_bytes(cache))])
+    def _write(self, history: list[dict], quota: list[dict], tokens: list[dict], cache: dict[tuple[str, str], dict], packs: dict[str, dict[str, str]]) -> None:
+        transactional_replace([(self.history_path, self._history_bytes(history)), (self.quota_path, self._quota_bytes(quota)), (self.token_path, self._token_bytes(tokens)), (self.cache_path, self._cache_bytes(cache, packs))])
 
     def _normalize_local(self) -> tuple[list[dict], list[dict], list[dict]]:
         history, quota, tokens = self._load()
-        cache = self._load_cache()
-        cache_changed = not self.cache_path.exists()
+        cache, packs = self._load_cache()
+        cache_changed = not self.cache_path.exists() or self._cache_repair_needed
         def normalize(kind: str, row: dict, local_only: bool = False) -> dict | None:
             nonlocal cache_changed
             meta = sync_meta(row)
@@ -439,39 +476,83 @@ class UsageDataStore:
         normalized_quota = [normalized for row in quota if (normalized := normalize("quota", row)) is not None]
         normalized_tokens = [normalized for row in tokens if (normalized := normalize("token", row)) is not None]
         if cache_changed or (normalized_history, normalized_quota, normalized_tokens) != (history, quota, tokens):
-            self._write(normalized_history, normalized_quota, normalized_tokens, cache)
-        return normalized_history, normalized_quota, normalized_tokens
+            self._write(normalized_history, normalized_quota, normalized_tokens, cache, packs)
+            self._cache_repair_needed = False
+        local = normalized_history, normalized_quota, normalized_tokens
+        if cache_changed or local != self._local_datasets_cache or self._merged_datasets_cache is None:
+            self._materialize_datasets(local, cache)
+        return local
 
     def normalize_local(self) -> tuple[list[dict], list[dict], list[dict]]:
         with self.lock:
             return self._normalize_local()
 
+    def refresh_accounts(self) -> None:
+        with self.lock:
+            if self._local_datasets_cache is None:
+                self._normalize_local()
+            else:
+                self._materialize_datasets(self._load(), self._load_cache()[0])
+
     def _datasets(self, view: str) -> tuple[list[dict], list[dict], list[dict]]:
-        history, quota, tokens = self._normalize_local()
-        if view != "merged":
-            return history, quota, tokens
-        remote = [entry["record"] for entry in self._load_cache().values()]
-        history = merge_cost_rows(history + [self._map_account(record["row"]) for record in remote if record["kind"] == "cost"])
-        quota = merge_quota_rows(quota + [self._map_account(record["row"]) for record in remote if record["kind"] == "quota"])
-        tokens, self.conflicts = merge_token_rows(tokens + [self._map_account(record["row"]) for record in remote if record["kind"] == "token"])
-        return history, quota, tokens
+        if self._local_datasets_cache is None or self._merged_datasets_cache is None:
+            self._normalize_local()
+        elif self.account_revision_resolver is not None and self.account_revision_resolver() != self._account_revision:
+            self._materialize_datasets(self._local_datasets_cache, self._load_cache()[0])
+        return self._merged_datasets_cache if view == "merged" else self._local_datasets_cache
 
     def datasets(self, view: str = "local") -> tuple[list[dict], list[dict], list[dict]]:
         with self.lock:
             return self._datasets("merged" if view == "merged" else "local")
 
-    def snapshot(self) -> tuple[dict[str, dict], set[str]]:
+    def snapshot(self, necessary_only: bool = True) -> tuple[dict[str, dict], set[str]]:
         with self.lock:
             history, quota, tokens = self._normalize_local()
-            local = active_records(history, quota, tokens, self.machine_id)
+            local = active_records(history, quota, tokens, self.machine_id, necessary_only)
             return local, set(local)
+
+    def pack_hashes(self, machine_id: str) -> dict[str, str]:
+        with self.lock:
+            return self._load_cache()[1].get(machine_id, {}).copy()
+
+    def apply_pack_snapshot(self, machine_id: str, manifest: dict[str, str], downloaded: dict[str, list[dict]], replace_all: bool = False) -> list[dict]:
+        with self.lock:
+            local = self._normalize_local()
+            cache, packs = self._load_cache()
+            cached = packs.get(machine_id, {})
+            changed = set(manifest) if replace_all else {pack_id for pack_id, pack_hash in manifest.items() if cached.get(pack_id) != pack_hash}
+            if set(downloaded) != changed:
+                raise ValueError("Synchronized usage pack download set does not match the manifest changes")
+            replace = changed | (set(cached) - set(manifest))
+            if replace_all or not cached:
+                cache = {key: entry for key, entry in cache.items() if key[0] != machine_id}
+            elif replace:
+                cache = {key: entry for key, entry in cache.items() if key[0] != machine_id or entry.get("sourcePackId") not in replace}
+            for pack_id, entries in downloaded.items():
+                for item in entries:
+                    operation = {"action": "upsert", **item}
+                    validate_sync_operation(operation)
+                    if sync_meta(operation["record"]["row"]).get("originMachineId") != machine_id:
+                        raise ValueError("Synchronized usage pack origin does not match its record")
+                    cache[(machine_id, operation["key"])] = {
+                        "sourceMachineId": machine_id, "sourcePackId": pack_id, "sourcePackHash": manifest[pack_id], "key": operation["key"], "record": operation["record"],
+                    }
+            if manifest:
+                packs[machine_id] = manifest.copy()
+            else:
+                packs.pop(machine_id, None)
+            transactional_replace([(self.cache_path, self._cache_bytes(cache, packs))])
+            self._materialize_datasets(local, cache)
+            return self.conflicts
 
     def apply(self, operations: list[dict], checkpoint_origin: str | None = None, operation_origin: str | None = None) -> list[dict]:
         with self.lock:
-            self._normalize_local()
-            cache = self._load_cache()
+            local = self._normalize_local()
+            cache, packs = self._load_cache()
+            previous = cache.copy()
             if checkpoint_origin:
                 cache = {key: value for key, value in cache.items() if key[0] != checkpoint_origin}
+                packs.pop(checkpoint_origin, None)
             for operation in operations:
                 validate_sync_operation(operation)
                 if operation["action"] == "upsert":
@@ -479,10 +560,13 @@ class UsageDataStore:
                     if not source or sync_meta(operation["record"]["row"]).get("originMachineId") != source:
                         raise ValueError("Synchronized usage operation origin does not match its record")
                     cache[(source, operation["key"])] = {"sourceMachineId": source, "key": operation["key"], "record": operation["record"]}
+                    packs.pop(source, None)
                 else:
                     if not operation_origin:
                         raise ValueError("Synchronized usage deletion is missing its origin")
                     cache.pop((operation_origin, operation["key"]), None)
-            transactional_replace([(self.cache_path, self._cache_bytes(cache))])
-            self._datasets("merged")
+                    packs.pop(operation_origin, None)
+            if cache != previous:
+                transactional_replace([(self.cache_path, self._cache_bytes(cache, packs))])
+                self._materialize_datasets(local, cache)
             return self.conflicts

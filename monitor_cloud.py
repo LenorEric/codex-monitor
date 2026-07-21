@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import base64
 import functools
 import hashlib
@@ -21,7 +23,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from monitor_accounts import atomic_write_json, auth_identity, parse_auth_bytes
 from monitor_common import SafeRedirectHandler
 from monitor_skills import SkillError
-from monitor_usage_sync import canonical_json, content_hash
+from monitor_usage_sync import canonical_json, content_hash, validate_sync_operation
 
 AUTO_PUSH_STABLE_SECONDS = 120
 AUTO_PUSH_RETRY_SECONDS = 30
@@ -30,8 +32,8 @@ AUTO_FETCH_INTERVAL_SECONDS = 300
 USAGE_SYNC_INTERVAL_SECONDS = 30 * 60
 LEGACY_PASSPHRASE_SALT = b"codex-switch-passphrase-v1"
 USAGE_SYNC_RETRY_SECONDS = (60, 5 * 60, 15 * 60)
-USAGE_CHECKPOINT_MIN_CHUNKS = 128
-USAGE_CHUNK_MAX_BYTES = 512 * 1024
+USAGE_PACK_BUCKETS = "0123456789abcdef"
+USAGE_PACK_MAX_BYTES = 64 * 1024
 
 
 def _serialized_cloud_operation(method):
@@ -448,7 +450,7 @@ class CloudManager:
                     atomic_write_json(self.config_path, config)
         if not self.state_path.exists():
             atomic_write_json(self.state_path, {
-                "version": 1, "skills": {"indexEtag": None, "indexId": None, "localSha256": {}}, "usage": {"published": {}, "remote": {}, "sequence": 0, "lastSuccessAt": None, "failure": None},
+                "version": 1, "skills": {"indexEtag": None, "indexId": None, "localSha256": {}}, "usage": {"published": {}, "remote": {}, "lastSuccessAt": None, "failure": None},
                 "remote": {"accounts": {}, "skills": {}}, "pendingAccountOperation": None, "conditionalWritesVerified": False, "decryptFailure": None,
             })
         else:
@@ -466,13 +468,16 @@ class CloudManager:
                 state["remote"]["skills"] = {"version": 1, "indexEtag": remote_skills.get("pointerEtag"), "indexId": remote_skills.get("snapshotId"), "legacySnapshotId": remote_skills.get("snapshotId"), "updatedAt": remote_skills.get("updatedAt")}
                 changed = True
             if not isinstance(state.get("usage"), dict):
-                state["usage"] = {"published": {}, "remote": {}, "sequence": 0, "lastSuccessAt": None, "failure": None}
+                state["usage"] = {"published": {}, "remote": {}, "lastSuccessAt": None, "failure": None}
                 changed = True
             else:
-                for key, value in (("published", {}), ("remote", {}), ("sequence", 0), ("lastSuccessAt", None), ("failure", None)):
+                for key, value in (("published", {}), ("remote", {}), ("lastSuccessAt", None), ("failure", None)):
                     if key not in state["usage"]:
                         state["usage"][key] = value
                         changed = True
+                if "sequence" in state["usage"]:
+                    del state["usage"]["sequence"]
+                    changed = True
             if "decryptFailure" not in state:
                 state["decryptFailure"] = None
                 changed = True
@@ -659,13 +664,23 @@ class CloudManager:
         self._usage_account_ids[cache_key] = digest if passphrase_hash_value else f"local:{digest}"
         return self._usage_account_ids[cache_key]
 
-    def local_usage_account(self, usage_account_id: str, fallback_slot_id: str | None, fallback_label: str | None) -> tuple[str, str]:
+    def local_usage_account(self, usage_account_id: str, fallback_slot_id: str | None, fallback_label: str | None) -> tuple[str, str] | None:
         if self.accounts is not None:
             with self.accounts.lock:
                 for account in self.accounts.manifest.get("accounts", []):
                     if self.usage_account_id(account.get("id")) == usage_account_id:
                         return account["id"], account.get("label") or fallback_label or "Unknown"
-        return f"cloud-usage-{usage_account_id[:16]}", fallback_label or "Cloud usage"
+        return None
+
+    def usage_account_revision(self) -> tuple:
+        webdav = self.config().get("webdav") or {}
+        if self.accounts is None:
+            return webdav.get("encryptionPassphraseHash"), ()
+        with self.accounts.lock:
+            return webdav.get("encryptionPassphraseHash"), tuple(
+                (account.get("id"), account.get("label"), (account.get("identity") or {}).get("accountId"), (account.get("identity") or {}).get("idTokenHash"))
+                for account in self.accounts.manifest.get("accounts", [])
+            )
 
     def _save_state(self) -> None:
         atomic_write_json(self.state_path, self._state)
@@ -758,7 +773,7 @@ class CloudManager:
         return None
 
     @_serialized_cloud_operation
-    def fetch(self) -> dict:
+    def fetch(self, include_usage: bool = True, force_full: bool = False) -> dict:
         client, box = self._connection()
         client.ensure_directories("accounts/states")
         local = self._state
@@ -770,7 +785,7 @@ class CloudManager:
                 continue
             key = item["name"][:-4]
             previous = cached_accounts.get(key)
-            if item.get("etag") and isinstance(previous, dict) and previous.get("etag") == item["etag"] and isinstance(previous.get("state"), dict):
+            if not force_full and item.get("etag") and isinstance(previous, dict) and previous.get("etag") == item["etag"] and isinstance(previous.get("state"), dict):
                 accounts[key] = previous
                 continue
             try:
@@ -792,7 +807,9 @@ class CloudManager:
         if pointer_data is not None:
             cached_skills = self._parse_skill_pointer(box, pointer_data, pointer_etag)
         if cached_skills.get("indexId"):
-            package_names = self._skill_packages_needing_fetch(cached_skills, skills_changed)
+            package_names = set(cached_skills.get("packages", {})) if force_full and cached_skills.get("version") == 2 else self._skill_packages_needing_fetch(cached_skills, skills_changed)
+            if force_full and cached_skills.get("version") == 1:
+                package_names = None
             if package_names is None or package_names:
                 snapshot = self._download_skill_snapshot(client, box, cached_skills, package_names)
                 skill_merge = self.skills.merge(snapshot)
@@ -802,6 +819,7 @@ class CloudManager:
         else:
             skill_merge = {"added": [], "updated": [], "deleted": [], "projectionErrors": []}
         skills_changed = skills_changed or bool(skill_merge["added"] or skill_merge["updated"] or skill_merge.get("deleted"))
+        usage = (self._fetch_usage_data(client, box, True) if force_full else self._fetch_usage_data(client, box)) if include_usage else {"skipped": True}
         cached = {"accounts": accounts, "skills": cached_skills, "fetchedAt": _timestamp()}
         local["remote"] = cached
         local["decryptFailure"] = None
@@ -810,7 +828,8 @@ class CloudManager:
             self._finish_fetch_baseline(time.monotonic())
         return {
             "accountsChanged": len(changed), "accountsRemoved": len(removed), "skillsChanged": skills_changed, "skillsAdded": skill_merge["added"],
-            "skillsUpdated": skill_merge["updated"], "skillsDeleted": skill_merge.get("deleted", []), "accountsUpdated": 0, "projectionErrors": skill_merge["projectionErrors"], "fetchedAt": cached["fetchedAt"]
+            "skillsUpdated": skill_merge["updated"], "skillsDeleted": skill_merge.get("deleted", []), "accountsUpdated": 0, "usage": usage,
+            "projectionErrors": skill_merge["projectionErrors"], "fetchedAt": cached["fetchedAt"]
         }
 
     def begin_account_transition(self, operation: str, **details) -> None:
@@ -992,7 +1011,7 @@ class CloudManager:
                 continue
             machine_id = name[:-4]
             inventory.append((self._usage_pointer_path(machine_id), f"usage-pointer:{machine_id}"))
-            for kind in ("chunks", "checkpoints"):
+            for kind in ("packs", "chunks", "checkpoints"):
                 for payload_id in sorted(item[:-4] for item in self._optional_remote_list(client, f"usage/{kind}/{machine_id}") if item.endswith(".enc") and "/" not in item and "\\" not in item):
                     inventory.append((self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"))
         return inventory
@@ -1097,7 +1116,7 @@ class CloudManager:
             path = self._usage_pointer_path(machine_id)
             self._reencrypt_object(client, box, path, f"usage-pointer:{machine_id}")
             refreshed.append(path)
-            for kind in ("chunks", "checkpoints"):
+            for kind in ("packs", "chunks", "checkpoints"):
                 try:
                     payloads = self._encrypted_payloads(client, f"usage/{kind}/{machine_id}")
                 except CloudError as exc:
@@ -1115,17 +1134,17 @@ class CloudManager:
         return {"reencrypted": len(refreshed), "paths": refreshed, "verifiedAt": _timestamp(), "fetch": verification}
 
     @_serialized_cloud_operation
-    def push(self) -> dict:
+    def push(self, force_full: bool = False) -> dict:
         accounts = {"pushedAccounts": []}
-        result = {"skills": self.upload_skills(), "accounts": accounts}
-        result["changed"] = bool(result["skills"].get("changed"))
+        result = {"skills": self.upload_skills(force=True) if force_full else self.upload_skills(), "accounts": accounts, "usage": self._push_usage_data(True) if force_full else self._push_usage_data()}
+        result["changed"] = bool(result["skills"].get("changed") or result["usage"].get("uploaded") or result["usage"].get("deleted"))
         self._finish_successful_push(time.monotonic())
         self._state["decryptFailure"] = None
         self._save_state()
         return result
 
     @_serialized_cloud_operation
-    def upload_skills(self, names: set[str] | None = None) -> dict:
+    def upload_skills(self, names: set[str] | None = None, force: bool = False) -> dict:
         client, box = self._connection(True)
         client.ensure_directories("skills/packages")
         existing_packages = self._encrypted_payloads(client, "skills/packages")
@@ -1150,15 +1169,17 @@ class CloudManager:
                 packages[name] = self._upload_skill_package(client, box, data, content_hash)
         for name, data in local_packages.items():
             previous = packages.get(name)
-            if previous and previous.get("contentSha256") == local_hashes[name]:
+            unchanged = previous and previous.get("contentSha256") == local_hashes[name]
+            if unchanged and not force:
                 continue
-            manifest = self.skills.inspect_snapshot(data)[0]
-            if previous is None and manifest["skills"]:
-                added.append(name)
-            elif manifest["skills"]:
-                updated.append(name)
-            else:
-                deleted.append(name)
+            if not unchanged:
+                manifest = self.skills.inspect_snapshot(data)[0]
+                if previous is None and manifest["skills"]:
+                    added.append(name)
+                elif manifest["skills"]:
+                    updated.append(name)
+                else:
+                    deleted.append(name)
             packages[name] = self._upload_skill_package(client, box, data, local_hashes[name])
         changed = bool(added or updated or deleted)
         if not changed and not migrated:
@@ -1325,8 +1346,16 @@ class CloudManager:
             pointer = json.loads(box.decrypt(f"usage-pointer:{machine_id}", encrypted, 1024 * 1024))
         except json.JSONDecodeError as exc:
             raise CloudError("Invalid usage pointer", 409) from exc
-        if pointer.get("version") != 1 or pointer.get("machineId") != machine_id or not isinstance(pointer.get("sequence"), int):
+        if pointer.get("machineId") != machine_id:
             raise CloudError("Usage pointer identity check failed", 409)
+        if pointer.get("version") == 1 and isinstance(pointer.get("sequence"), int):
+            return pointer
+        packs = pointer.get("packs")
+        if pointer.get("version") != 2 or not isinstance(packs, dict) or any(
+            not isinstance(pack_id, str) or not pack_id or len(pack_id) > 128 or not isinstance(pack_hash, str) or len(pack_hash) != 64 or any(character not in "0123456789abcdef" for character in pack_hash)
+            for pack_id, pack_hash in packs.items()
+        ):
+            raise CloudError("Invalid usage pack manifest", 409)
         return pointer
 
     def _usage_pointer(self, client: WebDavClient, box: CryptoBox, machine_id: str) -> tuple[dict | None, str | None]:
@@ -1344,134 +1373,181 @@ class CloudManager:
 
     def _verify_usage_pointer(self, client: WebDavClient, box: CryptoBox, expected: dict) -> str:
         verified, etag = self._usage_pointer(client, box, expected["machineId"])
-        if any(verified.get(key) != expected.get(key) for key in ("sequence", "headChunkId", "checkpointId")):
+        keys = ("packs", "recordCount") if expected.get("version") == 2 else ("sequence", "headChunkId", "checkpointId")
+        if verified.get("version") != expected.get("version") or any(verified.get(key) != expected.get(key) for key in keys):
             raise CloudError("Usage pointer verification failed", 409)
         return etag
 
-    def _publish_usage(self, client: WebDavClient, box: CryptoBox, records: dict[str, dict], present_keys: set[str]) -> dict:
+    @classmethod
+    def _usage_record_packs(cls, machine_id: str, records: dict[str, dict]) -> dict[str, dict]:
+        groups = {bucket: [] for bucket in USAGE_PACK_BUCKETS}
+        for key in sorted(records):
+            groups[hashlib.sha256(key.encode()).hexdigest()[0]].append({"key": key, "record": records[key]})
+        packs = {}
+        for bucket, entries in groups.items():
+            batch, index = [], 0
+            for entry in entries:
+                pack_id = f"{bucket}-{index:04x}"
+                candidate = {"version": 1, "machineId": machine_id, "packId": pack_id, "records": batch + [entry]}
+                if batch and len(cls._usage_payload_bytes(candidate)[1]) > USAGE_PACK_MAX_BYTES:
+                    value = {"version": 1, "machineId": machine_id, "packId": pack_id, "records": batch}
+                    pack_hash, compressed = cls._usage_payload_bytes(value)
+                    packs[pack_id] = {"hash": pack_hash, "bytes": len(compressed), "records": len(batch), "value": value}
+                    index += 1
+                    pack_id, batch = f"{bucket}-{index:04x}", []
+                batch.append(entry)
+            if batch:
+                pack_id = f"{bucket}-{index:04x}"
+                value = {"version": 1, "machineId": machine_id, "packId": pack_id, "records": batch}
+                pack_hash, compressed = cls._usage_payload_bytes(value)
+                packs[pack_id] = {"hash": pack_hash, "bytes": len(compressed), "records": len(batch), "value": value}
+        return packs
+
+    def _publish_usage(self, client: WebDavClient, box: CryptoBox, records: dict[str, dict], present_keys: set[str], force_full: bool = False) -> dict:
         machine_id, usage = self.machine_id, self._state["usage"]
         pointer, pointer_etag = self._usage_pointer(client, box, machine_id)
         current_hashes = {key: content_hash(record) for key, record in records.items()}
         published = usage.get("published") if isinstance(usage.get("published"), dict) else {}
-        if pointer is None:
-            checkpoint = {"version": 1, "machineId": machine_id, "sequence": 0, "records": [{"key": key, "record": records[key]} for key in sorted(records)]}
-            checkpoint_id, checkpoint_bytes = self._put_usage_payload(client, box, "checkpoints", machine_id, checkpoint)
-            pointer = {"version": 1, "machineId": machine_id, "sequence": 0, "headChunkId": None, "checkpointId": checkpoint_id, "checkpointSequence": 0, "checkpointBytes": checkpoint_bytes, "tailChunks": 0, "tailBytes": 0, "updatedAt": _timestamp()}
-            pointer_etag = self._write_usage_pointer(client, box, pointer, None)
-            pointer_etag = self._verify_usage_pointer(client, box, pointer)
-            usage.update({"published": current_hashes, "localPointerEtag": pointer_etag, "sequence": 0})
-            self._save_state()
-            return {"uploaded": len(records), "deleted": 0, "checkpoint": True}
-        operations = [
-            {"action": "upsert", "key": key, "record": records[key]} for key in sorted(records) if published.get(key) != current_hashes[key]
-        ] + [{"action": "delete", "key": key} for key in sorted(set(published) - present_keys)]
-        if not operations:
-            usage.update({"localPointerEtag": pointer_etag, "sequence": pointer["sequence"]})
-            return {"uploaded": 0, "deleted": 0, "checkpoint": False}
-        batches, batch, batch_size = [], [], 0
-        for operation in operations:
-            operation_size = len(canonical_json(operation))
-            if batch and (len(batch) >= 500 or batch_size + operation_size > USAGE_CHUNK_MAX_BYTES):
-                batches.append(batch)
-                batch, batch_size = [], 0
-            batch.append(operation)
-            batch_size += operation_size
-        if batch:
-            batches.append(batch)
-        parent, sequence, tail_bytes = pointer.get("headChunkId"), pointer["sequence"], pointer.get("tailBytes", 0)
-        for batch in batches:
-            sequence += 1
-            chunk = {"version": 1, "machineId": machine_id, "sequence": sequence, "parentChunkId": parent, "operations": batch}
-            parent, size = self._put_usage_payload(client, box, "chunks", machine_id, chunk)
-            tail_bytes += size
-        updated = pointer | {"sequence": sequence, "headChunkId": parent, "tailChunks": pointer.get("tailChunks", 0) + len(batches), "tailBytes": tail_bytes, "updatedAt": _timestamp()}
-        pointer_etag = self._write_usage_pointer(client, box, updated, pointer_etag)
-        pointer_etag = self._verify_usage_pointer(client, box, updated)
-        usage.update({"published": current_hashes, "localPointerEtag": pointer_etag, "sequence": sequence})
-        self._save_state()
-        if updated["tailChunks"] >= USAGE_CHECKPOINT_MIN_CHUNKS:
-            pointer_etag, updated = self._compact_usage_stream(client, box, updated, pointer_etag, records)
-            usage.update({"localPointerEtag": pointer_etag, "sequence": updated["sequence"]})
-            self._save_state()
-        return {"uploaded": sum(operation["action"] == "upsert" for operation in operations), "deleted": sum(operation["action"] == "delete" for operation in operations), "checkpoint": updated.get("headChunkId") is None}
-
-    def _compact_usage_stream(self, client: WebDavClient, box: CryptoBox, pointer: dict, pointer_etag: str, records: dict[str, dict]) -> tuple[str, dict]:
-        machine_id = self.machine_id
-        checkpoint = {"version": 1, "machineId": machine_id, "sequence": pointer["sequence"], "records": [{"key": key, "record": records[key]} for key in sorted(records)]}
-        checkpoint_id, checkpoint_bytes = self._usage_payload_bytes(checkpoint)
-        if len(checkpoint_bytes) > 0.75 * (pointer.get("checkpointBytes", 0) + pointer.get("tailBytes", 0)):
-            return pointer_etag, pointer
-        old_checkpoint = pointer.get("checkpointId")
-        old_chunks = self._encrypted_payloads(client, f"usage/chunks/{machine_id}")
-        checkpoint_id, checkpoint_size = self._put_usage_payload(client, box, "checkpoints", machine_id, checkpoint)
-        compacted = pointer | {"checkpointId": checkpoint_id, "checkpointSequence": pointer["sequence"], "checkpointBytes": checkpoint_size, "headChunkId": None, "tailChunks": 0, "tailBytes": 0, "updatedAt": _timestamp()}
-        pointer_etag = self._write_usage_pointer(client, box, compacted, pointer_etag)
-        verified, _ = self._usage_pointer(client, box, machine_id)
-        if verified.get("checkpointId") != checkpoint_id or verified.get("headChunkId") is not None:
-            raise CloudError("Usage checkpoint verification failed", 409)
+        built = self._usage_record_packs(machine_id, records)
+        manifest = {pack_id: pack["hash"] for pack_id, pack in built.items()}
+        old_manifest = pointer.get("packs", {}) if pointer and pointer.get("version") == 2 else {}
         try:
-            authoritative, _ = self._usage_pointer(client, box, machine_id)
-            if authoritative.get("checkpointId") == checkpoint_id and authoritative.get("headChunkId") is None:
-                for payload_id in old_chunks:
+            remote_payloads = self._encrypted_payloads(client, f"usage/packs/{machine_id}")
+        except CloudError as exc:
+            if "HTTP 404" not in str(exc):
+                raise
+            remote_payloads = set()
+        changed_packs = {pack_id for pack_id, pack_hash in manifest.items() if force_full or old_manifest.get(pack_id) != pack_hash or pack_hash not in remote_payloads}
+        for pack_id in sorted(changed_packs):
+            uploaded_hash, _ = self._put_usage_payload(client, box, "packs", machine_id, built[pack_id]["value"])
+            if uploaded_hash != manifest[pack_id]:
+                raise CloudError("Usage pack hash changed during upload", 409)
+        changed = pointer is None or pointer.get("version") != 2 or old_manifest != manifest or force_full
+        if changed:
+            updated = {
+                "version": 2, "machineId": machine_id, "packs": manifest, "packBytes": {pack_id: built[pack_id]["bytes"] for pack_id in sorted(built)},
+                "recordCount": len(records), "updatedAt": _timestamp(),
+            }
+            pointer_etag = self._write_usage_pointer(client, box, updated, pointer_etag)
+            pointer_etag = self._verify_usage_pointer(client, box, updated)
+        usage.update({"published": current_hashes, "localPointerEtag": pointer_etag})
+        usage.pop("sequence", None)
+        self._save_state()
+        if changed:
+            for payload_hash in set(old_manifest.values()) - set(manifest.values()):
+                client.delete(self._usage_payload_path("packs", machine_id, payload_hash))
+            if pointer and pointer.get("version") == 1:
+                for payload_id in self._encrypted_payloads(client, f"usage/chunks/{machine_id}"):
                     client.delete(self._usage_payload_path("chunks", machine_id, payload_id))
-                if old_checkpoint and old_checkpoint != checkpoint_id:
-                    client.delete(self._usage_payload_path("checkpoints", machine_id, old_checkpoint))
-        except CloudError:
-            pass
-        return pointer_etag, compacted
+                if pointer.get("checkpointId"):
+                    client.delete(self._usage_payload_path("checkpoints", machine_id, pointer["checkpointId"]))
+        return {
+            "uploaded": len(records) if force_full or not published else sum(published.get(key) != current_hashes[key] for key in records),
+            "deleted": len(set(published) - present_keys), "fullSnapshot": pointer is None or pointer.get("version") != 2 or force_full,
+            "packsUploaded": len(changed_packs), "packs": len(manifest),
+        }
 
     def _download_usage_payload(self, client: WebDavClient, box: CryptoBox, kind: str, machine_id: str, payload_id: str) -> dict:
         encrypted, _ = client.get(self._usage_payload_path(kind, machine_id, payload_id))
         return self._decode_usage_payload(box, f"usage-{kind}:{machine_id}:{payload_id}", encrypted, payload_id)
 
-    def _fetch_usage(self, client: WebDavClient, box: CryptoBox) -> dict:
+    def _fetch_legacy_usage(self, client: WebDavClient, box: CryptoBox, machine_id: str, pointer: dict) -> tuple[list[dict], int]:
+        checkpoint = self._download_usage_payload(client, box, "checkpoints", machine_id, pointer["checkpointId"])
+        operations = [{"action": "upsert", **record} for record in checkpoint.get("records", [])]
+        chunks, chunk_id = [], pointer.get("headChunkId")
+        while chunk_id:
+            chunk = self._download_usage_payload(client, box, "chunks", machine_id, chunk_id)
+            chunks.append(chunk)
+            chunk_id = chunk.get("parentChunkId")
+        for chunk in reversed(chunks):
+            operations.extend(chunk.get("operations") or [])
+        return operations, len(chunks) + 1
+
+    def _migrate_legacy_usage(self, client: WebDavClient, box: CryptoBox, machine_id: str, pointer_etag: str, operations: list[dict]) -> tuple[dict[str, str], dict[str, list[dict]]]:
+        records = {}
+        for operation in operations:
+            validate_sync_operation(operation)
+            if operation["action"] == "upsert":
+                if operation["record"]["row"].get("sync", {}).get("originMachineId") != machine_id:
+                    raise CloudError("Legacy usage operation origin does not match its machine", 409)
+                records[operation["key"]] = operation["record"]
+            else:
+                records.pop(operation["key"], None)
+        client.ensure_directories(f"usage/packs/{machine_id}")
+        built = self._usage_record_packs(machine_id, records)
+        for pack_id in sorted(built):
+            uploaded_hash, _ = self._put_usage_payload(client, box, "packs", machine_id, built[pack_id]["value"])
+            if uploaded_hash != built[pack_id]["hash"]:
+                raise CloudError("Usage pack hash changed during legacy migration", 409)
+        manifest = {pack_id: pack["hash"] for pack_id, pack in built.items()}
+        updated = {
+            "version": 2, "machineId": machine_id, "packs": manifest, "packBytes": {pack_id: built[pack_id]["bytes"] for pack_id in sorted(built)},
+            "recordCount": len(records), "updatedAt": _timestamp(),
+        }
+        self._write_usage_pointer(client, box, updated, pointer_etag)
+        self._verify_usage_pointer(client, box, updated)
+        for kind in ("chunks", "checkpoints"):
+            for payload_id in self._encrypted_payloads(client, f"usage/{kind}/{machine_id}"):
+                client.delete(self._usage_payload_path(kind, machine_id, payload_id))
+        return manifest, {pack_id: pack["value"]["records"] for pack_id, pack in built.items()}
+
+    def _fetch_usage(self, client: WebDavClient, box: CryptoBox, force_full: bool = False) -> dict:
         remote = self._state["usage"].setdefault("remote", {})
-        changed, downloaded, conflicts = 0, 0, []
+        changed, downloaded, migrated, conflicts = 0, 0, 0, []
         for item in client.list_details("usage/machines"):
             if not item["name"].endswith(".enc"):
                 continue
             machine_id = item["name"][:-4]
-            if machine_id == self.machine_id:
-                continue
-            cached = remote.get(machine_id) if isinstance(remote.get(machine_id), dict) else {}
-            if item.get("etag") and cached.get("pointerEtag") == item["etag"]:
-                continue
             encrypted, etag = client.get(self._usage_pointer_path(machine_id))
             pointer = self._parse_usage_pointer(box, machine_id, encrypted)
-            operations, checkpoint_origin = [], None
-            checkpoint_changed = cached.get("checkpointId") != pointer.get("checkpointId")
-            if checkpoint_changed:
-                checkpoint = self._download_usage_payload(client, box, "checkpoints", machine_id, pointer["checkpointId"])
-                operations.extend({"action": "upsert", **record} for record in checkpoint.get("records", []))
-                checkpoint_origin = machine_id
-                stop = None
-                downloaded += 1
+            if machine_id == self.machine_id:
+                if pointer.get("version") == 1:
+                    operations, legacy_downloaded = self._fetch_legacy_usage(client, box, machine_id, pointer)
+                    self._migrate_legacy_usage(client, box, machine_id, etag, operations)
+                    changed += 1
+                    downloaded += legacy_downloaded
+                    migrated += 1
+                continue
+            if pointer.get("version") == 2:
+                cached_packs = self._usage_data.pack_hashes(machine_id)
+                changed_packs = set(pointer["packs"]) if force_full else {pack_id for pack_id, pack_hash in pointer["packs"].items() if cached_packs.get(pack_id) != pack_hash}
+                payloads = {}
+                for pack_id in sorted(changed_packs):
+                    pack = self._download_usage_payload(client, box, "packs", machine_id, pointer["packs"][pack_id])
+                    if pack.get("machineId") != machine_id or pack.get("packId") != pack_id or not isinstance(pack.get("records"), list):
+                        raise CloudError("Usage pack identity check failed", 409)
+                    payloads[pack_id] = pack["records"]
+                if changed_packs or set(cached_packs) - set(pointer["packs"]):
+                    conflicts.extend(self._usage_data.apply_pack_snapshot(machine_id, pointer["packs"], payloads, force_full))
+                    changed += 1
+                downloaded += len(payloads)
+                remote[machine_id] = {"pointerEtag": etag, "version": 2, "packCount": len(pointer["packs"])}
             else:
-                stop = cached.get("headChunkId")
-            chunks, chunk_id = [], pointer.get("headChunkId")
-            while chunk_id and chunk_id != stop:
-                chunk = self._download_usage_payload(client, box, "chunks", machine_id, chunk_id)
-                chunks.append(chunk)
-                chunk_id = chunk.get("parentChunkId")
-                downloaded += 1
-            if chunk_id != stop and not checkpoint_changed:
-                checkpoint = self._download_usage_payload(client, box, "checkpoints", machine_id, pointer["checkpointId"])
-                operations = [{"action": "upsert", **record} for record in checkpoint.get("records", [])]
-                checkpoint_origin = machine_id
-                chunks, chunk_id = [], pointer.get("headChunkId")
-                while chunk_id:
-                    chunk = self._download_usage_payload(client, box, "chunks", machine_id, chunk_id)
-                    chunks.append(chunk)
-                    chunk_id = chunk.get("parentChunkId")
-                    downloaded += 1
-            for chunk in reversed(chunks):
-                operations.extend(chunk.get("operations") or [])
-            if operations or checkpoint_origin:
-                conflicts.extend(self._usage_data.apply(operations, checkpoint_origin, machine_id))
-            remote[machine_id] = {"pointerEtag": etag, "checkpointId": pointer.get("checkpointId"), "headChunkId": pointer.get("headChunkId"), "sequence": pointer["sequence"]}
-            changed += 1
+                operations, legacy_downloaded = self._fetch_legacy_usage(client, box, machine_id, pointer)
+                manifest, payloads = self._migrate_legacy_usage(client, box, machine_id, etag, operations)
+                conflicts.extend(self._usage_data.apply_pack_snapshot(machine_id, manifest, payloads, True))
+                downloaded += legacy_downloaded
+                changed += 1
+                migrated += 1
+                remote[machine_id] = {"version": 2, "packCount": len(manifest)}
             self._save_state()
-        return {"machinesChanged": changed, "payloadsDownloaded": downloaded, "conflicts": len(conflicts)}
+        return {"machinesChanged": changed, "machinesMigrated": migrated, "payloadsDownloaded": downloaded, "conflicts": len(conflicts)}
+
+    def _fetch_usage_data(self, client: WebDavClient, box: CryptoBox, force_full: bool = False) -> dict:
+        if self._usage_data is None:
+            return {"skipped": True}
+        client.ensure_directories("usage/machines")
+        return {**self._fetch_usage(client, box, force_full), "fetchedAt": _timestamp()}
+
+    def _push_usage_data(self, force_full: bool = False) -> dict:
+        if self._usage_data is None:
+            return {"skipped": True}
+        self._require_conditional_writes()
+        client, box = self._connection(True)
+        for path in ("usage/machines", f"usage/packs/{self.machine_id}"):
+            client.ensure_directories(path)
+        records, present_keys = self._usage_data.snapshot(necessary_only=False) if force_full else self._usage_data.snapshot()
+        return {**self._publish_usage(client, box, records, present_keys, force_full), "pushedAt": _timestamp()}
 
     @_serialized_cloud_operation
     def sync_usage_data(self) -> dict:
@@ -1479,7 +1555,7 @@ class CloudManager:
             return {"skipped": True}
         self._require_conditional_writes()
         client, box = self._connection(True)
-        for path in ("usage/machines", f"usage/chunks/{self.machine_id}", f"usage/checkpoints/{self.machine_id}"):
+        for path in ("usage/machines", f"usage/packs/{self.machine_id}"):
             client.ensure_directories(path)
         records, present_keys = self._usage_data.snapshot()
         published = self._publish_usage(client, box, records, present_keys)
@@ -1545,7 +1621,7 @@ class CloudManager:
             return False
         self._last_auto_fetch_at = now
         try:
-            self.fetch()
+            self.fetch(include_usage=False)
         except Exception as exc:
             self._record_decrypt_failure(exc, "fetch")
             if getattr(exc, "decrypt_failed", False):

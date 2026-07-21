@@ -43,6 +43,7 @@ DEFAULT_SAMPLE_LOG_MAX_BYTES = 50 * 1024 * 1024
 DEFAULT_RETRY_LIMIT = 3
 TOKEN_REFRESH_REMAINING_FRACTION = 0.30
 TOKEN_REFRESH_FALLBACK_SECONDS = 60
+TOKEN_REFRESH_MAX_MARGIN_SECONDS = 10 * 60
 UNKNOWN_EVENT_ACCOUNT_ID = "unknown"
 UNKNOWN_EVENT_ACCOUNT_LABEL = "Unknown"
 
@@ -126,7 +127,7 @@ def jwt_payload(token: str) -> dict:
     except (binascii.Error, IndexError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
 
-def token_expired(token: str, skew_seconds: int = TOKEN_REFRESH_FALLBACK_SECONDS, remaining_fraction: float = TOKEN_REFRESH_REMAINING_FRACTION) -> bool:
+def token_expired(token: str, skew_seconds: int = TOKEN_REFRESH_FALLBACK_SECONDS, remaining_fraction: float = TOKEN_REFRESH_REMAINING_FRACTION, max_margin_seconds: int = TOKEN_REFRESH_MAX_MARGIN_SECONDS) -> bool:
     payload = jwt_payload(token)
     try:
         expires_at = float(payload["exp"])
@@ -136,7 +137,7 @@ def token_expired(token: str, skew_seconds: int = TOKEN_REFRESH_FALLBACK_SECONDS
         issued_at = float(payload["iat"])
     except (KeyError, TypeError, ValueError):
         issued_at = expires_at
-    refresh_margin = (expires_at - issued_at) * remaining_fraction if expires_at > issued_at else skew_seconds
+    refresh_margin = min((expires_at - issued_at) * remaining_fraction, max_margin_seconds) if expires_at > issued_at else skew_seconds
     return expires_at <= time.time() + refresh_margin
 
 def normalize_proxy(value: str) -> str:
@@ -187,8 +188,6 @@ def load_proxy_config(home: Path) -> dict:
 
 def opener_for(home: Path) -> urllib.request.OpenerDirector:
     proxies = load_windows_system_proxy() or load_environment_proxy() or load_proxy_config(home)
-    if not proxies:
-        raise UsageError("no system proxy is configured; refusing to connect directly")
     return urllib.request.build_opener(urllib.request.ProxyHandler(proxies), SafeRedirectHandler())
 
 def retry_operation(operation, retries: int = DEFAULT_RETRY_LIMIT, delay_seconds: float = 1.0):
@@ -200,7 +199,7 @@ def retry_operation(operation, retries: int = DEFAULT_RETRY_LIMIT, delay_seconds
                 raise
             time.sleep(delay_seconds)
 
-def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, headers: dict, body: dict | None = None, timeout: int = 10, retries: int = DEFAULT_RETRY_LIMIT) -> tuple[int, dict]:
+def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, headers: dict, body: dict | None = None, timeout: int = 10, retries: int = DEFAULT_RETRY_LIMIT, retry_network_errors_forever: bool = True) -> tuple[int, dict]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     redirected_headers = {key: value for key, value in headers.items() if key.lower() not in {"authorization", "proxy-authorization", "chatgpt-account-id"}}
     request = urllib.request.Request(url, data=data, method=method, headers=redirected_headers | ({"Content-Type": "application/json"} if body is not None else {}))
@@ -215,29 +214,38 @@ def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, h
         except urllib.error.HTTPError as exc:
             if attempt >= retries:
                 raise UsageError(f"{method} {url} -> HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')[:500]}") from exc
-        except (urllib.error.URLError, OSError):
-            time.sleep(1)
-            continue
+        except (urllib.error.URLError, OSError) as exc:
+            if not retry_network_errors_forever and attempt >= retries:
+                raise UsageError(f"{method} {url} -> network error: {exc}") from exc
+            if retry_network_errors_forever:
+                time.sleep(1)
+                continue
         attempt += 1
         time.sleep(1)
 
-def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None) -> str:
+def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_refresh: bool = True) -> str:
     tokens = auth.get("tokens") or {}
-    if tokens.get("access_token") and not token_expired(tokens["access_token"]):
-        return tokens["access_token"]
+    access_token = tokens.get("access_token")
+    if access_token and not (token_expired(access_token) if allow_refresh else token_expired(access_token, 0, 0, 0)):
+        return access_token
+    if not allow_refresh:
+        raise UsageError("Waiting for Codex to refresh the active account credentials")
     if auth_lock is not None:
         with auth_lock:
             auth.clear()
             auth.update(load_json(auth_path))
-            return refresh_access_token(auth, opener, auth_path, timeout, retries, refreshed_callback=refreshed_callback)
+            return refresh_access_token(auth, opener, auth_path, timeout, retries, refreshed_callback=refreshed_callback, allow_refresh=allow_refresh)
     if not tokens.get("refresh_token"):
         raise UsageError("access token is expired and auth.json has no refresh_token")
     payload = jwt_payload(tokens.get("access_token") or tokens.get("id_token") or "")
-    status, refreshed = request_json(opener, "POST", "https://auth.openai.com/oauth/token", {}, {
-        "client_id": payload.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann",
-        "grant_type": "refresh_token",
-        "refresh_token": tokens["refresh_token"],
-    }, timeout, retries)
+    try:
+        status, refreshed = request_json(opener, "POST", "https://auth.openai.com/oauth/token", {}, {
+            "client_id": payload.get("client_id") or "app_EMoamEEZ73f0CkXaXp7hrann",
+            "grant_type": "refresh_token",
+            "refresh_token": tokens["refresh_token"],
+        }, timeout, 0, False)
+    except UsageError as exc:
+        raise UsageError(f"token refresh failed without retry because rotating-token requests are not safely repeatable: {exc}") from exc
     if status != 200 or not refreshed.get("access_token"):
         raise UsageError(f"token refresh did not return access_token: HTTP {status}")
     tokens.update({k: refreshed[k] for k in ("access_token", "id_token", "refresh_token") if refreshed.get(k)})

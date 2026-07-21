@@ -309,7 +309,7 @@ class SkillManager:
     def _projection(self, name: str, app: str) -> dict:
         source, target = self.skills_root / name, self.paths[app] / name
         if not target.exists() and not target.is_symlink():
-            return {"state": "missing"}
+            return {"state": "unlinked"}
         if _is_link(target):
             try:
                 return {"state": "linked" if target.resolve(strict=True) == source.resolve(strict=True) else "conflict", "target": str(target.resolve(strict=False))}
@@ -388,21 +388,18 @@ class SkillManager:
             except OSError as junction_exc:
                 raise SkillError(f"Could not create the {app} skill link: {junction_exc}", 409) from junction_exc
 
-    def _replace_local_skill_with_link(self, name: str, app: str) -> None:
+    def _replace_projection_conflict(self, name: str, app: str) -> None:
         target = self.paths[app] / name
-        if _is_link(target) or not target.is_dir() or not (target / "SKILL.md").is_file():
-            raise SkillError(f"Cannot assign {name} to {app}: {target} is unrelated", 409)
-        _tree_manifest(target)
         quarantine = target.with_name(f".{name}.{uuid.uuid4().hex}.quarantine")
         os.replace(target, quarantine)
         try:
             self._create_projection_link(name, app)
         except Exception:
             if target.exists() or target.is_symlink():
-                _unlink_directory_link(target) if _is_link(target) else shutil.rmtree(target)
+                _unlink_directory_link(target) if _is_link(target) else shutil.rmtree(target) if target.is_dir() else target.unlink()
             os.replace(quarantine, target)
             raise
-        shutil.rmtree(quarantine)
+        _unlink_directory_link(quarantine) if _is_link(quarantine) else shutil.rmtree(quarantine) if quarantine.is_dir() else quarantine.unlink()
 
     def assign(self, name: str, app: str, enabled: bool) -> dict:
         name = _safe_name(name)
@@ -410,16 +407,13 @@ class SkillManager:
             raise SkillError("Unknown managed skill or application", 404)
         record = self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp()})
         projection = self._projection(name, app)
-        target = self.paths[app] / name
         if enabled:
             if projection["state"] == "conflict":
-                self._replace_local_skill_with_link(name, app)
-            if projection["state"] == "missing":
+                self._replace_projection_conflict(name, app)
+            if projection["state"] == "unlinked":
                 self._create_projection_link(name, app)
         elif projection["state"] == "linked":
             self._remove_projection(name, app)
-        elif projection["state"] == "conflict":
-            raise SkillError(f"Cannot remove {name} from {app}: {target} is unrelated", 409)
         record[app] = bool(enabled)
         record.pop(f"{app}Error", None)
         self._save()
@@ -537,7 +531,11 @@ class SkillManager:
             for app in self.paths:
                 try:
                     projection = self._projection(name, app)
-                    self.assign(name, app, True if projection["state"] == "conflict" and not _is_link(self.paths[app] / name) and (self.paths[app] / name / "SKILL.md").is_file() else bool(record.get(app)))
+                    if projection["state"] == "conflict":
+                        record[app] = False
+                        record.pop(f"{app}Error", None)
+                        continue
+                    self.assign(name, app, bool(record.get(app)))
                 except SkillError as exc:
                     record[f"{app}Error"] = str(exc)
                     errors.append({"name": name, "app": app, "error": str(exc)})

@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import shutil
+import subprocess
+import sys
 import threading
 import unittest
 import urllib.error
@@ -18,13 +20,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import monitor_common
+import monitor_codex_usage
 import monitor_dashboard
 import monitor_history
 import monitor_quota
 import monitor_tokens
 from monitor_accounts import AccountError, AccountManager, atomic_write_json
 from monitor_cloud import (
-    AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
+    AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_PACK_MAX_BYTES, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
     control_password_matches, hash_control_password, load_server_config, new_control_password_salt, normalized_webdav_identity, passphrase_hash, valid_passphrase_hash, webdav_passphrase_salt,
 )
 from monitor_skills import MANIFEST_FULL_REHASH_SECONDS, SkillError, SkillManager, _safe_name
@@ -90,6 +93,49 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with mock.patch.object(monitor_common, "winreg", None), mock.patch("urllib.request.getproxies", return_value={"http": "proxy:8080", "all": "fallback:1080", "no": "localhost"}):
             self.assertEqual(monitor_common.load_windows_system_proxy(), {})
             self.assertEqual(monitor_common.load_environment_proxy(), {"http": "http://proxy:8080", "https": "http://fallback:1080"})
+
+    def test_opener_uses_direct_connection_when_no_proxy_is_configured(self):
+        with self.account_directory() as directory:
+            with (
+                mock.patch.object(monitor_common, "load_windows_system_proxy", return_value={}), mock.patch.object(monitor_common, "load_environment_proxy", return_value={}),
+                mock.patch.object(monitor_common, "load_proxy_config", return_value={}), mock.patch("urllib.request.build_opener") as build_opener,
+            ):
+                monitor_common.opener_for(directory)
+        self.assertEqual(build_opener.call_args.args[0].proxies, {})
+        self.assertIsInstance(build_opener.call_args.args[1], monitor_common.SafeRedirectHandler)
+
+    def test_opener_uses_system_proxy_when_configured(self):
+        with self.account_directory() as directory:
+            with (
+                mock.patch.object(monitor_common, "load_windows_system_proxy", return_value={"http": "http://system-proxy:8080", "https": "http://system-proxy:8080"}),
+                mock.patch.object(monitor_common, "load_environment_proxy") as environment_proxy, mock.patch.object(monitor_common, "load_proxy_config") as config_proxy,
+                mock.patch("urllib.request.build_opener") as build_opener,
+            ):
+                monitor_common.opener_for(directory)
+        self.assertEqual(build_opener.call_args.args[0].proxies, {"http": "http://system-proxy:8080", "https": "http://system-proxy:8080"})
+        environment_proxy.assert_not_called()
+        config_proxy.assert_not_called()
+
+    def test_process_history_does_not_initialize_proxy(self):
+        with self.account_directory() as directory:
+            with (
+                mock.patch.object(sys, "argv", ["monitor_codex_usage.py", "--process-history", "--history", str(directory / "history.jsonl")]),
+                mock.patch.object(monitor_codex_usage, "migrate_account_vault"), mock.patch.object(monitor_codex_usage, "backfill_quota_history"),
+                mock.patch.object(monitor_codex_usage, "load_history", return_value=[]), mock.patch.object(monitor_codex_usage, "load_state", return_value={}),
+                mock.patch.object(monitor_codex_usage, "print_valid_delta_events"), mock.patch.object(monitor_codex_usage, "opener_for") as opener_for,
+            ):
+                self.assertEqual(monitor_codex_usage.main(), 0)
+        opener_for.assert_not_called()
+
+    def test_local_only_does_not_initialize_proxy(self):
+        with self.account_directory() as directory:
+            with (
+                mock.patch.object(sys, "argv", ["monitor_codex_usage.py", "--local-only", "--history", str(directory / "history.jsonl")]),
+                mock.patch.object(monitor_codex_usage, "migrate_account_vault"), mock.patch.object(monitor_codex_usage, "backfill_quota_history"),
+                mock.patch.object(monitor_codex_usage, "serve_dashboard", return_value=0), mock.patch.object(monitor_codex_usage, "opener_for") as opener_for,
+            ):
+                self.assertEqual(monitor_codex_usage.main(), 0)
+        opener_for.assert_not_called()
 
     def test_codex_home_expands_cross_platform_home_syntax(self):
         with mock.patch.dict("os.environ", {"CODEX_HOME": "~/.custom-codex"}):
@@ -240,7 +286,52 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with mock.patch.object(monitor_common, "jwt_payload", return_value={"iat": 100}):
             self.assertTrue(token_expired("synthetic-token"))
 
-    def test_failed_usage_request_still_mirrors_rotated_refresh_token(self):
+    def test_token_refresh_margin_is_capped_at_ten_minutes(self):
+        with mock.patch.object(monitor_common, "jwt_payload", return_value={"iat": 100, "exp": 10100}):
+            with mock.patch.object(monitor_common.time, "time", return_value=9499.999):
+                self.assertFalse(token_expired("synthetic-token"))
+            with mock.patch.object(monitor_common.time, "time", return_value=9500):
+                self.assertTrue(token_expired("synthetic-token"))
+
+    def test_rotating_token_refresh_does_not_retry_ambiguous_network_failure(self):
+        class FailingOpener:
+            def __init__(self):
+                self.count = 0
+
+            def open(self, request, timeout):
+                self.count += 1
+                raise urllib.error.URLError("response lost")
+
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth = self.account_auth("acct-a", "refresh-a")
+            auth["tokens"]["access_token"] = "x.eyJleHAiOjB9.x"
+            auth_path.write_text(json.dumps(auth), encoding="utf-8")
+            opener = FailingOpener()
+            with self.assertRaisesRegex(UsageError, "not safely repeatable"):
+                refresh_access_token(auth, opener, auth_path, 1, retries=3)
+            self.assertEqual(opener.count, 1)
+
+    def test_bootstrap_waits_for_complete_auth_instead_of_vaulting_it(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "access_token": "access-a"}}), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            self.assertTrue(manager.status()["awaitingLogin"])
+            self.assertIn("refresh token", manager.status()["error"])
+            self.assertFalse(manager._account_path("ppl-pro").exists())
+
+    def test_incomplete_live_update_does_not_replace_complete_saved_credentials(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "access_token": "partial-access"}}), encoding="utf-8")
+            self.assertFalse(manager.sync_active_from_live())
+            saved = json.loads(manager._account_path("ppl-pro").read_text(encoding="utf-8"))
+            self.assertEqual(saved["tokens"]["refresh_token"], "refresh-a")
+
+    def test_active_account_waits_for_codex_instead_of_refreshing(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-original")), encoding="utf-8")
@@ -250,12 +341,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
 
-            with mock.patch.object(monitor_common, "request_json", return_value=(200, {"access_token": "access-rotated", "refresh_token": "refresh-rotated"})):
-                with mock.patch.object(monitor_quota, "request_json", side_effect=UsageError("usage failed after refresh")):
-                    with self.assertRaises(UsageError):
+            with mock.patch.object(monitor_common, "request_json") as refresh_request:
+                with mock.patch.object(monitor_quota, "request_json") as usage_request:
+                    with self.assertRaisesRegex(UsageError, "Waiting for Codex to refresh"):
                         state.poll_once()
             saved = json.loads((state.accounts.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))
-            self.assertEqual(saved["tokens"]["refresh_token"], "refresh-rotated")
+            self.assertEqual(saved["tokens"]["refresh_token"], "refresh-original")
+            refresh_request.assert_not_called()
+            usage_request.assert_not_called()
+
+    def test_active_account_uses_access_token_until_actual_expiration(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth = self.account_auth("acct-a", "refresh-a")
+            auth["tokens"]["access_token"] = "synthetic-token"
+            with mock.patch.object(monitor_common, "jwt_payload", return_value={"iat": 100, "exp": 1100}), mock.patch.object(monitor_common.time, "time", return_value=1000), mock.patch.object(monitor_common, "request_json") as refresh_request:
+                self.assertEqual(refresh_access_token(auth, object(), auth_path, 10, allow_refresh=False), "synthetic-token")
+            refresh_request.assert_not_called()
 
     def test_token_refresh_updates_local_vault_without_cloud_upload(self):
         with self.account_directory() as directory:
@@ -430,6 +532,30 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertFalse(state.accounts._account_path(empty_id).exists())
             self.assertEqual([credential["id"] for credential in state.accounts.inactive_ready_credentials()], [second_id])
 
+    def test_inactive_poll_failure_is_exposed_as_stale_account_health(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            args = SimpleNamespace(
+                auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", sample_log=directory / "samples.jsonl",
+                codex_home=directory, local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+            )
+            state = monitor_dashboard.UsageDashboardState(args, object())
+            with mock.patch("builtins.print"):
+                second_id = state.create_account("Second")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
+            state.accounts.status()
+            with mock.patch("builtins.print"):
+                state.switch_account("ppl-pro")
+
+            with mock.patch.object(state, "_poll_inactive_account", side_effect=UsageError("refresh rejected")), mock.patch("sys.stderr"):
+                self.assertEqual(state.poll_due_inactive_accounts(now=100), 0)
+
+            account = next(account for account in state.status_payload()["accounts"]["items"] if account["id"] == second_id)
+            self.assertTrue(account["pollError"])
+            self.assertTrue(account["stale"])
+            self.assertIsNotNone(account["pollErrorAt"])
+
     def test_dashboard_prints_secret_free_account_events(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
@@ -537,7 +663,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 manager.sync_active_from_live()
             self.assertEqual(raised.exception.status, 409)
 
-    def test_new_account_refuses_changed_id_token_without_modifying_live_or_saved_auth(self):
+    def test_new_account_accepts_rotated_id_token_and_saves_current_auth(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -545,17 +671,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
             changed = self.account_auth("acct-a", "refresh-new")
             changed["tokens"]["id_token"] = "id-another-login"
             auth_path.write_text(json.dumps(changed), encoding="utf-8")
-            saved = (manager.root / "ppl-pro" / "auth.json").read_bytes()
+            manager.create_account("Second")
 
-            with self.assertRaises(AccountError) as raised:
-                manager.create_account("Second")
-
-            self.assertEqual(raised.exception.status, 409)
-            self.assertIn("id_token", str(raised.exception))
-            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["id_token"], "id-another-login")
-            self.assertEqual((manager.root / "ppl-pro" / "auth.json").read_bytes(), saved)
-            self.assertEqual(manager.status()["activeAccountId"], "ppl-pro")
-            self.assertEqual(len(manager.status()["items"]), 1)
+            self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["id_token"], "id-another-login")
+            self.assertFalse(auth_path.exists())
+            self.assertNotEqual(manager.status()["activeAccountId"], "ppl-pro")
+            self.assertEqual(len(manager.status()["items"]), 2)
 
     def test_switch_refuses_changed_account_id_even_when_id_token_matches(self):
         with self.account_directory() as directory:
@@ -586,14 +707,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
             live = self.account_auth("acct-a", "refresh-a")
-            del live["tokens"]["id_token"]
+            del live["tokens"]["account_id"]
             auth_path.write_text(json.dumps(live), encoding="utf-8")
 
             with self.assertRaises(AccountError) as raised:
                 manager.create_account("Second")
 
             self.assertEqual(raised.exception.status, 409)
-            self.assertIn("id_token is missing", str(raised.exception))
+            self.assertIn("account_id is missing", str(raised.exception))
 
     def test_signed_out_account_can_be_saved_switched_away_from_and_restored(self):
         with self.account_directory() as directory:
@@ -803,17 +924,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
-            real_save = manager._save_manifest
-            calls = 0
 
-            def fail_second_save():
-                nonlocal calls
-                calls += 1
-                if calls == 2:
-                    raise OSError("simulated manifest failure")
-                real_save()
+            def fail_save():
+                raise OSError("simulated manifest failure")
 
-            with mock.patch.object(manager, "_save_manifest", side_effect=fail_second_save):
+            with mock.patch.object(manager, "_save_manifest", side_effect=fail_save):
                 with self.assertRaises(AccountError) as raised:
                     manager.switch("ppl-pro")
             self.assertEqual(raised.exception.status, 500)
@@ -2310,6 +2425,24 @@ class MonitorCodexUsageTests(unittest.TestCase):
         process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=10, cost=106, five_hour_reset="2030-01-01T12:00:00Z"), history)
         self.assertTrue(state["_specialEvents"][0]["extra"]["suppressConsole"])
 
+    def test_consecutive_reset_time_moved_forward_events_are_suppressed_per_window(self):
+        state = {}
+        history = []
+        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=10, seven_day=10, cost=100, five_hour_reset="2030-01-01T10:00:00Z", seven_day_reset="2030-01-08T00:00:00Z"), history)
+
+        process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=10, seven_day=10, cost=100, five_hour_reset="2030-01-01T11:00:00Z", seven_day_reset="2030-01-08T01:00:00Z"), history)
+        self.assertEqual([event["reason"] for event in state["_specialEvents"]], ["reset-time-moved-forward", "reset-time-moved-forward"])
+        self.assertEqual([event["extra"]["suppressConsole"] for event in state["_specialEvents"]], [False, False])
+
+        process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=10, seven_day=10, cost=100, five_hour_reset="2030-01-01T12:00:00Z", seven_day_reset="2030-01-08T02:00:00Z"), history)
+        self.assertEqual([event["extra"]["suppressConsole"] for event in state["_specialEvents"]], [True, True])
+
+        process_sample_delta_events(state, event_sample("2030-01-01T03:00:00Z", five_hour=11, seven_day=10, cost=100, five_hour_reset="2030-01-01T12:00:00Z", seven_day_reset="2030-01-08T02:00:00Z"), history)
+        self.assertEqual(state["_specialEvents"][0]["reason"], "low-cost-delta-discarded")
+
+        process_sample_delta_events(state, event_sample("2030-01-01T04:00:00Z", five_hour=11, seven_day=10, cost=100, five_hour_reset="2030-01-01T13:00:00Z", seven_day_reset="2030-01-08T03:00:00Z"), history)
+        self.assertEqual([event["extra"]["suppressConsole"] for event in state["_specialEvents"]], [False, True])
+
     def test_live_processing_rebases_on_remote_identity_switch_with_usable_windows(self):
         state = {}
         history = []
@@ -2792,7 +2925,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
 
         self.assertIn('<button data-data-view="local">Local</button><button data-data-view="merged">Merged</button>', html)
-        self.assertIn('dataView="local"', html)
+        self.assertIn('dataView="merged"', html)
         self.assertIn('fetch(`/api/series?view=${encodeURIComponent(view)}`', html)
         self.assertIn('vscode.postMessage({type:"getCodexUsageSeries",view})', html)
         self.assertIn('button.classList.toggle("active",button.dataset.dataView===dataView)', html)
@@ -2800,7 +2933,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('url.searchParams.set("view", view)', extension)
         self.assertIn('target.webview.postMessage({ type: "codexUsageSeries", view, payload: await monitor.getSeries(view) })', extension)
 
-    def test_dashboard_local_view_still_uses_merged_quota_for_usage_time(self):
+    def test_dashboard_local_view_uses_only_local_quota_tokens_and_cost(self):
         local_quota = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}
         merged_quota = {"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 2}}}
         local_session = {"sessionId": "local", "tokens": {}, "byModel": {}}
@@ -2812,8 +2945,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         payload = monitor_dashboard.dashboard_series_payload(SimpleNamespace(history=Path("history.jsonl")), state, "local")
 
         self.assertEqual(payload["dataView"], "local")
-        self.assertEqual(payload["quotaDataView"], "merged")
-        self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 2)
+        self.assertEqual(payload["quotaDataView"], "local")
+        self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 1)
         self.assertEqual(payload["tokenSessions"][0]["sessionId"], "local")
         self.assertNotIn("<span class=\"rate\">Merged</span>", dashboard_html())
 
@@ -2822,7 +2955,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = dashboard_html()
         manifest = json.loads(Path(__file__).with_name("package.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["version"], "1.0.0")
+        self.assertEqual(manifest["version"], "1.1.0")
         self.assertIn('const DASHBOARD_URL = new URL("http://127.0.0.1:8765/")', extension)
         self.assertIn("PAGE_ALLOWLIST", extension)
         self.assertIn('asset: "dashboard.html"', extension)
@@ -2847,6 +2980,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertNotIn("RELATIVE_TIME_UPDATE_INTERVAL_MS", extension)
         self.assertNotIn("lastTooltipRevision", extension)
+        self.assertIn("const TOOLTIP_HOVER_DELAY_SECONDS = 3", extension)
+        self.assertIn("Math.floor((Date.now() - timestamp) / 1000) + TOOLTIP_HOVER_DELAY_SECONDS", extension)
         self.assertIn("const tooltip = stableTooltip(display)", extension)
         self.assertIn("if (tooltip !== this.lastTooltip)", extension)
         self.assertIn('`Last update ${secondsAgo(display.percentCheckedAt)}`', extension)
@@ -2892,6 +3027,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('{name:"Managed skill validation",status:"passed"', html)
         self.assertIn('{name:`${body.app} projection`,status:"passed"', html)
 
+    def test_skill_projection_status_has_stable_width(self):
+        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
+
+        self.assertIn('.skill-status{flex:none;inline-size:calc(8ch + 18px);text-align:center}', html)
+        self.assertIn('class="pill skill-status"', html)
+
     def test_cloud_operation_messages_cover_started_completion_and_error(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
@@ -2933,12 +3074,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
         self.assertIn('showMessage("Push Completed"', html)
-        self.assertIn('"Cloud skills were already current."', html)
+        self.assertIn('"Cloud skills and recorded usage were already current."', html)
         self.assertIn('`Added skills:\\n${added.map(name=>`- ${name}`).join("\\n")}`', html)
         self.assertIn('`Updated skills:\\n${updated.map(name=>`- ${name}`).join("\\n")}`', html)
         self.assertIn('`Deleted skills:\\n${deleted.map(name=>`- ${name}`).join("\\n")}`', html)
         self.assertIn('{name:"Local skill packaging",status:"passed"', html)
         self.assertIn('{name:"Cloud skill index",status:"passed"', html)
+        self.assertIn('{name:"Recorded usage data",status:usage.skipped?"skipped":"passed"', html)
         self.assertIn('{name:"Account payloads",status:"skipped"', html)
         self.assertNotIn('Accounts updated:', html)
 
@@ -2986,7 +3128,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("retry_operation(state.poll_once", serve_source)
         self.assertLess(serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'), serve_source.index("thread.start()"))
         self.assertLess(serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'), serve_source.index("state = UsageDashboardState(args, opener)"))
-        self.assertIn("allow_reuse_address = False", source)
+        self.assertIn("allow_reuse_address = True", source)
+        self.assertLess(serve_source.index("instance_lock.acquire()"), serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'))
         self.assertIn("self.wake_event.wait(poll_sleep_seconds(self.last_acquire_started_at, self.args.interval))", source)
         self.assertIn("threading.Thread(target=state.run_cloud_maintenance, daemon=True)", source)
         self.assertIn("threading.Thread(target=state.run_inactive_account_polling, daemon=True)", source)
@@ -2995,6 +3138,27 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('if path == "/api/status":', source)
         self.assertIn('self.headers.get("If-None-Match") == etag', source)
         self.assertIn('self.send_header("ETag", etag)', source)
+
+    def test_dashboard_instance_lock_rejects_only_a_live_instance(self):
+        first = monitor_dashboard.DashboardInstanceLock()
+        second = monitor_dashboard.DashboardInstanceLock()
+        self.assertTrue(first.acquire())
+        try:
+            self.assertFalse(second.acquire())
+        finally:
+            first.release()
+        self.assertTrue(second.acquire())
+        second.release()
+
+    def test_dashboard_server_reports_an_existing_instance_before_binding(self):
+        lock = mock.Mock()
+        lock.acquire.return_value = False
+        with self.account_directory() as directory, mock.patch.object(monitor_dashboard, "DashboardInstanceLock", return_value=lock), mock.patch.object(monitor_dashboard, "DashboardHTTPServer") as server, mock.patch.object(monitor_dashboard, "UsageDashboardState") as state_class, mock.patch("sys.stderr", new_callable=StringIO) as stderr:
+            self.assertEqual(monitor_dashboard.serve_dashboard(SimpleNamespace(data_home=directory), None), 1)
+
+        server.assert_not_called()
+        state_class.assert_not_called()
+        self.assertIn("another monitor instance is already running", stderr.getvalue())
 
     def test_dashboard_server_reports_occupied_port_before_initializing_state(self):
         with self.account_directory() as directory, mock.patch.object(monitor_dashboard, "DashboardHTTPServer", side_effect=OSError(10048, "address already in use")), mock.patch.object(monitor_dashboard, "UsageDashboardState") as state_class, mock.patch("sys.stderr", new_callable=StringIO) as stderr:
@@ -3010,6 +3174,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 self.assertEqual(monitor_dashboard.serve_dashboard(SimpleNamespace(data_home=directory), None), 1)
 
         server.assert_called_once_with(("0.0.0.0", 8765), mock.ANY)
+
+    def test_dashboard_control_requests_are_not_rejected_by_proxy_origin(self):
+        source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("Cross-site control requests are not allowed", source)
+        self.assertNotIn("origin_is_allowed", source)
 
     def test_dashboard_server_config_keeps_fixed_port_and_validates_ip(self):
         with self.account_directory() as directory:
@@ -3035,6 +3205,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('<option value="127.0.0.1">', html)
         self.assertIn('<option value="0.0.0.0">', html)
         self.assertIn("Port 8765 is fixed.", html)
+        self.assertIn("full password-protected dashboard through this machine's LAN or public IP", html)
+        self.assertIn("prefer a trusted VPN or an HTTPS reverse proxy", html)
         self.assertNotIn('id="serverPort"', html)
         self.assertNotIn('id="machineName"', html)
         for field in ("webdavBaseUrl", "webdavUsername", "webdavPassword", "webdavRemoteRoot", "encryptionPassphrase", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites", "newControlPassword"):
@@ -3157,7 +3329,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertFalse(monitor_history.append_quota_history_sample(path, accepted | {"checkedAt": "2030-01-01T00:01:30Z", "usingPreviousWindows": True}))
             self.assertEqual(len(monitor_history.load_quota_history(path)), 1)
 
-    def test_append_quota_history_sample_keeps_only_plateau_boundaries(self):
+    def test_append_quota_history_sample_keeps_complete_local_plateau(self):
         with self.account_directory() as directory:
             path = directory / "quota.jsonl"
             for index, percent in enumerate((5, 5, 5, 5, 5, 6)):
@@ -3166,7 +3338,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     "windows": {"5h": {"usedPercent": percent, "resetAt": "2030-01-01T05:00:00Z", "plan": "plus"}},
                 }))
 
-            self.assertEqual([row["checkedAt"] for row in monitor_history.load_quota_history(path)], ["2030-01-01T00:00:00Z", "2030-01-01T00:04:00Z", "2030-01-01T00:05:00Z"])
+            self.assertEqual([row["checkedAt"] for row in monitor_history.load_quota_history(path)], [f"2030-01-01T00:0{index}:00Z" for index in range(6)])
 
     def test_quota_history_compaction_tracks_interleaved_accounts_independently(self):
         rows = []
@@ -3182,6 +3354,22 @@ class MonitorCodexUsageTests(unittest.TestCase):
             ("account-a", "2030-01-01T00:00:00Z"), ("account-b", "2030-01-01T00:00:01Z"),
             ("account-a", "2030-01-01T00:02:00Z"), ("account-b", "2030-01-01T00:02:01Z"),
         ])
+        self.assertEqual([row["compaction"] for row in compacted if row.get("compaction")], [
+            {"continuousFrom": "2030-01-01T00:00:00Z", "omittedSamples": 1},
+            {"continuousFrom": "2030-01-01T00:00:01Z", "omittedSamples": 1},
+        ])
+
+    def test_quota_history_compaction_keeps_real_long_gap_discontinuous(self):
+        rows = [{
+            "checkedAt": checked_at, "accountSlotId": "account-a", "accountLabel": "Account A",
+            "windows": {"5h": {"usedPercent": 5, "resetAt": "2030-01-02T05:00:00Z", "plan": "plus"}},
+        } for checked_at in ("2030-01-01T00:00:00Z", "2030-01-01T00:10:00Z", "2030-01-01T00:20:00Z", "2030-01-01T08:00:00Z", "2030-01-01T08:10:00Z", "2030-01-01T08:20:00Z")]
+
+        compacted = monitor_history.compact_quota_history_rows(rows)
+
+        self.assertEqual([row["checkedAt"] for row in compacted], ["2030-01-01T00:00:00Z", "2030-01-01T00:20:00Z", "2030-01-01T08:00:00Z", "2030-01-01T08:20:00Z"])
+        self.assertNotIn("compaction", compacted[2])
+        self.assertEqual([row["compaction"]["continuousFrom"] for row in (compacted[1], compacted[3])], ["2030-01-01T00:00:00Z", "2030-01-01T08:00:00Z"])
 
     def test_quota_history_sample_does_not_require_cost_or_trusted_delta_baseline(self):
         sample = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 42}, "7d": {"usedPercent": 61}}}
@@ -3211,7 +3399,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             history=lambda: [],
             quota_history=lambda: [
                 {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 12, "resetAt": None, "plan": "plus"}}},
-                {"checkedAt": "2030-01-01T00:01:30Z", "accountSlotId": "account-b", "accountLabel": "Account B", "windows": {"7d": {"usedPercent": 34, "resetAt": None}}},
+                {"checkedAt": "2030-01-01T00:01:30Z", "accountSlotId": "account-b", "accountLabel": "Account B", "windows": {"7d": {"usedPercent": 34, "resetAt": None}}, "compaction": {"continuousFrom": "2029-12-31T12:00:00Z", "omittedSamples": 3}},
             ],
             state=lambda: {},
             accounts=SimpleNamespace(status=lambda: accounts),
@@ -3225,7 +3413,79 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("quotaHistoryPath", payload)
         self.assertEqual([point["accountSlotId"] for point in payload["quotaPoints"]], ["account-a", "account-b"])
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 12.0)
+        self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["continuous"], 12.0)
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["plan"], "plus")
+        self.assertEqual(payload["quotaPoints"][1]["compactedFrom"], monitor_common.parse_timestamp("2029-12-31T12:00:00Z"))
+
+    def test_usage_time_filter_removes_isolated_and_consecutive_false_drops_without_changing_raw_history(self):
+        rows = [
+            {"checkedAt": checked_at, "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
+            for checked_at, percent in (
+                ("2030-01-01T00:00:00Z", 38), ("2030-01-01T00:01:30Z", 3), ("2030-01-01T00:03:00Z", 3), ("2030-01-01T00:04:30Z", 38),
+                ("2030-01-01T00:06:00Z", 13), ("2030-01-01T00:07:30Z", 13), ("2030-01-01T00:09:00Z", 39),
+            )
+        ]
+
+        points = monitor_dashboard.dashboard_quota_points(rows)
+
+        self.assertEqual([point["sevenDay"]["raw"] for point in points], [38, 3, 3, 38, 13, 13, 39])
+        self.assertEqual([point["sevenDay"]["continuous"] for point in points], [38, None, None, 38, None, None, 39])
+
+    def test_usage_time_filter_removes_consecutive_upward_spikes_using_historical_rate(self):
+        rows = [
+            {"checkedAt": checked_at, "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
+            for checked_at, percent in (
+                ("2030-01-01T00:00:00Z", 20), ("2030-01-01T00:01:30Z", 70), ("2030-01-01T00:03:00Z", 71), ("2030-01-01T00:04:30Z", 21),
+            )
+        ]
+
+        points = monitor_dashboard.dashboard_quota_points(rows)
+
+        self.assertEqual([point["sevenDay"]["continuous"] for point in points], [20, None, None, 21])
+
+    def test_usage_time_filter_learns_a_legitimate_fast_rate_from_history(self):
+        rows = [
+            {"checkedAt": f"2030-01-01T00:{minute:02}:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": minute * 8, "resetAt": "2030-01-01T05:00:00Z"}}}
+            for minute in range(11)
+        ]
+
+        points = monitor_dashboard.dashboard_quota_points(rows)
+
+        self.assertEqual([point["fiveHour"]["continuous"] for point in points], [minute * 8 for minute in range(11)])
+
+    def test_usage_time_filter_keeps_due_and_supported_manual_resets_with_post_reset_consumption(self):
+        due_rows = [
+            {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "due", "windows": {"7d": {"usedPercent": 80, "resetAt": "2030-01-01T00:02:00Z"}}},
+            {"checkedAt": "2030-01-01T00:03:00Z", "accountSlotId": "due", "windows": {"7d": {"usedPercent": 7, "resetAt": "2030-01-08T00:03:00Z"}}},
+            {"checkedAt": "2030-01-01T00:04:30Z", "accountSlotId": "due", "windows": {"7d": {"usedPercent": 8, "resetAt": "2030-01-08T00:03:00Z"}}},
+        ]
+        manual_rows = [
+            {"checkedAt": checked_at, "accountSlotId": "manual", "windows": {"7d": {"usedPercent": percent, "resetAt": reset_at}}}
+            for checked_at, percent, reset_at in (
+                ("2030-01-01T00:00:00Z", 70, "2030-01-05T00:00:00Z"), ("2030-01-01T01:00:00Z", 6, "2030-01-08T01:00:00Z"),
+                ("2030-01-01T01:02:00Z", 7, "2030-01-08T01:00:00Z"), ("2030-01-01T01:04:00Z", 7, "2030-01-08T01:00:00Z"),
+                ("2030-01-01T01:06:00Z", 8, "2030-01-08T01:00:00Z"),
+            )
+        ]
+
+        points = monitor_dashboard.dashboard_quota_points(due_rows + manual_rows)
+
+        self.assertEqual([point["sevenDay"]["continuous"] for point in points[:3]], [80, 7, 8])
+        self.assertEqual([point["sevenDay"]["continuous"] for point in points[3:]], [70, 6, 7, 7, 8])
+
+    def test_usage_time_filter_rejects_consecutive_foreign_reset_responses_when_original_stream_returns(self):
+        rows = [
+            {"checkedAt": checked_at, "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": reset_at}}}
+            for checked_at, percent, reset_at in (
+                ("2030-01-01T00:00:00Z", 40, "2030-01-05T00:00:00Z"), ("2030-01-01T01:00:00Z", 12, "2030-01-08T01:00:00Z"),
+                ("2030-01-01T01:02:00Z", 12, "2030-01-08T01:00:00Z"), ("2030-01-01T01:04:00Z", 13, "2030-01-08T01:00:00Z"),
+                ("2030-01-01T01:06:00Z", 13, "2030-01-08T01:00:00Z"), ("2030-01-01T01:08:00Z", 40, "2030-01-05T00:00:00Z"),
+            )
+        ]
+
+        points = monitor_dashboard.dashboard_quota_points(rows)
+
+        self.assertEqual([point["sevenDay"]["continuous"] for point in points], [40, None, None, None, None, 40])
 
     def test_dashboard_payload_removes_sensitive_account_and_sample_data(self):
         accounts = {"activeAccountId": "local-a", "awaitingLogin": False, "items": [{"id": "local-a", "label": "Account A", "email": "private@example.test", "ready": True, "active": True, "accountKey": "cloud-key"}]}
@@ -3270,13 +3530,19 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('<canvas class="chart" id="usageTime7d"></canvas>', html)
         self.assertIn('<div class="legend" id="usageTime5hLegend"></div>', html)
         self.assertIn('<div class="legend" id="usageTime7dLegend"></div>', html)
+        self.assertIn('<button id="collapseUsageGaps" type="button">Collapse gaps</button>', html)
+        self.assertIn('<button id="collapseUsageFlat" type="button">Collapse flat</button>', html)
+        self.assertIn('function setupUsageFoldControls()', html)
+        self.assertIn('button.setAttribute("aria-pressed",String(getValue()))', html)
+        self.assertIn('setupAccountControls();setupUsageFoldControls();load(true)', html)
         self.assertIn('function quotaTimeDomain(points)', html)
         self.assertIn('function drawUsageTimeChart(id,label,points,animate=false)', html)
         self.assertIn('function accountCurveColor(accountId)', html)
+        self.assertIn('.sort((a,b)=>accountDisplayName(a,', html)
+        self.assertIn('{numeric:true})||a.localeCompare(b)', html)
         self.assertIn('function renderUsageLegend(id,groups)', html)
-        self.assertIn('function usageTimeRenderedValues(points,valueOf)', html)
-        self.assertIn('if(previous!==null&&raw<previous)descending++;else{descending=0;anchor=raw}', html)
-        self.assertIn('descending>0&&descending<=2&&anchor-raw<=2?anchor:raw', html)
+        self.assertIn('valueOf=point=>windowOf(point)?.continuous', html)
+        self.assertNotIn('function usageTimeRenderedValues(points,valueOf)', html)
         self.assertIn('function usageTimeFoldMetrics(gaps,x0,x1,left,right,charWidth)', html)
         self.assertIn('const minWidth=charWidth*4.5', html)
         self.assertIn('base=Math.min(10,Math.max(2,', html)
@@ -3284,11 +3550,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('plotWidth*.012', html)
         self.assertNotIn('maxWidth=', html)
         self.assertIn('const calculatedWidth=amplifier*Math.log1p(gap.duration/referenceGap)/Math.log(base);return {...gap,width:Math.max(minWidth,calculatedWidth)}', html)
-        self.assertIn('function usageTimeGapIsDiscontinuous(groups,gap,label,valueOf)', html)
-        self.assertIn('function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth)', html)
-        self.assertIn('usageTimeGapIsDiscontinuous(groups,gap,label,valueOf)', html)
-        self.assertIn('timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*2', html)
-        self.assertIn('if(!additions.length)return folds', html)
+        self.assertIn('function usageTimeAccountFoldRanges(points,label,valueOf,x0,x1)', html)
+        self.assertIn('if(breakUsageCurve(previous,current,label,valueOf))add(start,end,"gap")', html)
+        self.assertIn('else if(valueOf(previous)===valueOf(current))add(start,end,"flat")', html)
+        self.assertIn('function usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat)', html)
+        self.assertIn('if(!states.every(kind=>kind==="gap"?collapseGaps:kind==="flat"&&collapseFlat))continue', html)
+        self.assertIn('previous.kind=previous.hasGap&&previous.hasFlat?"mixed":previous.hasGap?"gap":"unchanged"', html)
+        self.assertIn('function usageTimeEdgeFoldRange(range,x0,x1,left,right)', html)
+        self.assertIn('const leadingMargin=range.start===x0?10:0, trailingMargin=range.end===x1?10:0', html)
+        self.assertIn('sourceStart:range.start,sourceEnd:range.end,leadingMargin,trailingMargin', html)
+        self.assertIn('function usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right)', html)
+        self.assertIn('const secondsPerPixel=unfoldedDuration/flexibleWidth', html)
+        self.assertIn('if(unfoldedDuration<=0||flexibleWidth<=0)return []', html)
+        self.assertIn('function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth,collapseGaps=true,collapseFlat=true)', html)
+        self.assertIn('usageTimeFoldMetrics(usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat)', html)
+        self.assertIn('.map(range=>usageTimeEdgeFoldRange(range,x0,x1,left,right)).filter(Boolean)', html)
+        self.assertIn('timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?2:4)', html)
+        self.assertIn('if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right)', html)
         self.assertIn('function usageTimeScale(x0,x1,folds,left,right)', html)
         self.assertIn('folds.reduce((sum,gap)=>sum+gap.width,0)', html)
         self.assertIn('function drawUsageTimeFolds(ctx,folds,top,bottom,part="all")', html)
@@ -3297,7 +3575,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn('ctx.fillRect(center-labelWidth/2-3,top+3,labelWidth+6,13)', html)
         self.assertIn('const renderGapLabelLayer=(folds,layer=document.createElement("canvas"))=>', html)
         self.assertIn('ctx.font="11px system-ui"', html)
-        self.assertIn('usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width)', html)
+        self.assertIn('usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width,collapseUsageGaps,collapseUsageFlat)', html)
         self.assertIn('drawUsageTimeFolds(layerContext,folds,m.t,h-m.b,"labels")', html)
         self.assertIn('drawUsageTimeFolds(layerContext,folds,m.t,h-m.b,"geometry")', html)
         self.assertIn('gapTransitions=currentFolds.map', html)
@@ -3318,7 +3596,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('layerContext.rect(m.l-layerContext.lineWidth,m.t-layerContext.lineWidth,w-m.l-m.r+layerContext.lineWidth*2,h-m.t-m.b+layerContext.lineWidth*2);layerContext.clip()', html)
         self.assertIn('for(const item of series){if(!item.points.length||item.alpha===0)continue;layerContext.globalAlpha=item.alpha??1;layerContext.strokeStyle=item.color;', html)
         self.assertIn('for(const point of item.points){if(!paths.length||point.breakBefore)paths.push([]);paths[paths.length-1].push(point)}', html)
-        self.assertIn('const curveLength=path.slice(1).reduce((length,point,index)=>length+Math.hypot(point.x-path[index].x,point.y-path[index].y),0), pointDiameter=layerContext.lineWidth*2;', html)
+        self.assertIn('const curveLength=path.slice(1).reduce((length,point,index)=>length+Math.hypot((point.markerX??point.x)-(path[index].markerX??path[index].x),(point.markerY??point.y)-(path[index].markerY??path[index].y)),0), pointDiameter=layerContext.lineWidth*2;', html)
         self.assertIn('if(curveLength>=pointDiameter)continue;', html)
         self.assertIn('layerContext.arc(center[0],center[1],layerContext.lineWidth,0,Math.PI*2)', html)
         self.assertNotIn('visiblePoints.some', html)
@@ -3326,6 +3604,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("Not enough data for the selected accounts", html)
         self.assertIn('function plusEquivalentUsage(point,label,valueOf)', html)
         self.assertIn('{plus:1,pro_lite:5,pro:20}[point[label]?.plan]||1', html)
+        self.assertIn('function compactedUsageGap(previous,current)', html)
+        self.assertIn('if(compactedUsageGap(previous,current))return false', html)
         self.assertIn('function breakUsageCurve(previous,current,label,valueOf)', html)
         self.assertIn('if(gap>4*3600)return true', html)
         self.assertIn('if(gap<=30*60)return false', html)
@@ -3342,6 +3622,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('Math.abs(candidate.timestamp-point.timestamp)<Math.abs(nearest.timestamp-point.timestamp)', html)
         self.assertIn('point.startX+(point.x-point.startX)*progress', html)
         self.assertIn('point.startY+(point.y-point.startY)*progress', html)
+        self.assertIn('markerX:point.x,markerY:point.y', html)
         self.assertIn('alpha:series.hasOverlap?1:progress', html)
         self.assertIn('const currentSegments=new Map', html)
         self.assertIn('point.breakBefore||currentSegments.get(series.accountId)?.has', html)
@@ -3356,6 +3637,47 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertLess(html.index("5h Usage vs Time"), html.index("5h Cost vs Usage"))
         self.assertNotIn("Current active account", html)
         self.assertNotIn("Delta Cost vs Delta Usage", html)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
+    def test_dashboard_combines_gap_and_flat_usage_fold_intervals(self):
+        html = dashboard_html()
+        script = html[html.index("function eventTimestamp"):html.index("function updateWindowTime")] + html[html.index("function plusEquivalentUsage"):html.index("function accountCurveColor")] + r'''
+const point=(timestamp,value,compactedFrom=null)=>({timestamp,compactedFrom,fiveHour:{continuous:value,plan:"plus"}}), valueOf=point=>point.fiveHour.continuous;
+const candidates=(groups,x0,x1,gaps=true,flat=true)=>usageTimeFoldCandidates(groups,"fiveHour",valueOf,x0,x1,gaps,flat), folds=(groups,x0,x1,gaps=true,flat=true)=>usageTimeFolds(groups,"fiveHour",valueOf,x0,x1,0,1000,6,gaps,flat);
+const outside=usageTimeAccountFoldRanges([point(1000,1),point(2000,2)],"fiveHour",valueOf,0,3000), expectedOutside=[{start:0,end:1000,kind:"gap"},{start:2000,end:3000,kind:"gap"}];
+if(JSON.stringify(outside)!==JSON.stringify(expectedOutside))throw new Error(`Before/after sample gaps were not preserved: ${JSON.stringify(outside)}`);
+const pureGap=candidates([["a",[point(0,1),point(20000,2)]],["b",[point(0,3),point(20000,4)]]],0,20000), pureFlat=candidates([["a",[point(0,1),point(1000,1)]],["b",[point(0,3),point(1000,3)]]],0,1000);
+if(pureGap.length!==1||pureGap[0].kind!=="gap"||pureFlat.length!==1||pureFlat[0].kind!=="unchanged")throw new Error(`Pure fold kinds were incorrect: ${JSON.stringify({pureGap,pureFlat})}`);
+const exactGroups=[["a",[point(0,1),point(20000,2),point(21000,3)]],["b",[point(0,10),point(1000,11),point(10000,11),point(21000,11)]]];
+const exact=candidates(exactGroups,0,21000), expectedExact=[{start:1000,end:20000,duration:19000,kind:"mixed",hasGap:true,hasFlat:true}];
+if(JSON.stringify(exact)!==JSON.stringify(expectedExact))throw new Error(`Expected exact B-C mixed fold, received ${JSON.stringify(exact)}`);
+if(usageGapLabel(exact[0].duration)!=="5h")throw new Error("Mixed fold label did not use the combined duration");
+const swapGroups=[["a",[point(0,0),point(1000,1),point(21000,2),point(31000,2),point(41000,2),point(42000,3)]],["b",[point(0,10),point(1000,11),point(11000,11),point(21000,11),point(41000,12),point(42000,13)]]];
+const swapped=candidates(swapGroups,0,42000), expectedSwap=[{start:1000,end:41000,duration:40000,kind:"mixed",hasGap:true,hasFlat:true}];
+if(JSON.stringify(swapped)!==JSON.stringify(expectedSwap))throw new Error(`Expected maximal state-switch fold, received ${JSON.stringify(swapped)}`);
+if(candidates(swapGroups,0,42000,false,true).length||candidates(swapGroups,0,42000,true,false).length)throw new Error("Mixed folds must require both controls");
+const changingGroups=[...swapGroups,["c",[point(0,20),point(1000,21),point(11000,21),point(12000,22),point(22000,22),point(32000,22),point(41000,22),point(42000,23)]]], split=candidates(changingGroups,0,42000);
+if(split.length!==2||split[0].end!==11000||split[1].start!==12000)throw new Error(`Changing curve did not split mixed fold: ${JSON.stringify(split)}`);
+if(split.some((candidate,index)=>index&&split[index-1].end>candidate.start))throw new Error(`Mixed folds overlap: ${JSON.stringify(split)}`);
+const compacted=usageTimeAccountFoldRanges([point(0,5),point(20000,5,0)],"fiveHour",valueOf,0,20000);
+if(compacted.length!==1||compacted[0].kind!=="flat")throw new Error(`Compacted plateau was not flat: ${JSON.stringify(compacted)}`);
+const changingTail=(start,end,offset)=>Array.from({length:(end-start)/1000+1},(_,index)=>point(start+index*1000,offset+index));
+const gapAccount=[point(0,0),point(15000,1),...changingTail(16000,200000,2)], flatAccount=[...Array.from({length:16},(_,index)=>point(index*1000,10)),...changingTail(16000,200000,11)];
+if(!folds([["a",gapAccount],["b",gapAccount]],0,200000,true,false).some(fold=>fold.kind==="gap"))throw new Error("Pure gap did not pass 2x threshold");
+if(folds([["a",flatAccount],["b",flatAccount]],0,200000,false,true).length)throw new Error("Pure flat incorrectly passed 4x threshold");
+if(folds([["a",gapAccount],["b",flatAccount]],0,200000,true,true).length)throw new Error("Mixed fold incorrectly used 2x threshold");
+const leadingGroups=[["a",[point(0,0),point(40000,1),...changingTail(41000,200000,2)]],["b",[point(0,10),point(10000,10),point(20000,10),point(30000,10),point(40000,10),...changingTail(41000,200000,11)]]];
+const leading=folds(leadingGroups,0,200000), leadingScale=usageTimeScale(0,200000,leading,0,1000);
+if(leading.length!==1||leading[0].kind!=="mixed"||Math.abs(leadingScale.folds[0].x0-10)>1e-9)throw new Error(`Leading mixed margin was not 10px: ${JSON.stringify(leadingScale.folds)}`);
+const prefixA=changingTail(0,160000,0), prefixB=changingTail(0,160000,1000), trailingValue=prefixB.at(-1).fiveHour.continuous;
+const trailingGroups=[["a",[...prefixA,point(200000,999)]],["b",[...prefixB,point(170000,trailingValue),point(180000,trailingValue),point(190000,trailingValue),point(200000,trailingValue)]]];
+const trailing=folds(trailingGroups,0,200000), trailingScale=usageTimeScale(0,200000,trailing,0,1000);
+if(trailing.length!==1||trailing[0].kind!=="mixed"||Math.abs(1000-trailingScale.folds[0].x1-10)>1e-9)throw new Error(`Trailing mixed margin was not 10px: ${JSON.stringify(trailingScale.folds)}`);
+'''
+
+        result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
 
     def test_write_history_groups_delta_events_by_window(self):
         path = Path(__file__).with_name("test_history_tmp.jsonl")
@@ -3774,7 +4096,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual((conflict / "keep.txt").read_text(encoding="utf-8"), "keep")
             self.assertEqual((managed / "SKILL.md").read_text(encoding="utf-8"), "managed")
 
-    def test_skill_assignment_preserves_unrelated_path(self):
+    def test_skill_assignment_replaces_unrelated_same_name_path(self):
         with self.account_directory() as directory:
             codex_home, private = directory / "codex", directory / "private"
             managed = private / "skills" / "demo"
@@ -3785,10 +4107,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
             (conflict / "keep.txt").write_text("keep", encoding="utf-8")
             manager = SkillManager(codex_home, private, directory / "gemini")
 
-            with self.assertRaises(SkillError):
-                manager.assign("demo", "codex", True)
+            manager.assign("demo", "codex", True)
 
-            self.assertEqual((conflict / "keep.txt").read_text(encoding="utf-8"), "keep")
+            self.assertEqual(conflict.resolve(), managed.resolve())
+            self.assertFalse((conflict / "keep.txt").exists())
+            self.assertEqual((conflict / "SKILL.md").read_text(encoding="utf-8"), "managed")
 
     def test_skill_assignment_replaces_same_name_local_skill_with_managed_link(self):
         with self.account_directory() as directory:
@@ -3808,7 +4131,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertTrue(manager.state["skills"]["demo"]["codex"])
             self.assertEqual(manager.status()["items"][0]["projections"]["codex"]["state"], "linked")
 
-    def test_skill_reconcile_applies_managed_precedence_to_same_name_local_skill(self):
+    def test_skill_reconcile_leaves_same_name_local_skill_as_unassigned_conflict(self):
         with self.account_directory() as directory:
             codex_home, private = directory / "codex", directory / "private"
             managed = private / "skills" / "demo"
@@ -3818,11 +4141,16 @@ class MonitorCodexUsageTests(unittest.TestCase):
             local.mkdir(parents=True)
             (local / "SKILL.md").write_text("local", encoding="utf-8")
             manager = SkillManager(codex_home, private, directory / "gemini")
+            manager.state["skills"]["demo"] = {"codex": True, "gemini": False, "managedAt": None, "codexError": "stale projection error"}
+            manager._save()
 
             self.assertEqual(manager.reconcile(), [])
 
-            self.assertEqual(local.resolve(), managed.resolve())
-            self.assertTrue(manager.state["skills"]["demo"]["codex"])
+            self.assertNotEqual(local.resolve(), managed.resolve())
+            self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "local")
+            self.assertFalse(manager.state["skills"]["demo"]["codex"])
+            self.assertEqual(manager.status()["items"][0]["projections"]["codex"]["state"], "conflict")
+            self.assertEqual(manager.status()["items"][0]["errors"], {})
 
     def test_skill_merge_applies_remote_then_managed_then_local_precedence(self):
         with self.account_directory() as directory:
@@ -3848,8 +4176,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual((private / "skills" / "updated" / "SKILL.md").read_text(encoding="utf-8"), "webdav")
             self.assertEqual((private / "skills" / "managed-only" / "SKILL.md").read_text(encoding="utf-8"), "keep")
             self.assertFalse((codex_home / "skills" / "new").exists())
-            self.assertEqual(local.resolve(), (private / "skills" / "updated").resolve())
-            self.assertTrue(manager.state["skills"]["updated"]["codex"])
+            self.assertNotEqual(local.resolve(), (private / "skills" / "updated").resolve())
+            self.assertEqual((local / "SKILL.md").read_text(encoding="utf-8"), "local")
+            self.assertFalse(manager.state["skills"]["updated"]["codex"])
             self.assertFalse(manager.state["skills"]["new"]["codex"])
 
     def test_skill_snapshot_rejects_traversal_and_preserves_assignments_outside_payload(self):
@@ -4038,6 +4367,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         for url in ("http://localhost:8080/", "http://127.0.0.1:8080/", "http://[::1]:8080/"):
             with self.subTest(url=url):
                 self.assertEqual(WebDavClient({"baseUrl": url, "username": "user", "password": "secret"}).base, url)
+
+    def test_webdav_list_method_does_not_shadow_annotation_builtin(self):
+        self.assertEqual(WebDavClient.list_details.__annotations__["return"], "list[dict]")
 
     def test_cloud_crypto_initialization_requires_exact_http_404(self):
         manager = object.__new__(CloudManager)
@@ -4334,7 +4666,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             client = Client()
             box = SimpleNamespace(decrypt=lambda _purpose, payload, *_args: payload)
-            with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(
+            usage = {"machinesChanged": 1, "payloadsDownloaded": 2, "conflicts": 0, "fetchedAt": "now"}
+            with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "_fetch_usage_data", return_value=usage) as fetch_usage, mock.patch.object(
                 skills, "merge", return_value={"added": ["new-skill"], "updated": ["updated-skill"], "projectionErrors": []}
             ), mock.patch.object(skills, "snapshot_content_hash", return_value="remote-hash"), mock.patch.object(skills, "content_hash", return_value="merged-hash"):
                 result = cloud.fetch()
@@ -4342,8 +4675,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
             saved = json.loads(cloud.state_path.read_text(encoding="utf-8"))["remote"]
             self.assertEqual(client.downloads, ["accounts/states/changed.enc", "skills/snapshots/new.enc"])
             self.assertEqual(result, {
-                "accountsChanged": 1, "accountsRemoved": 1, "skillsChanged": True, "skillsAdded": ["new-skill"], "skillsUpdated": ["updated-skill"], "skillsDeleted": [], "accountsUpdated": 0, "projectionErrors": [], "fetchedAt": saved["fetchedAt"]
+                "accountsChanged": 1, "accountsRemoved": 1, "skillsChanged": True, "skillsAdded": ["new-skill"], "skillsUpdated": ["updated-skill"], "skillsDeleted": [],
+                "accountsUpdated": 0, "usage": usage, "projectionErrors": [], "fetchedAt": saved["fetchedAt"]
             })
+            fetch_usage.assert_called_once_with(client, box)
             self.assertEqual(set(saved["accounts"]), {"same", "changed"})
             self.assertEqual(saved["skills"]["indexId"], "new")
             self.assertEqual(cloud._state["skills"]["localSha256"], {})
@@ -4522,16 +4857,18 @@ class MonitorCodexUsageTests(unittest.TestCase):
             accounts.push_bound_accounts.assert_not_called()
             self.assertEqual(result["accountsUpdated"], 0)
 
-    def test_cloud_push_uploads_skills_but_no_account_payloads(self):
+    def test_cloud_push_uploads_skills_and_usage_but_no_account_payloads(self):
         with self.account_directory() as directory:
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
             cloud = CloudManager(directory / "private", skills, None)
 
-            with mock.patch.object(cloud, "upload_skills", return_value={"snapshotId": "skills", "changed": False}) as upload_skills:
+            usage = {"uploaded": 2, "deleted": 1, "fullSnapshot": False, "pushedAt": "now"}
+            with mock.patch.object(cloud, "upload_skills", return_value={"snapshotId": "skills", "changed": False}) as upload_skills, mock.patch.object(cloud, "_push_usage_data", return_value=usage) as push_usage:
                 result = cloud.push()
 
             upload_skills.assert_called_once_with()
-            self.assertEqual(result, {"skills": {"snapshotId": "skills", "changed": False}, "accounts": {"pushedAccounts": []}, "changed": False})
+            push_usage.assert_called_once_with()
+            self.assertEqual(result, {"skills": {"snapshotId": "skills", "changed": False}, "accounts": {"pushedAccounts": []}, "usage": usage, "changed": True})
 
     def test_cloud_account_operations_wait_for_the_shared_push_fetch_serialization_lock(self):
         with self.account_directory() as directory:
@@ -4651,6 +4988,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('["/api/manage/accounts/delete", { url: ACCOUNT_DELETE_URL, method: "POST" }]', extension)
         self.assertIn('elif path == "/api/manage/cloud/fetch":', dashboard)
         self.assertIn('elif path == "/api/manage/cloud/push":', dashboard)
+        self.assertIn('state.cloud.fetch(include_usage=True, force_full=True)', dashboard)
+        self.assertIn('state.cloud.push(force_full=True)', dashboard)
         self.assertIn('elif path == "/api/manage/accounts/delete":', dashboard)
         self.assertNotIn('/api/manage/cloud/upload', html + extension + dashboard)
         self.assertNotIn('/api/manage/accounts/backup-all', html + extension + dashboard)
@@ -4963,13 +5302,16 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('["/api/control/setup", { url: CONTROL_SETUP_URL, method: "POST" }]', extension)
         self.assertIn('cookie: controlCookie', extension)
         self.assertIn('authenticatedAccountAction(action,body)', dashboard)
+        self.assertIn('if(error.status!==401&&error.status!==428)throw error;', dashboard)
+        self.assertIn('await accountAction(setup?"setup":"login",{password});', dashboard)
+        self.assertIn('document.getElementById("accountSelect").onchange=event=>performAccountAction("switch"', dashboard)
         self.assertIn('id="dashboardControlPassword" type="password"', dashboard)
         self.assertIn('id="dashboardControlPasswordConfirmation" type="password"', dashboard)
         self.assertIn('id="controlPasswordMatchStatus" aria-live="polite"', dashboard)
         self.assertIn('"✓ Passwords match":"✕ Passwords do not match"', dashboard)
         self.assertIn('password.oninput=confirmation.oninput=setup?updateMatchStatus:null', dashboard)
         self.assertIn('await requestControlPassword(true)', dashboard)
-        self.assertIn('await requestControlPassword()', dashboard)
+        self.assertIn('password=await requestControlPassword(setup)', dashboard)
         self.assertNotIn('prompt("Control password")', dashboard)
         self.assertIn('load(true);pollStatus(true);setInterval(pollStatus,5000)', dashboard)
 
@@ -5124,7 +5466,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             with mock.patch.object(cloud, "fetch", return_value={}) as fetch:
                 self.assertTrue(cloud._auto_fetch_if_due(AUTO_FETCH_INTERVAL_SECONDS))
 
-            fetch.assert_called_once_with()
+            fetch.assert_called_once_with(include_usage=False)
 
     def test_periodic_auto_fetch_waits_for_interval(self):
         with self.account_directory() as directory:
@@ -5171,6 +5513,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             self.assertEqual(cloud.usage_account_id("ppl-pro"), first)
             self.assertNotIn("stable-id-token", first)
+            self.assertEqual(cloud.local_usage_account(first, None, None), ("ppl-pro", "A completely different label"))
+            self.assertIsNone(cloud.local_usage_account("unmatched-usage-account", None, None))
 
     def test_cloud_bind_only_downloads_and_integrity_checks_account_file(self):
         with self.account_directory() as directory:
@@ -5320,15 +5664,21 @@ class MonitorCodexUsageTests(unittest.TestCase):
             rows = [{
                 "checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "Managed name",
                 "windows": {"5h": {"usedPercent": 5 if index < 5 else 6, "resetAt": "2030-01-01T05:00:00Z"}, "7d": {"usedPercent": 20, "resetAt": "2030-01-08T00:00:00Z"}},
+                "sync": {"version": 1, "originMachineId": "machine-a", "accountId": "usage-a", "recordId": f"quota-{index}"},
             } for index in range(6)]
-            monitor_history.write_quota_history(quota, rows)
+            quota.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
             store = UsageDataStore(history, quota, tokens, "machine-a", lambda _slot: "usage-a", threading.Lock())
 
             records, present = store.snapshot()
+            full_records, full_present = store.snapshot(necessary_only=False)
 
             self.assertEqual([record["row"]["checkedAt"] for record in records.values()], ["2030-01-01T00:00:00Z", "2030-01-01T00:04:00Z", "2030-01-01T00:05:00Z"])
+            self.assertEqual(next(record["row"]["compaction"] for record in records.values() if record["row"]["checkedAt"] == "2030-01-01T00:04:00Z"), {"continuousFrom": "2030-01-01T00:00:00Z", "omittedSamples": 3})
             self.assertEqual(present, set(records))
+            self.assertEqual([record["row"]["checkedAt"] for record in full_records.values()], [row["checkedAt"] for row in rows])
+            self.assertEqual(full_present, set(full_records))
             self.assertNotIn("Managed name", json.dumps(records))
+            self.assertEqual([row["checkedAt"] for row in monitor_history.load_quota_history(quota)], [row["checkedAt"] for row in rows])
 
     def test_usage_quota_plateau_moves_latest_boundary_without_reuploading_middle_rows(self):
         with self.account_directory() as directory:
@@ -5472,6 +5822,42 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(merged[1][-1]["accountSlotId"], "a")
             self.assertTrue(store.cache_path.exists())
 
+            with mock.patch.object(store, "_load") as load, mock.patch("monitor_usage_sync.merge_cost_rows") as merge_cost, mock.patch("monitor_usage_sync.merge_quota_rows") as merge_quota, mock.patch("monitor_usage_sync.merge_token_rows") as merge_tokens:
+                store.datasets("local")
+                store.datasets("merged")
+            load.assert_not_called()
+            merge_cost.assert_not_called()
+            merge_quota.assert_not_called()
+            merge_tokens.assert_not_called()
+
+            with mock.patch.object(store, "_materialize_datasets") as materialize:
+                store.apply([{"action": "upsert", "key": record_key("quota", remote), "record": {"kind": "quota", "row": remote}}], operation_origin="machine-b")
+            materialize.assert_not_called()
+
+    def test_usage_merged_dataset_temporarily_ignores_remote_accounts_missing_locally(self):
+        with self.account_directory() as directory:
+            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
+            for path in (history, quota, tokens):
+                path.write_text("", encoding="utf-8")
+            accounts = {"usage-a": ("a", "Local A")}
+            revision = [1]
+            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock(), lambda account_id, _slot, _label: accounts.get(account_id), account_revision_resolver=lambda: revision[0])
+            known = {"checkedAt": "2030-01-01T00:01:00Z", "windows": {"5h": {"usedPercent": 2}}, "sync": {"version": 1, "originMachineId": "machine-b", "accountId": "usage-a", "recordId": "known"}}
+            unknown = {"checkedAt": "2030-01-01T00:02:00Z", "windows": {"5h": {"usedPercent": 3}}, "sync": {"version": 1, "originMachineId": "machine-b", "accountId": "usage-b", "recordId": "unknown"}}
+
+            store.apply([{"action": "upsert", "key": record_key("quota", row), "record": {"kind": "quota", "row": row}} for row in (known, unknown)], operation_origin="machine-b")
+
+            self.assertEqual(store.datasets("local")[1], [])
+            self.assertEqual([(row["checkedAt"], row["accountSlotId"], row["accountLabel"]) for row in store.datasets("merged")[1]], [("2030-01-01T00:01:00Z", "a", "Local A")])
+            self.assertEqual(len(json.loads(store.cache_path.read_text(encoding="utf-8"))["records"]), 2)
+            cache_bytes = store.cache_path.read_bytes()
+
+            accounts["usage-b"] = ("b", "Local B")
+            revision[0] += 1
+
+            self.assertEqual([(row["checkedAt"], row["accountSlotId"], row["accountLabel"]) for row in store.datasets("merged")[1]], [("2030-01-01T00:01:00Z", "a", "Local A"), ("2030-01-01T00:02:00Z", "b", "Local B")])
+            self.assertEqual(store.cache_path.read_bytes(), cache_bytes)
+
     def test_usage_cache_migration_removes_prior_remote_rows_from_local_raw_files(self):
         with self.account_directory() as directory:
             history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
@@ -5488,7 +5874,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 },
             ]
             monitor_history.write_quota_history(quota, rows)
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock())
+            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock(), lambda account_id, _slot, _label: ("a", "Local") if account_id == "usage-a" else None)
 
             local = store.normalize_local()
 
@@ -5510,6 +5896,43 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(len(json.loads(store.cache_path.read_text(encoding="utf-8"))["records"]), 2)
             store.apply([{"action": "delete", "key": "quota:shared"}], operation_origin="machine-b")
             self.assertEqual(json.loads(store.cache_path.read_text(encoding="utf-8"))["records"][0]["sourceMachineId"], "machine-c")
+
+    def test_usage_pack_inventory_drops_hash_when_its_cached_records_are_missing(self):
+        with self.account_directory() as directory:
+            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
+            for path in (history, quota, tokens):
+                path.write_text("", encoding="utf-8")
+            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock())
+            records = {
+                "pack-1": [{"key": "quota:one", "record": {"kind": "quota", "row": {"checkedAt": "2030-01-01T00:00:00Z", "windows": {}, "sync": {"originMachineId": "machine-b", "accountId": "usage-b", "recordId": "one"}}}}],
+                "pack-2": [{"key": "quota:two", "record": {"kind": "quota", "row": {"checkedAt": "2030-01-01T00:01:00Z", "windows": {}, "sync": {"originMachineId": "machine-b", "accountId": "usage-b", "recordId": "two"}}}}],
+            }
+            manifest = {"pack-1": "1" * 64, "pack-2": "2" * 64}
+            store.apply_pack_snapshot("machine-b", manifest, records)
+            payload = json.loads(store.cache_path.read_text(encoding="utf-8"))
+            payload["records"] = [entry for entry in payload["records"] if entry.get("sourcePackId") != "pack-1"]
+            store.cache_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+
+            recovered = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock(), cache_path=store.cache_path)
+
+            self.assertEqual(recovered.pack_hashes("machine-b"), {"pack-2": "2" * 64})
+            self.assertTrue(recovered.needs_remote_rebuild)
+
+    def test_usage_packs_are_stable_hash_buckets_split_by_compressed_length(self):
+        keys, candidate = [], 0
+        while len(keys) < 80:
+            key = f"quota:bucket-test-{candidate}"
+            if hashlib.sha256(key.encode()).hexdigest()[0] == "a":
+                keys.append(key)
+            candidate += 1
+        records = {key: {"kind": "quota", "row": {"blob": "".join(hashlib.sha256(f"{key}:{index}".encode()).hexdigest() for index in range(48))}} for key in keys}
+
+        packs = CloudManager._usage_record_packs("machine-a", records)
+
+        self.assertGreater(len(packs), 1)
+        self.assertTrue(all(pack_id.startswith("a-") for pack_id in packs))
+        self.assertTrue(all(pack["bytes"] <= USAGE_PACK_MAX_BYTES for pack in packs.values()))
+        self.assertEqual(sum(pack["records"] for pack in packs.values()), len(records))
 
     def test_usage_sync_interval_is_thirty_minutes(self):
         self.assertEqual(USAGE_SYNC_INTERVAL_SECONDS, 1800)
@@ -5547,7 +5970,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual((intervals[0]["startedAt"], intervals[0]["startPercent"], intervals[0]["endPercent"]), ("2030-01-01T00:00:00Z", 0, 1))
         self.assertEqual((intervals[0]["modelCostsUsd"]["gpt-5.5"], intervals[0]["deltaCostUsd"]), (2, 2))
 
-    def test_usage_cloud_stream_uploads_checkpoint_then_only_incremental_changes(self):
+    def test_usage_cloud_pack_manifest_fetches_each_missing_hash_and_updates_only_changed_buckets(self):
         class Client:
             def __init__(self):
                 self.files, self.revision = {}, 0
@@ -5572,18 +5995,30 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 prefix = path.rstrip("/") + "/"
                 return [{"name": name[len(prefix):], "etag": value[1]} for name, value in self.files.items() if name.startswith(prefix) and "/" not in name[len(prefix):]]
 
+            def list(self, path):
+                return [item["name"] for item in self.list_details(path)]
+
             def delete(self, path, etag=None):
                 self.files.pop(path, None)
 
         class Store:
             def __init__(self, records):
-                self.records, self.received = records, []
+                self.records, self.received, self.packs = records, [], {}
 
-            def snapshot(self):
+            def snapshot(self, necessary_only=True):
+                self.necessary_only = necessary_only
                 return self.records, set(self.records)
 
             def apply(self, operations, checkpoint_origin=None, operation_origin=None):
                 self.received.extend(operations)
+                return []
+
+            def pack_hashes(self, machine_id):
+                return self.packs.get(machine_id, {}).copy()
+
+            def apply_pack_snapshot(self, machine_id, manifest, downloaded, replace_all=False):
+                self.received.extend({"action": "upsert", **entry} for entries in downloaded.values() for entry in entries)
+                self.packs[machine_id] = manifest.copy()
                 return []
 
         with self.account_directory() as directory:
@@ -5596,23 +6031,75 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 cloud._state["conditionalWritesVerified"] = True
                 cloud._connection = lambda initialize=False: (client, box)
                 clouds.append(cloud)
-            record = {"kind": "quota", "row": {"checkedAt": "2030-01-01T00:00:00Z", "windows": {"5h": {"usedPercent": 1}}, "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": "quota-a"}}}
-            first_store, second_store = Store({"quota:quota-a": record}), Store({})
+            records = {
+                f"quota:quota-{index}": {"kind": "quota", "row": {
+                    "checkedAt": f"2030-01-01T00:{index:02}:00Z", "windows": {"5h": {"usedPercent": index}},
+                    "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": f"quota-{index}"},
+                }}
+                for index in range(32)
+            }
+            first_store, second_store = Store(records), Store({})
             clouds[0].configure_usage_sync(first_store)
             clouds[1].configure_usage_sync(second_store)
 
             first = clouds[0].sync_usage_data()
             second = clouds[1].sync_usage_data()
-            files_after_checkpoint = set(client.files)
+            files_after_snapshot = set(client.files)
             unchanged = clouds[0].sync_usage_data()
-            first_store.records["quota:quota-b"] = {"kind": "quota", "row": {"checkedAt": "2030-01-01T00:01:30Z", "windows": {"5h": {"usedPercent": 2}}, "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": "quota-b"}}}
+            manifest = clouds[0]._usage_pointer(client, box, clouds[0].machine_id)[0]["packs"]
+            retained_pack = sorted(manifest)[-1]
+            second_store.packs[clouds[0].machine_id] = {retained_pack: manifest[retained_pack]}
+            second_store.received.clear()
+            repair = clouds[1]._fetch_usage_data(client, box)
+            self.assertEqual(repair["payloadsDownloaded"], len(manifest) - 1)
+            self.assertEqual(second_store.packs[clouds[0].machine_id], manifest)
+            first_store.records["quota:quota-new"] = {"kind": "quota", "row": {"checkedAt": "2030-01-01T01:00:00Z", "windows": {"5h": {"usedPercent": 33}}, "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": "quota-new"}}}
             incremental = clouds[0].sync_usage_data()
 
-            self.assertTrue(first["published"]["checkpoint"])
-            self.assertTrue(any(operation.get("key") == "quota:quota-a" for operation in second_store.received))
+            self.assertTrue(first["published"]["fullSnapshot"])
+            self.assertGreater(first["published"]["packs"], 1)
+            self.assertGreater(len(second_store.received), 0)
             self.assertEqual(unchanged["published"]["uploaded"], 0)
-            self.assertEqual(files_after_checkpoint, set(client.files) - {next(path for path in set(client.files) - files_after_checkpoint if "/chunks/" in path)})
+            self.assertEqual(unchanged["published"]["packsUploaded"], 0)
+            self.assertNotEqual(files_after_snapshot, set(client.files))
             self.assertEqual(incremental["published"]["uploaded"], 1)
+            self.assertEqual(incremental["published"]["packsUploaded"], 1)
+            full = clouds[0]._push_usage_data(True)
+            self.assertTrue(full["fullSnapshot"])
+            self.assertEqual(full["uploaded"], len(first_store.records))
+            self.assertEqual(full["packsUploaded"], full["packs"])
+            self.assertFalse(first_store.necessary_only)
+            received_before_full_fetch = len(second_store.received)
+            full_fetch = clouds[1]._fetch_usage_data(client, box, True)
+            self.assertEqual(full_fetch["payloadsDownloaded"], full["packs"])
+            self.assertEqual(len(second_store.received), received_before_full_fetch + len(first_store.records))
+
+            legacy_machine = "legacy-machine"
+            legacy_records = [{
+                "key": "quota:legacy-a", "record": {"kind": "quota", "row": {
+                    "checkedAt": "2029-12-31T23:58:00Z", "windows": {"5h": {"usedPercent": 1}},
+                    "sync": {"originMachineId": legacy_machine, "accountId": "usage-legacy", "recordId": "legacy-a"},
+                }},
+            }]
+            checkpoint_id, _ = clouds[0]._put_usage_payload(client, box, "checkpoints", legacy_machine, {"version": 1, "machineId": legacy_machine, "sequence": 0, "records": legacy_records})
+            chunk_id, _ = clouds[0]._put_usage_payload(client, box, "chunks", legacy_machine, {
+                "version": 1, "machineId": legacy_machine, "sequence": 1, "parentChunkId": None,
+                "operations": [{"action": "upsert", "key": "quota:legacy-b", "record": {"kind": "quota", "row": {
+                    "checkedAt": "2029-12-31T23:59:00Z", "windows": {"5h": {"usedPercent": 2}},
+                    "sync": {"originMachineId": legacy_machine, "accountId": "usage-legacy", "recordId": "legacy-b"},
+                }}}],
+            })
+            legacy_pointer = {"version": 1, "machineId": legacy_machine, "sequence": 1, "checkpointId": checkpoint_id, "headChunkId": chunk_id}
+            client.put(clouds[0]._usage_pointer_path(legacy_machine), box.encrypt(f"usage-pointer:{legacy_machine}", json.dumps(legacy_pointer, separators=(",", ":")).encode()), create=True)
+
+            migration = clouds[1]._fetch_usage_data(client, box)
+            migrated_pointer = clouds[1]._usage_pointer(client, box, legacy_machine)[0]
+
+            self.assertEqual(migration["machinesMigrated"], 1)
+            self.assertEqual(migrated_pointer["version"], 2)
+            self.assertEqual(migrated_pointer["recordCount"], 2)
+            self.assertEqual(second_store.packs[legacy_machine], migrated_pointer["packs"])
+            self.assertFalse(any(f"/{kind}/{legacy_machine}/" in path for path in client.files for kind in ("chunks", "checkpoints")))
 
 
 def sample(checked_at, five_hour=None, seven_day=None, five_hour_reset=None, seven_day_reset=None):

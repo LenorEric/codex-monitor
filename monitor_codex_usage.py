@@ -50,10 +50,6 @@ def main() -> int:
     args.legacy_account_root = args.auth.parent / "usage-monitor-accounts"
     migrate_account_vault(args.legacy_account_root, args.account_root)
     backfill_quota_history(args.sample_log, args.quota_history)
-    opener = None
-    if not args.local_only:
-        opener = opener_for(args.auth.parent)
-
     if args.process_history:
         history = load_history(args.history)
         print_valid_delta_events(valid_delta_events(derive_history_events(history)), (load_state(args.state) or {}).get("lastSample"))
@@ -63,6 +59,9 @@ def main() -> int:
         print(f"Re-encrypted and verified {result['reencrypted']} cloud payloads.")
         return 0
 
+    opener = None
+    if not args.local_only:
+        opener = opener_for(args.auth.parent)
     return serve_dashboard(args, opener)
 
 
