@@ -76,8 +76,8 @@ from monitor_codex_usage import (
 class MonitorCodexUsageTests(unittest.TestCase):
     def test_cloud_maintenance_reports_each_network_outage_once(self):
         state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
-        state.cloud = SimpleNamespace(maintenance_tick=mock.Mock(side_effect=(CloudError("offline", 502, category="network"), CloudError("offline", 502, category="network"), None, CloudError("offline", 502, category="network"))))
-        state.cloud_maintenance_event = mock.Mock(wait=mock.Mock(side_effect=lambda _: setattr(state, "running", False) if state.cloud.maintenance_tick.call_count == 4 else None), clear=mock.Mock())
+        state.cloud = SimpleNamespace(maintenance_tick=mock.Mock(side_effect=(CloudError("offline", 502, category="network"), {"pushed": False, "fetched": False, "usageSynced": False}, CloudError("offline", 502, category="network"), {"pushed": False, "fetched": True, "usageSynced": False}, CloudError("offline", 502, category="network"))))
+        state.cloud_maintenance_event = mock.Mock(wait=mock.Mock(side_effect=lambda _: setattr(state, "running", False) if state.cloud.maintenance_tick.call_count == 5 else None), clear=mock.Mock())
         state.cloud_maintenance_connection_failed = False
         state.running = True
         with mock.patch("sys.stderr", new_callable=StringIO) as stderr:
@@ -2706,6 +2706,29 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('reset.textContent="Reset: N/A"', html)
         self.assertIn("Math.max(0,Math.min(100,(1-(resetMs-Date.now())/(durationSeconds*1000))*100))", html)
 
+    def test_dashboard_restores_button_selections_after_refresh(self):
+        html = dashboard_html()
+
+        self.assertIn('const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections"', html)
+        self.assertIn("DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000", html)
+        self.assertIn("DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000", html)
+        self.assertIn('function restoreSelections()', html)
+        self.assertIn('vscode?.getState()?.dashboardSelections', html)
+        self.assertIn('localStorage.getItem(DASHBOARD_SELECTIONS_STORAGE_KEY)', html)
+        self.assertIn('Math.abs(Date.now()-saved.lastActiveAt)>DASHBOARD_SELECTIONS_MAX_IDLE_MS', html)
+        self.assertIn("function clearSavedSelections()", html)
+        self.assertIn("delete state.dashboardSelections", html)
+        self.assertIn("localStorage.removeItem(DASHBOARD_SELECTIONS_STORAGE_KEY)", html)
+        self.assertIn('vscode.setState({...vscode.getState(),dashboardSelections:selections})', html)
+        self.assertIn('localStorage.setItem(DASHBOARD_SELECTIONS_STORAGE_KEY', html)
+        self.assertIn("lastActiveAt:Date.now()", html)
+        self.assertIn("setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS)", html)
+        self.assertIn('addEventListener("pagehide",saveSelections)', html)
+        self.assertIn('restoreSelections();setupControls()', html)
+        saved = html[html.index("function saveSelections()"):html.index("function latestSelectableDate()")]
+        for selection in ("selected", "previousRange", "selectedDate", "selectedModels", "selectedAccounts", "dataView", "collapseUsageGaps", "collapseUsageFlat", "normalizedUsage"):
+            self.assertIn(selection, saved)
+
     def test_dashboard_token_summary_follows_shared_filters_and_precedes_usage_charts(self):
         html = dashboard_html()
 
@@ -2749,7 +2772,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("date.setDate(date.getDate()+1);return localDateValue(date)", html)
         self.assertIn("function shiftSelectedDate(days)", html)
         self.assertIn("date.setDate(date.getDate()+days)", html)
-        self.assertIn('selectedDate=localDateValue(date);if(selectedDate>latestSelectableDate())selectedDate=latestSelectableDate();selected="Date";setupControls();drawAll(true)', html)
+        self.assertIn('selectedDate=localDateValue(date);if(selectedDate>latestSelectableDate())selectedDate=latestSelectableDate();selected="Date";saveSelections();setupControls();drawAll(true)', html)
         self.assertIn("function syncControls()", html)
         self.assertIn('document.querySelectorAll("[data-range]").forEach(b=>b.classList.toggle("active",b.dataset.range===selected))', html)
         self.assertIn('date.max=latest', html)
@@ -2758,14 +2781,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("function activateDateInput()", html)
         self.assertIn("if(!selectedDate)selectedDate=localDateValue(new Date())", html)
         self.assertIn('if(selected==="Date"){syncControls();return}', html)
-        self.assertIn('selected="Date";syncControls();drawAll(true)', html)
+        self.assertIn('selected="Date";saveSelections();syncControls();drawAll(true)', html)
         self.assertIn('if(selected==="Date")', html)
 
         self.assertIn("p.synthetic||(eventTimestamp(p)!=null&&eventTimestamp(p)*1000>=bounds.startMs&&eventTimestamp(p)*1000<bounds.endMs)", html)
         self.assertIn("return hasRealEvents(filtered)?filtered:[]", html)
         self.assertIn("date.onclick=activateDateInput", html)
         self.assertIn("date.onfocus=activateDateInput", html)
-        self.assertIn('date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}setupControls();drawAll(true)}', html)
+        self.assertIn('date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}saveSelections();setupControls();drawAll(true)}', html)
         self.assertIn('function datePickerIsOpen(date)', html)
         self.assertIn('try{return date.matches(":open")}catch{return false}', html)
         self.assertIn('DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50', html)
@@ -3313,7 +3336,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(history[0]["windows"]["5h"]["usedPercent"], 12.0)
             self.assertEqual(history[0]["windows"]["5h"]["plan"], "plus")
             self.assertEqual(history[0]["windows"]["7d"]["plan"], "pro_lite")
-            self.assertEqual(history[1]["windows"]["5h"]["plan"], "unknown")
+            self.assertEqual(history[1]["windows"]["5h"]["plan"], "plus")
             self.assertEqual(history[-1]["windows"]["5h"]["usedPercent"], 88.0)
             self.assertNotIn("model", quota_history.read_text(encoding="utf-8"))
 
@@ -3377,7 +3400,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         row = monitor_history.quota_history_row_from_sample(sample)
 
         self.assertEqual(row["windows"]["5h"]["usedPercent"], 42.0)
-        self.assertEqual(row["windows"]["5h"]["plan"], "unknown")
+        self.assertEqual(row["windows"]["5h"]["plan"], "plus")
         self.assertNotIn("cost", row)
 
     def test_quota_history_merge_preserves_known_plan_over_legacy_duplicate(self):
@@ -3532,10 +3555,17 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('<div class="legend" id="usageTime7dLegend"></div>', html)
         self.assertIn('<button id="collapseUsageGaps" type="button">Collapse gaps</button>', html)
         self.assertIn('<button id="collapseUsageFlat" type="button">Collapse flat</button>', html)
+        self.assertIn('<button id="normalizeUsage" type="button"', html)
+        self.assertIn('Pro Lite ×5 and Pro ×20', html)
         self.assertIn('function setupUsageFoldControls()', html)
         self.assertIn('button.setAttribute("aria-pressed",String(getValue()))', html)
+        self.assertIn('normalize.setAttribute("aria-pressed",String(normalizedUsage))', html)
+        self.assertIn('normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)', html)
         self.assertIn('setupAccountControls();setupUsageFoldControls();load(true)', html)
         self.assertIn('function quotaTimeDomain(points)', html)
+        self.assertIn('function quotaPointsInRange(points,domain)', html)
+        self.assertIn('compactedBoundary:true', html)
+        self.assertIn('const start=Math.max(domain[0],point.compactedFrom), end=Math.min(domain[1],timestamp)', html)
         self.assertIn('function drawUsageTimeChart(id,label,points,animate=false)', html)
         self.assertIn('function accountCurveColor(accountId)', html)
         self.assertIn('.sort((a,b)=>accountDisplayName(a,', html)
@@ -3551,7 +3581,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn('maxWidth=', html)
         self.assertIn('const calculatedWidth=amplifier*Math.log1p(gap.duration/referenceGap)/Math.log(base);return {...gap,width:Math.max(minWidth,calculatedWidth)}', html)
         self.assertIn('function usageTimeAccountFoldRanges(points,label,valueOf,x0,x1)', html)
-        self.assertIn('if(breakUsageCurve(previous,current,label,valueOf))add(start,end,"gap")', html)
+        self.assertIn('if(breakUsageCurve(previous,current,label,valueOf,compactedRanges))add(start,end,"gap")', html)
         self.assertIn('else if(valueOf(previous)===valueOf(current))add(start,end,"flat")', html)
         self.assertIn('function usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat)', html)
         self.assertIn('if(!states.every(kind=>kind==="gap"?collapseGaps:kind==="flat"&&collapseFlat))continue', html)
@@ -3588,7 +3618,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('drawLayer(previousLabelLayer,transitioning?1-progress:0,liveLabelContext)', html)
         self.assertIn('drawLayer(labelLayer,transitioning?progress:1,liveLabelContext)', html)
         self.assertIn('(x,index,labelCount)=>{const timestamp=timeScale.timestampAt(x)', html)
-        self.assertIn('values=valid.map(point=>Math.max(0,Math.min(100,renderedValueOf(point))))', html)
+        self.assertIn('const renderedValueOf=normalizedUsage?point=>plusEquivalentUsage(point,label,valueOf):valueOf', html)
+        self.assertIn('values=valid.map(point=>Math.max(0,normalizedUsage?renderedValueOf(point):Math.min(100,renderedValueOf(point))))', html)
         self.assertIn('xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1]', html)
         self.assertIn('Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b)', html)
         self.assertIn('if(x0===x1)return {x:()=>left+(right-left)/2,timestampAt:()=>x0,folds:[]}', html)
@@ -3604,16 +3635,19 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("Not enough data for the selected accounts", html)
         self.assertIn('function plusEquivalentUsage(point,label,valueOf)', html)
         self.assertIn('{plus:1,pro_lite:5,pro:20}[point[label]?.plan]||1', html)
-        self.assertIn('function compactedUsageGap(previous,current)', html)
-        self.assertIn('if(compactedUsageGap(previous,current))return false', html)
-        self.assertIn('function breakUsageCurve(previous,current,label,valueOf)', html)
+        self.assertIn('function compactedUsageRanges(points)', html)
+        self.assertIn('ranges.some(range=>range.start<=previousAt&&currentAt<=range.end)', html)
+        self.assertIn('function compactedUsageGap(previous,current,ranges)', html)
+        self.assertIn('if(compactedUsageGap(previous,current,compactedRanges))return false', html)
+        self.assertIn('function breakUsageCurve(previous,current,label,valueOf,compactedRanges=[])', html)
         self.assertIn('if(gap>4*3600)return true', html)
         self.assertIn('if(gap<=30*60)return false', html)
         self.assertIn('const previousUsage=plusEquivalentUsage(previous,label,valueOf), currentUsage=plusEquivalentUsage(current,label,valueOf)', html)
         self.assertIn('if(previousUsage-currentUsage>=3)return true', html)
         self.assertIn('Math.abs(currentUsage-previousUsage)/(gap/60)>=(label==="fiveHour"?.5:.1)', html)
-        self.assertIn('breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,renderedValueOf)', html)
-        self.assertIn('`${label==="fiveHour"?"5h":"7d"} usage ${Number(nearest.value).toFixed(1)}%`', html)
+        self.assertIn('breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,renderedValueOf,compactedRanges)', html)
+        self.assertIn('`${label==="fiveHour"?"5h":"7d"} ${normalizedUsage?"normalized ":""}usage ${Number(nearest.value).toFixed(1)}%`', html)
+        self.assertIn('normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}%', html)
         self.assertIn('drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)', html)
         self.assertIn('drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)', html)
         self.assertIn('const previousSeries=previous?.series||[]', html)
@@ -3630,6 +3664,21 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('drawLayer(baseLayer);drawLayer(liveLabels);drawLayer(liveGap);drawLayer(liveGapLabels);drawLayer(liveCurve)', html)
         self.assertIn('drawLayer(baseLayer);drawLayer(labelLayer);drawLayer(gapLayer);drawLayer(gapLabelLayer);drawLayer(curveLayer)', html)
         self.assertNotIn('drawLayer(previousCurve', html)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
+    def test_dashboard_normalized_usage_uses_plus_equivalent_plan_multipliers(self):
+        html = dashboard_html()
+        script = html[html.index("function plusEquivalentUsage"):html.index("function compactedUsageRanges")] + r'''
+const valueOf=point=>point.fiveHour.continuous;
+const point=(plan,continuous)=>({fiveHour:{plan,continuous}});
+if(plusEquivalentUsage(point("pro_lite",20),"fiveHour",valueOf)!==100)throw new Error("Pro Lite 20% did not normalize to 100%");
+if(plusEquivalentUsage(point("pro",20),"fiveHour",valueOf)!==400)throw new Error("Pro 20% did not normalize to 400%");
+if(plusEquivalentUsage(point(undefined,20),"fiveHour",valueOf)!==20)throw new Error("Missing plan was not treated as Plus");
+'''
+
+        result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn('const started=performance.now(), duration=820', html)
         self.assertIn('if(!animate||!previousLabelLayer||matchMedia("(prefers-reduced-motion: reduce)").matches){finish();return}', html)
         self.assertIn('state.series=animatedSeries', html)
@@ -3661,6 +3710,10 @@ if(split.length!==2||split[0].end!==11000||split[1].start!==12000)throw new Erro
 if(split.some((candidate,index)=>index&&split[index-1].end>candidate.start))throw new Error(`Mixed folds overlap: ${JSON.stringify(split)}`);
 const compacted=usageTimeAccountFoldRanges([point(0,5),point(20000,5,0)],"fiveHour",valueOf,0,20000);
 if(compacted.length!==1||compacted[0].kind!=="flat")throw new Error(`Compacted plateau was not flat: ${JSON.stringify(compacted)}`);
+const interleavedCompacted=usageTimeAccountFoldRanges([point(0,5),point(15305,5),point(18179,5,0)],"fiveHour",valueOf,0,18179);
+if(interleavedCompacted.length!==1||interleavedCompacted[0].kind!=="flat")throw new Error(`Interleaved local point split the remote compacted plateau: ${JSON.stringify(interleavedCompacted)}`);
+const interleavedRanges=compactedUsageRanges([point(0,5),point(15305,5),point(18179,5,0)]);
+if(breakUsageCurve(point(0,5),point(15305,5),"fiveHour",valueOf,interleavedRanges))throw new Error("Interleaved local point was treated as a gap inside compacted coverage");
 const changingTail=(start,end,offset)=>Array.from({length:(end-start)/1000+1},(_,index)=>point(start+index*1000,offset+index));
 const gapAccount=[point(0,0),point(15000,1),...changingTail(16000,200000,2)], flatAccount=[...Array.from({length:16},(_,index)=>point(index*1000,10)),...changingTail(16000,200000,11)];
 if(!folds([["a",gapAccount],["b",gapAccount]],0,200000,true,false).some(fold=>fold.kind==="gap"))throw new Error("Pure gap did not pass 2x threshold");
@@ -3673,6 +3726,24 @@ const prefixA=changingTail(0,160000,0), prefixB=changingTail(0,160000,1000), tra
 const trailingGroups=[["a",[...prefixA,point(200000,999)]],["b",[...prefixB,point(170000,trailingValue),point(180000,trailingValue),point(190000,trailingValue),point(200000,trailingValue)]]];
 const trailing=folds(trailingGroups,0,200000), trailingScale=usageTimeScale(0,200000,trailing,0,1000);
 if(trailing.length!==1||trailing[0].kind!=="mixed"||Math.abs(1000-trailingScale.folds[0].x1-10)>1e-9)throw new Error(`Trailing mixed margin was not 10px: ${JSON.stringify(trailingScale.folds)}`);
+'''
+
+        result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
+    def test_dashboard_clips_compacted_quota_plateaus_to_selected_time_span(self):
+        html = dashboard_html()
+        script = html[html.index("function eventTimestamp"):html.index("function updateWindowTime")] + html[html.index("function quotaPointsInRange"):html.index("function sameLocalDate")] + r'''
+const point=(timestamp,compactedFrom=null)=>({checkedAt:new Date(timestamp*1000).toISOString(),timestamp,compactedFrom,accountSlotId:"a",fiveHour:{continuous:5}});
+const timestamps=points=>points.map(eventTimestamp);
+const endpointInside=quotaPointsInRange([point(90),point(180,90)],[100,200]);
+if(JSON.stringify(timestamps(endpointInside))!==JSON.stringify([100,180])||!endpointInside[0].compactedBoundary)throw new Error(`Compacted plateau with its first node outside the span was not clipped: ${JSON.stringify(endpointInside)}`);
+const endpointOutside=quotaPointsInRange([point(250,50)],[100,200]);
+if(JSON.stringify(timestamps(endpointOutside))!==JSON.stringify([100,200])||endpointOutside.some(point=>!point.compactedBoundary))throw new Error(`Compacted plateau crossing the whole span was not clipped: ${JSON.stringify(endpointOutside)}`);
+const uncovered=quotaPointsInRange([point(250)],[100,200]);
+if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into the span: ${JSON.stringify(uncovered)}`);
 '''
 
         result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)

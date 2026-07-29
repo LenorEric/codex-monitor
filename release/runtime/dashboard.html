@@ -75,7 +75,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <div class="control-group time-range-group"><span class="control-label">Time range</span><div class="controls"><div class="range-buttons" id="ranges"></div><span class="date-selector" id="dateSelector"><button id="prevDate" aria-label="Previous day">&lt;</button>
 <input class="date-range" id="rangeDate" type="date" aria-label="Calendar day"><button id="nextDate" aria-label="Next day">&gt;</button></span></div></div>
 <div class="control-group"><span class="control-label">Data source</span><div class="data-view-buttons" aria-label="Data source"><button data-data-view="local">Local</button><button data-data-view="merged">Merged</button></div></div>
-<div class="control-group"><span class="control-label">Chart display</span><div class="fold-buttons" aria-label="Usage chart collapse options"><button id="collapseUsageGaps" type="button">Collapse gaps</button><button id="collapseUsageFlat" type="button">Collapse flat</button></div></div>
+<div class="control-group"><span class="control-label">Chart display</span><div class="fold-buttons" aria-label="Usage chart display options"><button id="collapseUsageGaps" type="button">Collapse gaps</button><button id="collapseUsageFlat" type="button">Collapse flat</button><button id="normalizeUsage" type="button" title="Show Plus-equivalent usage: Pro Lite ×5 and Pro ×20">Normalized usage</button></div></div>
 </div>
 <div class="account-banner" id="accountBanner" role="status"></div>
 <div class="filter-bar">
@@ -160,7 +160,9 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <script>
 const ranges=[["5h",5*3600],["24h",24*3600],["7d",7*24*3600],["30d",30*24*3600],["All",0]];
 const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null;
-let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, payload={points:[],quotaPoints:[],tokenSessions:[],events:{fiveHour:[],sevenDay:[]}};
+const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
+const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
+let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],events:{fiveHour:[],sevenDay:[]}};
 let pendingStatusRequest=null, pendingSeriesRequests=new Map(), currentSeriesRevision=null, actionBusy=false, accountLabelMode="create", actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
@@ -199,7 +201,7 @@ function pointFromSample(sample){
   if(!sample)return null;
   const windowPoint=label=>{
     const window=(sample.windows||{})[label]||{};
-    return {raw:window.usedPercent??null,continuous:window.usedPercent??null,resetAt:window.resetAt};
+    return {raw:window.usedPercent??null,continuous:window.usedPercent??null,resetAt:window.resetAt,plan:window.plan||"plus"};
   };
   return {checkedAt:sample.checkedAt,timestamp:eventTimestamp(sample),fiveHour:windowPoint("5h"),sevenDay:windowPoint("7d"),cost:sample.cost||{}};
 }
@@ -235,6 +237,31 @@ function selectedDateBounds(){
 }
 function localDateValue(date){
   return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;
+}
+function clearSavedSelections(){
+  try{if(vscode){const state={...vscode.getState()};delete state.dashboardSelections;vscode.setState(state)}}catch{}
+  try{localStorage.removeItem(DASHBOARD_SELECTIONS_STORAGE_KEY)}catch{}
+}
+function restoreSelections(){
+  try{
+    const saved=vscode?.getState()?.dashboardSelections??JSON.parse(localStorage.getItem(DASHBOARD_SELECTIONS_STORAGE_KEY)||"null"), validRanges=new Set(["Date",...ranges.map(([range])=>range)]);
+    if(!saved||typeof saved!=="object")return;
+    if(!Number.isFinite(saved.lastActiveAt)||Math.abs(Date.now()-saved.lastActiveAt)>DASHBOARD_SELECTIONS_MAX_IDLE_MS){clearSavedSelections();return}
+    if(validRanges.has(saved.selected))selected=saved.selected;
+    if(validRanges.has(saved.previousRange)&&saved.previousRange!=="Date")previousRange=saved.previousRange;
+    if(typeof saved.selectedDate==="string"&&/^\d{4}-\d{2}-\d{2}$/.test(saved.selectedDate))selectedDate=saved.selectedDate;
+    if(Array.isArray(saved.selectedModels))selectedModels=new Set(saved.selectedModels.filter(model=>typeof model==="string"));
+    if(Array.isArray(saved.selectedAccounts))selectedAccounts=new Set(saved.selectedAccounts.filter(accountId=>typeof accountId==="string"));
+    if(["local","merged"].includes(saved.dataView))dataView=saved.dataView;
+    if(typeof saved.collapseUsageGaps==="boolean")collapseUsageGaps=saved.collapseUsageGaps;
+    if(typeof saved.collapseUsageFlat==="boolean")collapseUsageFlat=saved.collapseUsageFlat;
+    if(typeof saved.normalizedUsage==="boolean")normalizedUsage=saved.normalizedUsage;
+  }catch{}
+}
+function saveSelections(){
+  const selections={selected,previousRange,selectedDate,selectedModels:[...selectedModels],selectedAccounts:[...selectedAccounts],dataView,collapseUsageGaps,collapseUsageFlat,normalizedUsage,lastActiveAt:Date.now()};
+  try{if(vscode)vscode.setState({...vscode.getState(),dashboardSelections:selections})}catch{}
+  try{localStorage.setItem(DASHBOARD_SELECTIONS_STORAGE_KEY,JSON.stringify(selections))}catch{}
 }
 function latestSelectableDate(){
   const date=new Date();date.setDate(date.getDate()+1);return localDateValue(date);
@@ -281,7 +308,7 @@ function updateDateLeavePointer(event){
 function shiftSelectedDate(days){
   const bounds=selectedDateBounds(), date=bounds?new Date(bounds.startMs):new Date();
   date.setDate(date.getDate()+days);
-  selectedDate=localDateValue(date);if(selectedDate>latestSelectableDate())selectedDate=latestSelectableDate();selected="Date";setupControls();drawAll(true);
+  selectedDate=localDateValue(date);if(selectedDate>latestSelectableDate())selectedDate=latestSelectableDate();selected="Date";saveSelections();setupControls();drawAll(true);
 }
 function syncControls(){
   document.querySelectorAll("[data-range]").forEach(b=>b.classList.toggle("active",b.dataset.range===selected));
@@ -295,7 +322,7 @@ function syncControls(){
 function activateDateInput(){
   if(!selectedDate)selectedDate=localDateValue(new Date());
   if(selected==="Date"){syncControls();return}
-  selected="Date";syncControls();drawAll(true);
+  selected="Date";saveSelections();syncControls();drawAll(true);
 }
 function filteredEvents(list){
   if(selected==="All"||!list.length)return list;
@@ -324,7 +351,7 @@ function updateModelControls(events){
   const container=document.getElementById("models");container.replaceChildren();
   const addButton=(label,model,active)=>{
     const button=document.createElement("button");button.textContent=label;button.classList.toggle("active",active);button.dataset.model=model;button.title=model==="all"?"Show all models":model;
-    button.onclick=()=>{toggleScopeSelection(selectedModels,model,available);drawAll(true)};
+    button.onclick=()=>{toggleScopeSelection(selectedModels,model,available);saveSelections();drawAll(true)};
     container.appendChild(button);
   };
   addButton("All","all",selectedModels.size===0);
@@ -344,7 +371,7 @@ function updateAccountControls(events){
   const container=document.getElementById("eventAccounts");container.replaceChildren();
   const addButton=(label,accountId,active)=>{
     const button=document.createElement("button");button.textContent=label;button.classList.toggle("active",active);button.dataset.accountId=accountId;button.title=accountId==="all"?"Show all accounts":label;
-    button.onclick=()=>{toggleScopeSelection(selectedAccounts,accountId,available.keys());drawAll(true)};
+    button.onclick=()=>{toggleScopeSelection(selectedAccounts,accountId,available.keys());saveSelections();drawAll(true)};
     container.appendChild(button);
   };
   addButton("All","all",selectedAccounts.size===0);
@@ -400,12 +427,12 @@ function updateTokenSummary(sessions){
 }
 function setupControls(){
   document.getElementById("ranges").replaceChildren(...ranges.map(([range])=>{const button=document.createElement("button");button.dataset.range=range;button.classList.toggle("active",range===selected);button.textContent=range;return button}));
-  document.querySelectorAll("[data-range]").forEach(b=>b.onclick=()=>{selected=b.dataset.range;previousRange=selected;cancelDateLeaveTracking();setupControls();drawAll(true)});
+  document.querySelectorAll("[data-range]").forEach(b=>b.onclick=()=>{selected=b.dataset.range;previousRange=selected;saveSelections();cancelDateLeaveTracking();setupControls();drawAll(true)});
   const date=document.getElementById("rangeDate");
   syncControls();
   date.onclick=activateDateInput;
   date.onfocus=activateDateInput;
-  date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}setupControls();drawAll(true)};
+  date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}saveSelections();setupControls();drawAll(true)};
   const selector=document.getElementById("dateSelector");selector.onpointerenter=cancelDateLeaveTracking;selector.onpointerleave=startDateLeaveTracking;
   document.getElementById("prevDate").onclick=()=>shiftSelectedDate(-1);
   document.getElementById("nextDate").onclick=()=>shiftSelectedDate(1);
@@ -413,8 +440,10 @@ function setupControls(){
 function setupUsageFoldControls(){
   [["collapseUsageGaps",()=>collapseUsageGaps,value=>collapseUsageGaps=value],["collapseUsageFlat",()=>collapseUsageFlat,value=>collapseUsageFlat=value]].forEach(([id,getValue,setValue])=>{
     const button=document.getElementById(id), sync=()=>{button.classList.toggle("active",getValue());button.setAttribute("aria-pressed",String(getValue()))};
-    sync();button.onclick=()=>{setValue(!getValue());sync();drawAll(true)};
+    sync();button.onclick=()=>{setValue(!getValue());saveSelections();sync();drawAll(true)};
   });
+  const normalize=document.getElementById("normalizeUsage"), sync=()=>{normalize.classList.toggle("active",normalizedUsage);normalize.setAttribute("aria-pressed",String(normalizedUsage))};
+  sync();normalize.onclick=()=>{normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)};
 }
 addEventListener("pointermove",updateDateLeavePointer,{passive:true});
 function requestSeries(view=dataView){
@@ -589,7 +618,7 @@ async function load(force=false){
   }catch(error){showRefreshError(error)}
 }
 function setupDataView(){
-  document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;currentSeriesRevision=null;setupDataView();load(true)}});
+  document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();currentSeriesRevision=null;setupDataView();load(true)}});
 }
 async function pollStatus(force=false){
   if(document.hidden&&!force)return;
@@ -823,7 +852,21 @@ function quotaTimeDomain(points){
 }
 function quotaPointsInRange(points,domain){
   if(!domain)return [];
-  return points.filter(point=>{const timestamp=eventTimestamp(point);return Number.isFinite(timestamp)&&timestamp>=domain[0]&&timestamp<=domain[1]}).sort((a,b)=>eventTimestamp(a)-eventTimestamp(b));
+  const visible=new Map(), add=(point,timestamp,boundary)=>{
+    if(timestamp<domain[0]||timestamp>domain[1])return;
+    const key=`${point.accountSlotId||"unknown"}\0${timestamp}`;
+    if(boundary&&visible.has(key))return;
+    visible.set(key,boundary?{...point,checkedAt:new Date(timestamp*1000).toISOString(),timestamp,compactedBoundary:true}:point);
+  };
+  points.forEach(point=>{
+    const timestamp=eventTimestamp(point);
+    if(!Number.isFinite(timestamp))return;
+    add(point,timestamp,false);
+    if(!Number.isFinite(point.compactedFrom)||point.compactedFrom>=timestamp)return;
+    const start=Math.max(domain[0],point.compactedFrom), end=Math.min(domain[1],timestamp);
+    if(start<end){add(point,start,true);add(point,end,end!==timestamp)}
+  });
+  return [...visible.values()].sort((a,b)=>eventTimestamp(a)-eventTimestamp(b)||(a.accountSlotId||"unknown").localeCompare(b.accountSlotId||"unknown"));
 }
 function sameLocalDate(first,second){
   const a=new Date(first*1000), b=new Date(second*1000);
@@ -850,12 +893,20 @@ function drawXAxisTickLabels(ctx,labels,start,pixels,y){
   labels.forEach((label,index)=>{ctx.textAlign=labels.length===1?"center":index===0?"left":index===labels.length-1?"right":"center";ctx.fillText(label,axisTickPosition(start,pixels,index,labels.length),y)});
 }
 function plusEquivalentUsage(point,label,valueOf){return valueOf(point)*({plus:1,pro_lite:5,pro:20}[point[label]?.plan]||1)}
-function compactedUsageGap(previous,current){
-  const from=current.compactedFrom, previousAt=eventTimestamp(previous), currentAt=eventTimestamp(current);
-  return Number.isFinite(from)&&Number.isFinite(previousAt)&&Number.isFinite(currentAt)&&from<=previousAt&&previousAt<currentAt;
+function compactedUsageRanges(points){
+  return points.map(point=>({start:point.compactedFrom,end:eventTimestamp(point)})).filter(range=>Number.isFinite(range.start)&&Number.isFinite(range.end)&&range.start<range.end).sort((a,b)=>a.start-b.start||a.end-b.end).reduce((merged,range)=>{
+    const previous=merged.at(-1);
+    if(previous&&range.start<=previous.end)previous.end=Math.max(previous.end,range.end);
+    else merged.push(range);
+    return merged;
+  },[]);
 }
-function breakUsageCurve(previous,current,label,valueOf){
-  if(compactedUsageGap(previous,current))return false;
+function compactedUsageGap(previous,current,ranges){
+  const previousAt=eventTimestamp(previous), currentAt=eventTimestamp(current);
+  return Number.isFinite(previousAt)&&Number.isFinite(currentAt)&&ranges.some(range=>range.start<=previousAt&&currentAt<=range.end);
+}
+function breakUsageCurve(previous,current,label,valueOf,compactedRanges=[]){
+  if(compactedUsageGap(previous,current,compactedRanges))return false;
   const gap=eventTimestamp(current)-eventTimestamp(previous);
   if(gap>4*3600)return true;
   if(gap<=30*60)return false;
@@ -871,7 +922,7 @@ function usageTimeFoldMetrics(gaps,x0,x1,left,right,charWidth){
   return gaps.map(gap=>{const calculatedWidth=amplifier*Math.log1p(gap.duration/referenceGap)/Math.log(base);return {...gap,width:Math.max(minWidth,calculatedWidth)}});
 }
 function usageTimeAccountFoldRanges(points,label,valueOf,x0,x1){
-  const ranges=[], valid=points.filter(point=>Number.isFinite(eventTimestamp(point))), add=(start,end,kind)=>{
+  const ranges=[], valid=points.filter(point=>Number.isFinite(eventTimestamp(point))), compactedRanges=compactedUsageRanges(valid), add=(start,end,kind)=>{
     start=Math.max(x0,start);end=Math.min(x1,end);
     if(!(start<end))return;
     const previous=ranges[ranges.length-1];
@@ -883,7 +934,7 @@ function usageTimeAccountFoldRanges(points,label,valueOf,x0,x1){
   for(let index=1;index<valid.length;index++){
     const previous=valid[index-1], current=valid[index], start=eventTimestamp(previous), end=eventTimestamp(current);
     if(end<=start)continue;
-    if(breakUsageCurve(previous,current,label,valueOf))add(start,end,"gap");
+    if(breakUsageCurve(previous,current,label,valueOf,compactedRanges))add(start,end,"gap");
     else if(valueOf(previous)===valueOf(current))add(start,end,"flat");
   }
   add(eventTimestamp(valid[valid.length-1]),x1,"gap");
@@ -993,9 +1044,9 @@ function drawUsageTimeChart(id,label,points,animate=false){
   if(!valid.length){labelContext.fillStyle=css("--muted");labelContext.textAlign="center";labelContext.fillText(points.length?"Not enough data for the selected scope":"No data for this range",w/2,h/2)}
   else{
     groups.forEach(([,accountPoints])=>accountPoints.sort((a,b)=>eventTimestamp(a)-eventTimestamp(b)));
-    const renderedValueOf=valueOf;
+    const renderedValueOf=normalizedUsage?point=>plusEquivalentUsage(point,label,valueOf):valueOf;
     ctx.font="11px system-ui";
-    const timestamps=valid.map(eventTimestamp), values=valid.map(point=>Math.max(0,Math.min(100,renderedValueOf(point)))), xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1], dateOnly=x1-x0>=7*24*3600, crossesDate=!sameLocalDate(x0,x1), timeScale=usageTimeScale(x0,x1,usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width,collapseUsageGaps,collapseUsageFlat),m.l,w-m.r), X=timeScale.x, Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
+    const timestamps=valid.map(eventTimestamp), values=valid.map(point=>Math.max(0,normalizedUsage?renderedValueOf(point):Math.min(100,renderedValueOf(point)))), xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1], dateOnly=x1-x0>=7*24*3600, crossesDate=!sameLocalDate(x0,x1), timeScale=usageTimeScale(x0,x1,usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width,collapseUsageGaps,collapseUsageFlat),m.l,w-m.r), X=timeScale.x, Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
     currentFolds=timeScale.folds;
     ctx.strokeStyle=css("--border");ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(m.l,m.t);ctx.lineTo(m.l,h-m.b);ctx.lineTo(w-m.r,h-m.b);ctx.stroke();
     ctx.strokeStyle="rgba(255,255,255,.06)";ctx.font="11px system-ui";labelContext.fillStyle=css("--muted");labelContext.font="11px system-ui";labelContext.textAlign="right";
@@ -1003,14 +1054,18 @@ function drawUsageTimeChart(id,label,points,animate=false){
     yTicks.labels.forEach((tickLabel,i)=>{const y=axisTickPosition(m.t,h-m.t-m.b,i,yTicks.labels.length);labelContext.fillText(tickLabel,m.l-7,y+4);ctx.beginPath();ctx.moveTo(m.l,y);ctx.lineTo(w-m.r,y);ctx.stroke()});
     const xTicks=axisTicks(ctx,m.l,w-m.r,w-m.l-m.r,(x,index,labelCount)=>{const timestamp=timeScale.timestampAt(x), previousTimestamp=index?timeScale.timestampAt(m.l+(w-m.l-m.r)*(index-1)/(labelCount-1)):null;return usageTimeLabel(timestamp,dateOnly?"date":crossesDate&&(!index||!sameLocalDate(previousTimestamp,timestamp))?"dateTime":"time")},"x");
     drawXAxisTickLabels(labelContext,xTicks.labels,m.l,w-m.l-m.r,h-10);
-    currentSeries=groups.map(([accountId,accountPoints])=>({accountId,color:accountCurveColor(accountId),points:accountPoints.map((point,index)=>({point,value:renderedValueOf(point),key:point.checkedAt,timestamp:eventTimestamp(point),x:X(eventTimestamp(point)),y:Y(renderedValueOf(point)),breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,renderedValueOf)}))}));
+    currentSeries=groups.map(([accountId,accountPoints])=>{
+      const compactedRanges=compactedUsageRanges(accountPoints);
+      return {accountId,color:accountCurveColor(accountId),points:accountPoints.map((point,index)=>({point,value:renderedValueOf(point),key:point.checkedAt,timestamp:eventTimestamp(point),x:X(eventTimestamp(point)),y:Y(renderedValueOf(point)),breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,renderedValueOf,compactedRanges)}))};
+    });
     const hit=currentSeries.flatMap(series=>series.points);
     mousemove=event=>{
       const nearest=hit.reduce((best,item)=>!best||Math.hypot(event.offsetX-item.x,event.offsetY-item.y)<Math.hypot(event.offsetX-best.x,event.offsetY-best.y)?item:best,null);
       if(!nearest||Math.abs(event.offsetX-nearest.x)>24||Math.abs(event.offsetY-nearest.y)>36)return hideTip();
       const point=nearest.point, tip=document.getElementById("tip"), window=point[label]||{};
       renderTip(tip,[
-        {text:new Date(point.checkedAt).toLocaleString(),strong:true},`${label==="fiveHour"?"5h":"7d"} usage ${Number(nearest.value).toFixed(1)}%`,
+        {text:new Date(point.checkedAt).toLocaleString(),strong:true},`${label==="fiveHour"?"5h":"7d"} ${normalizedUsage?"normalized ":""}usage ${Number(nearest.value).toFixed(1)}%`,
+        normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}% · ${window.plan==="pro_lite"?"Pro Lite":window.plan==="pro"?"Pro":"Plus"} ×${{pro_lite:5,pro:20}[window.plan]||1}`:null,
         `Account ${accountDisplayName(point.accountSlotId,point.accountLabel)}`,window.resetAt?`Reset ${new Date(window.resetAt).toLocaleString()}`:null,
       ]);
       tip.style.display="block";positionTip(event,tip);
@@ -1092,7 +1147,7 @@ function drawAll(animate=false){
   drawUsageTimeChart("usageTime5h","fiveHour",quota,animate);
   drawUsageTimeChart("usageTime7d","sevenDay",quota,animate);
 }
-setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();load(true);pollStatus(true);setInterval(pollStatus,5000);setInterval(updateLastUpdateAge,1000);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}});addEventListener("resize",drawAll);
+restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();load(true);pollStatus(true);setInterval(pollStatus,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}});addEventListener("resize",drawAll);
 </script>
 </body>
 </html>

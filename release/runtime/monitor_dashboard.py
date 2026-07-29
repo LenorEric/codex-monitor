@@ -150,7 +150,7 @@ def dashboard_safe_json(value):
 def window_point(sample: dict, label: str) -> dict:
     window = (sample.get("windows") or {}).get(label) or {}
     raw = coerce_float(window.get("usedPercent"))
-    return {"raw": raw, "continuous": raw, "resetAt": window.get("resetAt"), "plan": window.get("plan") or "unknown"}
+    return {"raw": raw, "continuous": raw, "resetAt": window.get("resetAt"), "plan": window.get("plan") or "plus"}
 
 def dashboard_sample(sample: dict | None) -> dict | None:
     if not isinstance(sample, dict):
@@ -158,7 +158,7 @@ def dashboard_sample(sample: dict | None) -> dict | None:
     return {
         "checkedAt": sample.get("checkedAt"),
         "percentCheckedAt": sample.get("percentCheckedAt"),
-        "windows": {label: {"usedPercent": ((sample.get("windows") or {}).get(label) or {}).get("usedPercent"), "resetAt": ((sample.get("windows") or {}).get(label) or {}).get("resetAt")} for label in ("5h", "7d")},
+        "windows": {label: {"usedPercent": ((sample.get("windows") or {}).get(label) or {}).get("usedPercent"), "resetAt": ((sample.get("windows") or {}).get(label) or {}).get("resetAt"), "plan": ((sample.get("windows") or {}).get(label) or {}).get("plan") or "plus"} for label in ("5h", "7d")},
         "cost": sample.get("cost") or empty_cost_totals(),
     }
 
@@ -681,13 +681,14 @@ class UsageDashboardState:
     def run_cloud_maintenance(self) -> None:
         while self.running:
             try:
-                self.cloud.maintenance_tick()
+                result = self.cloud.maintenance_tick()
             except Exception as exc:
                 if not isinstance(exc, CloudError) or exc.category != "network" or not self.cloud_maintenance_connection_failed:
                     print(f"Cloud maintenance failed: {exc}", file=sys.stderr, flush=True)
                 self.cloud_maintenance_connection_failed = isinstance(exc, CloudError) and exc.category == "network"
             else:
-                self.cloud_maintenance_connection_failed = False
+                if any(result.values()):
+                    self.cloud_maintenance_connection_failed = False
             self.cloud_maintenance_event.wait(5)
             self.cloud_maintenance_event.clear()
 

@@ -316,7 +316,8 @@ def normalize_quota_history_row(row: dict) -> dict | None:
         used_percent = coerce_float(window.get("usedPercent"))
         if used_percent is None or window.get("unavailable"):
             continue
-        windows[label] = {"usedPercent": used_percent, "resetAt": window.get("resetAt"), "plan": normalize_plan_type(window.get("plan"))}
+        plan = normalize_plan_type(window.get("plan"))
+        windows[label] = {"usedPercent": used_percent, "resetAt": window.get("resetAt"), "plan": "plus" if plan == "unknown" else plan}
     if not windows:
         return None
     normalized = {
