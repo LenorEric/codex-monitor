@@ -8,9 +8,10 @@ from pathlib import Path
 from monitor_common import empty_cost_totals, empty_token_totals, parse_timestamp
 
 MODEL_PRICES_PER_MILLION = {
+    "gpt-5.6": {"input": 5.00, "cachedInput": 0.50, "cacheWriteInput": 6.25, "output": 30.00},
     "gpt-5.6-sol": {"input": 5.00, "cachedInput": 0.50, "cacheWriteInput": 6.25, "output": 30.00},
-    "gpt-5.6-terra": {"input": 2.50, "cachedInput": 0.25, "cacheWriteInput": 3.125, "output": 15.00},
-    "gpt-5.6-luna": {"input": 1.00, "cachedInput": 0.10, "cacheWriteInput": 1.25, "output": 6.00},
+    "gpt-5.6-terra": {"input": 2.00, "cachedInput": 0.20, "cacheWriteInput": 2.50, "output": 12.00},
+    "gpt-5.6-luna": {"input": 0.20, "cachedInput": 0.02, "cacheWriteInput": 0.25, "output": 1.20},
     "gpt-5.5": {"input": 5.00, "cachedInput": 0.50, "output": 30.00},
     "chat-latest": {"input": 5.00, "cachedInput": 0.50, "output": 30.00},
     "gpt-5.5-pro": {"input": 30.00, "cachedInput": None, "output": 180.00},
@@ -24,10 +25,19 @@ MODEL_PRICES_PER_MILLION = {
     "codex-auto-review": {"input": 1.75, "cachedInput": 0.175, "output": 14.00},
 }
 
+GPT_5_6_PRICE_CHANGE_AT = "2026-07-30T00:00:00Z"
+MODEL_PRICE_HISTORY_PER_MILLION = {
+    "gpt-5.6-terra": ((None, {"input": 2.50, "cachedInput": 0.25, "cacheWriteInput": 3.125, "output": 15.00}), (GPT_5_6_PRICE_CHANGE_AT, MODEL_PRICES_PER_MILLION["gpt-5.6-terra"])),
+    "gpt-5.6-luna": ((None, {"input": 1.00, "cachedInput": 0.10, "cacheWriteInput": 1.25, "output": 6.00}), (GPT_5_6_PRICE_CHANGE_AT, MODEL_PRICES_PER_MILLION["gpt-5.6-luna"])),
+}
+
 FAST_MODE_COST_MULTIPLIERS = {
     "gpt-5.4": 2.0,
     "gpt-5.5": 2.5,
-    "gpt-5.6": 2.5,
+    "gpt-5.6": 2.0,
+}
+FAST_MODE_COST_MULTIPLIER_HISTORY = {
+    "gpt-5.6": ((None, 2.5), (GPT_5_6_PRICE_CHANGE_AT, 2.0)),
 }
 DEFAULT_FAST_MODE_COST_MULTIPLIER = 2.0
 MAX_CODEX_APPEND_DRAIN_READS = 3
@@ -61,6 +71,42 @@ def pricing_for_model(model: str) -> dict | None:
 def fast_mode_cost_multiplier(model: str) -> float:
     normalized = normalize_codex_model(model)
     return next((multiplier for prefix, multiplier in FAST_MODE_COST_MULTIPLIERS.items() if normalized.startswith(prefix)), DEFAULT_FAST_MODE_COST_MULTIPLIER)
+
+def _epoch_value(history, occurred_at: str | None):
+    timestamp = parse_timestamp(occurred_at)
+    selected = history[0]
+    for epoch in history[1:]:
+        if timestamp is None or timestamp >= (parse_timestamp(epoch[0]) or 0):
+            selected = epoch
+    return selected
+
+def pricing_epoch_for_model(model: str, service_tier: str = "default", occurred_at: str | None = None) -> dict | None:
+    normalized = normalize_codex_model(model)
+    pricing = pricing_for_model(normalized)
+    if pricing is None:
+        return None
+    effective_from = None
+    for prefix in sorted(MODEL_PRICE_HISTORY_PER_MILLION, key=len, reverse=True):
+        if normalized.startswith(prefix):
+            effective_from, pricing = _epoch_value(MODEL_PRICE_HISTORY_PER_MILLION[prefix], occurred_at)
+            break
+    multiplier = 1.0
+    if normalize_service_tier(service_tier) == "fast":
+        multiplier = fast_mode_cost_multiplier(normalized)
+        for prefix in sorted(FAST_MODE_COST_MULTIPLIER_HISTORY, key=len, reverse=True):
+            if normalized.startswith(prefix):
+                multiplier_effective_from, multiplier = _epoch_value(FAST_MODE_COST_MULTIPLIER_HISTORY[prefix], occurred_at)
+                if effective_from is None or multiplier_effective_from is not None and (parse_timestamp(multiplier_effective_from) or 0) > (parse_timestamp(effective_from) or 0):
+                    effective_from = multiplier_effective_from
+                break
+    return {
+        "model": normalized,
+        "serviceTier": normalize_service_tier(service_tier),
+        "effectiveFrom": effective_from,
+        "currency": "USD",
+        "unitTokens": 1_000_000,
+        "rates": {key: round((pricing.get(key) if pricing.get(key) is not None else pricing.get("input") or 0.0) * multiplier, 8) for key in ("input", "cachedInput", "cacheWriteInput", "output")},
+    }
 
 def normalize_service_tier(value) -> str:
     return "fast" if str(value or "").strip().lower() in {"fast", "priority"} else "default"
@@ -181,6 +227,23 @@ def normalize_saved_token_totals(value: dict | None) -> dict:
         "totalTokens": input_tokens + output_tokens,
         "requests": max(0, int(value.get("requests") or 0)),
     }
+
+def token_totals_delta(current: dict | None, previous: dict | None = None) -> dict:
+    current = normalize_saved_token_totals(current)
+    previous = normalize_saved_token_totals(previous)
+    return {
+        key: max(0, current[key] - previous[key])
+        for key in ("inputTokens", "freshInputTokens", "cachedInputTokens", "cacheWriteInputTokens", "outputTokens", "totalTokens", "requests")
+    }
+
+def sum_cost_totals(*values: dict | None) -> dict:
+    result = empty_cost_totals()
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for key in result:
+            result[key] = round(result[key] + (value.get(key) or 0.0), 8)
+    return result
 
 def _codex_session_identity(payload: dict, path: Path) -> tuple[str, bool]:
     thread_id = payload.get("id") or payload.get("thread_id") or payload.get("threadId") or payload.get("session_id") or payload.get("sessionId") or path.stem
@@ -406,20 +469,11 @@ def scan_codex_token_usage(home: Path) -> dict:
         "byModel": by_model,
         "fastByModel": fast_by_model,
         "sessions": token_sessions_from_events(usage_events),
+        "events": usage_events,
         "errors": [],
     }
 
 def token_progress(current: dict, previous: dict | None) -> dict:
     if previous is None:
         return empty_token_totals()
-    current_totals = current["totals"]
-    previous_totals = previous["totals"]
-    return {
-        "inputTokens": max(0, current_totals["inputTokens"] - previous_totals["inputTokens"]),
-        "freshInputTokens": max(0, current_totals["freshInputTokens"] - previous_totals.get("freshInputTokens", 0)),
-        "cachedInputTokens": max(0, current_totals["cachedInputTokens"] - previous_totals["cachedInputTokens"]),
-        "cacheWriteInputTokens": max(0, current_totals.get("cacheWriteInputTokens", 0) - previous_totals.get("cacheWriteInputTokens", 0)),
-        "outputTokens": max(0, current_totals["outputTokens"] - previous_totals["outputTokens"]),
-        "totalTokens": max(0, current_totals["totalTokens"] - previous_totals["totalTokens"]),
-        "requests": max(0, current_totals["requests"] - previous_totals["requests"]),
-    }
+    return token_totals_delta(current["totals"], previous["totals"])

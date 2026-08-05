@@ -24,6 +24,7 @@ import monitor_codex_usage
 import monitor_dashboard
 import monitor_history
 import monitor_quota
+import monitor_token_ledger
 import monitor_tokens
 from monitor_accounts import AccountError, AccountManager, atomic_write_json
 from monitor_cloud import (
@@ -196,6 +197,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             expected = {
                 "usage_monitor_history.jsonl": b'{"history":true}\n',
                 "usage_monitor_quota_history.jsonl": b'{"quota":true}\n',
+                "usage_monitor_token_ledger.jsonl": b'{"ledger":true}\n',
                 "usage_monitor_samples.jsonl": b'{"samples":true}\n',
                 "usage_monitor_state.json": b'{"state":true}\n',
             }
@@ -208,6 +210,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(monitor_history.default_history_path(data_home), data_home / "usage_monitor_history.jsonl")
             self.assertEqual(monitor_history.default_quota_history_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_quota_history.jsonl")
             self.assertEqual(monitor_history.default_quota_history_path(data_home / "custom.jsonl"), data_home / "custom.quota.jsonl")
+            self.assertEqual(monitor_token_ledger.default_token_ledger_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_token_ledger.jsonl")
+            self.assertEqual(monitor_token_ledger.default_token_ledger_path(data_home / "custom.jsonl"), data_home / "custom.token-ledger.jsonl")
             for name, data in expected.items():
                 self.assertFalse((legacy_home / name).exists())
                 self.assertEqual((data_home / name).read_bytes(), data)
@@ -1410,8 +1414,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_gpt_5_6_family_uses_tier_specific_prices(self):
         expected = {
             "gpt-5.6-sol": (5.0, 0.5, 6.25, 30.0, 41.75),
-            "gpt-5.6-terra": (2.5, 0.25, 3.125, 15.0, 20.875),
-            "gpt-5.6-luna": (1.0, 0.1, 1.25, 6.0, 8.35),
+            "gpt-5.6-terra": (2.0, 0.2, 2.5, 12.0, 16.7),
+            "gpt-5.6-luna": (0.2, 0.02, 0.25, 1.2, 1.67),
         }
         for model, (input_cost, cached_cost, cache_write_cost, output_cost, total_cost) in expected.items():
             with self.subTest(model=model):
@@ -1426,7 +1430,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         cases = {
             "gpt-5.4": (2.0, 2.5),
             "gpt-5.5": (2.5, 5.0),
-            "gpt-5.6-sol": (2.5, 5.0),
+            "gpt-5.6-sol": (2.0, 5.0),
+            "gpt-5.6-terra": (2.0, 2.0),
+            "gpt-5.6-luna": (2.0, 0.2),
             "gpt-5.3-codex": (2.0, 1.75),
         }
         for model, (multiplier, input_price) in cases.items():
@@ -1442,8 +1448,61 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_gpt_5_6_pricing_accepts_provider_and_snapshot_model_ids(self):
         self.assertEqual(pricing_for_model("openai/gpt-5.6-sol-2026-06-26"), {"input": 5.0, "cachedInput": 0.5, "cacheWriteInput": 6.25, "output": 30.0})
-        self.assertEqual(pricing_for_model("gpt-5.6-terra-20260626"), {"input": 2.5, "cachedInput": 0.25, "cacheWriteInput": 3.125, "output": 15.0})
-        self.assertEqual(pricing_for_model("GPT-5.6-LUNA"), {"input": 1.0, "cachedInput": 0.1, "cacheWriteInput": 1.25, "output": 6.0})
+        self.assertEqual(pricing_for_model("gpt-5.6-terra-20260626"), {"input": 2.0, "cachedInput": 0.2, "cacheWriteInput": 2.5, "output": 12.0})
+        self.assertEqual(pricing_for_model("GPT-5.6-LUNA"), {"input": 0.2, "cachedInput": 0.02, "cacheWriteInput": 0.25, "output": 1.2})
+        self.assertEqual(pricing_for_model("gpt-5.6"), {"input": 5.0, "cachedInput": 0.5, "cacheWriteInput": 6.25, "output": 30.0})
+
+    def test_gpt_5_6_price_epochs_use_event_time_and_resolved_fast_rates(self):
+        self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-terra", "default", "2026-07-29T23:59:59Z")["rates"]["input"], 2.5)
+        self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-terra", "default", "2026-07-30T00:00:00Z")["rates"]["input"], 2.0)
+        self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-sol", "fast", "2026-07-29T23:59:59Z")["rates"]["input"], 12.5)
+        self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-sol", "fast", "2026-07-30T00:00:00Z")["rates"]["input"], 10.0)
+
+    def test_token_session_history_preserves_recorded_costs_when_prices_change(self):
+        recorded_cost = {"inputCostUsd": 2.5, "cachedInputCostUsd": 0.25, "cacheWriteInputCostUsd": 3.125, "outputCostUsd": 15.0, "totalCostUsd": 20.875}
+        tokens = {"inputTokens": 1_000_000, "freshInputTokens": 1_000_000, "cachedInputTokens": 1_000_000, "cacheWriteInputTokens": 1_000_000, "outputTokens": 1_000_000, "totalTokens": 2_000_000, "requests": 1}
+        row = monitor_history.normalize_token_session_row({"sessionId": "historical", "tokens": tokens, "cost": recorded_cost, "byModel": {"gpt-5.6-terra": {"tokens": tokens, "cost": recorded_cost}}})
+
+        self.assertEqual(row["cost"], recorded_cost)
+        self.assertEqual(row["byModel"]["gpt-5.6-terra"]["cost"], recorded_cost)
+
+    def test_token_ledger_migrates_legacy_cost_once_and_prices_only_new_usage(self):
+        with self.account_directory() as directory:
+            path = directory / "token-ledger.jsonl"
+            old_cost = {"inputCostUsd": 2.5, "cachedInputCostUsd": 0.0, "cacheWriteInputCostUsd": 0.0, "outputCostUsd": 0.0, "totalCostUsd": 2.5}
+            first_tokens = {"inputTokens": 1_000_000, "freshInputTokens": 1_000_000, "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 0, "totalTokens": 1_000_000, "requests": 1}
+            legacy = {"sessionId": "historical", "updatedAt": "2026-07-20T00:00:00Z", "accountSlotId": "account", "accountLabel": "Account", "tokens": first_tokens, "cost": old_cost, "byModel": {"gpt-5.6-terra": {"tokens": first_tokens, "cost": old_cost}}}
+            events = [
+                {"eventId": "historical:1", "sessionId": "historical", "checkedAt": "2026-07-20T00:00:00Z", "model": "gpt-5.6-terra", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
+                {"eventId": "historical:2", "sessionId": "historical", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-terra", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
+            ]
+
+            rows = monitor_token_ledger.sync_token_ledger(path, [legacy], events, "account", "Account")
+            repeated = monitor_token_ledger.sync_token_ledger(path, rows, events, "account", "Account")
+            ledger = monitor_token_ledger.load_token_ledger(path)
+            with mock.patch.dict(monitor_tokens.MODEL_PRICES_PER_MILLION, {"gpt-5.6-terra": {"input": 99.0, "cachedInput": 99.0, "cacheWriteInput": 99.0, "output": 99.0}}):
+                reloaded = monitor_token_ledger.token_sessions_from_ledger(ledger)
+
+        self.assertEqual(rows[0]["cost"]["totalCostUsd"], 4.5)
+        self.assertEqual(repeated[0]["cost"]["totalCostUsd"], 4.5)
+        self.assertEqual(reloaded[0]["cost"]["totalCostUsd"], 4.5)
+        self.assertEqual([row["recordType"] for row in ledger], ["legacyBaseline", "priceEpoch", "usage"])
+        self.assertEqual(ledger[1]["rates"]["input"], 2.0)
+        self.assertEqual(ledger[2]["pricingId"], ledger[1]["pricingId"])
+
+    def test_token_ledger_uses_event_time_price_epochs_without_legacy_data(self):
+        with self.account_directory() as directory:
+            path = directory / "token-ledger.jsonl"
+            events = [
+                {"eventId": "session:1", "sessionId": "session", "checkedAt": "2026-07-20T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
+                {"eventId": "session:2", "sessionId": "session", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
+            ]
+
+            sessions = monitor_token_ledger.sync_token_ledger(path, [], events, "account", "Account")
+            ledger = monitor_token_ledger.load_token_ledger(path)
+
+        self.assertEqual(sessions[0]["cost"]["totalCostUsd"], 1.2)
+        self.assertEqual([row["rates"]["input"] for row in ledger if row["recordType"] == "priceEpoch"], [1.0, 0.2])
 
     def test_history_sample_preserves_cumulative_cost_by_normalized_model(self):
         token_usage = {
@@ -1776,19 +1835,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_priority_service_tier_is_treated_as_fast(self):
         self.assertEqual(monitor_tokens.normalize_service_tier("priority"), "fast")
-
-    def test_token_session_history_preserves_original_account_attribution(self):
-        with self.account_directory() as directory:
-            path = directory / "token-sessions.jsonl"
-            session = {"sessionId": "session-a", "startedAt": "2030-01-01T00:00:00Z", "updatedAt": "2030-01-01T00:01:00Z", "tokens": empty_token_totals(), "cost": {}, "byModel": {}}
-
-            monitor_history.sync_token_session_history(path, [session], "account-a", "Account A")
-            session["updatedAt"] = "2030-01-01T00:02:00Z"
-            rows = monitor_history.sync_token_session_history(path, [session], "account-b", "Account B")
-
-            self.assertEqual(rows[0]["accountSlotId"], "account-a")
-            self.assertEqual(rows[0]["accountLabel"], "Account A")
-            self.assertEqual(rows[0]["updatedAt"], "2030-01-01T00:02:00Z")
 
     def test_token_session_history_migrates_legacy_cached_output_to_cache_write(self):
         legacy_tokens = {"inputTokens": 100, "freshInputTokens": 80, "cachedInputTokens": 20, "outputTokens": 10, "freshOutputTokens": 0, "cachedOutputTokens": 30, "totalTokens": 110, "requests": 1}
@@ -2710,23 +2756,25 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = dashboard_html()
 
         self.assertIn('const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections"', html)
+        self.assertIn('const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections"', html)
         self.assertIn("DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000", html)
         self.assertIn("DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000", html)
         self.assertIn('function restoreSelections()', html)
         self.assertIn('vscode?.getState()?.dashboardSelections', html)
-        self.assertIn('localStorage.getItem(DASHBOARD_SELECTIONS_STORAGE_KEY)', html)
-        self.assertIn('Math.abs(Date.now()-saved.lastActiveAt)>DASHBOARD_SELECTIONS_MAX_IDLE_MS', html)
-        self.assertIn("function clearSavedSelections()", html)
-        self.assertIn("delete state.dashboardSelections", html)
-        self.assertIn("localStorage.removeItem(DASHBOARD_SELECTIONS_STORAGE_KEY)", html)
-        self.assertIn('vscode.setState({...vscode.getState(),dashboardSelections:selections})', html)
-        self.assertIn('localStorage.setItem(DASHBOARD_SELECTIONS_STORAGE_KEY', html)
-        self.assertIn("lastActiveAt:Date.now()", html)
+        self.assertIn('function storedSelections(storage,key)', html)
+        self.assertIn('storedSelections(localStorage,DASHBOARD_SELECTIONS_STORAGE_KEY)', html)
+        self.assertIn('storedSelections(sessionStorage,DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY)', html)
+        self.assertIn('Math.abs(Date.now()-saved.lastActiveAt)<=DASHBOARD_SELECTIONS_MAX_IDLE_MS', html)
+        self.assertIn('vscode.setState({...vscode.getState(),dashboardSelections:durable})', html)
+        self.assertIn('localStorage.setItem(DASHBOARD_SELECTIONS_STORAGE_KEY,JSON.stringify(durable))', html)
+        self.assertIn('sessionStorage.setItem(DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY,JSON.stringify(transient))', html)
         self.assertIn("setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS)", html)
         self.assertIn('addEventListener("pagehide",saveSelections)', html)
         self.assertIn('restoreSelections();setupControls()', html)
         saved = html[html.index("function saveSelections()"):html.index("function latestSelectableDate()")]
-        for selection in ("selected", "previousRange", "selectedDate", "selectedModels", "selectedAccounts", "dataView", "collapseUsageGaps", "collapseUsageFlat", "normalizedUsage"):
+        self.assertIn('durable={dataView,collapseUsageGaps,collapseUsageFlat,normalizedUsage}', saved)
+        self.assertIn('transient={selected,previousRange,selectedDate,selectedModels:[...selectedModels],selectedAccounts:[...selectedAccounts]}', saved)
+        for selection in ("selected", "previousRange", "selectedDate", "selectedModels", "selectedAccounts"):
             self.assertIn(selection, saved)
 
     def test_dashboard_token_summary_follows_shared_filters_and_precedes_usage_charts(self):
@@ -2978,7 +3026,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = dashboard_html()
         manifest = json.loads(Path(__file__).with_name("package.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["version"], "1.1.0")
+        self.assertEqual(manifest["version"], "1.2.0")
         self.assertIn('const DASHBOARD_URL = new URL("http://127.0.0.1:8765/")', extension)
         self.assertIn("PAGE_ALLOWLIST", extension)
         self.assertIn('asset: "dashboard.html"', extension)
@@ -3686,6 +3734,25 @@ if(plusEquivalentUsage(point(undefined,20),"fiveHour",valueOf)!==20)throw new Er
         self.assertLess(html.index("5h Usage vs Time"), html.index("5h Cost vs Usage"))
         self.assertNotIn("Current active account", html)
         self.assertNotIn("Delta Cost vs Delta Usage", html)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
+    def test_dashboard_usage_time_legend_accumulates_resets_and_normalizes(self):
+        html = dashboard_html()
+        script = html[html.index("function eventTimestamp"):html.index("function updateWindowTime")] + html[html.index("function plusEquivalentUsage"):html.index("function drawUsageTimeChart")] + r'''
+const valueOf=point=>point.fiveHour.continuous;
+const point=(timestamp,continuous,plan="plus")=>({timestamp,fiveHour:{continuous,plan}});
+const resetPoints=[point(300,5),point(100,10),point(200,20),point(400,15),point(500,2),point(600,12)];
+if(usageTimeAccountTotal(resetPoints,valueOf)!==30)throw new Error(`Reset-aware total was incorrect: ${usageTimeAccountTotal(resetPoints,valueOf)}`);
+const normalizedValueOf=point=>plusEquivalentUsage(point,"fiveHour",valueOf), litePoints=[point(0,10,"pro_lite"),point(1,20,"pro_lite"),point(2,5,"pro_lite"),point(3,8,"pro_lite")];
+if(usageTimeAccountTotal(litePoints,normalizedValueOf)!==65)throw new Error(`Normalized total was incorrect: ${usageTimeAccountTotal(litePoints,normalizedValueOf)}`);
+'''
+
+        result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)
+
+        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
+        self.assertIn('item.append(dot,`${accountDisplayName(accountId,points[0]?.accountLabel)} · ${usage.toFixed(1)}%`)', html)
+        self.assertIn('drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)', html)
+        self.assertIn('drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)', html)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
     def test_dashboard_combines_gap_and_flat_usage_fold_intervals(self):

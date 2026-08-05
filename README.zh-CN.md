@@ -4,7 +4,7 @@
 
 **一个本地优先的 Codex 配额、Token、成本、账号、技能与加密同步仪表盘，并提供 VS Code 集成。**
 
-[![Version](https://img.shields.io/badge/version-1.1.0-4f8cff)](#快速开始)
+[![Version](https://img.shields.io/badge/version-1.2.0-4f8cff)](#快速开始)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#运行要求)
@@ -76,7 +76,7 @@ python monitor_codex_usage.py
 
 ### 2. 安装 VS Code 扩展
 
-在 VS Code 中安装 `release/codex-usage-monitor-1.1.0.vsix`：
+在 VS Code 中安装 `release/codex-usage-monitor-1.2.0.vsix`：
 
 1. 打开 **扩展**。
 2. 选择 **视图和更多操作 (…) → 从 VSIX 安装…**。
@@ -85,7 +85,7 @@ python monitor_codex_usage.py
 也可以使用命令行：
 
 ```console
-code --install-extension release/codex-usage-monitor-1.1.0.vsix
+code --install-extension release/codex-usage-monitor-1.2.0.vsix
 ```
 
 ### 3. 完成首次设置
@@ -219,9 +219,12 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 | `usage_monitor_history.jsonl` | 本地原始成本/百分比区间 | 仅同步派生记录 |
 | `usage_monitor_quota_history.jsonl` | 完整的本地已接受额度读数 | 仅同步压缩后的派生记录 |
 | `usage_monitor_token_sessions.jsonl` | 本地逐会话 Token 与成本 | 仅同步派生记录 |
+| `usage_monitor_token_ledger.jsonl` | 追加式用量记录与去重价格时期；本地 Token 成本的权威数据源 | 从不同步 |
 | `usage_monitor_samples.jsonl` | 本地详细诊断样本 | 永不 |
 | `usage_monitor_state.json` | 运行基线和游标 | 永不 |
 | `usage_monitor_sync_cache.json` | 下载记录和每台机器的完整数据包哈希清单 | 不作为记录文件上传 |
+
+Token 账本在价格时期首次使用时写入一次完整定义，后续用量记录仅引用其 `pricingId`。现有会话汇总只会被导入一次并形成精简的旧数据基线，之后逐会话历史文件均由账本重新生成。
 
 > [!WARNING]
 > 请保护整个 `~/.codex-switch`。不要提交到仓库、放入支持包、写入日志或分享其内容截图。丢失加密口令后，远端加密数据将无法恢复。
@@ -244,6 +247,7 @@ python monitor_codex_usage.py --help
 | `--history PATH` | 覆盖本地成本区间历史 JSONL。 |
 | `--quota-history PATH` | 覆盖逐账号额度历史 JSONL。 |
 | `--token-session-history PATH` | 覆盖逐会话 Token/成本 JSONL。 |
+| `--token-ledger PATH` | 覆盖追加式 Token 与价格账本 JSONL。 |
 | `--sample-log PATH` | 覆盖详细诊断 JSONL。 |
 | `--sample-log-max-bytes N` | 超过该大小后压缩样本日志；默认 50 MiB，压缩目标为 80%。 |
 | `--local-only` | 只扫描本地会话日志，不访问 ChatGPT 使用量接口。 |
@@ -319,6 +323,7 @@ npm run release
 | `monitor_cloud.py` | 配置、WebDAV、加密、串行云操作、软件包与使用记录。 |
 | `monitor_skills.py` | 技能发现、托管存储、验证、分配与投影。 |
 | `monitor_tokens.py` | 增量会话日志解析、Token 聚合、Fast 归因与成本计算。 |
+| `monitor_token_ledger.py` | 追加式 Token/价格账本、精简旧数据基线迁移与会话汇总派生。 |
 | `monitor_events.py` / `monitor_quota.py` | 远端使用量解释、重置处理与增量校验。 |
 | `monitor_history.py` / `monitor_usage_sync.py` | 本地持久化、压缩、来源信息、同步缓存与合并数据集。 |
 | `extension.js` / `package.json` | 轻量 VS Code 扩展宿主与清单。 |

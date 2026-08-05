@@ -14,6 +14,7 @@ from monitor_events import *
 from monitor_history import *
 from monitor_quota import *
 from monitor_skills import SkillManager
+from monitor_token_ledger import default_token_ledger_path
 from monitor_tokens import *
 
 
@@ -26,6 +27,7 @@ def main() -> int:
     parser.add_argument("--history", type=Path, help="JSONL history path. Defaults to ~/.codex-switch/usage_monitor_history.jsonl.")
     parser.add_argument("--quota-history", type=Path, help="Per-account quota history path. Defaults to usage_monitor_quota_history.jsonl beside the delta history file.")
     parser.add_argument("--token-session-history", type=Path, help="Per-session token and cost history path. Defaults to usage_monitor_token_sessions.jsonl beside the delta history file.")
+    parser.add_argument("--token-ledger", type=Path, help="Append-only token and price ledger path. Defaults to usage_monitor_token_ledger.jsonl beside the delta history file.")
     parser.add_argument("--sample-log", type=Path, help="Detailed JSONL sample debug log path. Defaults to usage_monitor_samples.jsonl beside the history file.")
     parser.add_argument("--sample-log-max-bytes", type=int, default=DEFAULT_SAMPLE_LOG_MAX_BYTES, help="Maximum detailed sample debug log size before oldest rows are trimmed. Defaults to 50 MiB.")
     parser.add_argument("--dashboard", action="store_true", help="Open the local dashboard in the default browser after starting the server.")
@@ -44,6 +46,7 @@ def main() -> int:
     args.sample_log = args.sample_log or default_sample_log_path(args.history)
     args.quota_history = args.quota_history or default_quota_history_path(args.history)
     args.token_session_history = args.token_session_history or default_token_session_history_path(args.history)
+    args.token_ledger = args.token_ledger or default_token_ledger_path(args.history)
     args.usage_sync_cache = default_usage_sync_cache_path(args.history)
     args.state = state_path_for(args.history)
     args.account_root = args.data_home / "accounts"

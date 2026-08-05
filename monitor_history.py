@@ -14,13 +14,16 @@ from monitor_common import (
     empty_token_totals, first_value, load_json, now_iso, parse_timestamp,
 )
 from monitor_quota import fetch_usage
-from monitor_tokens import calculate_token_costs, calculate_token_costs_by_model, cost_progress, cost_progress_by_model, normalize_saved_token_totals, scan_codex_token_usage, token_progress
+from monitor_tokens import (
+    calculate_token_costs, calculate_token_costs_by_model, cost_progress, cost_progress_by_model, normalize_saved_token_totals,
+    scan_codex_token_usage, sum_cost_totals, token_progress,
+)
 
 MAX_PERCENT_ARBITRATION_RESPONSES = 5
 SAMPLE_LOG_COMPACT_RATIO = 0.8
 QUOTA_HISTORY_DISCONTINUITY_SECONDS = 4 * 60 * 60
 JSONL_COPY_CHUNK_BYTES = 1024 * 1024
-DEFAULT_DATA_FILES = ("usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_sessions.jsonl", "usage_monitor_samples.jsonl", "usage_monitor_state.json")
+DEFAULT_DATA_FILES = ("usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_sessions.jsonl", "usage_monitor_token_ledger.jsonl", "usage_monitor_samples.jsonl", "usage_monitor_state.json")
 
 def default_history_path(data_home: Path | None = None) -> Path:
     return (Path(data_home) if data_home is not None else codex_switch_home()) / "usage_monitor_history.jsonl"
@@ -43,12 +46,15 @@ def normalize_token_session_row(row: dict) -> dict | None:
         if not isinstance(value, dict):
             continue
         tokens = normalize_saved_token_totals(value.get("tokens"))
-        normalized_value = {"tokens": tokens, "cost": calculate_token_costs({"byModel": {model: tokens}})}
+        stored_cost = value.get("cost")
+        normalized_value = {"tokens": tokens, "cost": stored_cost if isinstance(stored_cost, dict) and stored_cost else calculate_token_costs({"byModel": {model: tokens}})}
         if isinstance(value.get("fastTokens"), dict):
             normalized_value["fastTokens"] = normalize_saved_token_totals(value["fastTokens"])
             fast_by_model[model] = normalized_value["fastTokens"]
-            normalized_value["cost"] = calculate_token_costs({"byModel": {model: tokens}, "fastByModel": {model: normalized_value["fastTokens"]}})
+            if not (isinstance(stored_cost, dict) and stored_cost):
+                normalized_value["cost"] = calculate_token_costs({"byModel": {model: tokens}, "fastByModel": {model: normalized_value["fastTokens"]}})
         by_model[str(model)] = normalized_value
+    stored_cost = row.get("cost")
     normalized = {
         "sessionId": str(row["sessionId"]),
         "startedAt": row.get("startedAt"),
@@ -56,7 +62,7 @@ def normalize_token_session_row(row: dict) -> dict | None:
         "accountSlotId": str(row.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID),
         "accountLabel": str(row.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL),
         "tokens": normalize_saved_token_totals(row["tokens"]),
-        "cost": calculate_token_costs({"byModel": {model: value["tokens"] for model, value in by_model.items()}, "fastByModel": fast_by_model}) if by_model else row.get("cost") or empty_cost_totals(),
+        "cost": stored_cost if isinstance(stored_cost, dict) and stored_cost else sum_cost_totals(*(value["cost"] for value in by_model.values())) if by_model else stored_cost or empty_cost_totals(),
         "byModel": by_model,
     }
     if isinstance(row.get("sync"), dict):
@@ -87,24 +93,6 @@ def write_token_session_history(path: Path, rows: list[dict]) -> None:
         except OSError:
             pass
         raise
-
-def sync_token_session_history(path: Path, scanned_sessions: list[dict], account_slot_id: str, account_label: str, account_timeline: list[dict] | None = None) -> list[dict]:
-    existing = {row["sessionId"]: row for row in load_token_session_history(path)}
-    timeline = sorted((row for row in account_timeline or [] if row.get("accountSlotId") and parse_timestamp(row.get("checkedAt")) is not None), key=lambda row: parse_timestamp(row["checkedAt"]))
-    for scanned in scanned_sessions:
-        timestamp = parse_timestamp(scanned.get("updatedAt"))
-        attributed = next((row for row in reversed(timeline) if parse_timestamp(row["checkedAt"]) <= timestamp), None) if timestamp is not None else None
-        if not (normalized := normalize_token_session_row({**scanned, "accountSlotId": attributed.get("accountSlotId") if attributed else account_slot_id, "accountLabel": attributed.get("accountLabel") or account_label if attributed else account_label})):
-            continue
-        if previous := existing.get(normalized["sessionId"]):
-            normalized["accountSlotId"] = previous["accountSlotId"]
-            normalized["accountLabel"] = previous["accountLabel"]
-            if isinstance(previous.get("sync"), dict):
-                normalized["sync"] = previous["sync"]
-        existing[normalized["sessionId"]] = normalized
-    rows = sorted(existing.values(), key=lambda row: (parse_timestamp(row.get("updatedAt")) or 0, row["sessionId"]))
-    write_token_session_history(path, rows)
-    return rows
 
 def migrate_default_monitor_data(legacy_home: Path, data_home: Path | None = None) -> list[str]:
     data_home = Path(data_home) if data_home is not None else codex_switch_home()

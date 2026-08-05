@@ -24,10 +24,14 @@ from monitor_cloud import CloudError, CloudManager, control_password_is_compromi
 from monitor_common import DEFAULT_RETRY_LIMIT, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_events import collect_with_bad_remote_usage_retry, compact_delta_event, derive_history_events, print_ratio_warnings, print_special_events, print_valid_delta_events, process_sample_delta_events, sample_debug_log_row
 from monitor_history import (
-    append_capped_jsonl, append_history, append_quota_history_sample, apply_runtime_cost_measurement, collect_usage_sample, compact_history, compact_quota_history, default_quota_history_path, default_token_session_history_path, load_history,
-    fetch_usage_with_percent_arbitration, load_quota_history, load_state, load_token_session_history, make_history_sample, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, rewrite_account_labels, sync_token_session_history, write_state,
+    append_capped_jsonl, append_history, append_quota_history_sample, apply_runtime_cost_measurement, collect_usage_sample, compact_history, compact_quota_history,
+    default_quota_history_path, default_token_session_history_path, load_history,
+    fetch_usage_with_percent_arbitration, load_quota_history, load_state, load_token_session_history, make_history_sample, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines,
+    rewrite_account_labels, write_state, write_token_session_history,
 )
 from monitor_skills import SkillError, SkillManager
+from monitor_token_ledger import default_token_ledger_path, sync_token_ledger, token_cost_snapshot
+from monitor_tokens import cost_progress, cost_progress_by_model
 from monitor_usage_sync import UsageDataStore, add_record_provenance, default_usage_sync_cache_path
 
 DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
@@ -395,6 +399,8 @@ class UsageDashboardState:
             self.args.quota_history = default_quota_history_path(self.args.history)
         if not getattr(self.args, "token_session_history", None):
             self.args.token_session_history = default_token_session_history_path(self.args.history)
+        if not getattr(self.args, "token_ledger", None):
+            self.args.token_ledger = default_token_ledger_path(self.args.history)
         self.opener = opener
         self.lock = threading.RLock()
         self.accounts = AccountManager(args.auth, getattr(args, "account_root", None), getattr(args, "legacy_account_root", None))
@@ -485,8 +491,9 @@ class UsageDashboardState:
         return dashboard_account_status(status)
 
     def _series_revision_locked(self, accounts: dict) -> str:
+        token_ledger = getattr(self.args, "token_ledger", default_token_ledger_path(self.args.history))
         return _dashboard_revision({
-            "files": [_path_revision(path) for path in (self.args.history, self.args.quota_history, self.args.token_session_history, self.args.state, getattr(self.args, "usage_sync_cache", default_usage_sync_cache_path(self.args.history)))],
+            "files": [_path_revision(path) for path in (self.args.history, self.args.quota_history, self.args.token_session_history, token_ledger, self.args.state, getattr(self.args, "usage_sync_cache", default_usage_sync_cache_path(self.args.history)))],
             "accounts": accounts,
         })
 
@@ -576,15 +583,21 @@ class UsageDashboardState:
         sample["sync"] = {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": sample["usageAccountId"]}
         with self.lock:
             token_usage = sample.get("tokenUsage") or {}
-            if token_usage.get("sessions"):
-                sync_token_session_history(
-                    self.args.token_session_history,
-                    token_usage["sessions"],
+            if token_usage:
+                token_sessions = sync_token_ledger(
+                    self.args.token_ledger,
+                    load_token_session_history(self.args.token_session_history),
+                    token_usage.get("events") or [],
                     account_status["activeAccountId"],
                     next((account["label"] for account in account_status["items"] if account["id"] == account_status["activeAccountId"]), "Unknown"),
                     load_quota_history(self.args.quota_history) + history,
                 )
+                write_token_session_history(self.args.token_session_history, token_sessions)
+                sample["cost"], sample["costByModel"] = token_cost_snapshot(token_sessions)
+                sample["costDelta"] = cost_progress(sample["cost"], previous_cost)
+                sample["costDeltaByModel"] = cost_progress_by_model(sample["costByModel"], self.runtime_state.get("costByModel"))
                 token_usage.pop("sessions", None)
+                token_usage.pop("events", None)
             self.runtime_state["activeAccountSlotId"] = account_status["activeAccountId"]
             apply_runtime_cost_measurement(sample, self.runtime_state)
             append_quota_history_sample(self.args.quota_history, sample)

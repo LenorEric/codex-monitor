@@ -4,7 +4,7 @@
 
 **A local-first Codex quota, token, cost, account, skill, and encrypted-sync dashboard for VS Code.**
 
-[![Version](https://img.shields.io/badge/version-1.1.0-4f8cff)](#quick-start)
+[![Version](https://img.shields.io/badge/version-1.2.0-4f8cff)](#quick-start)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#requirements)
@@ -77,7 +77,7 @@ python monitor_codex_usage.py
 
 ### 2. Install the VS Code extension
 
-Install `release/codex-usage-monitor-1.1.0.vsix` from VS Code:
+Install `release/codex-usage-monitor-1.2.0.vsix` from VS Code:
 
 1. Open **Extensions**.
 2. Select **Views and More Actions (…) → Install from VSIX…**.
@@ -86,7 +86,7 @@ Install `release/codex-usage-monitor-1.1.0.vsix` from VS Code:
 The command line is also supported:
 
 ```console
-code --install-extension release/codex-usage-monitor-1.1.0.vsix
+code --install-extension release/codex-usage-monitor-1.2.0.vsix
 ```
 
 ### 3. Complete first-run setup
@@ -223,9 +223,12 @@ The canonical data root is `~/.codex-switch`:
 | `usage_monitor_history.jsonl` | Local raw cost/delta intervals | Derived records only |
 | `usage_monitor_quota_history.jsonl` | Complete local accepted quota readings | Compacted derived records only |
 | `usage_monitor_token_sessions.jsonl` | Local per-session token and cost totals | Derived records only |
+| `usage_monitor_token_ledger.jsonl` | Append-only usage records and deduplicated price epochs; authoritative for local token cost | Never |
 | `usage_monitor_samples.jsonl` | Detailed local diagnostic samples | Never |
 | `usage_monitor_state.json` | Runtime baselines and cursors | Never |
 | `usage_monitor_sync_cache.json` | Downloaded records and complete per-machine pack-hash inventories | Never uploaded as a recorder file |
+
+The token ledger writes a complete price epoch once when it is first used; subsequent usage rows reference its `pricingId`. Existing session totals are imported once as compact legacy baselines, and the session-history file is then regenerated from the ledger.
 
 > [!WARNING]
 > Protect the whole `~/.codex-switch` directory. Never commit it, place it in support bundles, log it, or share screenshots of its contents. Losing the encryption passphrase makes encrypted remote data unrecoverable.
@@ -253,6 +256,7 @@ python monitor_codex_usage.py --help
 | `--history PATH` | Override local delta-history JSONL. |
 | `--quota-history PATH` | Override per-account quota-history JSONL. |
 | `--token-session-history PATH` | Override per-session token/cost JSONL. |
+| `--token-ledger PATH` | Override the append-only token and price ledger JSONL. |
 | `--sample-log PATH` | Override the detailed diagnostic JSONL. |
 | `--sample-log-max-bytes N` | Compact the sample log after this size; default is 50 MiB with an 80% target. |
 | `--local-only` | Scan local session logs without calling ChatGPT usage endpoints. |
@@ -329,6 +333,7 @@ Credentials, local history, caches, tests, reference sources, and development-on
 | `monitor_cloud.py` | Configuration, WebDAV, encryption, serialized cloud operations, packages, and usage journal. |
 | `monitor_skills.py` | Skill discovery, managed storage, validation, assignments, and projections. |
 | `monitor_tokens.py` | Incremental session-log parsing, token aggregation, Fast attribution, and cost calculation. |
+| `monitor_token_ledger.py` | Append-only token/price ledger, compact legacy baseline migration, and derived session totals. |
 | `monitor_events.py` / `monitor_quota.py` | Remote usage interpretation, reset handling, and delta validation. |
 | `monitor_history.py` / `monitor_usage_sync.py` | Local persistence, compaction, provenance, synchronized cache, and merged datasets. |
 | `extension.js` / `package.json` | Thin VS Code extension host and manifest. |
