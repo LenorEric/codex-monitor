@@ -138,11 +138,11 @@ def token_sessions_from_ledger(rows: list[dict]) -> list[dict]:
     for row in rows:
         if row.get("recordType") == "legacyBaseline" and isinstance(row.get("session"), dict):
             session = row["session"]
-            sessions[str(session.get("sessionId"))] = json.loads(json.dumps(session))
+            sessions[(str(session.get("sessionId")), str(session.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID))] = json.loads(json.dumps(session))
     for row in rows:
         if row.get("recordType") != "usage" or not row.get("sessionId"):
             continue
-        session = sessions.setdefault(str(row["sessionId"]), _empty_session(row))
+        session = sessions.setdefault((str(row["sessionId"]), str(row.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID)), _empty_session(row))
         occurred_at = row.get("occurredAt")
         if occurred_at and (parse_timestamp(occurred_at) or 0) < (parse_timestamp(session.get("startedAt")) or float("inf")):
             session["startedAt"] = occurred_at

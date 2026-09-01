@@ -28,19 +28,25 @@ from monitor_usage_sync import canonical_json, content_hash, validate_sync_opera
 AUTO_PUSH_STABLE_SECONDS = 120
 AUTO_PUSH_RETRY_SECONDS = 30
 AUTO_PUSH_MAX_ATTEMPTS = 3
-AUTO_FETCH_INTERVAL_SECONDS = 300
-USAGE_SYNC_INTERVAL_SECONDS = 30 * 60
+AUTO_FETCH_INTERVAL_SECONDS = 60 * 60
+USAGE_SYNC_INTERVAL_SECONDS = 60 * 60
 LEGACY_PASSPHRASE_SALT = b"codex-switch-passphrase-v1"
-USAGE_SYNC_RETRY_SECONDS = (60, 5 * 60, 15 * 60)
-USAGE_PACK_BUCKETS = "0123456789abcdef"
-USAGE_PACK_MAX_BYTES = 64 * 1024
+USAGE_PACK_FORMAT_VERSION = 2
+USAGE_PACK_BUCKET_BITS = 6
+USAGE_PACK_MAX_BYTES = 16 * 1024
+USAGE_REGULAR_VERIFY_PACKS = 2
+USAGE_FULL_VERIFY_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 
 
 def _serialized_cloud_operation(method):
     @functools.wraps(method)
     def wrapped(self, *args, **kwargs):
-        with self._operation_lock:
+        if not self._operation_lock.acquire(blocking=False):
+            raise CloudError("Another WebDAV operation is already running", 409)
+        try:
             return method(self, *args, **kwargs)
+        finally:
+            self._operation_lock.release()
     return wrapped
 
 
@@ -75,6 +81,13 @@ def load_server_config(config_path: Path) -> dict:
 
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _elapsed_since(timestamp: str | None, default: float) -> float:
+    try:
+        return max(0.0, time.time() - datetime.fromisoformat(timestamp.replace("Z", "+00:00")).timestamp()) if timestamp else default
+    except (AttributeError, TypeError, ValueError):
+        return default
 
 
 def new_control_password_salt() -> str:
@@ -372,7 +385,7 @@ class CloudManager:
         self._pending_skill_pushes = {}
         self._auto_push_failures = {}
         self._auto_push_failure_id = 0
-        self._last_auto_fetch_at = time.monotonic()
+        self._last_auto_fetch_at = time.monotonic() - min(_elapsed_since(self._state.get("lastAutoFetchAt"), AUTO_FETCH_INTERVAL_SECONDS), AUTO_FETCH_INTERVAL_SECONDS)
         self._usage_data = None
         self._usage_hmac_key = None
         self._usage_account_ids = {}
@@ -450,12 +463,16 @@ class CloudManager:
                     atomic_write_json(self.config_path, config)
         if not self.state_path.exists():
             atomic_write_json(self.state_path, {
-                "version": 1, "skills": {"indexEtag": None, "indexId": None, "localSha256": {}}, "usage": {"published": {}, "remote": {}, "lastSuccessAt": None, "failure": None},
+                "version": 1, "lastAutoFetchAt": None, "skills": {"indexEtag": None, "indexId": None, "localSha256": {}},
+                "usage": {"published": {}, "remote": {}, "lastSuccessAt": None, "lastAttemptAt": None, "lastFullVerificationAt": None, "failure": None},
                 "remote": {"accounts": {}, "skills": {}}, "pendingAccountOperation": None, "conditionalWritesVerified": False, "decryptFailure": None,
             })
         else:
             state = json.loads(self.state_path.read_text(encoding="utf-8"))
             changed = False
+            if "lastAutoFetchAt" not in state:
+                state["lastAutoFetchAt"] = None
+                changed = True
             if not isinstance(state.get("remote"), dict) or not isinstance(state["remote"].get("accounts"), dict) or not isinstance(state["remote"].get("skills"), dict):
                 state["remote"] = {"accounts": {}, "skills": {}}
                 changed = True
@@ -468,10 +485,10 @@ class CloudManager:
                 state["remote"]["skills"] = {"version": 1, "indexEtag": remote_skills.get("pointerEtag"), "indexId": remote_skills.get("snapshotId"), "legacySnapshotId": remote_skills.get("snapshotId"), "updatedAt": remote_skills.get("updatedAt")}
                 changed = True
             if not isinstance(state.get("usage"), dict):
-                state["usage"] = {"published": {}, "remote": {}, "lastSuccessAt": None, "failure": None}
+                state["usage"] = {"published": {}, "remote": {}, "lastSuccessAt": None, "lastAttemptAt": None, "lastFullVerificationAt": None, "failure": None}
                 changed = True
             else:
-                for key, value in (("published", {}), ("remote", {}), ("lastSuccessAt", None), ("failure", None)):
+                for key, value in (("published", {}), ("remote", {}), ("lastSuccessAt", None), ("lastAttemptAt", None), ("lastFullVerificationAt", None), ("failure", None)):
                     if key not in state["usage"]:
                         state["usage"][key] = value
                         changed = True
@@ -633,16 +650,16 @@ class CloudManager:
 
     def configure_usage_sync(self, usage_data) -> None:
         self._usage_data = usage_data
-        last_success = (self._state.get("usage") or {}).get("lastSuccessAt")
-        try:
-            elapsed = max(0.0, time.time() - datetime.fromisoformat(last_success.replace("Z", "+00:00")).timestamp()) if last_success else USAGE_SYNC_INTERVAL_SECONDS
-        except (TypeError, ValueError):
-            elapsed = USAGE_SYNC_INTERVAL_SECONDS
+        usage = self._state.get("usage") or {}
+        last_attempt = usage.get("lastAttemptAt") or usage.get("lastSuccessAt")
+        elapsed = _elapsed_since(last_attempt, USAGE_SYNC_INTERVAL_SECONDS)
         self._next_usage_sync_at = time.monotonic() + max(0.0, USAGE_SYNC_INTERVAL_SECONDS - elapsed)
 
     def reset_usage_apply_cursors(self) -> None:
         self._state["usage"]["remote"] = {}
         self._state["usage"]["lastSuccessAt"] = None
+        self._state["usage"]["lastAttemptAt"] = None
+        self._state["usage"]["lastFullVerificationAt"] = None
         self._save_state()
 
     def usage_account_id(self, account_slot_id: str | None) -> str:
@@ -706,7 +723,7 @@ class CloudManager:
             },
             "decryptFailure": self._state.get("decryptFailure"),
             "usageSync": {
-                **{key: self._state.get("usage", {}).get(key) for key in ("lastSuccessAt", "failure")},
+                **{key: self._state.get("usage", {}).get(key) for key in ("lastSuccessAt", "lastAttemptAt", "failure")},
                 "nextAttemptInSeconds": max(0, round(self._next_usage_sync_at - time.monotonic())) if self._usage_data is not None else None,
             },
         }
@@ -848,8 +865,6 @@ class CloudManager:
             existing = next((account for account in self.accounts.manifest["accounts"] if (account.get("cloud") or {}).get("accountKey") == pending.get("accountKey")), None)
             if existing is None:
                 self.accounts.bind_cloud_account(self, pending.get("accountKey"), record_transition=False)
-            else:
-                self.delete_account_payloads(pending.get("accountKey"))
         elif pending.get("operation") == "release":
             try:
                 state, data, _ = self.bind_account(pending.get("accountKey"))
@@ -1253,6 +1268,14 @@ class CloudManager:
         return self.accounts.release_cloud_account(self, account_id)
 
     @_serialized_cloud_operation
+    def share_local_account(self, account_id: str) -> dict:
+        return self.accounts.share_cloud_account(self, account_id)
+
+    @_serialized_cloud_operation
+    def delete_remote_account(self, account_key: str) -> list[dict]:
+        return self.delete_account_payloads(str(account_key or ""))
+
+    @_serialized_cloud_operation
     def delete_local_account(self, account_id: str) -> dict:
         return self.accounts.delete(account_id)
 
@@ -1328,7 +1351,7 @@ class CloudManager:
             raise CloudError("Unsupported usage payload", 409)
         return value
 
-    def _put_usage_payload(self, client: WebDavClient, box: CryptoBox, kind: str, machine_id: str, value: dict) -> tuple[str, int]:
+    def _put_usage_payload(self, client: WebDavClient, box: CryptoBox, kind: str, machine_id: str, value: dict, verify: bool = True) -> tuple[str, int]:
         payload_id, compressed = self._usage_payload_bytes(value)
         path, purpose = self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"
         try:
@@ -1336,8 +1359,9 @@ class CloudManager:
         except CloudError as exc:
             if "HTTP 412" not in str(exc):
                 raise
-        downloaded, _ = client.get(path)
-        self._decode_usage_payload(box, purpose, downloaded, payload_id)
+        if verify:
+            downloaded, _ = client.get(path)
+            self._decode_usage_payload(box, purpose, downloaded, payload_id)
         return payload_id, len(compressed)
 
     @staticmethod
@@ -1350,10 +1374,16 @@ class CloudManager:
             raise CloudError("Usage pointer identity check failed", 409)
         if pointer.get("version") == 1 and isinstance(pointer.get("sequence"), int):
             return pointer
-        packs = pointer.get("packs")
+        packs, pack_format, verification = pointer.get("packs"), pointer.get("packFormat"), pointer.get("verification")
         if pointer.get("version") != 2 or not isinstance(packs, dict) or any(
             not isinstance(pack_id, str) or not pack_id or len(pack_id) > 128 or not isinstance(pack_hash, str) or len(pack_hash) != 64 or any(character not in "0123456789abcdef" for character in pack_hash)
             for pack_id, pack_hash in packs.items()
+        ) or pack_format is not None and (
+            not isinstance(pack_format, dict) or not isinstance(pack_format.get("version"), int) or not isinstance(pack_format.get("bucketBits"), int) or not isinstance(pack_format.get("maxCompressedBytes"), int)
+        ) or verification is not None and (
+            not isinstance(verification, dict) or verification.get("mode") not in {"sampled", "full"} or not isinstance(verification.get("verifiedPacks"), list)
+            or any(not isinstance(pack_id, str) or pack_id not in packs for pack_id in verification["verifiedPacks"])
+            or verification.get("fullVerifiedAt") is not None and not isinstance(verification.get("fullVerifiedAt"), str)
         ):
             raise CloudError("Invalid usage pack manifest", 409)
         return pointer
@@ -1373,16 +1403,16 @@ class CloudManager:
 
     def _verify_usage_pointer(self, client: WebDavClient, box: CryptoBox, expected: dict) -> str:
         verified, etag = self._usage_pointer(client, box, expected["machineId"])
-        keys = ("packs", "recordCount") if expected.get("version") == 2 else ("sequence", "headChunkId", "checkpointId")
+        keys = ("packs", "recordCount", "packFormat", "verification") if expected.get("version") == 2 else ("sequence", "headChunkId", "checkpointId")
         if verified.get("version") != expected.get("version") or any(verified.get(key) != expected.get(key) for key in keys):
             raise CloudError("Usage pointer verification failed", 409)
         return etag
 
     @classmethod
     def _usage_record_packs(cls, machine_id: str, records: dict[str, dict]) -> dict[str, dict]:
-        groups = {bucket: [] for bucket in USAGE_PACK_BUCKETS}
+        groups = {f"{bucket << (8 - USAGE_PACK_BUCKET_BITS):02x}": [] for bucket in range(1 << USAGE_PACK_BUCKET_BITS)}
         for key in sorted(records):
-            groups[hashlib.sha256(key.encode()).hexdigest()[0]].append({"key": key, "record": records[key]})
+            groups[f"{hashlib.sha256(key.encode()).digest()[0] >> (8 - USAGE_PACK_BUCKET_BITS) << (8 - USAGE_PACK_BUCKET_BITS):02x}"].append({"key": key, "record": records[key]})
         packs = {}
         for bucket, entries in groups.items():
             batch, index = [], 0
@@ -1403,6 +1433,30 @@ class CloudManager:
                 packs[pack_id] = {"hash": pack_hash, "bytes": len(compressed), "records": len(batch), "value": value}
         return packs
 
+    @staticmethod
+    def _usage_pack_format() -> dict:
+        return {"version": USAGE_PACK_FORMAT_VERSION, "bucketBits": USAGE_PACK_BUCKET_BITS, "maxCompressedBytes": USAGE_PACK_MAX_BYTES}
+
+    @staticmethod
+    def _usage_verification_sample(pack_ids: set[str], manifest: dict[str, str]) -> list[str]:
+        ordered = sorted(pack_ids)
+        if len(ordered) <= USAGE_REGULAR_VERIFY_PACKS:
+            return ordered
+        start = int(hashlib.sha256(canonical_json(manifest)).hexdigest()[:8], 16) % len(ordered)
+        return [ordered[(start + index) % len(ordered)] for index in range(USAGE_REGULAR_VERIFY_PACKS)]
+
+    def _verify_usage_packs(self, client: WebDavClient, box: CryptoBox, machine_id: str, manifest: dict[str, str], pack_ids) -> None:
+        for pack_id in pack_ids:
+            pack = self._download_usage_payload(client, box, "packs", machine_id, manifest[pack_id])
+            if pack.get("machineId") != machine_id or pack.get("packId") != pack_id or not isinstance(pack.get("records"), list):
+                raise CloudError("Usage pack verification failed", 409)
+
+    @staticmethod
+    def _usage_full_verification_due(pointer: dict | None, force_full: bool = False) -> bool:
+        if force_full or pointer is None or pointer.get("version") != 2 or pointer.get("packFormat") != CloudManager._usage_pack_format():
+            return True
+        return _elapsed_since((pointer.get("verification") or {}).get("fullVerifiedAt"), USAGE_FULL_VERIFY_INTERVAL_SECONDS) >= USAGE_FULL_VERIFY_INTERVAL_SECONDS
+
     def _publish_usage(self, client: WebDavClient, box: CryptoBox, records: dict[str, dict], present_keys: set[str], force_full: bool = False) -> dict:
         machine_id, usage = self.machine_id, self._state["usage"]
         pointer, pointer_etag = self._usage_pointer(client, box, machine_id)
@@ -1411,26 +1465,26 @@ class CloudManager:
         built = self._usage_record_packs(machine_id, records)
         manifest = {pack_id: pack["hash"] for pack_id, pack in built.items()}
         old_manifest = pointer.get("packs", {}) if pointer and pointer.get("version") == 2 else {}
-        try:
-            remote_payloads = self._encrypted_payloads(client, f"usage/packs/{machine_id}")
-        except CloudError as exc:
-            if "HTTP 404" not in str(exc):
-                raise
-            remote_payloads = set()
-        changed_packs = {pack_id for pack_id, pack_hash in manifest.items() if force_full or old_manifest.get(pack_id) != pack_hash or pack_hash not in remote_payloads}
+        full_verification = self._usage_full_verification_due(pointer, force_full)
+        changed_packs = {pack_id for pack_id, pack_hash in manifest.items() if force_full or old_manifest.get(pack_id) != pack_hash}
         for pack_id in sorted(changed_packs):
-            uploaded_hash, _ = self._put_usage_payload(client, box, "packs", machine_id, built[pack_id]["value"])
+            uploaded_hash, _ = self._put_usage_payload(client, box, "packs", machine_id, built[pack_id]["value"], verify=False)
             if uploaded_hash != manifest[pack_id]:
                 raise CloudError("Usage pack hash changed during upload", 409)
-        changed = pointer is None or pointer.get("version") != 2 or old_manifest != manifest or force_full
+        verified_packs = sorted(manifest) if full_verification else self._usage_verification_sample(changed_packs, manifest)
+        self._verify_usage_packs(client, box, machine_id, manifest, verified_packs)
+        full_verified_at = _timestamp() if full_verification else ((pointer or {}).get("verification") or {}).get("fullVerifiedAt")
+        changed = pointer is None or pointer.get("version") != 2 or old_manifest != manifest or force_full or full_verification
         if changed:
             updated = {
                 "version": 2, "machineId": machine_id, "packs": manifest, "packBytes": {pack_id: built[pack_id]["bytes"] for pack_id in sorted(built)},
-                "recordCount": len(records), "updatedAt": _timestamp(),
+                "packFormat": self._usage_pack_format(), "recordCount": len(records), "updatedAt": _timestamp(),
+                "verification": {"mode": "full" if full_verification else "sampled", "verifiedPacks": [] if full_verification else verified_packs, "fullVerifiedAt": full_verified_at},
             }
             pointer_etag = self._write_usage_pointer(client, box, updated, pointer_etag)
-            pointer_etag = self._verify_usage_pointer(client, box, updated)
-        usage.update({"published": current_hashes, "localPointerEtag": pointer_etag})
+            if full_verification:
+                pointer_etag = self._verify_usage_pointer(client, box, updated)
+        usage.update({"published": current_hashes, "localPointerEtag": pointer_etag, "lastFullVerificationAt": full_verified_at})
         usage.pop("sequence", None)
         self._save_state()
         if changed:
@@ -1443,8 +1497,8 @@ class CloudManager:
                     client.delete(self._usage_payload_path("checkpoints", machine_id, pointer["checkpointId"]))
         return {
             "uploaded": len(records) if force_full or not published else sum(published.get(key) != current_hashes[key] for key in records),
-            "deleted": len(set(published) - present_keys), "fullSnapshot": pointer is None or pointer.get("version") != 2 or force_full,
-            "packsUploaded": len(changed_packs), "packs": len(manifest),
+            "deleted": len(set(published) - present_keys), "fullSnapshot": pointer is None or pointer.get("version") != 2 or pointer.get("packFormat") != self._usage_pack_format() or force_full,
+            "packsUploaded": len(changed_packs), "packs": len(manifest), "packsVerified": len(verified_packs), "fullVerification": full_verification,
         }
 
     def _download_usage_payload(self, client: WebDavClient, box: CryptoBox, kind: str, machine_id: str, payload_id: str) -> dict:
@@ -1476,13 +1530,16 @@ class CloudManager:
         client.ensure_directories(f"usage/packs/{machine_id}")
         built = self._usage_record_packs(machine_id, records)
         for pack_id in sorted(built):
-            uploaded_hash, _ = self._put_usage_payload(client, box, "packs", machine_id, built[pack_id]["value"])
+            uploaded_hash, _ = self._put_usage_payload(client, box, "packs", machine_id, built[pack_id]["value"], verify=False)
             if uploaded_hash != built[pack_id]["hash"]:
                 raise CloudError("Usage pack hash changed during legacy migration", 409)
         manifest = {pack_id: pack["hash"] for pack_id, pack in built.items()}
+        self._verify_usage_packs(client, box, machine_id, manifest, sorted(manifest))
+        full_verified_at = _timestamp()
         updated = {
             "version": 2, "machineId": machine_id, "packs": manifest, "packBytes": {pack_id: built[pack_id]["bytes"] for pack_id in sorted(built)},
-            "recordCount": len(records), "updatedAt": _timestamp(),
+            "packFormat": self._usage_pack_format(), "recordCount": len(records), "updatedAt": _timestamp(),
+            "verification": {"mode": "full", "verifiedPacks": [], "fullVerifiedAt": full_verified_at},
         }
         self._write_usage_pointer(client, box, updated, pointer_etag)
         self._verify_usage_pointer(client, box, updated)
@@ -1498,6 +1555,13 @@ class CloudManager:
             if not item["name"].endswith(".enc"):
                 continue
             machine_id = item["name"][:-4]
+            if machine_id == self.machine_id and item.get("etag") == self._state["usage"].get("localPointerEtag"):
+                continue
+            cached_packs = self._usage_data.pack_hashes(machine_id) if machine_id != self.machine_id else {}
+            remote_state = remote.get(machine_id) if isinstance(remote.get(machine_id), dict) else {}
+            full_verification = force_full or _elapsed_since(remote_state.get("lastFullVerificationAt"), USAGE_FULL_VERIFY_INTERVAL_SECONDS) >= USAGE_FULL_VERIFY_INTERVAL_SECONDS
+            if machine_id != self.machine_id and not full_verification and item.get("etag") and item["etag"] == remote_state.get("pointerEtag") and len(cached_packs) == remote_state.get("packCount"):
+                continue
             encrypted, etag = client.get(self._usage_pointer_path(machine_id))
             pointer = self._parse_usage_pointer(box, machine_id, encrypted)
             if machine_id == self.machine_id:
@@ -1507,10 +1571,12 @@ class CloudManager:
                     changed += 1
                     downloaded += legacy_downloaded
                     migrated += 1
+                else:
+                    self._state["usage"]["localPointerEtag"] = etag
+                    self._save_state()
                 continue
             if pointer.get("version") == 2:
-                cached_packs = self._usage_data.pack_hashes(machine_id)
-                changed_packs = set(pointer["packs"]) if force_full else {pack_id for pack_id, pack_hash in pointer["packs"].items() if cached_packs.get(pack_id) != pack_hash}
+                changed_packs = set(pointer["packs"]) if full_verification else {pack_id for pack_id, pack_hash in pointer["packs"].items() if cached_packs.get(pack_id) != pack_hash}
                 payloads = {}
                 for pack_id in sorted(changed_packs):
                     pack = self._download_usage_payload(client, box, "packs", machine_id, pointer["packs"][pack_id])
@@ -1518,10 +1584,13 @@ class CloudManager:
                         raise CloudError("Usage pack identity check failed", 409)
                     payloads[pack_id] = pack["records"]
                 if changed_packs or set(cached_packs) - set(pointer["packs"]):
-                    conflicts.extend(self._usage_data.apply_pack_snapshot(machine_id, pointer["packs"], payloads, force_full))
+                    conflicts.extend(self._usage_data.apply_pack_snapshot(machine_id, pointer["packs"], payloads, full_verification))
                     changed += 1
                 downloaded += len(payloads)
-                remote[machine_id] = {"pointerEtag": etag, "version": 2, "packCount": len(pointer["packs"])}
+                remote[machine_id] = {
+                    "pointerEtag": etag, "version": 2, "packCount": len(pointer["packs"]),
+                    "lastFullVerificationAt": _timestamp() if full_verification else remote_state.get("lastFullVerificationAt"),
+                }
             else:
                 operations, legacy_downloaded = self._fetch_legacy_usage(client, box, machine_id, pointer)
                 manifest, payloads = self._migrate_legacy_usage(client, box, machine_id, etag, operations)
@@ -1529,7 +1598,7 @@ class CloudManager:
                 downloaded += legacy_downloaded
                 changed += 1
                 migrated += 1
-                remote[machine_id] = {"version": 2, "packCount": len(manifest)}
+                remote[machine_id] = {"version": 2, "packCount": len(manifest), "lastFullVerificationAt": _timestamp()}
             self._save_state()
         return {"machinesChanged": changed, "machinesMigrated": migrated, "payloadsDownloaded": downloaded, "conflicts": len(conflicts)}
 
@@ -1553,6 +1622,8 @@ class CloudManager:
     def sync_usage_data(self) -> dict:
         if self._usage_data is None:
             return {"skipped": True}
+        self._state["usage"]["lastAttemptAt"] = _timestamp()
+        self._save_state()
         self._require_conditional_writes()
         client, box = self._connection(True)
         for path in ("usage/machines", f"usage/packs/{self.machine_id}"):
@@ -1620,6 +1691,8 @@ class CloudManager:
         if now - self._last_auto_fetch_at < AUTO_FETCH_INTERVAL_SECONDS:
             return False
         self._last_auto_fetch_at = now
+        self._state["lastAutoFetchAt"] = _timestamp()
+        self._save_state()
         try:
             self.fetch(include_usage=False)
         except Exception as exc:
@@ -1633,18 +1706,15 @@ class CloudManager:
         if self._usage_data is None or not self.config()["webdav"].get("usageDataAutoSync", True) or now < self._next_usage_sync_at:
             return False
         usage = self._state["usage"]
+        self._next_usage_sync_at = now + USAGE_SYNC_INTERVAL_SECONDS
         try:
             self.sync_usage_data()
         except Exception as exc:
             self._record_decrypt_failure(exc, "usage sync")
             attempt = int((usage.get("failure") or {}).get("attempt") or 0) + 1
             usage["failure"] = {"message": str(exc), "attempt": attempt, "failedAt": _timestamp()}
-            self._next_usage_sync_at = now + (USAGE_SYNC_RETRY_SECONDS[attempt - 1] if attempt <= len(USAGE_SYNC_RETRY_SECONDS) else USAGE_SYNC_INTERVAL_SECONDS)
-            if attempt > len(USAGE_SYNC_RETRY_SECONDS):
-                usage["failure"]["attempt"] = 0
             self._save_state()
             return False
-        self._next_usage_sync_at = now + USAGE_SYNC_INTERVAL_SECONDS
         return True
 
     @_serialized_cloud_operation
@@ -1786,11 +1856,13 @@ class CloudManager:
             raise CloudError("Invalid remote account revision", 409) from exc
         identity = auth_identity(parse_auth_bytes(auth_data))
         account_id = state.get("accountId") or identity.get("accountId")
-        key_type = state.get("keyType", "identity")
+        state_account_id = state.get("accountId")
+        state_email = state.get("email")
         if (
             revision_data.get("version") != 1 or revision_data.get("accountKey") != key or len(auth_data) != revision_data.get("authSize") or hashlib.sha256(auth_data).hexdigest() != revision_data.get("authSha256")
-            or revision_data.get("keyType", "identity") != key_type or (hashlib.sha256(account_id.encode()).hexdigest() if account_id else None) != revision_data.get("accountIdHash")
-            or key_type not in {"identity", "opaque"} or (key_type == "identity" and (not account_id or box.account_key(account_id) != key))
+            or (hashlib.sha256(account_id.encode()).hexdigest() if account_id else None) != revision_data.get("accountIdHash")
+            or (state_account_id and identity.get("accountId") != state_account_id)
+            or (state_email and identity.get("email") != state_email)
         ):
             raise CloudError("Account revision completion check failed", 409)
         return auth_data
@@ -1817,12 +1889,10 @@ class CloudManager:
         state, etag = self.account_state(key)
         return state, self._download_account_revision_with(client, box, state), etag
 
-    def release_account(self, key: str, auth_data: bytes, identity: dict, label: str, ready: bool = True, key_type: str | None = None) -> dict:
+    def release_account(self, key: str, auth_data: bytes, identity: dict, label: str, ready: bool = True, key_type: str | None = None, config_header: dict | None = None, account_type: str = "account", config_header_toml: str = "") -> dict:
         self._require_conditional_writes()
         client, box = self._connection()
-        key_type = key_type or ("identity" if identity.get("accountId") and box.account_key(identity["accountId"]) == key else "opaque")
-        if key_type not in {"identity", "opaque"} or key_type == "identity" and (not identity.get("accountId") or box.account_key(identity["accountId"]) != key):
-            raise CloudError("Account release identity does not match the local binding", 409)
+        key_type = key_type or "opaque"
         try:
             state, etag = self.account_state(key)
         except CloudError as exc:
@@ -1831,7 +1901,9 @@ class CloudManager:
             state, etag = None, None
         revision = hashlib.sha256(auth_data).hexdigest()
         if state is not None:
-            if state.get("revisionId") == revision and state.get("accountId") == identity.get("accountId") and state.get("ready", True) == ready:
+            if state.get("accountId") and state.get("accountId") != identity.get("accountId") or state.get("email") and state.get("email") != identity.get("email"):
+                raise CloudError("Account release identity does not match the local binding", 409)
+            if state.get("revisionId") == revision and state.get("accountId") == identity.get("accountId") and state.get("ready", True) == ready and state.get("accountType", "account") == account_type and (state.get("configHeader") or {}) == (config_header or {}) and state.get("configHeaderToml", "") == config_header_toml:
                 if self._download_account_revision_with(client, box, state) != auth_data:
                     raise CloudError("Existing cloud account payload does not match the local account", 409)
                 self._cache_remote_account(state, etag)
@@ -1841,7 +1913,7 @@ class CloudManager:
         client.ensure_directories(self._account_paths(key)[1])
         existing_revisions = self._encrypted_payloads(client, self._account_paths(key)[1])
         self._upload_revision(client, box, key, auth_data, identity, key_type)
-        state = {"version": 1, "accountKey": key, "keyType": key_type, "accountId": identity.get("accountId"), "label": label, "email": identity.get("email"), "ready": ready, "revisionId": revision, "boundMachineId": None, "updatedAt": _timestamp()}
+        state = {"version": 1, "accountKey": key, "keyType": key_type, "accountId": identity.get("accountId"), "label": label, "email": identity.get("email"), "ready": ready, "accountType": account_type, "revisionId": revision, "boundMachineId": None, "updatedAt": _timestamp(), **({"configHeader": config_header} if isinstance(config_header, dict) and config_header else {}), **({"configHeaderToml": config_header_toml} if config_header_toml else {})}
         new_etag = client.put(self._account_paths(key)[0], box.encrypt(f"account-state:{key}", json.dumps(state).encode()), create=True)
         verified, _ = self.account_state(key)
         if verified.get("accountId") != identity.get("accountId") or verified.get("ready", True) != ready or verified.get("revisionId") != revision:

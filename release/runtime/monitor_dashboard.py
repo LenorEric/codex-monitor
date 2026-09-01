@@ -19,17 +19,18 @@ from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 
-from monitor_accounts import AccountError, AccountManager
+from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_api_auth
 from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
-from monitor_common import DEFAULT_RETRY_LIMIT, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
-from monitor_events import collect_with_bad_remote_usage_retry, compact_delta_event, derive_history_events, print_ratio_warnings, print_special_events, print_valid_delta_events, process_sample_delta_events, sample_debug_log_row
+from monitor_common import DEFAULT_RETRY_LIMIT, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
+from monitor_events import collect_with_bad_remote_usage_retry, compact_delta_event, cost_percent_ratio, derive_history_events, print_ratio_warnings, print_special_events, print_valid_delta_events, process_sample_delta_events, ratio_deviation, ratio_deviation_warning, sample_debug_log_row
 from monitor_history import (
     append_capped_jsonl, append_history, append_quota_history_sample, apply_runtime_cost_measurement, collect_usage_sample, compact_history, compact_quota_history,
-    default_quota_history_path, default_token_session_history_path, load_history,
+    default_dashboard_cache_path, default_quota_history_path, default_token_session_history_path, load_history,
     fetch_usage_with_percent_arbitration, load_quota_history, load_state, load_token_session_history, make_history_sample, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines,
     rewrite_account_labels, write_state, write_token_session_history,
 )
 from monitor_skills import SkillError, SkillManager
+from monitor_session_refresh import refresh_session
 from monitor_token_ledger import default_token_ledger_path, sync_token_ledger, token_cost_snapshot
 from monitor_tokens import cost_progress, cost_progress_by_model
 from monitor_usage_sync import UsageDataStore, add_record_provenance, default_usage_sync_cache_path
@@ -39,6 +40,11 @@ MANAGEMENT_HTML_PATH = Path(__file__).with_name("management.html")
 DASHBOARD_PORT = 8765
 DASHBOARD_INSTANCE_NAME = f"CodexUsageMonitorDashboard-{DASHBOARD_PORT}"
 INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS = 10 * 60
+SESSION_REFRESH_MAX_ATTEMPTS = 10
+SESSION_REFRESH_FAILURE_RETRY_SECONDS = 60 * 60
+SESSION_REFRESH_RESET_LATENCY_SECONDS = 60
+SESSION_REFRESH_SUCCESS_TOLERANCE_SECONDS = 10
+SESSION_REFRESH_WINDOW_SECONDS = {"5h": 5 * 60 * 60, "7d": 7 * 24 * 60 * 60}
 CONTROL_COOKIE_NAME = "codex_monitor_control"
 CONTROL_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
 USAGE_TIME_WINDOWS = {"fiveHour": 5 * 60 * 60, "sevenDay": 7 * 24 * 60 * 60}
@@ -46,10 +52,21 @@ USAGE_TIME_RATE_FLOORS = {"fiveHour": 5.0, "sevenDay": 1.0}
 USAGE_TIME_ROUNDING_ALLOWANCE = 2.0
 USAGE_TIME_RESET_JITTER_SECONDS = 2 * 60
 USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS = 30 * 60
+QUOTA_HISTORY_DISPLAY_FULL_SECONDS = 3 * 24 * 60 * 60
+# The x4/x8/x16 tiers mean 4/8/16 source points per display point.
+QUOTA_HISTORY_DISPLAY_X4_SECONDS = 7 * 24 * 60 * 60
+QUOTA_HISTORY_DISPLAY_X8_SECONDS = 30 * 24 * 60 * 60
+DASHBOARD_DISPLAY_CACHE_VERSION = 1
+DASHBOARD_DISPLAY_CACHE_GAP_SECONDS = 4 * 60 * 60
+DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS = 60
 SENSITIVE_DASHBOARD_FIELDS = {
     "access_token", "account_id", "accountId", "authIdentity", "baseUrl", "boundMachineId", "configPath", "email", "encryptionPassphrase", "fingerprint", "id_token", "identity",
     "password", "privatePath", "rawResponse", "refresh_token", "remoteRoot", "revisionId", "statePath", "target", "tokens", "user_id", "username",
 }
+
+
+def session_refresh_cost_text(cost: float | None) -> str:
+    return f"${cost:.8f}" if cost is not None else "unavailable (Codex CLI did not report token usage)"
 
 
 def client_host_is_loopback(host) -> bool:
@@ -159,10 +176,12 @@ def window_point(sample: dict, label: str) -> dict:
 def dashboard_sample(sample: dict | None) -> dict | None:
     if not isinstance(sample, dict):
         return None
+    api_account = bool(sample.get("isApiAccount"))
     return {
         "checkedAt": sample.get("checkedAt"),
         "percentCheckedAt": sample.get("percentCheckedAt"),
-        "windows": {label: {"usedPercent": ((sample.get("windows") or {}).get(label) or {}).get("usedPercent"), "resetAt": ((sample.get("windows") or {}).get(label) or {}).get("resetAt"), "plan": ((sample.get("windows") or {}).get(label) or {}).get("plan") or "plus"} for label in ("5h", "7d")},
+        "windows": {} if api_account else {label: {"usedPercent": ((sample.get("windows") or {}).get(label) or {}).get("usedPercent"), "resetAt": ((sample.get("windows") or {}).get(label) or {}).get("resetAt"), "plan": ((sample.get("windows") or {}).get(label) or {}).get("plan") or "plus"} for label in ("5h", "7d")},
+        "isApiAccount": api_account,
         "cost": sample.get("cost") or empty_cost_totals(),
     }
 
@@ -173,7 +192,7 @@ def dashboard_account_status(status: dict) -> dict:
         "cloudBindingEnabled": bool(status.get("cloudBindingEnabled")),
         "error": "Account operation failed" if status.get("error") else None,
         "message": status.get("message"),
-        "items": [{key: account.get(key) for key in ("id", "label", "ready", "active", "cloudState", "pollError", "pollErrorAt", "stale")} for account in status.get("items", [])],
+        "items": [{key: account.get(key) for key in ("id", "label", "ready", "active", "cloudState", "accountKey", "pollError", "pollErrorAt", "stale", "accountType", "isApiAccount", "sessionRefresh", "configHeader", "configHeaderToml")} for account in status.get("items", [])],
     }
 
 def dashboard_skill_status(status: dict) -> dict:
@@ -277,17 +296,38 @@ def _usage_time_continuous_values(records: list[dict], label: str) -> None:
     if not records:
         return
     rate_limit = _usage_time_rate_limit(records, label)
-    previous = None
+    previous, lower_anchor, lower_run = None, None, []
     for index, current in enumerate(records):
         if not 0 <= current["raw"] <= 100:
             current["window"]["continuous"] = None
+            lower_anchor, lower_run = None, []
             continue
         if previous is None:
             previous = current
             continue
+        if lower_anchor is not None:
+            if current["raw"] >= lower_anchor["raw"]:
+                for candidate in lower_run:
+                    candidate["window"]["continuous"] = lower_anchor["raw"]
+                previous, lower_anchor, lower_run = lower_anchor, None, []
+            elif current["raw"] >= lower_anchor["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE:
+                current["window"]["continuous"] = lower_anchor["raw"]
+                lower_run.append(current)
+                if len(lower_run) >= 3:
+                    for candidate in lower_run:
+                        candidate["window"]["continuous"] = candidate["raw"]
+                    previous = current
+                continue
+            else:
+                if len(lower_run) < 3:
+                    previous = lower_anchor
+                lower_anchor, lower_run = None, []
         if current["raw"] < previous["raw"]:
             if _usage_time_reset_is_credible(records, index, previous, USAGE_TIME_WINDOWS[label]):
                 previous = current
+            elif current["raw"] >= previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE:
+                current["window"]["continuous"] = previous["raw"]
+                lower_anchor, lower_run = previous, [current]
             else:
                 current["window"]["continuous"] = None
             continue
@@ -392,6 +432,247 @@ def _path_revision(path: Path) -> tuple:
 def _dashboard_revision(value) -> str:
     return hashlib.sha256(json.dumps(dashboard_safe_json(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
 
+def dashboard_display_factor(timestamp: float | None, now: float) -> int:
+    if timestamp is None or now - timestamp <= QUOTA_HISTORY_DISPLAY_FULL_SECONDS:
+        return 1
+    if now - timestamp <= QUOTA_HISTORY_DISPLAY_X4_SECONDS:
+        return 4
+    if now - timestamp <= QUOTA_HISTORY_DISPLAY_X8_SECONDS:
+        return 8
+    return 16
+
+def _dashboard_display_timestamp(value: dict) -> float | None:
+    if not isinstance(value, dict):
+        return None
+    timestamp = coerce_float(value.get("timestamp"))
+    return timestamp if timestamp is not None else parse_timestamp(value.get("checkedAt"))
+
+def _dashboard_display_sort_key(value: dict) -> tuple:
+    timestamp = _dashboard_display_timestamp(value)
+    return timestamp is None, timestamp or 0, str(value.get("accountSlotId") or value.get("accountLabel") or "")
+
+def _dashboard_display_points_are_contiguous(previous: dict | None, current: dict) -> bool:
+    previous_timestamp = _dashboard_display_timestamp(previous or {})
+    current_timestamp = _dashboard_display_timestamp(current)
+    return previous_timestamp is not None and current_timestamp is not None and 0 <= current_timestamp - previous_timestamp <= DASHBOARD_DISPLAY_CACHE_GAP_SECONDS
+
+def _dashboard_display_point_has_discontinuity(point: dict) -> bool:
+    return any(window.get("raw") is not None and window.get("continuous") is None for window in (point.get("fiveHour") or {}, point.get("sevenDay") or {}))
+
+def _dashboard_compact_quota_group(group: list[dict]) -> dict:
+    if len(group) == 1:
+        return group[0]
+    compacted = dict(group[-1])
+    starts = []
+    for point in group:
+        compacted_from = coerce_float(point.get("compactedFrom"))
+        starts.append(compacted_from if compacted_from is not None else _dashboard_display_timestamp(point))
+    starts = [start for start in starts if start is not None]
+    if starts:
+        compacted["compactedFrom"] = min(starts)
+    return compacted
+
+def _dashboard_compact_quota_account_points(points: list[dict], now: float) -> list[dict]:
+    compacted = []
+    pending = []
+    pending_factor = None
+    previous = None
+    for point in sorted(points, key=_dashboard_display_sort_key):
+        timestamp = _dashboard_display_timestamp(point)
+        factor = dashboard_display_factor(timestamp, now)
+        if factor == 1 or timestamp is None or _dashboard_display_point_has_discontinuity(point):
+            if pending:
+                compacted.append(_dashboard_compact_quota_group(pending))
+                pending = []
+                pending_factor = None
+            compacted.append(point)
+        elif not pending or factor != pending_factor or not _dashboard_display_points_are_contiguous(previous, point):
+            if pending:
+                compacted.append(_dashboard_compact_quota_group(pending))
+            pending = [point]
+            pending_factor = factor
+        else:
+            pending.append(point)
+        if pending and len(pending) >= pending_factor:
+            compacted.append(_dashboard_compact_quota_group(pending))
+            pending = []
+            pending_factor = None
+        previous = point
+    if pending:
+        compacted.append(_dashboard_compact_quota_group(pending))
+    return compacted
+
+def dashboard_compact_quota_points(points: list[dict], now: float | None = None) -> list[dict]:
+    now = time.time() if now is None else now
+    by_account = {}
+    for point in points:
+        key = point.get("accountSlotId") or point.get("accountLabel") or "unknown"
+        by_account.setdefault(key, []).append(point)
+    compacted = [point for points_for_account in by_account.values() for point in _dashboard_compact_quota_account_points(points_for_account, now)]
+    return sorted(compacted, key=_dashboard_display_sort_key)
+
+def _dashboard_compact_event_group(group: list[dict]) -> dict:
+    if len(group) == 1:
+        return group[0]
+    first, last = group[0], group[-1]
+    delta_percent = sum(coerce_float(event.get("deltaPercent")) or 0.0 for event in group)
+    delta_cost = sum(coerce_float(event.get("deltaCostUsd")) or 0.0 for event in group)
+    first_cumulative_percent = coerce_float(first.get("cumulativePercent")) or 0.0
+    first_cumulative_cost = coerce_float(first.get("cumulativeCostUsd")) or 0.0
+    ratio = cost_percent_ratio(delta_cost, delta_percent)
+    average_ratio = cost_percent_ratio(first_cumulative_cost - (coerce_float(first.get("deltaCostUsd")) or 0.0), first_cumulative_percent - (coerce_float(first.get("deltaPercent")) or 0.0))
+    merged_count = sum(int(coerce_float(event.get("mergedCount")) or 1) for event in group)
+    compacted = dict(last)
+    compacted.update({
+        "deltaPercent": round(delta_percent, 8),
+        "deltaCostUsd": round(delta_cost, 8),
+        "costPercentRatio": None if ratio is None else round(ratio, 8),
+        "averageCostPercentRatio": None if average_ratio is None else round(average_ratio, 8),
+        "ratioDeviation": None if ratio_deviation(ratio, average_ratio) is None else round(ratio_deviation(ratio, average_ratio), 8),
+        "ratioDeviationWarning": ratio_deviation_warning(ratio, average_ratio),
+        "mergedCount": merged_count,
+        "mergedFrom": first.get("mergedFrom") or first.get("checkedAt"),
+        "mergedTo": last.get("mergedTo") or last.get("checkedAt"),
+    })
+    if coerce_float(last.get("cumulativePercent")) is None:
+        compacted["cumulativePercent"] = round(first_cumulative_percent + delta_percent, 8)
+    if coerce_float(last.get("cumulativeCostUsd")) is None:
+        compacted["cumulativeCostUsd"] = round(first_cumulative_cost + delta_cost, 8)
+    compacted.pop("rawKeys", None)
+    return compacted
+
+def _dashboard_event_sort_key(event: dict) -> tuple:
+    timestamp = _dashboard_display_timestamp(event)
+    return timestamp is None, timestamp or 0, str(event.get("accountSlotId") or ""), str(event.get("model") or "")
+
+def dashboard_compact_event_series(events: list[dict], now: float | None = None) -> list[dict]:
+    now = time.time() if now is None else now
+    synthetic = [event for event in events if event.get("synthetic")]
+    streams = {}
+    standalone = []
+    for event in events:
+        if event.get("synthetic"):
+            continue
+        timestamp = _dashboard_display_timestamp(event)
+        if timestamp is None:
+            standalone.append(event)
+            continue
+        key = (event.get("accountSlotId") or "unknown", event.get("model") or "unknown")
+        streams.setdefault(key, []).append(event)
+    compacted = list(standalone)
+    for stream in streams.values():
+        pending = []
+        pending_factor = None
+        previous = None
+        for event in sorted(stream, key=_dashboard_event_sort_key):
+            factor = dashboard_display_factor(_dashboard_display_timestamp(event), now)
+            if factor == 1 or not pending or factor != pending_factor or not _dashboard_display_points_are_contiguous(previous, event):
+                if pending:
+                    compacted.append(_dashboard_compact_event_group(pending))
+                pending = [event]
+                pending_factor = factor
+            else:
+                pending.append(event)
+            if len(pending) >= pending_factor:
+                compacted.append(_dashboard_compact_event_group(pending))
+                pending = []
+                pending_factor = None
+            previous = event
+        if pending:
+            compacted.append(_dashboard_compact_event_group(pending))
+    return synthetic + sorted(compacted, key=_dashboard_event_sort_key)
+
+def dashboard_compact_events(events: dict[str, list[dict]], now: float | None = None) -> dict[str, list[dict]]:
+    return {label: dashboard_compact_event_series(values, now) for label, values in events.items()}
+
+def _dashboard_display_next_maintenance_at(quota_points: list[dict], events: dict[str, list[dict]], now: float) -> float | None:
+    timestamps = [_dashboard_display_timestamp(point) for point in quota_points]
+    timestamps.extend(_dashboard_display_timestamp(event) for values in events.values() for event in values)
+    candidates = []
+    for timestamp in (value for value in timestamps if value is not None):
+        for threshold in (QUOTA_HISTORY_DISPLAY_FULL_SECONDS, QUOTA_HISTORY_DISPLAY_X4_SECONDS, QUOTA_HISTORY_DISPLAY_X8_SECONDS):
+            candidate = timestamp + threshold + 1
+            if candidate > now:
+                candidates.append(candidate)
+    return min(candidates, default=None)
+
+def _dashboard_display_data(history: list[dict], quota_history: list[dict], token_sessions: list[dict], accounts: dict, now: float | None = None) -> dict:
+    now = time.time() if now is None else now
+    events = derive_history_events(history)
+    active = next((item for item in accounts.get("items", []) if item.get("id") == accounts.get("activeAccountId")), None)
+    if active and active.get("isApiAccount"):
+        events, quota_points = {"fiveHour": [], "sevenDay": []}, []
+    else:
+        quota_points = dashboard_quota_points(quota_history)
+    history_stats = {
+        "rows": len(history),
+        "fiveHourEvents": len(events["fiveHour"]),
+        "sevenDayEvents": len(events["sevenDay"]),
+        "fiveHourRealEvents": sum(1 for event in events["fiveHour"] if not event.get("synthetic")),
+        "sevenDayRealEvents": sum(1 for event in events["sevenDay"] if not event.get("synthetic")),
+    }
+    return {
+        "quotaPoints": dashboard_compact_quota_points(quota_points, now),
+        "tokenSessions": [dashboard_token_session(row) for row in token_sessions],
+        "events": dashboard_compact_events(events, now),
+        "historyStats": history_stats,
+        "nextMaintenanceAt": _dashboard_display_next_maintenance_at(quota_points, events, now),
+    }
+
+class DashboardDisplayCache:
+    def __init__(self, path: Path):
+        self.path = Path(path)
+        self.payload = None
+        self.load()
+
+    def load(self) -> None:
+        try:
+            payload = json.loads(self.path.read_text(encoding="utf-8"))
+        except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
+            self.payload = None
+            return
+        self.payload = payload if isinstance(payload, dict) and payload.get("version") == DASHBOARD_DISPLAY_CACHE_VERSION and isinstance(payload.get("views"), dict) else None
+
+    def entry(self, view: str, source_revision: str, now: float) -> dict | None:
+        payload = self.payload
+        if not payload or payload.get("sourceRevision") != source_revision:
+            return None
+        next_maintenance = coerce_float(payload.get("nextMaintenanceAt"))
+        if next_maintenance is not None and now >= next_maintenance:
+            return None
+        entry = payload.get("views", {}).get(view)
+        required = ("quotaPoints", "tokenSessions", "events", "historyStats")
+        return entry if isinstance(entry, dict) and all(key in entry for key in required) else None
+
+    def revision(self, source_revision: str, now: float) -> str:
+        if self.entry("local", source_revision, now) is not None or self.entry("merged", source_revision, now) is not None:
+            return str(self.payload.get("displayRevision") or "legacy")
+        return "stale" if self.payload and self.payload.get("sourceRevision") == source_revision else "missing"
+
+    def next_maintenance_at(self) -> float | None:
+        return coerce_float((self.payload or {}).get("nextMaintenanceAt"))
+
+    def replace(self, payload: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{self.path.name}.", suffix=".tmp", dir=self.path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
+                stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.chmod(temp_name, 0o600)
+            except OSError:
+                pass
+            os.replace(temp_name, self.path)
+        except Exception:
+            try:
+                os.unlink(temp_name)
+            except OSError:
+                pass
+            raise
+        self.payload = payload
+
 class UsageDashboardState:
     def __init__(self, args, opener: urllib.request.OpenerDirector | None):
         self.args = args
@@ -401,6 +682,9 @@ class UsageDashboardState:
             self.args.token_session_history = default_token_session_history_path(self.args.history)
         if not getattr(self.args, "token_ledger", None):
             self.args.token_ledger = default_token_ledger_path(self.args.history)
+        if not getattr(self.args, "dashboard_cache", None):
+            self.args.dashboard_cache = default_dashboard_cache_path(self.args.history)
+        self.dashboard_cache = DashboardDisplayCache(self.args.dashboard_cache)
         self.opener = opener
         self.lock = threading.RLock()
         self.accounts = AccountManager(args.auth, getattr(args, "account_root", None), getattr(args, "legacy_account_root", None))
@@ -431,6 +715,8 @@ class UsageDashboardState:
         self.wake_event = threading.Event()
         self.inactive_account_poll_event = threading.Event()
         self.cloud_maintenance_event = threading.Event()
+        self.config_monitor_event = threading.Event()
+        self.dashboard_cache_event = threading.Event()
         self.cloud_maintenance_connection_failed = False
         self.running = True
         self.last_sample = None
@@ -438,8 +724,18 @@ class UsageDashboardState:
         self.last_acquire_started_at = None
         self.inactive_account_poll_started_at = {}
         self.inactive_account_poll_errors = {}
+        self.session_refresh_event = threading.Event()
+        self.session_refresh_attempts = {}
+        self.session_refresh_costs = {}
+        self.session_refresh_reset_at = {}
+        self.session_refresh_procedures = set()
+        self.session_refresh_failed = {}
+        self.session_refresh_suppressed_reset_at = {}
+        self.external_auth_validation_threads = set()
+        self.external_auth_validation_fingerprints = set()
         self._series_cache = {}
         self._series_build_lock = threading.Lock()
+        self.dashboard_cache_event.set()
         self.runtime_state = reset_runtime_baselines(load_state(args.state))
         account_status = self.accounts.status()
         self.account_statuses = {account["id"]: None for account in account_status["items"]}
@@ -449,6 +745,7 @@ class UsageDashboardState:
             if isinstance(self.runtime_state.get("lastSample"), dict) and not self.runtime_state["lastSample"].get("activeAccountSlotId"):
                 self.runtime_state["lastSample"]["activeAccountSlotId"] = active_account_id
             write_state(args.state, self.runtime_state)
+        self.sync_active_account_from_live()
 
     def _update_account_status_locked(self, account_id: str | None, sample: dict) -> bool:
         if sample.get("rejectedWindows") or sample.get("usingPreviousWindows") or (sample.get("remoteUsage") or {}).get("accepted") is False:
@@ -468,6 +765,8 @@ class UsageDashboardState:
             "activeAccountSlotId": account_id,
             "windows": ((previous or {}).get("windows") or {}) | row["windows"],
         }
+        if event := getattr(self, "session_refresh_event", None):
+            event.set()
         return True
 
     def _active_account_status_locked(self, accounts: dict) -> dict | None:
@@ -490,12 +789,18 @@ class UsageDashboardState:
                 account.update({"pollError": True, "pollErrorAt": error["at"], "stale": True})
         return dashboard_account_status(status)
 
-    def _series_revision_locked(self, accounts: dict) -> str:
+    def _series_source_revision_locked(self, accounts: dict) -> str:
         token_ledger = getattr(self.args, "token_ledger", default_token_ledger_path(self.args.history))
         return _dashboard_revision({
             "files": [_path_revision(path) for path in (self.args.history, self.args.quota_history, self.args.token_session_history, token_ledger, self.args.state, getattr(self.args, "usage_sync_cache", default_usage_sync_cache_path(self.args.history)))],
             "accounts": accounts,
         })
+
+    def _series_revision_locked(self, accounts: dict) -> str:
+        source_revision = self._series_source_revision_locked(accounts)
+        cache = getattr(self, "dashboard_cache", None)
+        display_revision = cache.revision(source_revision, time.time()) if cache is not None else "unavailable"
+        return _dashboard_revision({"source": source_revision, "display": display_revision})
 
     def status_payload(self) -> dict:
         with self.lock:
@@ -524,22 +829,82 @@ class UsageDashboardState:
                 cache = getattr(self, "_series_cache", {})
                 if view in cache and cache[view][0] == revision:
                     return cache[view][1], cache[view][2], revision
-                if hasattr(self, "usage_data"):
-                    history, quota_history, token_sessions = self.usage_data.datasets(view)
+                source_revision = self._series_source_revision_locked(accounts)
+                now = time.time()
+                display_data = getattr(self, "dashboard_cache", None)
+                display_data = display_data.entry(view, source_revision, now) if display_data is not None else None
+                if display_data is None:
+                    if hasattr(self, "dashboard_cache_event"):
+                        self.dashboard_cache_event.set()
+                    if hasattr(self, "usage_data"):
+                        history, quota_history, token_sessions = self.usage_data.datasets(view)
+                    else:
+                        history, quota_history, token_sessions = load_history(self.args.history), load_quota_history(self.args.quota_history), load_token_session_history(self.args.token_session_history)
                 else:
-                    history, quota_history, token_sessions = load_history(self.args.history), load_quota_history(self.args.quota_history), load_token_session_history(self.args.token_session_history)
+                    history = quota_history = token_sessions = None
                 current_state = load_state(self.args.state)
                 last_sample = self._active_account_status_locked(accounts)
                 if last_sample is None:
                     current_state = current_state | {"lastSample": None}
                 else:
                     current_state = current_state | {"lastSample": last_sample}
-            payload = _dashboard_series_from_snapshot(history, quota_history, current_state, token_sessions, last_sample, accounts, revision, view)
+            payload = _dashboard_series_from_snapshot(history, quota_history, current_state, token_sessions, last_sample, accounts, revision, view, display_data)
             body = json.dumps(dashboard_safe_json(payload), ensure_ascii=False).encode("utf-8")
             with self.lock:
                 self._series_cache = {key: value for key, value in getattr(self, "_series_cache", {}).items() if value[0] == revision}
                 self._series_cache[view] = (revision, payload, body)
             return payload, body, revision
+
+    def refresh_dashboard_cache(self, force: bool = False, now: float | None = None) -> bool:
+        cache = getattr(self, "dashboard_cache", None)
+        if cache is None:
+            return False
+        now = time.time() if now is None else now
+        with self._series_build_lock:
+            with self.lock:
+                accounts = self._dashboard_accounts_locked()
+                source_revision = self._series_source_revision_locked(accounts)
+                if not force and cache.entry("local", source_revision, now) is not None and cache.entry("merged", source_revision, now) is not None:
+                    return False
+                display_data = {}
+                for view in ("local", "merged"):
+                    history, quota_history, token_sessions = self.usage_data.datasets(view) if hasattr(self, "usage_data") else (load_history(self.args.history), load_quota_history(self.args.quota_history), load_token_session_history(self.args.token_session_history))
+                    display_data[view] = _dashboard_display_data(history, quota_history, token_sessions, accounts, now)
+                source_revision = self._series_source_revision_locked(accounts)
+                next_maintenance_values = [value.get("nextMaintenanceAt") for value in display_data.values() if value.get("nextMaintenanceAt") is not None]
+                next_maintenance = min(next_maintenance_values, default=None)
+                payload = {
+                    "version": DASHBOARD_DISPLAY_CACHE_VERSION,
+                    "sourceRevision": source_revision,
+                    "builtAt": now,
+                    "nextMaintenanceAt": next_maintenance,
+                    "displayRevision": _dashboard_revision({"version": DASHBOARD_DISPLAY_CACHE_VERSION, "sourceRevision": source_revision, "builtAt": now, "nextMaintenanceAt": next_maintenance}),
+                    "views": display_data,
+                }
+                cache.replace(payload)
+                self._series_cache = {}
+                return True
+
+    def dashboard_cache_wait_seconds(self, now: float | None = None) -> float:
+        now = time.time() if now is None else now
+        with self.lock:
+            next_maintenance = getattr(self, "dashboard_cache", None)
+            next_maintenance = next_maintenance.next_maintenance_at() if next_maintenance is not None else None
+        return DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS if next_maintenance is None or next_maintenance <= now else min(DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS, max(1, next_maintenance - now))
+
+    def run_dashboard_cache_maintenance(self) -> None:
+        while self.running:
+            try:
+                self.refresh_dashboard_cache()
+            except Exception as exc:
+                print(f"Dashboard display cache maintenance failed: {exc}", file=sys.stderr, flush=True)
+            self.dashboard_cache_event.wait(self.dashboard_cache_wait_seconds())
+            self.dashboard_cache_event.clear()
+
+    def _signal_dashboard_cache(self) -> None:
+        event = getattr(self, "dashboard_cache_event", None)
+        if event is not None:
+            event.set()
 
     def history(self) -> list[dict]:
         with self.lock:
@@ -578,9 +943,13 @@ class UsageDashboardState:
         if self.accounts.status()["activeAccountId"] != account_status["activeAccountId"]:
             return {}
         sample["activeAccountSlotId"] = account_status["activeAccountId"]
+        sample["accountSlotId"] = account_status["activeAccountId"]
+        sample["accountLabel"] = next((account["label"] for account in account_status["items"] if account["id"] == account_status["activeAccountId"]), "Unknown")
+        sample["isApiAccount"] = bool(next((account.get("isApiAccount") for account in account_status["items"] if account["id"] == account_status["activeAccountId"]), False))
         sample["originMachineId"] = self.cloud.machine_id
         sample["usageAccountId"] = self.cloud.usage_account_id(account_status["activeAccountId"])
         sample["sync"] = {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": sample["usageAccountId"]}
+        api_account = is_api_auth(json.loads(self.args.auth.read_text(encoding="utf-8")))
         with self.lock:
             token_usage = sample.get("tokenUsage") or {}
             if token_usage:
@@ -589,8 +958,8 @@ class UsageDashboardState:
                     load_token_session_history(self.args.token_session_history),
                     token_usage.get("events") or [],
                     account_status["activeAccountId"],
-                    next((account["label"] for account in account_status["items"] if account["id"] == account_status["activeAccountId"]), "Unknown"),
-                    load_quota_history(self.args.quota_history) + history,
+                    sample["accountLabel"],
+                    self.accounts.attribution_timeline(),
                 )
                 write_token_session_history(self.args.token_session_history, token_sessions)
                 sample["cost"], sample["costByModel"] = token_cost_snapshot(token_sessions)
@@ -600,8 +969,11 @@ class UsageDashboardState:
                 token_usage.pop("events", None)
             self.runtime_state["activeAccountSlotId"] = account_status["activeAccountId"]
             apply_runtime_cost_measurement(sample, self.runtime_state)
-            append_quota_history_sample(self.args.quota_history, sample)
+            if not api_account:
+                append_quota_history_sample(self.args.quota_history, sample)
             events = process_sample_delta_events(self.runtime_state, sample, history)
+            if api_account:
+                events = []
             append_capped_jsonl(self.args.sample_log, sample_debug_log_row(sample, events, self.runtime_state), self.args.sample_log_max_bytes)
             for interval in self.runtime_state.pop("_pendingCostIntervals", []):
                 append_history(self.args.history, add_record_provenance("cost", interval, self.cloud.machine_id, sample["usageAccountId"]))
@@ -609,6 +981,7 @@ class UsageDashboardState:
             compact_history(self.args.history, self.args.compact_history_days)
             compact_quota_history(self.args.quota_history, self.args.compact_history_days)
             self.usage_data.normalize_local()
+            self._signal_dashboard_cache()
             print_special_events(self.runtime_state.get("_specialEvents") or [])
             print_valid_delta_events(events, sample)
             print_ratio_warnings(events)
@@ -620,15 +993,26 @@ class UsageDashboardState:
     def _poll_inactive_account(self, credential: dict) -> None:
         fd, temp_name = tempfile.mkstemp(prefix=".inactive-usage-", suffix=".json", dir=self.accounts.root)
         temp_path = Path(temp_name)
+        expected_fingerprint = credential["fingerprint"]
         try:
             with os.fdopen(fd, "wb") as stream:
                 stream.write(credential["data"])
                 stream.flush()
                 os.fsync(stream.fileno())
             auth = json.loads(credential["data"].decode("utf-8"))
+            if is_api_auth(auth):
+                return
+
+            def commit_refreshed_credentials():
+                nonlocal expected_fingerprint
+                data = temp_path.read_bytes()
+                if not self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, data):
+                    raise UsageError("recorded credentials changed during token refresh")
+                expected_fingerprint = auth_fingerprint(data)
+
             debug = {}
             output = fetch_usage_with_percent_arbitration(
-                auth, self.opener, temp_path, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=None,
+                auth, self.opener, temp_path, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials,
             )
             usage_account_id = self.cloud.usage_account_id(credential["id"])
             output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"], "remoteUsage": debug, "sync": {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": usage_account_id}})
@@ -639,7 +1023,7 @@ class UsageDashboardState:
         finally:
             try:
                 if temp_path.exists():
-                    self.accounts.commit_polled_credentials(credential["id"], credential["fingerprint"], temp_path.read_bytes())
+                    self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, temp_path.read_bytes())
             finally:
                 temp_path.unlink(missing_ok=True)
 
@@ -653,6 +1037,11 @@ class UsageDashboardState:
                 continue
             self.inactive_account_poll_started_at[credential["id"]] = now
             try:
+                if is_api_auth(json.loads(credential["data"].decode("utf-8"))):
+                    continue
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            try:
                 self._poll_inactive_account(credential)
                 with self.lock:
                     self.inactive_account_poll_errors.pop(credential["id"], None)
@@ -665,6 +1054,7 @@ class UsageDashboardState:
             with self.lock:
                 compact_quota_history(self.args.quota_history, self.args.compact_history_days)
                 self.usage_data.normalize_local()
+                self._signal_dashboard_cache()
         return polled
 
     def inactive_account_poll_wait_seconds(self, now: float | None = None) -> float:
@@ -676,6 +1066,208 @@ class UsageDashboardState:
             self.poll_due_inactive_accounts()
             self.inactive_account_poll_event.wait(self.inactive_account_poll_wait_seconds())
             self.inactive_account_poll_event.clear()
+
+    @staticmethod
+    def _session_refresh_enabled(credential: dict, label: str) -> bool:
+        config = credential.get("sessionRefresh")
+        if not isinstance(config, dict):
+            return True
+        return bool(((config.get("fiveHour") if label == "5h" else config.get("sevenDay") if label == "7d" else {}) or {}).get("enabled"))
+
+    @staticmethod
+    def _session_refresh_window_allows(credential: dict, label: str, now: float) -> bool:
+        if label != "5h":
+            return True
+        windows = (((credential.get("sessionRefresh") or {}).get("fiveHour") or {}).get("windowsUtc") or [])
+        if not windows:
+            return True
+        minute = now % (24 * 60 * 60) / 60
+        return any(int(window["start"][:2]) * 60 + int(window["start"][3:]) <= minute < (24 * 60 if window["end"] == "24:00" else int(window["end"][:2]) * 60 + int(window["end"][3:])) for window in windows)
+
+    def _session_refresh_schedule_wait_seconds(self, now: float) -> float:
+        waits = []
+        second = now % (24 * 60 * 60)
+        for credential in self.accounts.session_refresh_credentials():
+            if not self._session_refresh_enabled(credential, "5h") or self._session_refresh_window_allows(credential, "5h", now):
+                continue
+            for window in (((credential.get("sessionRefresh") or {}).get("fiveHour") or {}).get("windowsUtc") or []):
+                start = (int(window["start"][:2]) * 60 + int(window["start"][3:])) * 60
+                waits.append((start - second) % (24 * 60 * 60) or 24 * 60 * 60)
+        return min(waits, default=10 * 60)
+
+    @staticmethod
+    def _session_needs_refresh(label: str, window: dict, now: float) -> bool:
+        used_percent = coerce_float(window.get("usedPercent"))
+        reset_at = parse_timestamp(window.get("resetAt"))
+        duration = SESSION_REFRESH_WINDOW_SECONDS.get(label)
+        return used_percent == 0 and reset_at is not None and duration is not None and 0 <= now + duration - reset_at <= SESSION_REFRESH_RESET_LATENCY_SECONDS
+
+    @staticmethod
+    def _session_refresh_succeeded(previous_reset_at: float | None, current_reset_at: float | None) -> bool:
+        return previous_reset_at is not None and current_reset_at is not None and abs(current_reset_at - previous_reset_at) < SESSION_REFRESH_SUCCESS_TOLERANCE_SECONDS
+
+    def _retrieve_session_refresh_reset_at(self, credential: dict, label: str) -> float | None:
+        auth_path = self.args.auth if credential["active"] else self.accounts._account_path(credential["id"])
+        auth_data = auth_path.read_bytes()
+        expected_fingerprint = auth_fingerprint(auth_data)
+        temp_path = auth_path
+        try:
+            if not credential["active"]:
+                fd, temp_name = tempfile.mkstemp(prefix=".session-refresh-usage-", suffix=".json", dir=self.accounts.root)
+                temp_path = Path(temp_name)
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(auth_data)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+            def commit_refreshed_credentials():
+                nonlocal expected_fingerprint
+                if credential["active"]:
+                    self.sync_active_account_from_live()
+                    return
+                data = temp_path.read_bytes()
+                if not self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, data):
+                    raise UsageError("recorded credentials changed during token refresh")
+                expected_fingerprint = auth_fingerprint(data)
+
+            output = fetch_usage_with_percent_arbitration(
+                json.loads(auth_data.decode("utf-8")), self.opener, temp_path, max(self.args.timeout, 1), {}, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT),
+                auth_lock=self.accounts.lock if credential["active"] else None, refreshed_callback=commit_refreshed_credentials,
+            )
+            output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"]})
+            sample = make_history_sample(output, None)
+            with self.lock:
+                self._update_account_status_locked(credential["id"], sample)
+            return parse_timestamp(((sample.get("windows") or {}).get(label) or {}).get("resetAt"))
+        finally:
+            if not credential["active"] and temp_path.exists():
+                try:
+                    self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, temp_path.read_bytes())
+                finally:
+                    temp_path.unlink(missing_ok=True)
+
+    def _due_session_refreshes(self) -> list[tuple[dict, str]]:
+        now = time.time()
+        due = []
+        eligible_keys = set()
+        for credential in self.accounts.session_refresh_credentials():
+            for label, window in (self.account_statuses.get(credential["id"]) or {}).get("windows", {}).items():
+                key = credential["id"], label
+                if not self._session_refresh_enabled(credential, label):
+                    continue
+                eligible_keys.add(key)
+                used_percent = coerce_float((window or {}).get("usedPercent"))
+                if used_percent is None or key in self.session_refresh_procedures and key not in self.session_refresh_attempts and used_percent != 0:
+                    self.session_refresh_attempts.pop(key, None)
+                    self.session_refresh_costs.pop(key, None)
+                    self.session_refresh_reset_at.pop(key, None)
+                    self.session_refresh_procedures.discard(key)
+                    self.session_refresh_failed.pop(key, None)
+                    self.session_refresh_suppressed_reset_at.pop(key, None)
+                    continue
+                if key in self.session_refresh_failed:
+                    if now - self.session_refresh_failed[key] < SESSION_REFRESH_FAILURE_RETRY_SECONDS:
+                        continue
+                    self.session_refresh_attempts.pop(key, None)
+                    self.session_refresh_costs.pop(key, None)
+                    self.session_refresh_reset_at.pop(key, None)
+                    self.session_refresh_procedures.discard(key)
+                    self.session_refresh_failed.pop(key)
+                    if coerce_float((window or {}).get("usedPercent")) == 0:
+                        due.append((credential, label))
+                        continue
+                if key not in self.session_refresh_procedures and not self._session_needs_refresh(label, window or {}, now):
+                    self.session_refresh_attempts.pop(key, None)
+                    self.session_refresh_costs.pop(key, None)
+                    self.session_refresh_reset_at.pop(key, None)
+                    self.session_refresh_procedures.discard(key)
+                    self.session_refresh_failed.pop(key, None)
+                    self.session_refresh_suppressed_reset_at.pop(key, None)
+                    continue
+                if key not in self.session_refresh_procedures:
+                    reset_at = parse_timestamp((window or {}).get("resetAt"))
+                    if self.session_refresh_suppressed_reset_at.get(key) == reset_at:
+                        continue
+                    self.session_refresh_suppressed_reset_at.pop(key, None)
+                if self.session_refresh_attempts.get(key, 0) >= SESSION_REFRESH_MAX_ATTEMPTS:
+                    if key not in self.session_refresh_failed:
+                        print(f"Manual refresh failed for {credential['label']!r} ({label}) after {SESSION_REFRESH_MAX_ATTEMPTS} attempts; token API-equivalent cost: {session_refresh_cost_text(self.session_refresh_costs.get(key))}.", flush=True)
+                        self.session_refresh_failed[key] = now
+                    continue
+                if key not in self.session_refresh_procedures or self._session_refresh_window_allows(credential, label, now):
+                    due.append((credential, label))
+        tracked_keys = self.session_refresh_attempts.keys() | self.session_refresh_costs.keys() | self.session_refresh_reset_at.keys() | self.session_refresh_procedures | self.session_refresh_failed.keys()
+        for key in tracked_keys - eligible_keys:
+            self.session_refresh_attempts.pop(key, None)
+            self.session_refresh_costs.pop(key, None)
+            self.session_refresh_reset_at.pop(key, None)
+            self.session_refresh_procedures.discard(key)
+            self.session_refresh_failed.pop(key, None)
+        for key in self.session_refresh_suppressed_reset_at.keys() - eligible_keys:
+            self.session_refresh_suppressed_reset_at.pop(key)
+        return due
+
+    def run_session_refreshing(self) -> None:
+        while self.running:
+            due = self._due_session_refreshes()
+            for credential, label in due:
+                key = credential["id"], label
+                if key not in self.session_refresh_procedures:
+                    window = ((self.account_statuses.get(credential["id"]) or {}).get("windows", {}).get(label) or {})
+                    previous_reset_at = parse_timestamp(window.get("resetAt"))
+                    try:
+                        reset_at = self._retrieve_session_refresh_reset_at(credential, label)
+                    except Exception:
+                        if previous_reset_at is not None:
+                            self.session_refresh_suppressed_reset_at[key] = previous_reset_at
+                        continue
+                    if previous_reset_at is None or reset_at is None or reset_at == previous_reset_at:
+                        if reset_at is not None:
+                            self.session_refresh_suppressed_reset_at[key] = reset_at
+                        continue
+                    window = ((self.account_statuses.get(credential["id"]) or {}).get("windows", {}).get(label) or {})
+                    if self._session_refresh_window_allows(credential, label, time.time()):
+                        print(f"Manual refresh needed for {credential['label']!r} ({label}; next refresh at {window.get('resetAt') or 'unknown'}); starting manual refresh procedure.", flush=True)
+                    else:
+                        print(f"Manual refresh needed for {credential['label']!r} ({label}; next refresh at {window.get('resetAt') or 'unknown'}); queued until an allowed UTC window.", flush=True)
+                    self.session_refresh_procedures.add(key)
+                    self.session_refresh_costs[key] = 0.0
+                    self.session_refresh_reset_at[key] = reset_at
+                if not self._session_refresh_window_allows(credential, label, time.time()):
+                    continue
+                try:
+                    refreshed, auth_data, refresh_cost = refresh_session(self.args.codex_home if credential["active"] else self.accounts.root / credential["id"] / "session-refresh", None if credential["active"] else credential["data"])
+                    current_cost = self.session_refresh_costs.get(key, 0.0)
+                    if refresh_cost is None or current_cost is None:
+                        self.session_refresh_costs[key] = None
+                    else:
+                        self.session_refresh_costs[key] = current_cost + refresh_cost
+                    if not refreshed:
+                        continue
+                    if credential["active"]:
+                        self.sync_active_account_from_live()
+                    elif auth_data is not None:
+                        self.accounts.commit_polled_credentials(credential["id"], credential["fingerprint"], auth_data)
+                    reset_at = self._retrieve_session_refresh_reset_at(credential, label)
+                    if self._session_refresh_succeeded(self.session_refresh_reset_at.get(key), reset_at):
+                        print(f"Manual refresh succeeded for {credential['label']!r} ({label}) after {self.session_refresh_attempts.get(key, 0) + 1} times; token API-equivalent cost: {session_refresh_cost_text(self.session_refresh_costs.get(key))}.", flush=True)
+                        self.session_refresh_suppressed_reset_at[key] = reset_at
+                        self.session_refresh_attempts.pop(key, None)
+                        self.session_refresh_costs.pop(key, None)
+                        self.session_refresh_reset_at.pop(key, None)
+                        self.session_refresh_procedures.discard(key)
+                        self.session_refresh_failed.pop(key, None)
+                        continue
+                    self.session_refresh_reset_at[key] = reset_at
+                except Exception:
+                    self.session_refresh_costs[key] = None
+                    pass
+                finally:
+                    if key in self.session_refresh_procedures:
+                        self.session_refresh_attempts[key] = self.session_refresh_attempts.get(key, 0) + 1
+            now = time.time()
+            self.session_refresh_event.wait(0 if due else min(self._session_refresh_schedule_wait_seconds(now), min((max(failed_at + SESSION_REFRESH_FAILURE_RETRY_SECONDS - now, 0) for failed_at in self.session_refresh_failed.values()), default=10 * 60)))
+            self.session_refresh_event.clear()
 
     def run(self) -> None:
         while self.running:
@@ -702,8 +1294,19 @@ class UsageDashboardState:
             else:
                 if any(result.values()):
                     self.cloud_maintenance_connection_failed = False
+                if result.get("usageSynced"):
+                    self._signal_dashboard_cache()
             self.cloud_maintenance_event.wait(5)
             self.cloud_maintenance_event.clear()
+
+    def run_config_monitor(self) -> None:
+        while self.running:
+            try:
+                self.accounts.sync_config_from_disk()
+            except AccountError as exc:
+                self.accounts.error = f"config.toml update could not be recorded: {exc}"
+            self.config_monitor_event.wait(5)
+            self.config_monitor_event.clear()
 
     def _account_changed(self) -> None:
         with self.lock:
@@ -711,18 +1314,82 @@ class UsageDashboardState:
             self.last_error = None
             self.inactive_account_poll_errors.pop(self.accounts.status()["activeAccountId"], None)
             self.usage_data.refresh_accounts()
+            self._signal_dashboard_cache()
         self.wake_event.set()
         self.inactive_account_poll_event.set()
 
     def sync_active_account_from_live(self) -> bool:
-        changed = self.accounts.sync_active_from_live()
+        changed, external_update = self.accounts.reconcile_active_from_live()
         if changed:
             self.usage_data.refresh_accounts()
+            self._signal_dashboard_cache()
+        if external_update is not None:
+            self._start_external_auth_validation(external_update)
         return changed
 
-    def create_account(self, label: str) -> dict:
+    def _start_external_auth_validation(self, external_update: dict) -> None:
+        fingerprint = auth_fingerprint(external_update["data"])
+        with self.lock:
+            if fingerprint in self.external_auth_validation_fingerprints:
+                return
+            self.external_auth_validation_fingerprints.add(fingerprint)
+
+        def validate():
+            fd, temp_name = tempfile.mkstemp(prefix=".external-auth-validation-", suffix=".json", dir=self.accounts.root)
+            temp_path = Path(temp_name)
+            expected_fingerprint = external_update["fingerprint"]
+            try:
+                with os.fdopen(fd, "wb") as stream:
+                    stream.write(external_update["data"])
+                    stream.flush()
+                    os.fsync(stream.fileno())
+
+                def commit_refreshed_credentials():
+                    nonlocal expected_fingerprint
+                    data = temp_path.read_bytes()
+                    if not self.accounts.commit_polled_credentials(external_update["id"], expected_fingerprint, data):
+                        raise UsageError("recorded credentials changed during external auth validation")
+                    expected_fingerprint = auth_fingerprint(data)
+
+                auth = json.loads(external_update["data"].decode("utf-8"))
+                output = fetch_usage_with_percent_arbitration(auth, self.opener, temp_path, max(self.args.timeout, 1), {}, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials)
+                data = temp_path.read_bytes()
+                if not self.accounts.commit_polled_credentials(external_update["id"], expected_fingerprint, data):
+                    raise UsageError("recorded credentials changed during external auth validation")
+                output.update({"checkedAt": now_iso(), "accountSlotId": external_update["id"], "accountLabel": external_update["label"]})
+                sample = make_history_sample(output, None)
+                with self.lock:
+                    append_quota_history_sample(self.args.quota_history, sample)
+                    self._update_account_status_locked(external_update["id"], sample)
+                    self._signal_dashboard_cache()
+                print(f"External credentials for {external_update['label']!r} were validated and saved.", flush=True)
+            except Exception as exc:
+                print(f"External credentials for {external_update['label']!r} were not saved because background validation failed: {exc}", file=sys.stderr, flush=True)
+            finally:
+                temp_path.unlink(missing_ok=True)
+                with self.lock:
+                    self.external_auth_validation_fingerprints.discard(fingerprint)
+                    self.external_auth_validation_threads.discard(threading.current_thread())
+
+        thread = threading.Thread(target=validate, daemon=True)
+        with self.lock:
+            self.external_auth_validation_threads.add(thread)
+        thread.start()
+
+    def wait_for_external_auth_validations(self, timeout: float) -> None:
+        deadline = time.monotonic() + max(timeout, 0)
+        while True:
+            with self.lock:
+                threads = list(self.external_auth_validation_threads)
+            if not threads:
+                return
+            threads[0].join(max(deadline - time.monotonic(), 0))
+            if time.monotonic() >= deadline:
+                return
+
+    def create_account(self, label: str, account_type: str = "account", api_key: str | None = None) -> dict:
         previous = self.accounts.status()
-        result = self.accounts.create_account(label)
+        result = self.accounts.create_account(label, account_type, api_key, self._start_external_auth_validation)
         self._account_changed()
         if previous["activeAccountId"] is None:
             print(f"Account event: prepared {str(label).strip()!r} for sign-in.", flush=True)
@@ -733,7 +1400,7 @@ class UsageDashboardState:
     def switch_account(self, account_id: str) -> dict:
         previous_status = self.accounts.status()
         previous_id = previous_status["activeAccountId"]
-        result = self.accounts.switch(account_id)
+        result = self.accounts.switch(account_id, self._start_external_auth_validation)
         if result["activeAccountId"] != previous_id:
             self._account_changed()
             print(
@@ -753,6 +1420,7 @@ class UsageDashboardState:
             replace_account_label(self.last_sample, str(account_id), renamed_label)
             replace_account_label(self.account_statuses.get(str(account_id)), str(account_id), renamed_label)
             self.usage_data.refresh_accounts()
+            self._signal_dashboard_cache()
         print(f"Account event: renamed {account['label'] if account else None!r} to {str(label).strip()!r}.", flush=True)
         return result
 
@@ -763,6 +1431,7 @@ class UsageDashboardState:
         with self.lock:
             self.account_statuses.pop(str(account_id or ""), None)
             self.usage_data.refresh_accounts()
+            self._signal_dashboard_cache()
         if result["activeAccountId"] != previous_status["activeAccountId"]:
             self._account_changed()
         print(f"Account event: deleted {deleted['label']!r}.", flush=True)
@@ -782,29 +1451,28 @@ def management_payload(state: UsageDashboardState, include_remote: bool = False,
         "scan": [{**{key: item.get(key) for key in ("name", "sources", "authoritativeSource", "defaultAssignments")}, **({"error": "Skill scan error"} if item.get("error") else {})} for item in state.skills.scan(refresh_scan)],
         "cloud": dashboard_cloud_status(state.cloud.redacted_status()),
         "accounts": dashboard_account_status(state.accounts.status()),
+        "apiConfig": state.accounts.config_editor_payload(),
     }
     if include_remote and payload["cloud"]["webdav"].get("enabled"):
         state.cloud.fetch(include_usage=False)
-    payload["remoteAccounts"] = [{"accountKey": item.get("accountKey"), "label": item.get("label"), "bindingState": "released"} for item in state.cloud.cached_remote_accounts()]
+    payload["remoteAccounts"] = [{"accountKey": item.get("accountKey"), "label": item.get("label"), "accountType": item.get("accountType", "account"), "bindingState": "released"} for item in state.cloud.cached_remote_accounts()]
     return payload
 
-def _dashboard_series_from_snapshot(history: list[dict], quota_history: list[dict], current_state: dict, token_sessions: list[dict], last_sample: dict | None, accounts: dict, revision: str | None = None, view: str = "local") -> dict:
-    events = derive_history_events(history)
+def _dashboard_series_from_snapshot(
+    history: list[dict] | None, quota_history: list[dict] | None, current_state: dict, token_sessions: list[dict] | None, last_sample: dict | None, accounts: dict,
+    revision: str | None = None, view: str = "local", display_data: dict | None = None,
+) -> dict:
+    if display_data is None:
+        display_data = _dashboard_display_data(history or [], quota_history or [], token_sessions or [], accounts)
     return {
         "seriesRevision": revision,
         "dataView": view,
         "quotaDataView": view,
         "points": dashboard_points_from_state(current_state),
-        "quotaPoints": dashboard_quota_points(quota_history),
-        "tokenSessions": [dashboard_token_session(row) for row in token_sessions],
-        "events": events,
-        "historyStats": {
-            "rows": len(history),
-            "fiveHourEvents": len(events["fiveHour"]),
-            "sevenDayEvents": len(events["sevenDay"]),
-            "fiveHourRealEvents": sum(1 for event in events["fiveHour"] if not event.get("synthetic")),
-            "sevenDayRealEvents": sum(1 for event in events["sevenDay"] if not event.get("synthetic")),
-        },
+        "quotaPoints": display_data["quotaPoints"],
+        "tokenSessions": display_data["tokenSessions"],
+        "events": display_data["events"],
+        "historyStats": display_data["historyStats"],
         "lastSample": dashboard_sample(last_sample),
         "display": dashboard_display(last_sample),
         "accounts": accounts,
@@ -968,9 +1636,10 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             path = urllib.parse.urlparse(self.path).path
             allowed = {
                 "/api/control/login", "/api/control/setup",
-                "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign",
-                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/push", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/release", "/api/manage/accounts/delete", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
+                "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/accounts/session-refresh", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign",
+                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/push", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
             }
+            allowed.add("/api/manage/accounts/common")
             if path not in allowed:
                 self.send_json(404, {"error": "Not found"})
                 return
@@ -999,13 +1668,16 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                 if not self.require_control_auth():
                     return
                 if path == "/api/accounts":
-                    result = state.create_account(body.get("label"))
+                    result = state.create_account(body.get("label"), body.get("accountType", "account"), body.get("apiKey"))
                 elif path == "/api/accounts/switch":
                     result = state.switch_account(body.get("accountId"))
                 elif path == "/api/accounts/rename":
                     result = state.rename_account(body.get("accountId"), body.get("label"))
                 elif path == "/api/accounts/delete":
                     result = state.delete_account(body.get("accountId"))
+                elif path == "/api/accounts/session-refresh":
+                    result = state.accounts.set_session_refresh(body.get("accountId"), body.get("sessionRefresh"))
+                    state.session_refresh_event.set()
                 elif path == "/api/manage/skills/manage":
                     self.send_json(200, state.skills.manage(body.get("names") if isinstance(body.get("names"), list) else []))
                     return
@@ -1048,6 +1720,21 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                 elif path == "/api/manage/accounts/release":
                     self.send_json(200, {"accounts": state.cloud.release_local_account(body.get("accountId"))})
                     return
+                elif path == "/api/manage/accounts/share":
+                    self.send_json(200, {"accounts": state.cloud.share_local_account(body.get("accountId"))})
+                    return
+                elif path == "/api/manage/accounts/delete-remote":
+                    self.send_json(200, {"remoteAccounts": state.cloud.delete_remote_account(body.get("accountKey"))})
+                    return
+                elif path == "/api/manage/accounts/header":
+                    self.send_json(200, {"accounts": state.accounts.update_api_config(body.get("accountId"), body.get("headerToml"))})
+                    return
+                elif path == "/api/manage/accounts/common-header":
+                    self.send_json(200, {"accounts": state.accounts.update_common_account_header(body.get("headerToml"))})
+                    return
+                elif path == "/api/manage/accounts/common":
+                    self.send_json(200, {"accounts": state.accounts.update_common_config(body.get("commonToml"))})
+                    return
                 elif path == "/api/manage/accounts/delete":
                     self.send_json(200, {"accounts": state.delete_account(body.get("accountId"))})
                     return
@@ -1079,8 +1766,14 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
     thread.start()
     inactive_account_thread = threading.Thread(target=state.run_inactive_account_polling, daemon=True)
     inactive_account_thread.start()
+    session_refresh_thread = threading.Thread(target=state.run_session_refreshing, daemon=True)
+    session_refresh_thread.start()
+    dashboard_cache_thread = threading.Thread(target=state.run_dashboard_cache_maintenance, daemon=True)
+    dashboard_cache_thread.start()
     cloud_thread = threading.Thread(target=state.run_cloud_maintenance, daemon=True)
     cloud_thread.start()
+    config_thread = threading.Thread(target=state.run_config_monitor, daemon=True)
+    config_thread.start()
     url = f"http://127.0.0.1:{DASHBOARD_PORT}/"
     print(f"Dashboard: {url}", flush=True)
     if args.dashboard:
@@ -1090,10 +1783,18 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
     except KeyboardInterrupt:
         pass
     finally:
+        try:
+            state.sync_active_account_from_live()
+            state.wait_for_external_auth_validations(max(getattr(args, "timeout", 10), 1) + 1)
+        except Exception as exc:
+            print(f"Final auth.json reconciliation failed: {exc}", file=sys.stderr, flush=True)
         state.running = False
         state.wake_event.set()
         state.inactive_account_poll_event.set()
+        state.session_refresh_event.set()
+        state.dashboard_cache_event.set()
         state.cloud_maintenance_event.set()
+        state.config_monitor_event.set()
         server.server_close()
         instance_lock.release()
     return 0

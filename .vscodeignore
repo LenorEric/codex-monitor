@@ -9,6 +9,7 @@ cc-switch-main/**
 release/**
 vsc-extension-release/**
 __pycache__/**
+.pytest_cache/**
 *.pyc
 *.log
 *.vsix

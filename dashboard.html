@@ -66,9 +66,9 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <header>
 <div class="bar">
 <div class="title">Codex Usage Monitor</div>
-<div class="quota"><span id="top5h">5h: N/A</span><span id="top7d">7d: N/A</span></div>
+<div class="quota" data-quota-widget><span id="top5h">5h: N/A</span><span id="top7d">7d: N/A</span></div>
 <div class="account-controls"><label for="accountSelect">Account</label><select id="accountSelect" aria-label="Active Codex account"></select>
-<button id="newAccount" hidden>New account</button><button id="renameAccount" hidden>Rename</button><button id="deleteAccount" hidden>Delete</button><button id="managePage">Manage skills &amp; accounts</button>
+<button id="renameAccount" hidden>Rename</button><button id="deleteAccount" hidden>Delete</button><button id="managePage">Manage skills &amp; accounts</button>
 <span class="account-detail" id="accountDetail"></span></div>
 </div>
 <div class="toolbar">
@@ -85,7 +85,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <div class="status" id="status"></div>
 </header>
 <main class="grid compact-grid">
-<section class="card window-card">
+<section class="card window-card" data-quota-widget>
 <div class="card-title"><h2>5h Reset Time vs Usage</h2></div>
 <div class="window-progress">
 <span class="progress-label">5h time</span><div class="progress-track"><div class="progress-fill time-fill" id="time5hFill"></div></div><span class="progress-value" id="time5hValue">N/A</span>
@@ -93,7 +93,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <span class="progress-label">5h usage</span><div class="progress-track"><div class="progress-fill usage-fill" id="usage5hFill"></div></div><span class="progress-value" id="usage5hValue">N/A</span>
 </div>
 </section>
-<section class="card window-card">
+<section class="card window-card" data-quota-widget>
 <div class="card-title"><h2>7d Reset Time vs Usage</h2></div>
 <div class="window-progress weekly">
 <span class="progress-label">7d time</span><div class="progress-track"><div class="progress-fill time-fill" id="time7dFill"></div></div><span class="progress-value" id="time7dValue">N/A</span>
@@ -112,24 +112,24 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <div class="token-metric"><div class="token-metric-label">Token cost</div><div class="token-metric-value" id="tokenCost">$0</div></div>
 </div>
 </section>
-<section class="card">
+<section class="card" data-quota-widget>
 <div class="card-title"><h2>5h Usage vs Time</h2></div>
 <div class="meta"><span>Time on X axis</span><span>Usage percentage on Y axis</span></div>
 <canvas class="chart" id="usageTime5h"></canvas>
 <div class="legend" id="usageTime5hLegend"></div>
 </section>
-<section class="card">
+<section class="card" data-quota-widget>
 <div class="card-title"><h2>7d Usage vs Time</h2></div>
 <div class="meta"><span>Time on X axis</span><span>Usage percentage on Y axis</span></div>
 <canvas class="chart" id="usageTime7d"></canvas>
 <div class="legend" id="usageTime7dLegend"></div>
 </section>
-<section class="card">
+<section class="card" data-quota-widget>
 <div class="card-title"><h2>5h Cost vs Usage</h2><span class="rate" id="rate5h">Cost / 100%: N/A</span></div>
 <div class="meta"><span>Cumulative delta % on X axis</span><span>Cumulative delta USD on Y axis</span></div>
 <canvas class="chart" id="scatter5h"></canvas>
 </section>
-<section class="card">
+<section class="card" data-quota-widget>
 <div class="card-title"><h2>7d Cost vs Usage</h2><span class="rate" id="rate7d">Cost / 100%: N/A</span></div>
 <div class="meta"><span>Cumulative delta % on X axis</span><span>Cumulative delta USD on Y axis</span></div>
 <canvas class="chart" id="scatter7d"></canvas>
@@ -146,11 +146,11 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <div id="controlPasswordConfirmationRow"><div class="password-label"><label for="dashboardControlPasswordConfirmation">Confirm password</label><span class="password-match-status" id="controlPasswordMatchStatus" aria-live="polite"></span></div><input id="dashboardControlPasswordConfirmation" type="password" maxlength="1024" autocomplete="new-password"></div>
 <p id="controlPasswordError" role="alert"></p><div class="modal-actions"><button id="cancelControlPassword" type="button">Cancel</button><button id="submitControlPassword" type="submit">Unlock</button></div></form>
 </div>
-<div class="modal-backdrop" id="newAccountModal" role="dialog" aria-modal="true" aria-labelledby="newAccountTitle">
-<div class="modal"><h2 id="newAccountTitle">Add Codex account</h2>
-<p>The current login will be saved, then auth.json will be removed. Run Codex login in a new or restarted terminal; this dashboard will adopt the new login automatically.</p>
-<label for="newAccountLabel">Account name</label><input id="newAccountLabel" type="text" maxlength="80" autocomplete="off" placeholder="e.g. Personal Pro">
-<div class="modal-actions"><button id="cancelNewAccount">Cancel</button><button id="confirmNewAccount">Save current &amp; sign in</button></div></div>
+<div class="modal-backdrop" id="renameAccountModal" role="dialog" aria-modal="true" aria-labelledby="renameAccountTitle">
+<div class="modal"><h2 id="renameAccountTitle">Rename Codex account</h2>
+<p>Only the dashboard label changes. Saved credentials and shared Codex configuration remain unchanged.</p>
+<label for="renameAccountLabel">Account name</label><input id="renameAccountLabel" type="text" maxlength="80" autocomplete="off">
+<div class="modal-actions"><button id="cancelRenameAccount">Cancel</button><button id="confirmRenameAccount">Save name</button></div></div>
 </div>
 <div class="modal-backdrop" id="deleteAccountModal" role="dialog" aria-modal="true" aria-labelledby="deleteAccountTitle">
 <div class="modal"><h2 id="deleteAccountTitle">Delete saved account</h2>
@@ -164,7 +164,7 @@ const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
 const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections";
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
 let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],events:{fiveHour:[],sevenDay:[]}};
-let pendingStatusRequest=null, pendingSeriesRequests=new Map(), currentSeriesRevision=null, actionBusy=false, accountLabelMode="create", actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
+let pendingStatusRequest=null, pendingSeriesRequests=new Map(), currentSeriesRevision=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
 const DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50, DATE_PICKER_VIRTUAL_WIDTH=280, DATE_PICKER_VIRTUAL_HEIGHT=360, DATE_PICKER_VIRTUAL_PADDING=8;
@@ -195,7 +195,8 @@ function showMessage(title,summary,details=summary,type="info"){
 const detailStatus=status=>status[0].toUpperCase()+status.slice(1);
 function messageDetailReport(operation,overall,steps=[],notes=[]){const lines=[`Operation: ${operation}`,`Overall status: ${overall}`];if(steps.length)lines.push("",...steps.map(step=>`[${detailStatus(step.status)}] ${step.name}${step.detail?` — ${step.detail}`:""}`));if(notes.length)lines.push("",...notes);return lines.join("\n")}
 document.getElementById("closeMessageDetail").onclick=()=>document.getElementById("messageDetailModal").classList.remove("open");
-document.getElementById("messageDetailModal").onclick=event=>{if(event.target===event.currentTarget)event.currentTarget.classList.remove("open")};
+function bindBackdropDismiss(modal){modal.onpointerdown=event=>{if(event.target===event.currentTarget)modal.classList.remove("open")}}
+bindBackdropDismiss(document.getElementById("messageDetailModal"));
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()}
 function allEvents(){return [...((payload.events||{}).fiveHour||[]),...((payload.events||{}).sevenDay||[])]}
 function pointFromSample(sample){
@@ -479,7 +480,7 @@ function requestStatus(){
 }
 function accountAction(action,body){
   if(!vscode){
-    const url={create:"/api/accounts",switch:"/api/accounts/switch",rename:"/api/accounts/rename",delete:"/api/accounts/delete",login:"/api/control/login",setup:"/api/control/setup"}[action];
+    const url={switch:"/api/accounts/switch",rename:"/api/accounts/rename",delete:"/api/accounts/delete",login:"/api/control/login",setup:"/api/control/setup"}[action];
     if(!url)return Promise.reject(new Error("Unknown account action"));
     return fetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)}).then(async response=>{
       const result=await response.json().catch(()=>({}));if(!response.ok){const error=new Error(result.error||`HTTP ${response.status}`);error.status=response.status;throw error}return result;
@@ -534,6 +535,7 @@ function renderAccounts(accounts){
   select.replaceChildren(...(accounts.items||[]).map(account=>{const option=document.createElement("option");option.value=account.id;option.textContent=`${account.label}${account.ready?account.pollError?" (poll failed)":"":" (sign in required)"}`;return option}));
   select.value=accounts.activeAccountId||"";
   const active=(accounts.items||[]).find(account=>account.id===accounts.activeAccountId), detail=document.getElementById("accountDetail"), banner=document.getElementById("accountBanner");
+  document.querySelectorAll("[data-quota-widget]").forEach(widget=>widget.hidden=Boolean(active?.isApiAccount));
   detail.textContent="";
   const accountError=accounts.error||"", accountMessage=accounts.message||"", awaitingLogin=Boolean(accounts.awaitingLogin), loginDetail=`${active?.label||"New account"} is waiting for login. Run Codex login in a new or restarted terminal; auth.json will be captured automatically.`;
   if(accountError&&accountError!==lastAccountError)showMessage("Account Action Failed",`The requested account change was not completed: ${accountError}`,messageDetailReport("Account action","Failed",[{name:"Requested account change",status:"failed",detail:accountError}],["The previous account state was preserved when rollback was required."]),"error");
@@ -542,49 +544,42 @@ function renderAccounts(accounts){
   lastAccountError=accountError;lastAccountMessage=accountMessage;awaitingLoginMessageShown=awaitingLogin;banner.classList.remove("error");
   if(awaitingLogin){banner.textContent=loginDetail;banner.style.display="block"}
   else banner.style.display="none";
-  select.disabled=actionBusy;document.getElementById("newAccount").disabled=actionBusy;
+  select.disabled=actionBusy;
   document.getElementById("renameAccount").disabled=actionBusy||!active;
   document.getElementById("deleteAccount").disabled=actionBusy||!active||(accounts.items||[]).length<=1;
 }
 async function performAccountAction(action,body){
   if(actionBusy)return;
   actionBusy=true;if(payload.accounts)payload.accounts={...payload.accounts,error:null};renderAccounts(payload.accounts);
-  const actionName={create:"Account Creation",switch:"Account Switch",rename:"Account Rename",delete:"Account Delete"}[action],workingDetail={create:"Saving the current account and preparing a new sign-in slot.",switch:"Saving the outgoing account and activating the selected account.",rename:"Updating the account label and persisted local history.",delete:"Removing the inactive account from this machine."}[action],workingSteps={create:["Verify and save outgoing credentials","Create the new account slot","Remove auth.json for the next login"],switch:["Verify and save outgoing credentials","Load selected credentials into auth.json"],rename:["Update the account label","Rewrite matching local history labels"],delete:["Validate that deletion is allowed","Remove local credentials and manifest entry"]}[action],workingMessage=showMessage(`${actionName} Started`,workingDetail,messageDetailReport(actionName,"In progress",workingSteps.map((name,index)=>({name,status:index?"pending":"in progress",detail:index?"Waiting for the preceding step.":"The operation is running."}))),"progress");
+  const actionName={switch:"Account Switch",rename:"Account Rename",delete:"Account Delete"}[action],workingDetail={switch:"Saving the outgoing account and activating the selected account.",rename:"Updating the account label and persisted local history.",delete:"Removing the inactive account from this machine."}[action],workingSteps={switch:["Verify and save outgoing credentials","Load selected credentials into auth.json"],rename:["Update the account label","Rewrite matching local history labels"],delete:["Validate that deletion is allowed","Remove local credentials and manifest entry"]}[action],workingMessage=showMessage(`${actionName} Started`,workingDetail,messageDetailReport(actionName,"In progress",workingSteps.map((name,index)=>({name,status:index?"pending":"in progress",detail:index?"Waiting for the preceding step.":"The operation is running."}))),"progress");
   let succeeded=false;
-  try{const result=await authenticatedAccountAction(action,body);payload.accounts=result.accounts||payload.accounts;succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={create:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"New account slot",status:"passed",detail:`${body.label} was created and made active.`},{name:"Codex login",status:"pending",detail:"Run Codex login in a new or restarted terminal to finish sign-in."}],switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(action==="create"?`${actionName} Completed — Login Required`:`${actionName} Completed`,{create:`${body.label} is ready for Codex sign-in.`,switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(actionName,action==="create"?"Completed; login required":"Completed",steps),action==="create"?"warning":"success")}
+  try{const result=await authenticatedAccountAction(action,body);payload.accounts=result.accounts||payload.accounts;succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(`${actionName} Completed`,{switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(action,"Completed",steps),"success")}
   catch(error){payload.accounts={...(payload.accounts||{}),error:error.message||String(error)}}
   finally{workingMessage.dismiss();actionBusy=false;renderAccounts(payload.accounts)}
   if(succeeded)load(true);
 }
 function setupAccountControls(){
-  const modal=document.getElementById("newAccountModal"), input=document.getElementById("newAccountLabel"), deleteModal=document.getElementById("deleteAccountModal");
+  const modal=document.getElementById("renameAccountModal"), input=document.getElementById("renameAccountLabel"), deleteModal=document.getElementById("deleteAccountModal");
   const activeAccount=()=>((payload.accounts||{}).items||[]).find(account=>account.id===payload.accounts?.activeAccountId);
   document.getElementById("accountSelect").onchange=event=>performAccountAction("switch",{accountId:event.target.value});
-  document.getElementById("newAccount").onclick=()=>{
-    accountLabelMode="create";document.getElementById("newAccountTitle").textContent="Add Codex account";
-    modal.querySelector("p").textContent="The current login will be saved, then auth.json will be removed. Run Codex login in a new or restarted terminal; this dashboard will adopt the new login automatically.";
-    document.getElementById("confirmNewAccount").textContent="Save current & sign in";input.value="";modal.classList.add("open");setTimeout(()=>input.focus(),0);
-  };
   document.getElementById("renameAccount").onclick=()=>{
-    const active=activeAccount();if(!active)return;accountLabelMode="rename";document.getElementById("newAccountTitle").textContent="Rename Codex account";
-    modal.querySelector("p").textContent="Only the dashboard label changes. Saved credentials and shared Codex configuration remain unchanged.";
-    document.getElementById("confirmNewAccount").textContent="Save name";input.value=active.label;modal.classList.add("open");setTimeout(()=>{input.focus();input.select()},0);
+    const active=activeAccount();if(!active)return;input.value=active.label;modal.classList.add("open");setTimeout(()=>{input.focus();input.select()},0);
   };
   document.getElementById("deleteAccount").onclick=()=>{
     const active=activeAccount();if(!active)return;
     document.getElementById("deleteAccountMessage").textContent=`Delete ${active.label} from this machine? Another account will become active first. This does not change any released cloud account.`;
     deleteModal.classList.add("open");
   };
-  document.getElementById("cancelNewAccount").onclick=()=>modal.classList.remove("open");
-  document.getElementById("confirmNewAccount").onclick=()=>{
+  document.getElementById("cancelRenameAccount").onclick=()=>modal.classList.remove("open");
+  document.getElementById("confirmRenameAccount").onclick=()=>{
     const label=input.value.trim();if(!label){input.focus();return}modal.classList.remove("open");
-    performAccountAction(accountLabelMode,accountLabelMode==="create"?{label}:{accountId:activeAccount()?.id,label});
+    performAccountAction("rename",{accountId:activeAccount()?.id,label});
   };
   document.getElementById("cancelDeleteAccount").onclick=()=>deleteModal.classList.remove("open");
   document.getElementById("confirmDeleteAccount").onclick=()=>{const active=activeAccount();deleteModal.classList.remove("open");if(active)performAccountAction("delete",{accountId:active.id})};
-  input.onkeydown=event=>{if(event.key==="Enter")document.getElementById("confirmNewAccount").click();if(event.key==="Escape")modal.classList.remove("open")};
-  modal.onclick=event=>{if(event.target===modal)modal.classList.remove("open")};
-  deleteModal.onclick=event=>{if(event.target===deleteModal)deleteModal.classList.remove("open")};
+  input.onkeydown=event=>{if(event.key==="Enter")document.getElementById("confirmRenameAccount").click();if(event.key==="Escape")modal.classList.remove("open")};
+  bindBackdropDismiss(modal);
+  bindBackdropDismiss(deleteModal);
 }
 document.getElementById("managePage").onclick=()=>vscode?vscode.postMessage({type:"codexUsageNavigate",page:"manage"}):location.assign("/manage");
 function renderCurrentStatus(status){
@@ -599,6 +594,7 @@ function renderCurrentStatus(status){
   lastUpdateTimestamp=!payload.accounts?.awaitingLogin&&latest?(display.percentCheckedAt||latest.checkedAt):null;
   document.getElementById("status").textContent=payload.accounts?.awaitingLogin?"Remote usage polling is paused until Codex login completes.":latest
     ?`Last update ${secondsAgo(lastUpdateTimestamp)}`
+    :payload.accounts?.items?.find(account=>account.id===payload.accounts.activeAccountId)?.isApiAccount?"Tracking API token usage from Codex sessions."
     :payload.accounts?.activeAccountId?"Refreshing account usage…":"No valid delta pairs yet. Keep this page open while polling.";
 }
 function updateLastUpdateAge(){if(lastUpdateTimestamp&&!document.hidden)document.getElementById("status").textContent=`Last update ${secondsAgo(lastUpdateTimestamp)}`}
@@ -692,6 +688,7 @@ function mergeDenseDeltaEvents(list,metrics){
 }
 function chart(id, series, opts={}){
   const c=document.getElementById(id), ctx=c.getContext("2d"), dpr=devicePixelRatio||1, rect=c.getBoundingClientRect();
+  if(!rect.width||!rect.height){if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);delete chartStates[id];return}
   c.width=rect.width*dpr;c.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,rect.width,rect.height);
   const w=rect.width,h=rect.height,m=CHART_MARGINS;
   if(series.reduce((count,s)=>count+s.points.filter(p=>Number.isFinite(p.x)&&Number.isFinite(p.y)).length,0)<(opts.minPoints||1)){
@@ -909,6 +906,7 @@ function compactedUsageGap(previous,current,ranges){
 function breakUsageCurve(previous,current,label,valueOf,compactedRanges=[]){
   if(compactedUsageGap(previous,current,compactedRanges))return false;
   const gap=eventTimestamp(current)-eventTimestamp(previous);
+  if((Number.isFinite(previous.compactedFrom)||Number.isFinite(current.compactedFrom))&&gap<=4*3600)return false;
   if(gap>4*3600)return true;
   if(gap<=30*60)return false;
   const previousUsage=plusEquivalentUsage(previous,label,valueOf), currentUsage=plusEquivalentUsage(current,label,valueOf);
@@ -1039,6 +1037,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
   if(previous?.frame)cancelAnimationFrame(previous.frame);
   const previousSeries=previous?.series||[], previousFolds=previous?.folds||[], previousLabelLayer=previous?.labelLayer;
   const dpr=devicePixelRatio||1, rect=c.getBoundingClientRect(), m=CHART_MARGINS;
+  if(!rect.width||!rect.height){delete usageTimeChartStates[id];return}
   c.width=rect.width*dpr;c.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,rect.width,rect.height);
   const w=rect.width,h=rect.height, windowOf=point=>point[label], valueOf=point=>windowOf(point)?.continuous, grouped=new Map();
   points.filter(point=>Number.isFinite(valueOf(point))).forEach(point=>{const accountId=point.accountSlotId||"unknown";if(!grouped.has(accountId))grouped.set(accountId,[]);grouped.get(accountId).push(point)});

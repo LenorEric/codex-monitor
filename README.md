@@ -51,7 +51,7 @@ The monitor is authoritative. The extension polls `/api/status` while visible, r
 - VS Code 1.96 or newer for the extension.
 - A working Codex login in the normal `CODEX_HOME`.
 - Port `8765` available.
-- Python dependencies from `requirements.txt`—currently `cryptography>=46.0.0,<47`.
+- Python dependencies from `requirements.txt`—currently `cryptography>=46.0.0,<47` and `tomlkit>=0.13.3,<1`.
 - Network/proxy access compatible with the environment variables recognized by Python and `monitor_common.py`.
 
 ## Quick start
@@ -139,6 +139,12 @@ Restart existing Codex terminals after switching accounts because a running proc
 - Before an outgoing signed-in account is saved, its live and vaulted `id_token` and `account_id` must match exactly.
 - The same authenticated identity cannot occupy two ready local slots.
 
+### Refresh after reset
+
+Each normal account has a **Refresh after reset…** editor with independent 5h and 7d automation switches. The 5h automation can be limited to one or more daily time windows by painting the 24-hour bar in ten-minute steps or entering minute-precise start and end times; overlapping entries are merged and cross-midnight entries are split automatically. Leaving the list empty allows refresh all day.
+
+The editor displays times in the browser's current time zone and shows the detected zone and UTC offset. On save, the browser converts each range to a fixed, timezone-free backend day position; the monitor stores neither the time zone nor its offset and compares those positions directly with the current timestamp. Any browser converts the saved positions through its own current offset for display. Consequently, switching users, travel, or daylight-saving changes can alter the displayed local hours without changing the saved execution windows. A 5h reset detected outside the allowed ranges remains queued until the next range opens, while 7d automation runs immediately after its reset.
+
 ### Move an account between machines
 
 Account cloud storage uses move semantics:
@@ -184,7 +190,7 @@ Open **Manage skills & accounts → Config file**. Configure the remote without 
 | Remote root | Isolated directory used by this application. |
 | Encryption passphrase | Optional second-layer AES-256-GCM encryption. Every machine must use the same normalized URL, username, and passphrase. |
 | Skills auto upload | Watches stable managed-skill changes and uploads only changed packages. |
-| Usage data auto sync | Synchronizes the encrypted incremental usage journal every 30 minutes. |
+| Usage data auto sync | Synchronizes the encrypted incremental usage journal every 60 minutes. |
 | Allow optimistic writes | Permits servers that ignore conditional writes; account exclusivity then becomes best-effort. |
 
 Use **Test WebDAV** before Push. Jianguoyun/Nutstore users can use `https://dav.jianguoyun.com/dav/` with an application password.
@@ -200,16 +206,23 @@ If authentication works but decryption fails, the management page can reload loc
 
 Automatic usage synchronization supplements the directional manual Push and Fetch actions:
 
-- It runs every 30 minutes when `usageDataAutoSync` is enabled.
+- It runs every 60 minutes when `usageDataAutoSync` is enabled. The one-hour interval is measured from the last attempted sync, so both successful and failed attempts delay the next attempt by one hour.
 - It synchronizes delta/cost intervals, quota history, and token-session history.
-- Local quota history keeps every accepted poll. Cloud synchronization removes only redundant interior samples from unchanged quota plateaus and marks the retained endpoint with the covered range; gaps over four hours remain separate and unmarked so charts can distinguish compaction from a real monitoring outage.
+- Local quota history keeps every accepted poll. Cloud synchronization removes only redundant interior samples from unchanged quota plateaus and marks the retained endpoint with the covered range;
+  gaps over four hours remain separate and unmarked so charts can distinguish compaction from a real monitoring outage.
 - It excludes credentials, skill contents, detailed sample logs, and runtime state.
 - Each machine publishes an encrypted manifest containing every logical usage-pack ID and content hash. Fetch compares that complete inventory with `usage_monitor_sync_cache.json`, so one known pack can never cause earlier or missing packs to be skipped.
-- Records are assigned to stable key-hash buckets, then split at 64 KiB of compressed data. Updating an active record normally replaces only its small bucket pack instead of rewriting a time sequence or a large checkpoint.
+- Records are assigned to 64 stable key-hash buckets, then split at 16 KiB of compressed data. Updating an active record normally replaces only its small bucket pack instead of rewriting a time sequence or a large checkpoint.
+- Ordinary publishing verifies at most two deterministically rotated changed packs and commits the manifest with a strong conditional ETag. It does not list the pack directory.
+  A full verification reads every referenced pack and verifies the committed pointer every 30 days, on format migration, and for an explicit full Push.
+- A failed upload cannot expose a partial manifest: immutable content-addressed packs are uploaded first, and the pointer is committed last with `If-Match`/`If-None-Match`.
+  A later attempt can reuse packs left by a failure before retrying the pointer commit.
 - Fetch reconstructs every legacy checkpoint/chunk stream it finds, uploads verified version-2 packs, conditionally replaces the manifest, and deletes the legacy payloads only after verification.
 - Downloaded records and their per-machine pack hashes are stored atomically by origin in `usage_monitor_sync_cache.json`; they never replace or append to local recorder files.
+- The dashboard maintains `usage_monitor_dashboard_cache.json` as a display-only cache. It keeps the newest three days lossless and progressively groups older chart points; raw recorder files and token/session totals are not changed.
 
-Every five minutes, periodic Fetch also checks the authoritative skill index and refreshes the released-account list. Unchanged pointers and matching package hashes avoid unnecessary downloads.
+Every 60 minutes, periodic Fetch also checks the authoritative skill index and refreshes the released-account list. Strong pointer ETags skip unchanged usage manifests, while missing local pack hashes still force repair.
+Every 30 days a full fetch verifies all active remote packs. The first periodic Fetch runs immediately when no previous attempt is recorded or when the recorded attempt is at least one hour old.
 
 ## Data and privacy
 
@@ -227,6 +240,7 @@ The canonical data root is `~/.codex-switch`:
 | `usage_monitor_samples.jsonl` | Detailed local diagnostic samples | Never |
 | `usage_monitor_state.json` | Runtime baselines and cursors | Never |
 | `usage_monitor_sync_cache.json` | Downloaded records and complete per-machine pack-hash inventories | Never uploaded as a recorder file |
+| `usage_monitor_dashboard_cache.json` | Backend-maintained display cache for tiered dashboard chart points | Never |
 
 The token ledger writes a complete price epoch once when it is first used; subsequent usage rows reference its `pricingId`. Existing session totals are imported once as compact legacy baselines, and the session-history file is then regenerated from the ledger.
 

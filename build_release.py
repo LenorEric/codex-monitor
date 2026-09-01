@@ -21,6 +21,7 @@ RUNTIME_FILES = (
     "monitor_history.py",
     "monitor_quota.py",
     "monitor_skills.py",
+    "monitor_session_refresh.py",
     "monitor_token_ledger.py",
     "monitor_tokens.py",
     "monitor_usage_sync.py",

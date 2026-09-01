@@ -13,6 +13,7 @@ from monitor_common import (
     DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, TARGET_WINDOWS, UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
     empty_token_totals, first_value, load_json, now_iso, parse_timestamp,
 )
+from monitor_accounts import is_api_auth
 from monitor_quota import fetch_usage
 from monitor_tokens import (
     calculate_token_costs, calculate_token_costs_by_model, cost_progress, cost_progress_by_model, normalize_saved_token_totals,
@@ -23,7 +24,7 @@ MAX_PERCENT_ARBITRATION_RESPONSES = 5
 SAMPLE_LOG_COMPACT_RATIO = 0.8
 QUOTA_HISTORY_DISCONTINUITY_SECONDS = 4 * 60 * 60
 JSONL_COPY_CHUNK_BYTES = 1024 * 1024
-DEFAULT_DATA_FILES = ("usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_sessions.jsonl", "usage_monitor_token_ledger.jsonl", "usage_monitor_samples.jsonl", "usage_monitor_state.json")
+DEFAULT_DATA_FILES = ("usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_sessions.jsonl", "usage_monitor_token_ledger.jsonl", "usage_monitor_samples.jsonl", "usage_monitor_state.json", "usage_monitor_dashboard_cache.json")
 
 def default_history_path(data_home: Path | None = None) -> Path:
     return (Path(data_home) if data_home is not None else codex_switch_home()) / "usage_monitor_history.jsonl"
@@ -36,6 +37,9 @@ def default_quota_history_path(history_path: Path) -> Path:
 
 def default_token_session_history_path(history_path: Path) -> Path:
     return history_path.with_name("usage_monitor_token_sessions.jsonl") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".token-sessions.jsonl")
+
+def default_dashboard_cache_path(history_path: Path) -> Path:
+    return history_path.with_name("usage_monitor_dashboard_cache.json") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".dashboard-cache.json")
 
 def normalize_token_session_row(row: dict) -> dict | None:
     if not isinstance(row, dict) or not row.get("sessionId") or not isinstance(row.get("tokens"), dict):
@@ -866,19 +870,20 @@ def compact_history(path: Path, retain_days: int | None) -> None:
     write_history(path, kept)
 
 def compact_quota_history(path: Path, retain_days: int | None) -> None:
+    if retain_days is None or retain_days <= 0:
+        return
     rows = load_quota_history(path)
-    if retain_days is not None and retain_days > 0:
-        cutoff = time.time() - retain_days * 24 * 60 * 60
-        rows = [row for row in rows if parse_timestamp(row.get("checkedAt")) is None or parse_timestamp(row.get("checkedAt")) >= cutoff]
+    cutoff = time.time() - retain_days * 24 * 60 * 60
+    rows = [row for row in rows if parse_timestamp(row.get("checkedAt")) is None or parse_timestamp(row.get("checkedAt")) >= cutoff]
     write_quota_history(path, rows)
 
 def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, previous_token_usage: dict | None, previous_cost: dict | None = None, runtime_state: dict | None = None, skip_remote: bool = False) -> dict:
     output = {}
-    if not args.local_only and not skip_remote:
+    auth = load_json(args.auth) if not args.local_only and not skip_remote else None
+    if not args.local_only and not skip_remote and not is_api_auth(auth or {}):
         output["remoteUsage"] = {}
         if opener is None:
             raise UsageError("no HTTP opener is available")
-        auth = load_json(args.auth)
         if getattr(args, "account_attribution_callback", None):
             output.update(args.account_attribution_callback(auth))
         output.update(fetch_usage_with_percent_arbitration(

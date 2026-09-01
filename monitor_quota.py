@@ -5,7 +5,7 @@ from pathlib import Path
 import time
 import urllib.request
 
-from monitor_common import DEFAULT_RETRY_LIMIT, TARGET_WINDOWS, USAGE_ENDPOINT, UsageError, now_iso, refresh_access_token, request_json
+from monitor_common import DEFAULT_RETRY_LIMIT, TARGET_WINDOWS, USAGE_ENDPOINT, UsageError, UsageHttpError, now_iso, refresh_access_token, request_json
 
 QUOTA_KEYS = {
     "balance",
@@ -142,7 +142,14 @@ def fetch_usage(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Pa
         "authIdentity": {"account_id": account_id} if account_id else None,
     })
     started_at = time.monotonic()
-    status, data = request_json(opener, "GET", USAGE_ENDPOINT, headers, timeout=timeout, retries=retries)
+    try:
+        status, data = request_json(opener, "GET", USAGE_ENDPOINT, headers, timeout=timeout, retries=retries)
+    except UsageHttpError as exc:
+        if not exc.is_expired_token():
+            raise
+        headers["Authorization"] = f"Bearer {refresh_access_token(auth, opener, auth_path, timeout, retries, auth_lock, refreshed_callback, True, True)}"
+        debug["expiredTokenRefreshAt"] = now_iso()
+        status, data = request_json(opener, "GET", USAGE_ENDPOINT, headers, timeout=timeout, retries=retries)
     compact = compact_quota(data)
     debug.update({
         "completedAt": now_iso(),

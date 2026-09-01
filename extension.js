@@ -33,6 +33,10 @@ const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/manage/cloud/overwrite", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/overwrite"), method: "POST" }],
     ["/api/manage/accounts/bind", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/bind"), method: "POST" }],
     ["/api/manage/accounts/release", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/release"), method: "POST" }],
+    ["/api/manage/accounts/share", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/share"), method: "POST" }],
+    ["/api/manage/accounts/header", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/header"), method: "POST" }],
+    ["/api/manage/accounts/common-header", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/common-header"), method: "POST" }],
+    ["/api/manage/accounts/common", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/common"), method: "POST" }],
     ["/api/manage/accounts/delete", { url: ACCOUNT_DELETE_URL, method: "POST" }],
     ["/api/manage/server", { url: new URL("http://127.0.0.1:8765/api/manage/server"), method: "POST" }],
     ["/api/manage/config", { url: new URL("http://127.0.0.1:8765/api/manage/config"), method: "POST" }],
@@ -40,6 +44,7 @@ const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/accounts", { url: ACCOUNT_CREATE_URL, method: "POST" }],
     ["/api/accounts/switch", { url: ACCOUNT_SWITCH_URL, method: "POST" }],
     ["/api/accounts/rename", { url: ACCOUNT_RENAME_URL, method: "POST" }],
+    ["/api/accounts/session-refresh", { url: new URL("http://127.0.0.1:8765/api/accounts/session-refresh"), method: "POST" }],
 ]);
 
 class PythonMonitor {

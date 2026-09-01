@@ -12,10 +12,11 @@ import urllib.error
 import urllib.request
 import uuid
 import zipfile
+import tomllib
 from io import BytesIO, StringIO
 from contextlib import contextmanager
 from unittest import mock
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,11 +25,13 @@ import monitor_codex_usage
 import monitor_dashboard
 import monitor_history
 import monitor_quota
+import monitor_session_refresh
 import monitor_token_ledger
 import monitor_tokens
-from monitor_accounts import AccountError, AccountManager, atomic_write_json
+from monitor_accounts import AccountError, AccountManager, atomic_write_json, normalize_session_refresh, normalize_session_refresh_windows
 from monitor_cloud import (
-    AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_PACK_MAX_BYTES, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
+    AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_FULL_VERIFY_INTERVAL_SECONDS, USAGE_PACK_BUCKET_BITS, USAGE_PACK_MAX_BYTES,
+    USAGE_REGULAR_VERIFY_PACKS, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
     control_password_matches, hash_control_password, load_server_config, new_control_password_salt, normalized_webdav_identity, passphrase_hash, valid_passphrase_hash, webdav_passphrase_salt,
 )
 from monitor_skills import MANIFEST_FULL_REHASH_SECONDS, SkillError, SkillManager, _safe_name
@@ -75,6 +78,37 @@ from monitor_codex_usage import (
 
 
 class MonitorCodexUsageTests(unittest.TestCase):
+    def test_cloud_operations_reject_concurrent_calls_without_waiting(self):
+        manager = object.__new__(CloudManager)
+        manager._operation_lock = threading.RLock()
+        manager._operation_lock.acquire()
+        result = []
+
+        def call_test():
+            try:
+                manager.test()
+            except CloudError as exc:
+                result.append((exc.status, str(exc)))
+
+        worker = threading.Thread(target=call_test)
+        worker.start()
+        worker.join(1)
+        manager._operation_lock.release()
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(result, [(409, "Another WebDAV operation is already running")])
+
+    def test_management_page_disables_every_webdav_action_while_busy(self):
+        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
+
+        self.assertIn("const webDavButtonSelector=", html)
+        for selector in ('[data-action^="cloud-"]', "[data-unmanage]", "[data-share]", "[data-release]", "[data-bind]", "[data-delete-remote]"):
+            self.assertIn(selector, html)
+        self.assertIn("if(busy||webDavBusy)return", html)
+        self.assertIn("setWebDavBusy(true)", html)
+        self.assertIn("finally{setWebDavBusy(false)}", html)
+        self.assertIn('document.getElementById("overwriteCloud").onclick=()=>{modal.classList.remove("open");run("/api/manage/cloud/overwrite",{})}', html)
+
     def test_cloud_maintenance_reports_each_network_outage_once(self):
         state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
         state.cloud = SimpleNamespace(maintenance_tick=mock.Mock(side_effect=(CloudError("offline", 502, category="network"), {"pushed": False, "fetched": False, "usageSynced": False}, CloudError("offline", 502, category="network"), {"pushed": False, "fetched": True, "usageSynced": False}, CloudError("offline", 502, category="network"))))
@@ -232,6 +266,208 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(restored["tokens"]["refresh_token"], "refresh-rotated")
             self.assertEqual(restored["unknown"], "preserved")
 
+    def test_account_activation_timeline_tracks_api_switches_and_survives_reload(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            api_id = manager.create_account("API")["activeAccountId"]
+            auth_path.write_text(json.dumps({"OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
+            self.assertFalse(manager.status()["awaitingLogin"])
+            manager.switch("ppl-pro")
+            manager.switch(api_id)
+
+            expected = ["ppl-pro", api_id, "ppl-pro", api_id]
+            self.assertEqual([row["accountSlotId"] for row in manager.attribution_timeline()], expected)
+            self.assertEqual([row["accountSlotId"] for row in AccountManager(auth_path).attribution_timeline()], expected)
+
+    def test_normal_account_config_changes_remain_common_without_changing_headers(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model = "old"\n\n[settings]\nlevel = 1\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.status()
+
+            config_path.write_text('model = "new"\nadded = true\n\n[settings]\nlevel = 2\nextra = [1, 2]\n', encoding="utf-8")
+            manager.status()
+
+            self.assertEqual(tomllib.loads(manager.config_editor_payload()["commonToml"]), tomllib.loads(config_path.read_text(encoding="utf-8")))
+            self.assertEqual(manager.active_account().get("configHeaderToml", ""), "")
+
+    def test_normal_account_config_auto_update_tracks_only_registered_header_content(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model = "old"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.status()
+            manager.update_common_account_header('registered = "old"\ncascade.key = "old"\narray = ["old"]\nremoved = true\n\n[provider]\nurl = "old"\n')
+
+            config_path.write_text('model = "new"\nregistered = "new"\ncascade.key = "new"\narray = ["new"]\nnew_free = true\n\n[provider]\nurl = "new"\nextra = "included"\n\n[new_table]\nenabled = true\n', encoding="utf-8")
+            self.assertTrue(manager.sync_config_from_disk())
+            common_toml, header_toml = manager._config_editor_parts(manager.manifest["commonAccountHeaderToml"])
+
+            self.assertEqual(tomllib.loads(common_toml), {"model": "new", "new_free": True, "new_table": {"enabled": True}})
+            self.assertEqual(tomllib.loads(header_toml), {"registered": "new", "cascade": {"key": "new"}, "array": ["new"], "provider": {"url": "new", "extra": "included"}})
+
+    def test_api_config_auto_update_keeps_unregistered_content_in_common_body(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps({"OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
+            config_path.write_text('model = "old"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.status()
+
+            config_path.write_text('model = "new"\nnew_free = true\n\n[new_table]\nenabled = true\n', encoding="utf-8")
+            self.assertFalse(manager.sync_config_from_disk())
+            common_toml, header_toml = manager._config_editor_parts(manager.active_account().get("configHeaderToml", ""))
+
+            self.assertEqual(tomllib.loads(common_toml), {"model": "new", "new_free": True, "new_table": {"enabled": True}})
+            self.assertEqual(tomllib.loads(header_toml), {})
+
+    def test_config_header_overlays_duplicate_body_values(self):
+        manager = AccountManager.__new__(AccountManager)
+        text = manager._compose_toml_parts('model = "body"\nbody_only = true\n\n[features]\ngoals = false\nbody_only = true\n\n[projects."C:\\\\Users\\\\Name"]\ntrust_level = "trusted"\n', 'model = "header"\n\n[features]\ngoals = true\nheader_only = true\n')
+        merged = tomllib.loads(text)
+        self.assertEqual(merged, {"model": "header", "body_only": True, "features": {"goals": True, "body_only": True, "header_only": True}, "projects": {"C:\\Users\\Name": {"trust_level": "trusted"}}})
+        self.assertLess(text.index('model = "header"'), text.index('body_only = true'))
+
+    def test_config_parts_reject_duplicates_within_one_part(self):
+        manager = AccountManager.__new__(AccountManager)
+        with self.assertRaises(AccountError):
+            manager._validate_config_parts('model = "first"\nmodel = "second"\n')
+        with self.assertRaises(AccountError):
+            manager._validate_config_parts('', ('model = "first"\nmodel = "second"\n',))
+
+    def test_manual_config_updates_normalize_repeated_empty_lines(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model = "old"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.update_common_config('model = "new"\n\n\n\n[settings]\nlevel = 1\n\n\n')
+            saved = config_path.read_text(encoding="utf-8")
+            self.assertNotIn("\n\n\n", saved)
+            self.assertEqual(tomllib.loads(saved), {"model": "new", "settings": {"level": 1}})
+
+    def test_config_disk_load_does_not_add_separators_between_entries(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model = "gpt-5"\nmodel_reasoning_effort = "high"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+
+            for _ in range(3):
+                common_toml, header_toml = manager._config_editor_parts()
+                self.assertEqual(common_toml, 'model = "gpt-5"\nmodel_reasoning_effort = "high"\n')
+                self.assertEqual(header_toml, "")
+                manager.update_common_config(common_toml)
+
+            self.assertEqual(config_path.read_text(encoding="utf-8"), 'model = "gpt-5"\nmodel_reasoning_effort = "high"\n')
+
+    def test_toml_spacing_separates_tables_but_not_entries(self):
+        manager = AccountManager.__new__(AccountManager)
+        formatted = manager._format_toml('model = "gpt-5"\n\n[provider]\nname = "OpenAI"\n\nbase_url = "https://example.test"\n\n[features]\ngoals = true\n\njs_repl = false\n')
+        self.assertEqual(formatted, 'model = "gpt-5"\n\n[provider]\nname = "OpenAI"\nbase_url = "https://example.test"\n\n[features]\ngoals = true\njs_repl = false\n')
+
+    def test_toml_spacing_preserves_blank_lines_inside_multiline_values(self):
+        manager = AccountManager.__new__(AccountManager)
+        text = 'message = """first\n\nsecond"""\nvalues = [\n  1,\n\n  2,\n]\n\n[features]\ngoals = true\n'
+        self.assertEqual(manager._format_toml(text), text)
+
+    def test_account_switch_reuses_common_body_without_outgoing_header_keys(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps({"OPENAI_API_KEY": "sk-api-a"}), encoding="utf-8")
+            config_path.write_text('model = "common"\napi_a = "a"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.status()
+            manager.update_api_config("ppl-pro", 'api_a = "a"\n')
+            api_header = manager.active_account()["configHeaderToml"]
+            second_id = manager.create_account("Normal")["activeAccountId"]
+            config_path.write_text('model = "common"\n', encoding="utf-8")
+            manager.status()
+            manager.switch("ppl-pro")
+            manager.switch(second_id)
+            self.assertEqual(tomllib.loads(config_path.read_text(encoding="utf-8")), {"model": "common"})
+            self.assertEqual(manager._find("ppl-pro")["configHeaderToml"], api_header)
+
+    def test_account_switch_updates_model_provider_in_latest_fifty_session_files(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model = "gpt-5"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            api_id = manager.create_account("API", "api", "sk-api")["activeAccountId"]
+            manager.update_api_config(api_id, 'model_provider = "custom-provider"\n')
+            manager.switch("ppl-pro")
+            sessions_dir = directory / "sessions"
+            sessions_dir.mkdir()
+            original = b'{"model_provider":"old","nested":{"model_provider_id":"old"},"text":"\\\"model_provider\\\":\\\"unchanged\\\""}\n'
+            paths = []
+            for index in range(51):
+                path = sessions_dir / f"session-{index:02}.jsonl"
+                path.write_bytes(original)
+                os.utime(path, (index + 1, index + 1))
+                paths.append(path)
+
+            manager.switch(api_id)
+
+            self.assertEqual(paths[0].read_bytes(), original)
+            for path in paths[1:]:
+                updated = json.loads(path.read_text(encoding="utf-8"))
+                self.assertEqual(updated["model_provider"], "custom-provider")
+                self.assertEqual(updated["nested"]["model_provider_id"], "custom-provider")
+                self.assertEqual(updated["text"], '"model_provider":"unchanged"')
+
+    def test_account_switch_defaults_session_model_provider_to_openai(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model = "gpt-5"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            api_id = manager.create_account("API", "api", "sk-api")["activeAccountId"]
+            manager.update_api_config(api_id, 'model_provider = "custom-provider"\n')
+            sessions_dir = directory / "sessions"
+            sessions_dir.mkdir()
+            session_path = sessions_dir / "session.jsonl"
+            session_path.write_text('{"model_provider":"old","model_provider_id":"old"}\n', encoding="utf-8")
+
+            manager.switch("ppl-pro")
+
+            self.assertEqual(json.loads(session_path.read_text(encoding="utf-8")), {"model_provider": "openai", "model_provider_id": "openai"})
+
+    def test_account_switch_skips_session_files_when_model_provider_is_unchanged(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model_provider = "custom-provider"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.create_account("Second")
+
+            with mock.patch.object(manager, "_rewrite_recent_session_model_providers", wraps=manager._rewrite_recent_session_model_providers) as rewrite:
+                manager.switch("ppl-pro")
+
+            rewrite.assert_not_called()
+
+    def test_api_config_auto_update_tracks_registered_paths_removals_and_new_content(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps({"OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
+            config_path.write_text('model = "common-old"\n\n[settings]\nlevel = 1\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.status()
+            manager.update_api_config("ppl-pro", 'api_key = "old"\ncascade.key = "old"\narray = ["old"]\n\n[provider]\nurl = "old"\n\n[[provider.models]]\nname = "old"\n')
+
+            config_path.write_text('model = "common-new"\napi_key = "new"\ncascade.key = "new"\nnew_free = true\n\n[settings]\nlevel = 2\nadded = [1, 2]\n\n[provider]\nurl = "new"\nextra = "included"\n\n[[provider.models]]\nname = "new"\n\n[new_table]\nenabled = true\n', encoding="utf-8")
+            self.assertTrue(manager.sync_config_from_disk())
+            common_toml, header_toml = manager._config_editor_parts(manager.active_account()["configHeaderToml"])
+
+            self.assertEqual(tomllib.loads(common_toml), {"model": "common-new", "new_free": True, "settings": {"level": 2, "added": [1, 2]}, "new_table": {"enabled": True}})
+            self.assertEqual(tomllib.loads(header_toml), {"api_key": "new", "cascade": {"key": "new"}, "provider": {"url": "new", "extra": "included", "models": [{"name": "new"}]}})
+            self.assertNotIn("array", tomllib.loads(header_toml))
+
     def test_refreshed_auth_is_atomically_mirrored_to_active_account(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
@@ -239,7 +475,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth["tokens"]["access_token"] = "x.eyJleHAiOjB9.x"
             auth_path.write_text(json.dumps(auth), encoding="utf-8")
             manager = AccountManager(auth_path)
-            with mock.patch.object(monitor_common, "request_json", return_value=(200, {"access_token": "access-rotated", "refresh_token": "refresh-rotated", "id_token": "id-rotated"})):
+            with mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-a", "access_token": "access-rotated", "refresh_token": "refresh-rotated", "id_token": "id-rotated"})):
                 refresh_access_token(auth, object(), auth_path, 10)
             manager.sync_active_from_live()
             saved = json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))
@@ -264,7 +500,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 thread = threading.Thread(target=contend_for_lock)
                 thread.start()
                 thread.join()
-                return 200, {"access_token": "access-rotated", "refresh_token": "refresh-rotated"}
+                return 200, {"account_id": "acct-a", "access_token": "access-rotated", "refresh_token": "refresh-rotated"}
 
             with mock.patch.object(monitor_common, "request_json", side_effect=refresh_response):
                 refresh_access_token(auth, object(), auth_path, 10, auth_lock=manager.lock, refreshed_callback=manager.sync_active_from_live)
@@ -316,6 +552,41 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 refresh_access_token(auth, opener, auth_path, 1, retries=3)
             self.assertEqual(opener.count, 1)
 
+    def test_token_refresh_rejects_mismatched_account_without_changing_auth(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth = self.account_auth("acct-a", "refresh-a")
+            auth["tokens"]["access_token"] = "x.eyJleHAiOjB9.x"
+            original = json.dumps(auth).encode()
+            auth_path.write_bytes(original)
+            with mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-b", "access_token": "access-b", "refresh_token": "refresh-b"})), mock.patch("sys.stderr", new_callable=StringIO) as stderr:
+                with self.assertRaisesRegex(UsageError, "different account"):
+                    refresh_access_token(auth, object(), auth_path, 10)
+            self.assertEqual(auth_path.read_bytes(), original)
+            self.assertEqual(auth["tokens"]["refresh_token"], "refresh-a")
+            self.assertIn("refreshed account_id does not match", stderr.getvalue())
+
+    def test_expired_token_401_forces_refresh_and_retries_usage_once(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            payload = base64.urlsafe_b64encode(json.dumps({"iat": 0, "exp": 9999999999}).encode()).decode().rstrip("=")
+            auth = self.account_auth("acct-a", "refresh-a")
+            auth["tokens"]["access_token"] = f"x.{payload}.x"
+            auth_path.write_text(json.dumps(auth), encoding="utf-8")
+            usage_response = {"rate_limit": {
+                "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
+                "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
+            }}
+            with (
+                mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-a", "access_token": "access-new", "refresh_token": "refresh-new"})) as refresh_request,
+                mock.patch.object(monitor_quota, "request_json", side_effect=(monitor_common.UsageHttpError("GET", monitor_common.USAGE_ENDPOINT, 401, '{"code":"token_expired"}'), (200, usage_response))) as usage_request,
+            ):
+                result = monitor_quota.fetch_usage(auth, object(), auth_path, 10, allow_token_refresh=False)
+            self.assertTrue(result["usage"]["complete"])
+            self.assertEqual(usage_request.call_count, 2)
+            refresh_request.assert_called_once()
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-new")
+
     def test_bootstrap_waits_for_complete_auth_instead_of_vaulting_it(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
@@ -334,8 +605,79 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertFalse(manager.sync_active_from_live())
             saved = json.loads(manager._account_path("ppl-pro").read_text(encoding="utf-8"))
             self.assertEqual(saved["tokens"]["refresh_token"], "refresh-a")
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
 
-    def test_active_account_waits_for_codex_instead_of_refreshing(self):
+    def test_unrecorded_external_account_is_rejected_and_active_auth_is_recovered(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            auth_path.write_text(json.dumps(self.account_auth("acct-unknown", "refresh-unknown")), encoding="utf-8")
+            with mock.patch("builtins.print") as output:
+                changed, external_update = manager.reconcile_active_from_live()
+            self.assertFalse(changed)
+            self.assertIsNone(external_update)
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
+            self.assertIn("unrecorded account", output.call_args.args[0])
+
+    def test_recorded_external_account_is_background_validated_before_replacement(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            args = SimpleNamespace(
+                auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", sample_log=directory / "samples.jsonl",
+                codex_home=directory, local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+            )
+            state = monitor_dashboard.UsageDashboardState(args, object())
+            with mock.patch("builtins.print"):
+                second_id = state.create_account("Second")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
+            state.accounts.status()
+            with mock.patch("builtins.print"):
+                state.switch_account("ppl-pro")
+            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-external")), encoding="utf-8")
+            usage_response = {"rate_limit": {
+                "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
+                "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
+            }}
+            with mock.patch.object(monitor_common, "token_expired", return_value=False), mock.patch.object(monitor_quota, "request_json", return_value=(200, usage_response)), mock.patch("builtins.print"):
+                state.sync_active_account_from_live()
+                state.wait_for_external_auth_validations(2)
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
+            self.assertEqual(json.loads(state.accounts._account_path(second_id).read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-external")
+
+    def test_startup_saves_complete_external_update_for_active_account(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-recorded")), encoding="utf-8")
+            AccountManager(auth_path)
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-external")), encoding="utf-8")
+            args = SimpleNamespace(
+                auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
+                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+            )
+
+            state = monitor_dashboard.UsageDashboardState(args, object())
+
+            self.assertEqual(json.loads(state.accounts._account_path("ppl-pro").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-external")
+
+    def test_startup_recovers_incomplete_external_update_for_active_account(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-recorded")), encoding="utf-8")
+            AccountManager(auth_path)
+            auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "access_token": "partial-access"}}), encoding="utf-8")
+            args = SimpleNamespace(
+                auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
+                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+            )
+
+            with mock.patch("builtins.print"):
+                monitor_dashboard.UsageDashboardState(args, object())
+
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-recorded")
+
+    def test_active_account_refreshes_expired_token_and_mirrors_rotation(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-original")), encoding="utf-8")
@@ -345,14 +687,19 @@ class MonitorCodexUsageTests(unittest.TestCase):
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
 
-            with mock.patch.object(monitor_common, "request_json") as refresh_request:
-                with mock.patch.object(monitor_quota, "request_json") as usage_request:
-                    with self.assertRaisesRegex(UsageError, "Waiting for Codex to refresh"):
-                        state.poll_once()
+            usage_response = {"rate_limit": {
+                "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
+                "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
+            }}
+            with (
+                mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-a", "access_token": "access-rotated", "refresh_token": "refresh-rotated"})) as refresh_request,
+                mock.patch.object(monitor_quota, "request_json", return_value=(200, usage_response)) as usage_request,
+            ):
+                state.poll_once()
             saved = json.loads((state.accounts.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))
-            self.assertEqual(saved["tokens"]["refresh_token"], "refresh-original")
-            refresh_request.assert_not_called()
-            usage_request.assert_not_called()
+            self.assertEqual(saved["tokens"]["refresh_token"], "refresh-rotated")
+            refresh_request.assert_called_once()
+            usage_request.assert_called_once()
 
     def test_active_account_uses_access_token_until_actual_expiration(self):
         with self.account_directory() as directory:
@@ -488,6 +835,338 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertTrue(state.wake_event.is_set())
             self.assertFalse(any(state.accounts.root.glob(".inactive-usage-*.json")))
 
+    def test_session_refresh_config_normalizes_windows_and_validates_shape(self):
+        self.assertEqual(normalize_session_refresh_windows([
+            {"start": "05:30", "end": "07:00"},
+            {"start": "04:00", "end": "06:00"},
+            {"start": "07:00", "end": "08:15"},
+        ]), [{"start": "04:00", "end": "08:15"}])
+        self.assertEqual(normalize_session_refresh({"fiveHour": {"enabled": True, "windowsUtc": []}, "sevenDay": {"enabled": False}}), {
+            "fiveHour": {"enabled": True, "windowsUtc": []}, "sevenDay": {"enabled": False},
+        })
+        for value in (
+            {"fiveHour": {"enabled": "yes", "windowsUtc": []}, "sevenDay": {"enabled": False}},
+            {"fiveHour": {"enabled": True, "windowsUtc": [{"start": "05:00", "end": "04:00"}]}, "sevenDay": {"enabled": False}},
+            {"fiveHour": {"enabled": True, "windowsUtc": [{"start": "05:00", "end": "05:00"}]}, "sevenDay": {"enabled": False}},
+        ):
+            with self.assertRaises(AccountError):
+                normalize_session_refresh(value)
+
+    def test_account_session_refresh_config_is_local_and_migrates_legacy_boolean(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            config = {"fiveHour": {"enabled": True, "windowsUtc": [{"start": "05:00", "end": "06:00"}]}, "sevenDay": {"enabled": False}}
+            status = manager.set_session_refresh("ppl-pro", config)
+            self.assertEqual(status["items"][0]["sessionRefresh"], config)
+            self.assertEqual(manager.session_refresh_credentials()[0]["sessionRefresh"], config)
+
+            manifest = json.loads(manager.manifest_path.read_text(encoding="utf-8"))
+            manifest["version"] = 2
+            manifest["accounts"][0].pop("sessionRefresh")
+            manifest["accounts"][0]["sessionRefreshEnabled"] = True
+            manager.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            migrated = AccountManager(auth_path)
+            self.assertEqual(migrated.manifest["version"], 3)
+            self.assertEqual(migrated.active_account()["sessionRefresh"], {"fiveHour": {"enabled": True, "windowsUtc": []}, "sevenDay": {"enabled": True}})
+            self.assertNotIn("sessionRefreshEnabled", migrated.active_account())
+
+    def test_session_refresh_uses_independent_toggles_and_utc_boundaries(self):
+        now = datetime(2030, 1, 1, 5, 0, tzinfo=timezone.utc).timestamp()
+        credential = {"id": "account", "label": "Account", "sessionRefresh": {"fiveHour": {"enabled": False, "windowsUtc": [{"start": "05:00", "end": "06:00"}]}, "sevenDay": {"enabled": True}}}
+        self.assertTrue(monitor_dashboard.UsageDashboardState._session_refresh_window_allows(credential, "5h", now))
+        self.assertFalse(monitor_dashboard.UsageDashboardState._session_refresh_window_allows(credential, "5h", datetime(2030, 1, 1, 6, 0, tzinfo=timezone.utc).timestamp()))
+        self.assertTrue(monitor_dashboard.UsageDashboardState._session_refresh_window_allows({**credential, "sessionRefresh": {"fiveHour": {"enabled": True, "windowsUtc": []}, "sevenDay": {"enabled": False}}}, "5h", now))
+
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.accounts = SimpleNamespace(session_refresh_credentials=lambda: [credential])
+        state.account_statuses = {"account": {"windows": {
+            "5h": {"usedPercent": 0, "resetAt": datetime.fromtimestamp(now + monitor_dashboard.SESSION_REFRESH_WINDOW_SECONDS["5h"], timezone.utc).isoformat().replace("+00:00", "Z")},
+            "7d": {"usedPercent": 0, "resetAt": datetime.fromtimestamp(now + monitor_dashboard.SESSION_REFRESH_WINDOW_SECONDS["7d"], timezone.utc).isoformat().replace("+00:00", "Z")},
+        }}}
+        state.session_refresh_attempts, state.session_refresh_costs, state.session_refresh_reset_at = {}, {}, {}
+        state.session_refresh_procedures, state.session_refresh_failed, state.session_refresh_suppressed_reset_at = set(), {}, {}
+        with mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+            self.assertEqual(state._due_session_refreshes(), [(credential, "7d")])
+
+    def test_session_refresh_queues_five_hour_work_until_allowed_window(self):
+        credential = {"id": "account", "label": "Account", "active": True, "sessionRefresh": {"fiveHour": {"enabled": True, "windowsUtc": [{"start": "05:00", "end": "06:00"}]}, "sevenDay": {"enabled": False}}}
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.running = True
+        state.accounts = SimpleNamespace()
+        state.account_statuses = {"account": {"windows": {"5h": {"usedPercent": 0, "resetAt": "2030-01-01T09:00:00Z"}}}}
+        state.session_refresh_attempts, state.session_refresh_costs, state.session_refresh_reset_at = {}, {}, {}
+        state.session_refresh_procedures, state.session_refresh_failed, state.session_refresh_suppressed_reset_at = set(), {}, {}
+        state.session_refresh_event = SimpleNamespace(wait=lambda _timeout: setattr(state, "running", False), clear=lambda: None)
+        state._due_session_refreshes = mock.Mock(return_value=[(credential, "5h")])
+        state._retrieve_session_refresh_reset_at = mock.Mock(return_value=monitor_dashboard.parse_timestamp("2030-01-01T09:00:01Z"))
+        state._session_refresh_window_allows = mock.Mock(return_value=False)
+        with mock.patch.object(monitor_dashboard, "refresh_session") as refresh, mock.patch("builtins.print") as printed:
+            state.run_session_refreshing()
+        refresh.assert_not_called()
+        self.assertEqual(state.session_refresh_procedures, {("account", "5h")})
+        printed.assert_called_once_with("Manual refresh needed for 'Account' (5h; next refresh at 2030-01-01T09:00:00Z); queued until an allowed UTC window.", flush=True)
+
+    def test_session_refresh_schedule_waits_for_next_utc_start(self):
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        credential = {"sessionRefresh": {"fiveHour": {"enabled": True, "windowsUtc": [{"start": "05:00", "end": "06:00"}]}, "sevenDay": {"enabled": False}}}
+        state.accounts = SimpleNamespace(session_refresh_credentials=lambda: [credential])
+        self.assertEqual(state._session_refresh_schedule_wait_seconds(datetime(2030, 1, 1, 4, 30, tzinfo=timezone.utc).timestamp()), 30 * 60)
+
+    def test_management_page_exposes_advanced_session_refresh_editor(self):
+        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
+        for marker in ('id="sessionRefreshModal"', 'id="refreshFiveHourEnabled"', 'id="refreshSevenDayEnabled"', 'id="refreshTimeline"', 'id="addRefreshWindow"', "Intl.DateTimeFormat().resolvedOptions().timeZone", "setPointerCapture", "event.clientX", "windowsUtc"):
+            self.assertIn(marker, html)
+        self.assertIn("No windows are listed, so refresh is allowed all day.", html)
+        self.assertIn("paint.replaceChildren(...sessionRefreshDraft.ranges.map", html)
+        self.assertIn("baseline:sessionRefreshDraft.ranges.map", html)
+        self.assertNotIn("#refreshWindowRows{padding-bottom", html)
+        self.assertIn("lockSessionRefreshDialogHeight()", html)
+        self.assertIn("unlockSessionRefreshDialogHeight()", html)
+        self.assertIn("if(start<end)ranges.push({start,end});else ranges.push", html)
+        self.assertNotIn('type="checkbox" data-session-refresh', html)
+
+    def test_session_refresh_requires_a_fresh_full_quota_window(self):
+        now = 1_000_000
+        for label, duration in monitor_dashboard.SESSION_REFRESH_WINDOW_SECONDS.items():
+            reset_at = datetime.fromtimestamp(now + duration, timezone.utc).isoformat().replace("+00:00", "Z")
+            lagged_reset_at = datetime.fromtimestamp(now + duration - monitor_dashboard.SESSION_REFRESH_RESET_LATENCY_SECONDS, timezone.utc).isoformat().replace("+00:00", "Z")
+            stale_reset_at = datetime.fromtimestamp(now + duration - monitor_dashboard.SESSION_REFRESH_RESET_LATENCY_SECONDS - 1, timezone.utc).isoformat().replace("+00:00", "Z")
+            leading_reset_at = datetime.fromtimestamp(now + duration + 1, timezone.utc).isoformat().replace("+00:00", "Z")
+            self.assertTrue(monitor_dashboard.UsageDashboardState._session_needs_refresh(label, {"usedPercent": 0, "resetAt": reset_at}, now))
+            self.assertTrue(monitor_dashboard.UsageDashboardState._session_needs_refresh(label, {"usedPercent": 0, "resetAt": lagged_reset_at}, now))
+            self.assertFalse(monitor_dashboard.UsageDashboardState._session_needs_refresh(label, {"usedPercent": 1, "resetAt": reset_at}, now))
+            self.assertFalse(monitor_dashboard.UsageDashboardState._session_needs_refresh(label, {"usedPercent": 0, "resetAt": stale_reset_at}, now))
+            self.assertFalse(monitor_dashboard.UsageDashboardState._session_needs_refresh(label, {"usedPercent": 0, "resetAt": leading_reset_at}, now))
+        self.assertTrue(monitor_dashboard.UsageDashboardState._session_refresh_succeeded(now, now + 9))
+        self.assertFalse(monitor_dashboard.UsageDashboardState._session_refresh_succeeded(now, now + 10))
+
+    def test_session_refresh_allows_five_hour_window_for_pro_plans(self):
+        now = 1_000_000
+        reset_at = datetime.fromtimestamp(now + monitor_dashboard.SESSION_REFRESH_WINDOW_SECONDS["5h"], timezone.utc).isoformat().replace("+00:00", "Z")
+        for plan in ("pro", "pro_lite"):
+            self.assertTrue(monitor_dashboard.UsageDashboardState._session_needs_refresh("5h", {"usedPercent": 0, "resetAt": reset_at, "plan": plan}, now))
+        self.assertTrue(monitor_dashboard.UsageDashboardState._session_needs_refresh("5h", {"usedPercent": 0, "resetAt": reset_at, "plan": "plus"}, now))
+        reset_at = datetime.fromtimestamp(now + monitor_dashboard.SESSION_REFRESH_WINDOW_SECONDS["7d"], timezone.utc).isoformat().replace("+00:00", "Z")
+        self.assertTrue(monitor_dashboard.UsageDashboardState._session_needs_refresh("7d", {"usedPercent": 0, "resetAt": reset_at, "plan": "pro"}, now))
+
+    def test_session_refresh_clears_disabled_five_hour_procedure(self):
+        key = ("account", "5h")
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.accounts = SimpleNamespace(session_refresh_credentials=lambda: [{"id": "account", "label": "Account", "sessionRefresh": {"fiveHour": {"enabled": False, "windowsUtc": []}, "sevenDay": {"enabled": True}}}])
+        state.account_statuses = {"account": {"windows": {"5h": {"usedPercent": 0, "resetAt": "2030-01-01T05:00:00Z", "plan": "pro"}}}}
+        state.session_refresh_attempts = {key: 3}
+        state.session_refresh_costs = {key: 1.0}
+        state.session_refresh_reset_at = {key: 1_000_000}
+        state.session_refresh_procedures = {key}
+        state.session_refresh_failed = {key: 1_000_000}
+        state.session_refresh_suppressed_reset_at = {key: 1_000_000}
+        self.assertEqual(state._due_session_refreshes(), [])
+        self.assertEqual(state.session_refresh_attempts, {})
+        self.assertEqual(state.session_refresh_reset_at, {})
+        self.assertEqual(state.session_refresh_procedures, set())
+        self.assertEqual(state.session_refresh_failed, {})
+        self.assertEqual(state.session_refresh_suppressed_reset_at, {})
+
+    def test_session_refresh_retries_immediately_until_condition_clears(self):
+        now = 1_000_000
+        reset_at = datetime.fromtimestamp(now + monitor_dashboard.SESSION_REFRESH_WINDOW_SECONDS["5h"], timezone.utc).isoformat().replace("+00:00", "Z")
+        credential = {"id": "account", "label": "Account", "active": True}
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.accounts = SimpleNamespace(session_refresh_credentials=lambda: [credential])
+        state.account_statuses = {"account": {"windows": {"5h": {"usedPercent": 0, "resetAt": reset_at}}}}
+        state.session_refresh_attempts = {}
+        state.session_refresh_costs = {}
+        state.session_refresh_reset_at = {}
+        state.session_refresh_procedures = set()
+        state.session_refresh_failed = {}
+        state.session_refresh_suppressed_reset_at = {}
+        with mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+            due = state._due_session_refreshes()
+        self.assertEqual(due, [(credential, "5h")])
+        state.session_refresh_suppressed_reset_at[("account", "5h")] = monitor_dashboard.parse_timestamp(reset_at)
+        with mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+            self.assertEqual(state._due_session_refreshes(), [])
+        state.session_refresh_suppressed_reset_at.clear()
+        state.session_refresh_attempts[("account", "5h")] = 1
+        with mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+            self.assertEqual(state._due_session_refreshes(), [(credential, "5h")])
+        state.account_statuses["account"]["windows"]["5h"]["usedPercent"] = 1
+        with mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+            self.assertEqual(state._due_session_refreshes(), [])
+        self.assertEqual(state.session_refresh_attempts, {})
+        self.assertEqual(state.session_refresh_procedures, set())
+        self.assertEqual(state.session_refresh_failed, {})
+
+    def test_session_refresh_starts_when_confirmation_reset_time_changes(self):
+        reset_at = "2030-01-01T05:00:00Z"
+        confirmed_reset_at = "2030-01-01T05:00:01Z"
+        credential = {"id": "account", "label": "Account", "active": True}
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.running = True
+        state.args = SimpleNamespace(codex_home=Path("codex-home"))
+        state.accounts = SimpleNamespace()
+        state.account_statuses = {"account": {"windows": {"5h": {"usedPercent": 0, "resetAt": reset_at}}}}
+        state.session_refresh_attempts = {}
+        state.session_refresh_costs = {}
+        state.session_refresh_reset_at = {}
+        state.session_refresh_procedures = set()
+        state.session_refresh_failed = {}
+        state.session_refresh_suppressed_reset_at = {}
+        state.session_refresh_event = SimpleNamespace(wait=lambda _timeout: setattr(state, "running", False), clear=lambda: None)
+        state._due_session_refreshes = mock.Mock(return_value=[(credential, "5h")])
+        state.sync_active_account_from_live = mock.Mock()
+
+        def retrieve_reset_at(_credential, _label):
+            state.account_statuses["account"]["windows"]["5h"]["resetAt"] = confirmed_reset_at
+            return monitor_dashboard.parse_timestamp(confirmed_reset_at)
+
+        state._retrieve_session_refresh_reset_at = mock.Mock(side_effect=retrieve_reset_at)
+
+        with mock.patch.object(monitor_dashboard, "refresh_session", return_value=(True, None, 0.01234567)) as refresh, mock.patch("builtins.print") as printed:
+            state.run_session_refreshing()
+
+        printed.assert_any_call("Manual refresh needed for 'Account' (5h; next refresh at 2030-01-01T05:00:01Z); starting manual refresh procedure.", flush=True)
+        printed.assert_any_call("Manual refresh succeeded for 'Account' (5h) after 1 times; token API-equivalent cost: $0.01234567.", flush=True)
+        self.assertEqual(state._retrieve_session_refresh_reset_at.call_count, 2)
+        refresh.assert_called_once()
+        self.assertEqual(state.session_refresh_costs, {})
+        self.assertEqual(state.session_refresh_suppressed_reset_at, {("account", "5h"): monitor_dashboard.parse_timestamp(confirmed_reset_at)})
+
+    def test_session_refresh_does_not_confirm_when_probe_reports_no_usage(self):
+        reset_at = "2030-01-01T05:00:00Z"
+        confirmed_reset_at = "2030-01-01T05:00:01Z"
+        credential = {"id": "account", "label": "Account", "active": True}
+        key = ("account", "5h")
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.running = True
+        state.args = SimpleNamespace(codex_home=Path("codex-home"))
+        state.accounts = SimpleNamespace()
+        state.account_statuses = {"account": {"windows": {"5h": {"usedPercent": 0, "resetAt": reset_at}}}}
+        state.session_refresh_attempts = {}
+        state.session_refresh_costs = {}
+        state.session_refresh_reset_at = {}
+        state.session_refresh_procedures = set()
+        state.session_refresh_failed = {}
+        state.session_refresh_suppressed_reset_at = {}
+        state.session_refresh_event = SimpleNamespace(wait=lambda _timeout: setattr(state, "running", False), clear=lambda: None)
+        state._due_session_refreshes = mock.Mock(return_value=[(credential, "5h")])
+        state._retrieve_session_refresh_reset_at = mock.Mock(return_value=monitor_dashboard.parse_timestamp(confirmed_reset_at))
+
+        with mock.patch.object(monitor_dashboard, "refresh_session", return_value=(False, None, None)) as refresh, mock.patch("builtins.print") as printed:
+            state.run_session_refreshing()
+
+        refresh.assert_called_once()
+        printed.assert_called_once_with("Manual refresh needed for 'Account' (5h; next refresh at 2030-01-01T05:00:00Z); starting manual refresh procedure.", flush=True)
+        self.assertEqual(state.session_refresh_attempts, {key: 1})
+        self.assertEqual(state.session_refresh_costs, {key: None})
+
+    def test_session_refresh_reports_missing_usage_as_unknown_cost(self):
+        with self.account_directory() as directory:
+            with mock.patch.object(monitor_session_refresh, "find_codex_executable", return_value="codex"), mock.patch.object(monitor_session_refresh.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=json.dumps({"type": "task_complete"}))):
+                refreshed, auth_data, cost = monitor_session_refresh.refresh_session(directory)
+        self.assertFalse(refreshed)
+        self.assertIsNone(auth_data)
+        self.assertIsNone(cost)
+
+    def test_session_refresh_suppresses_matching_confirmation_reset_time(self):
+        reset_at = "2030-01-01T05:00:00Z"
+        credential = {"id": "account", "label": "Account", "active": True}
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.running = True
+        state.args = SimpleNamespace(codex_home=Path("codex-home"))
+        state.accounts = SimpleNamespace()
+        state.account_statuses = {"account": {"windows": {"5h": {"usedPercent": 0, "resetAt": reset_at}}}}
+        state.session_refresh_attempts = {}
+        state.session_refresh_costs = {}
+        state.session_refresh_reset_at = {}
+        state.session_refresh_procedures = set()
+        state.session_refresh_failed = {}
+        state.session_refresh_suppressed_reset_at = {}
+        state.session_refresh_event = SimpleNamespace(wait=lambda _timeout: setattr(state, "running", False), clear=lambda: None)
+        state._due_session_refreshes = mock.Mock(return_value=[(credential, "5h")])
+        state._retrieve_session_refresh_reset_at = mock.Mock(return_value=monitor_dashboard.parse_timestamp(reset_at))
+
+        with mock.patch.object(monitor_dashboard, "refresh_session") as refresh, mock.patch("builtins.print") as printed:
+            state.run_session_refreshing()
+
+        refresh.assert_not_called()
+        printed.assert_not_called()
+        self.assertEqual(state._retrieve_session_refresh_reset_at.call_count, 1)
+        self.assertEqual(state.session_refresh_suppressed_reset_at, {("account", "5h"): monitor_dashboard.parse_timestamp(reset_at)})
+
+    def test_session_refresh_stops_when_usage_acquisition_is_unavailable(self):
+        key = ("account", "7d")
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.accounts = SimpleNamespace(session_refresh_credentials=lambda: [{"id": "account", "label": "Account"}])
+        state.account_statuses = {"account": {"windows": {"7d": {"usedPercent": None, "resetAt": "2030-01-08T00:00:00Z", "unavailable": True}}}}
+        state.session_refresh_attempts = {key: 3}
+        state.session_refresh_costs = {key: 1.0}
+        state.session_refresh_reset_at = {key: 1_000_000}
+        state.session_refresh_procedures = {key}
+        state.session_refresh_failed = {key: 1_000_000}
+        state.session_refresh_suppressed_reset_at = {key: 1_000_000}
+        self.assertEqual(state._due_session_refreshes(), [])
+        self.assertEqual(state.session_refresh_attempts, {})
+        self.assertEqual(state.session_refresh_reset_at, {})
+        self.assertEqual(state.session_refresh_procedures, set())
+        self.assertEqual(state.session_refresh_failed, {})
+        self.assertEqual(state.session_refresh_suppressed_reset_at, {})
+
+    def test_session_refresh_restarts_one_hour_after_ten_consecutive_attempts(self):
+        now = 1_000_000
+        reset_at = datetime.fromtimestamp(now + monitor_dashboard.SESSION_REFRESH_WINDOW_SECONDS["7d"], timezone.utc).isoformat().replace("+00:00", "Z")
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.accounts = SimpleNamespace(session_refresh_credentials=lambda: [{"id": "account", "label": "Account"}])
+        state.account_statuses = {"account": {"windows": {"7d": {"usedPercent": 0, "resetAt": reset_at}}}}
+        state.session_refresh_attempts = {("account", "7d"): monitor_dashboard.SESSION_REFRESH_MAX_ATTEMPTS}
+        state.session_refresh_costs = {("account", "7d"): 0.12345678}
+        state.session_refresh_reset_at = {("account", "7d"): now}
+        state.session_refresh_procedures = {("account", "7d")}
+        state.session_refresh_failed = {}
+        state.session_refresh_suppressed_reset_at = {}
+        with mock.patch("builtins.print") as printed, mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+            due = state._due_session_refreshes()
+        self.assertEqual(due, [])
+        printed.assert_called_once_with("Manual refresh failed for 'Account' (7d) after 10 attempts; token API-equivalent cost: $0.12345678.", flush=True)
+        with mock.patch.object(monitor_dashboard.time, "time", return_value=now + monitor_dashboard.SESSION_REFRESH_FAILURE_RETRY_SECONDS - 1):
+            self.assertEqual(state._due_session_refreshes(), [])
+        with mock.patch.object(monitor_dashboard.time, "time", return_value=now + monitor_dashboard.SESSION_REFRESH_FAILURE_RETRY_SECONDS):
+            self.assertEqual(state._due_session_refreshes(), [({"id": "account", "label": "Account"}, "7d")])
+        self.assertEqual(state.session_refresh_attempts, {})
+        self.assertEqual(state.session_refresh_costs, {})
+        self.assertEqual(state.session_refresh_procedures, set())
+        self.assertEqual(state.session_refresh_failed, {})
+
+    def test_session_refresh_failure_reports_unknown_cost(self):
+        now = 1_000_000
+        reset_at = datetime.fromtimestamp(now + monitor_dashboard.SESSION_REFRESH_WINDOW_SECONDS["7d"], timezone.utc).isoformat().replace("+00:00", "Z")
+        state = object.__new__(monitor_dashboard.UsageDashboardState)
+        state.accounts = SimpleNamespace(session_refresh_credentials=lambda: [{"id": "account", "label": "Account"}])
+        state.account_statuses = {"account": {"windows": {"7d": {"usedPercent": 0, "resetAt": reset_at}}}}
+        state.session_refresh_attempts = {("account", "7d"): monitor_dashboard.SESSION_REFRESH_MAX_ATTEMPTS}
+        state.session_refresh_costs = {("account", "7d"): None}
+        state.session_refresh_reset_at = {("account", "7d"): now}
+        state.session_refresh_procedures = {("account", "7d")}
+        state.session_refresh_failed = {}
+        state.session_refresh_suppressed_reset_at = {}
+        with mock.patch("builtins.print") as printed, mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+            state._due_session_refreshes()
+        printed.assert_called_once_with("Manual refresh failed for 'Account' (7d) after 10 attempts; token API-equivalent cost: unavailable (Codex CLI did not report token usage).", flush=True)
+
+    def test_session_refresh_uses_sol_for_one_probe(self):
+        with self.account_directory() as directory:
+            usage_output = json.dumps({"type": "turn.completed", "usage": {"input_tokens": 14_641, "cached_input_tokens": 11_008, "cache_write_input_tokens": 0, "output_tokens": 718}})
+            with mock.patch.object(monitor_session_refresh, "find_codex_executable", return_value="codex"), mock.patch.object(monitor_session_refresh.subprocess, "run", return_value=SimpleNamespace(returncode=0, stdout=usage_output)) as run:
+                refreshed, auth_data, cost = monitor_session_refresh.refresh_session(directory)
+        self.assertTrue(refreshed)
+        self.assertIsNone(auth_data)
+        self.assertEqual(cost, 0.045209)
+        self.assertIn("gpt-5.6-sol", run.call_args.args[0])
+        self.assertIn("--json", run.call_args.args[0])
+        self.assertEqual(run.call_count, 1)
+
     def test_inactive_poll_refresh_commit_does_not_overwrite_changed_credentials(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
@@ -527,7 +1206,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
             }}
             with mock.patch.object(monitor_common, "token_expired", return_value=True), mock.patch.object(
-                monitor_common, "request_json", return_value=(200, {"access_token": "access-rotated", "refresh_token": "refresh-rotated"}),
+                monitor_common, "request_json", return_value=(200, {"account_id": "acct-b", "access_token": "access-rotated", "refresh_token": "refresh-rotated"}),
             ) as refresh_request, mock.patch.object(monitor_quota, "request_json", return_value=(200, usage_response)):
                 self.assertEqual(state.poll_due_inactive_accounts(now=100), 1)
 
@@ -657,15 +1336,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(manager.active_account()["label"], "Current account")
             self.assertEqual((history.read_bytes(), invalid_log.read_bytes()), originals)
 
-    def test_account_manager_refuses_live_identity_mismatch(self):
+    def test_account_manager_recovers_live_identity_mismatch(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
-            with self.assertRaises(AccountError) as raised:
-                manager.sync_active_from_live()
-            self.assertEqual(raised.exception.status, 409)
+            self.assertFalse(manager.sync_active_from_live())
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
 
     def test_new_account_accepts_rotated_id_token_and_saves_current_auth(self):
         with self.account_directory() as directory:
@@ -682,7 +1360,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertNotEqual(manager.status()["activeAccountId"], "ppl-pro")
             self.assertEqual(len(manager.status()["items"]), 2)
 
-    def test_switch_refuses_changed_account_id_even_when_id_token_matches(self):
+    def test_switch_recovers_changed_account_id_even_when_id_token_matches(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -696,16 +1374,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(changed), encoding="utf-8")
             saved = (manager.root / "ppl-pro" / "auth.json").read_bytes()
 
-            with self.assertRaises(AccountError) as raised:
-                manager.switch(second_id)
+            status = manager.switch(second_id)
 
-            self.assertEqual(raised.exception.status, 409)
-            self.assertIn("account_id", str(raised.exception))
-            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-other")
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-b")
             self.assertEqual((manager.root / "ppl-pro" / "auth.json").read_bytes(), saved)
-            self.assertEqual(manager.status()["activeAccountId"], "ppl-pro")
+            self.assertEqual(status["activeAccountId"], second_id)
 
-    def test_account_change_refuses_when_verification_fields_are_missing(self):
+    def test_account_change_recovers_when_verification_fields_are_missing(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -714,13 +1389,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
             del live["tokens"]["account_id"]
             auth_path.write_text(json.dumps(live), encoding="utf-8")
 
-            with self.assertRaises(AccountError) as raised:
-                manager.create_account("Second")
+            status = manager.create_account("Second")
 
-            self.assertEqual(raised.exception.status, 409)
-            self.assertIn("account_id is missing", str(raised.exception))
+            self.assertTrue(status["awaitingLogin"])
+            self.assertEqual(json.loads(manager._account_path("ppl-pro").read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
 
-    def test_signed_out_account_can_be_saved_switched_away_from_and_restored(self):
+    def test_signed_out_external_update_is_recovered_before_switch(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -737,9 +1411,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             self.assertEqual(status["activeAccountId"], "ppl-pro")
             self.assertTrue(next(account for account in status["items"] if account["id"] == "ppl-pro")["ready"])
-            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8")), signed_out)
+            self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
 
-    def test_signed_out_inactive_account_can_be_released_without_identity_verification(self):
+    def test_signed_out_external_update_recovers_saved_auth_before_release(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -756,8 +1430,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             self.assertEqual(status["activeAccountId"], second_id)
             self.assertEqual([account["id"] for account in status["items"]], [second_id])
-            self.assertEqual(json.loads(cloud.release_account.call_args.args[1].decode("utf-8")), signed_out)
-            cloud.begin_account_transition.assert_called_once_with("release", accountId="ppl-pro", accountKey="key-a", revisionId=hashlib.sha256(json.dumps(signed_out).encode()).hexdigest())
+            released = json.loads(cloud.release_account.call_args.args[1].decode("utf-8"))
+            self.assertEqual(released["tokens"]["refresh_token"], "refresh-a")
+            cloud.begin_account_transition.assert_called_once_with("release", accountId="ppl-pro", accountKey="key-a", revisionId=hashlib.sha256(json.dumps(self.account_auth("acct-a", "refresh-a")).encode()).hexdigest())
 
     def test_new_empty_accounts_support_create_switch_rename_and_delete(self):
         with self.account_directory() as directory:
@@ -850,19 +1525,91 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertTrue(release_cloud.release_account.call_args.kwargs["ready"])
             self.assertEqual(release_cloud.release_account.call_args.kwargs["key_type"], "opaque")
 
-    def test_account_change_refuses_when_live_auth_is_missing(self):
+    def test_account_change_recovers_missing_live_auth_before_switching(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model = "gpt-5"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            auth_path.unlink()
+
+            status = manager.create_account("Second")
+
+            self.assertNotEqual(status["activeAccountId"], "ppl-pro")
+            self.assertTrue(status["awaitingLogin"])
+            self.assertFalse(auth_path.exists())
+            self.assertEqual(config_path.read_text(encoding="utf-8"), 'model = "gpt-5"\n')
+            self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
+            self.assertEqual(manager._find("ppl-pro")["identity"]["accountId"], "acct-a")
+            self.assertEqual(AccountManager(auth_path)._find("ppl-pro")["identity"]["accountId"], "acct-a")
+
+    def test_account_change_recovers_empty_live_auth_before_switching(self):
+        with self.account_directory() as directory:
+            auth_path, config_path = directory / "auth.json", directory / "config.toml"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            config_path.write_text('model = "gpt-5"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            auth_path.write_text("{}\n", encoding="utf-8")
+
+            status = manager.create_account("Second")
+
+            self.assertTrue(status["awaitingLogin"])
+            self.assertFalse(auth_path.exists())
+            self.assertEqual(config_path.read_text(encoding="utf-8"), 'model = "gpt-5"\n')
+            self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
+            self.assertEqual(manager._find("ppl-pro")["identity"]["accountId"], "acct-a")
+
+    def test_account_change_recovers_incomplete_auth_from_a_different_user(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path)
-            auth_path.unlink()
+            auth_path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-b", "access_token": "access-b"}}), encoding="utf-8")
 
-            with self.assertRaises(AccountError) as raised:
-                manager.create_account("Second")
+            status = manager.create_account("Second")
 
-            self.assertEqual(raised.exception.status, 409)
-            self.assertIn("current auth.json is missing", str(raised.exception))
-            self.assertEqual(manager.status()["activeAccountId"], "ppl-pro")
+            self.assertNotEqual(status["activeAccountId"], "ppl-pro")
+            self.assertEqual(json.loads(manager._account_path("ppl-pro").read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
+
+    def test_account_switch_recovers_missing_or_empty_live_auth(self):
+        for empty_auth in (None, b"", b"{}\n"):
+            with self.subTest(empty_auth=empty_auth), self.account_directory() as directory:
+                auth_path = directory / "auth.json"
+                auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+                manager = AccountManager(auth_path)
+                second_id = manager.create_account("Second")["activeAccountId"]
+                auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
+                manager.status()
+                manager.switch("ppl-pro")
+                if empty_auth is None:
+                    auth_path.unlink()
+                else:
+                    auth_path.write_bytes(empty_auth)
+
+                status = manager.switch(second_id)
+
+                self.assertEqual(status["activeAccountId"], second_id)
+                self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-b")
+                self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
+                self.assertEqual(manager._find("ppl-pro")["identity"]["accountId"], "acct-a")
+
+    def test_incomplete_external_account_is_recovered_after_reload(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            auth_path.write_text("{}\n", encoding="utf-8")
+            second_id = manager.create_account("Second")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
+            manager.status()
+            manager.switch("ppl-pro")
+            manager = AccountManager(auth_path)
+            auth_path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-other", "access_token": "access-other"}}), encoding="utf-8")
+
+            status = manager.switch(second_id)
+
+            self.assertEqual(status["activeAccountId"], second_id)
+            self.assertEqual(json.loads(manager._account_path("ppl-pro").read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
 
     def test_account_attribution_matches_registered_identity_and_marks_unregistered_unknown(self):
         with self.account_directory() as directory:
@@ -893,20 +1640,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(monitor_dashboard.dashboard_account_status(status)["message"], status["message"])
             self.assertIn('showMessage("Existing Account Update Completed"', Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8"))
 
-    def test_duplicate_pending_login_matches_id_token_when_account_id_is_missing(self):
+    def test_pending_login_requires_account_id_even_when_id_token_matches(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
-            auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "id_token": "stable-id-token", "refresh_token": "refresh-a"}}), encoding="utf-8")
+            original = self.account_auth("acct-a", "refresh-a")
+            original["tokens"]["id_token"] = "stable-id-token"
+            auth_path.write_text(json.dumps(original), encoding="utf-8")
             manager = AccountManager(auth_path)
             pending_id = manager.create_account("Second")["activeAccountId"]
-            auth_path.write_text(json.dumps({"tokens": {"id_token": "stable-id-token", "refresh_token": "refresh-new"}}), encoding="utf-8")
+            auth_path.write_text(json.dumps({"tokens": {"access_token": "access-new", "id_token": "stable-id-token", "refresh_token": "refresh-new"}}), encoding="utf-8")
 
             status = manager.status()
 
             self.assertEqual(status["activeAccountId"], pending_id)
             self.assertTrue(status["awaitingLogin"])
-            self.assertFalse(auth_path.exists())
-            self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-new")
+            self.assertIn("account_id", status["error"])
+            self.assertTrue(auth_path.exists())
+            self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
 
     def test_pending_account_survives_restart_and_ignores_incomplete_auth(self):
         with self.account_directory() as directory:
@@ -1503,6 +2253,33 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertEqual(sessions[0]["cost"]["totalCostUsd"], 1.2)
         self.assertEqual([row["rates"]["input"] for row in ledger if row["recordType"] == "priceEpoch"], [1.0, 0.2])
+
+    def test_token_ledger_splits_one_session_across_normal_and_api_account_activations(self):
+        with self.account_directory() as directory:
+            events = [
+                {"eventId": "session:1", "sessionId": "session", "checkedAt": "2030-01-01T00:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 100, "cachedInput": 20, "cacheWriteInput": 10, "output": 5}},
+                {"eventId": "session:2", "sessionId": "session", "checkedAt": "2030-01-01T01:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 200, "cachedInput": 40, "cacheWriteInput": 20, "output": 10}},
+            ]
+            timeline = [
+                {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "normal", "accountLabel": "Normal"},
+                {"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "API"},
+            ]
+
+            sessions = monitor_token_ledger.sync_token_ledger(directory / "token-ledger.jsonl", [], events, "api", "API", timeline)
+            usage_rows = [row for row in monitor_token_ledger.load_token_ledger(directory / "token-ledger.jsonl") if row["recordType"] == "usage"]
+
+        self.assertEqual([(row["accountSlotId"], row["tokens"]["freshInputTokens"]) for row in sessions], [("normal", 70), ("api", 140)])
+        self.assertEqual([row["accountSlotId"] for row in usage_rows], ["normal", "api"])
+
+    def test_token_ledger_ignores_inactive_account_polling_when_given_the_activation_timeline(self):
+        with self.account_directory() as directory:
+            event = {"eventId": "session:1", "sessionId": "session", "checkedAt": "2030-01-01T01:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 100, "cachedInput": 0, "cacheWriteInput": 0, "output": 10}}
+            activation_timeline = [{"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "UU API Pro"}]
+
+            monitor_token_ledger.sync_token_ledger(directory / "token-ledger.jsonl", [], [event], "api", "UU API Pro", activation_timeline)
+            usage_row = next(row for row in monitor_token_ledger.load_token_ledger(directory / "token-ledger.jsonl") if row["recordType"] == "usage")
+
+        self.assertEqual((usage_row["accountSlotId"], usage_row["accountLabel"]), ("api", "UU API Pro"))
 
     def test_history_sample_preserves_cumulative_cost_by_normalized_model(self):
         token_usage = {
@@ -2734,7 +3511,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('input class="date-range" id="rangeDate" type="date"', html)
         self.assertIn('button id="nextDate" aria-label="Next day">&gt;</button>', html)
         self.assertIn('<span class="date-selector" id="dateSelector">', html)
-        self.assertIn('<div class="quota"><span id="top5h">5h: N/A</span><span id="top7d">7d: N/A</span></div>', html)
+        self.assertIn('<div class="quota" data-quota-widget><span id="top5h">5h: N/A</span><span id="top7d">7d: N/A</span></div>', html)
         self.assertIn("function pointFromSample(sample)", html)
         self.assertIn('const window=(sample.windows||{})[label]||{}', html)
         self.assertIn('return {checkedAt:sample.checkedAt,timestamp:eventTimestamp(sample),fiveHour:windowPoint("5h"),sevenDay:windowPoint("7d"),cost:sample.cost||{}}', html)
@@ -2781,6 +3558,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = dashboard_html()
 
         self.assertLess(html.index("<h2>Token Usage</h2>"), html.index("<h2>5h Usage vs Time</h2>"))
+        self.assertEqual(html.count("data-quota-widget"), 8)
+        self.assertIn('document.querySelectorAll("[data-quota-widget]").forEach(widget=>widget.hidden=Boolean(active?.isApiAccount))', html)
+        self.assertIn(':payload.accounts?.items?.find(account=>account.id===payload.accounts.activeAccountId)?.isApiAccount?"Tracking API token usage from Codex sessions."', html)
+        self.assertNotIn('<section class="card wide" data-quota-widget>', html)
+        self.assertIn('if(!rect.width||!rect.height){if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);delete chartStates[id];return}', html)
+        self.assertIn('if(!rect.width||!rect.height){delete usageTimeChartStates[id];return}', html)
         for element_id in ("tokenInput", "tokenCachedInput", "tokenOutput", "tokenCacheWrite", "tokenCacheHit", "tokenCost"):
             self.assertIn(f'id="{element_id}"', html)
         self.assertIn("function filteredTokenSessions(list)", html)
@@ -2991,6 +3774,107 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertIsNot(first_payload, third_payload)
             self.assertEqual(history_load.call_count, 2)
 
+    def test_dashboard_display_tiers_keep_recent_points_and_compact_older_points(self):
+        now = 100 * 24 * 60 * 60
+
+        def point(age_days, index):
+            timestamp = now - age_days * 24 * 60 * 60 + index * 60
+            return {
+                "checkedAt": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(), "timestamp": timestamp, "accountSlotId": "account-a", "compactedFrom": None,
+                "fiveHour": {"raw": index, "continuous": index}, "sevenDay": {"raw": index, "continuous": index},
+            }
+
+        points = [point(2, index) for index in range(5)] + [point(4, index) for index in range(9)] + [point(10, index) for index in range(17)] + [point(40, index) for index in range(33)]
+        compacted = monitor_dashboard.dashboard_compact_quota_points(points, now)
+
+        self.assertEqual(len(compacted), 14)
+        self.assertEqual(len([item for item in compacted if item["timestamp"] >= now - 3 * 24 * 60 * 60]), 5)
+        self.assertTrue(all(item.get("compactedFrom") is None for item in compacted[-5:]))
+        self.assertTrue(any(item.get("compactedFrom") is not None for item in compacted[:-5]))
+
+    def test_dashboard_display_compaction_does_not_bridge_a_real_gap(self):
+        now = 100 * 24 * 60 * 60
+        timestamps = [now - 10 * 24 * 60 * 60 + index * 60 for index in range(6)] + [now - 10 * 24 * 60 * 60 + 5 * 60 * 60 + index * 60 for index in range(6)]
+        points = [
+            {
+                "checkedAt": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(), "timestamp": timestamp, "accountSlotId": "account-a", "compactedFrom": None,
+                "fiveHour": {"raw": index, "continuous": index}, "sevenDay": {"raw": index, "continuous": index},
+            }
+            for index, timestamp in enumerate(timestamps)
+        ]
+
+        compacted = monitor_dashboard.dashboard_compact_quota_points(points, now)
+
+        self.assertEqual(len(compacted), 2)
+        self.assertEqual(compacted[0]["compactedFrom"], timestamps[0])
+        self.assertEqual(compacted[1]["compactedFrom"], timestamps[6])
+        self.assertGreater(compacted[1]["timestamp"] - compacted[0]["timestamp"], monitor_dashboard.DASHBOARD_DISPLAY_CACHE_GAP_SECONDS)
+
+    def test_dashboard_display_event_compaction_preserves_delta_totals_and_filters(self):
+        now = 100 * 24 * 60 * 60
+        events = [{"checkedAt": None, "timestamp": None, "window": "5h", "synthetic": True, "deltaPercent": 0.0, "deltaCostUsd": 0.0, "cumulativePercent": 0.0, "cumulativeCostUsd": 0.0}]
+        for index in range(8):
+            timestamp = now - 10 * 24 * 60 * 60 + index * 60
+            events.append({
+                "checkedAt": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(), "timestamp": timestamp, "window": "5h", "model": "gpt-5.5", "accountSlotId": "account-a", "accountLabel": "A",
+                "deltaPercent": 1.0, "deltaCostUsd": 0.25, "cumulativePercent": index + 1.0, "cumulativeCostUsd": (index + 1) * 0.25,
+            })
+
+        compacted = monitor_dashboard.dashboard_compact_event_series(events, now)
+
+        self.assertEqual(len(compacted), 2)
+        self.assertTrue(compacted[0]["synthetic"])
+        self.assertEqual(compacted[1]["mergedCount"], 8)
+        self.assertEqual(compacted[1]["deltaPercent"], 8.0)
+        self.assertEqual(compacted[1]["deltaCostUsd"], 2.0)
+        self.assertEqual(compacted[1]["cumulativePercent"], 8.0)
+        self.assertEqual(compacted[1]["accountSlotId"], "account-a")
+        self.assertEqual(compacted[1]["mergedFrom"], events[1]["checkedAt"])
+        self.assertEqual(compacted[1]["mergedTo"], events[-1]["checkedAt"])
+
+    def test_dashboard_display_cache_round_trips_and_expires_at_next_tier(self):
+        with self.account_directory() as directory:
+            path = directory / "dashboard-cache.json"
+            cache = monitor_dashboard.DashboardDisplayCache(path)
+            entry = {"quotaPoints": [], "tokenSessions": [], "events": {"fiveHour": [], "sevenDay": []}, "historyStats": {"rows": 0}}
+            cache.replace({
+                "version": monitor_dashboard.DASHBOARD_DISPLAY_CACHE_VERSION, "sourceRevision": "source", "builtAt": 100.0, "nextMaintenanceAt": 200.0,
+                "displayRevision": "display", "views": {"local": entry, "merged": entry},
+            })
+            reloaded = monitor_dashboard.DashboardDisplayCache(path)
+
+            self.assertEqual(reloaded.entry("local", "source", 199.0)["historyStats"], {"rows": 0})
+            self.assertIsNone(reloaded.entry("local", "source", 200.0))
+            self.assertEqual(reloaded.revision("source", 200.0), "stale")
+
+    def test_dashboard_series_uses_persistent_display_cache_without_reloading_datasets(self):
+        with self.account_directory() as directory:
+            args = SimpleNamespace(
+                history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", token_session_history=directory / "tokens.jsonl", token_ledger=directory / "ledger.jsonl", state=directory / "state.json",
+                dashboard_cache=directory / "dashboard-cache.json", usage_sync_cache=directory / "sync.json",
+            )
+            for path, contents in ((args.history, ""), (args.quota_history, ""), (args.token_session_history, ""), (args.token_ledger, ""), (args.usage_sync_cache, "{}"), (args.state, "{}")):
+                path.write_text(contents, encoding="utf-8")
+            quota = [{"checkedAt": "2029-12-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 12}}}]
+            state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
+            state.args = args
+            state.lock = threading.RLock()
+            state._series_build_lock = threading.Lock()
+            state._series_cache = {}
+            state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
+            state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
+            state.usage_data = SimpleNamespace(datasets=lambda _view: ([], quota, []))
+            state.last_sample = state.last_error = None
+            state.runtime_state = {}
+            state.wake_event = threading.Event()
+
+            self.assertTrue(state.refresh_dashboard_cache(now=2000000000.0))
+            with mock.patch.object(state.usage_data, "datasets", side_effect=AssertionError("persistent cache should avoid dataset loading")):
+                payload, _, _ = state.cached_series_response()
+
+            self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 12.0)
+            self.assertTrue(args.dashboard_cache.exists())
+
     def test_dashboard_exposes_independent_local_and_merged_data_views(self):
         html = dashboard_html()
         extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
@@ -3119,8 +4003,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_all_slow_cloud_actions_have_progress_messages(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        for path, action in (("/cloud/test", "WebDAV Test"), ("/cloud/push", "Push"), ("/cloud/fetch", "Fetch"), ("/cloud/restore", "Restore"), ("/accounts/bind", "Bind"), ("/accounts/release", "Release"), ("/skills/unmanage", "Unmanage")):
+        for path, action in (("/cloud/test", "WebDAV Test"), ("/cloud/push", "Push"), ("/cloud/fetch", "Fetch"), ("/cloud/overwrite", "Cloud Overwrite"), ("/cloud/restore", "Restore"), ("/accounts/bind", "Bind"), ("/accounts/release", "Release"), ("/accounts/share", "Share"), ("/accounts/delete-remote", "Delete Remote"), ("/skills/unmanage", "Unmanage")):
             self.assertIn(f'path.endsWith("{path}")?{{name:"{action}"', html)
+
+        for title in ("Cloud Data Overwritten", "The API account is now shared through WebDAV.", "The account was deleted from WebDAV."):
+            self.assertIn(title, html)
+        self.assertIn('showMessage(`${operation.name} Started`', html)
+        self.assertIn('showMessage(`${operation.name} Failed`', html)
 
     def test_bind_messages_explicitly_cover_start_finished_and_error(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
@@ -3164,18 +4053,29 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('await load(true);load(false,true)', html)
         self.assertIn('if(loading){if(refreshScan)scanPending=true;return}', html)
 
+    def test_management_toml_updates_do_not_report_account_creation(self):
+        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
+
+        self.assertIn('tomlConfigUpdate=path.endsWith("/accounts/common")||path.endsWith("/accounts/header")', html)
+        self.assertIn('else if(tomlConfigUpdate)showTomlConfigResult(path)', html)
+        self.assertIn('else if(path==="/api/accounts"||path.startsWith("/api/accounts/"))showAccountResult(path,body,result)', html)
+        self.assertNotIn('else if(path.includes("/accounts"))showAccountResult(path,body,result)', html)
+        self.assertIn('"API Header TOML":"Common TOML"', html)
+
     def test_dashboard_exposes_clear_account_controls_without_credentials(self):
         html = dashboard_html()
         source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
         self.assertIn('id="accountSelect"', html)
-        self.assertIn('id="newAccount"', html)
+        self.assertNotIn('id="newAccount"', html)
         self.assertIn('id="renameAccount"', html)
         self.assertIn('id="deleteAccount"', html)
         self.assertIn('id="deleteAccountModal"', html)
-        self.assertIn('id="newAccountModal"', html)
+        self.assertIn('id="renameAccountModal"', html)
+        self.assertIn('id="managePage"', html)
+        self.assertNotIn('create:"/api/accounts"', html)
         self.assertIn('Run Codex login in a new or restarted terminal', html)
         self.assertIn('did not respond within five minutes', html)
-        self.assertIn('Saving the current account and preparing a new sign-in slot', html)
+        self.assertNotIn('Add Codex account', html)
         self.assertIn('Saving the outgoing account and activating the selected account', html)
         self.assertNotIn('Waiting for the current usage refresh', html)
         account_action_source = html[html.index('async function performAccountAction'):html.index('function setupAccountControls')]
@@ -3502,6 +4402,29 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual([point["sevenDay"]["raw"] for point in points], [38, 3, 3, 38, 13, 13, 39])
         self.assertEqual([point["sevenDay"]["continuous"] for point in points], [38, None, None, 38, None, None, 39])
 
+    def test_usage_time_filter_pins_unconfirmed_downward_rounding_jitter_to_previous_baseline(self):
+        def continuous(values):
+            rows = [
+                {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
+                for index, percent in enumerate(values)
+            ]
+            return [point["sevenDay"]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)]
+
+        self.assertEqual(continuous([98, 96, 96]), [98, 98, 98])
+        self.assertEqual(continuous([98, 96, 97]), [98, 98, 98])
+        self.assertEqual(continuous([98, 96, 96, 97, 98]), [98, 98, 98, 98, 98])
+
+    def test_usage_time_filter_retroactively_accepts_three_consecutive_lower_readings(self):
+        def continuous(values):
+            rows = [
+                {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
+                for index, percent in enumerate(values)
+            ]
+            return [point["sevenDay"]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)]
+
+        self.assertEqual(continuous([98, 96, 96, 96]), [98, 96, 96, 96])
+        self.assertEqual(continuous([98, 96, 97, 97]), [98, 96, 97, 97])
+
     def test_usage_time_filter_removes_consecutive_upward_spikes_using_historical_rate(self):
         rows = [
             {"checkedAt": checked_at, "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
@@ -3687,6 +4610,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('ranges.some(range=>range.start<=previousAt&&currentAt<=range.end)', html)
         self.assertIn('function compactedUsageGap(previous,current,ranges)', html)
         self.assertIn('if(compactedUsageGap(previous,current,compactedRanges))return false', html)
+        self.assertIn('if((Number.isFinite(previous.compactedFrom)||Number.isFinite(current.compactedFrom))&&gap<=4*3600)return false;', html)
         self.assertIn('function breakUsageCurve(previous,current,label,valueOf,compactedRanges=[])', html)
         self.assertIn('if(gap>4*3600)return true', html)
         self.assertIn('if(gap<=30*60)return false', html)
@@ -5682,7 +6606,22 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             opaque_box = download({"accountKey": "placeholder-key", "keyType": "opaque", "accountId": None}, b"{}", {"keyType": "opaque", "accountIdHash": None}, "wrong-key")
             opaque_box.account_key.assert_not_called()
             legacy_box = download({"accountKey": "identity-key", "accountId": "acct-a"}, json.dumps(self.account_auth("acct-a", "refresh-a")).encode(), {"accountIdHash": hashlib.sha256(b"acct-a").hexdigest()}, "identity-key")
-            legacy_box.account_key.assert_called_once_with("acct-a")
+            legacy_box.account_key.assert_not_called()
+
+    def test_cloud_release_accepts_matching_identity_on_opaque_binding_key(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            auth_data = json.dumps(self.account_auth("acct-a", "refresh-a")).encode()
+            identity = {"accountId": "acct-a", "email": "a@example.test"}
+            key = "opaque-key-from-another-system"
+            client = SimpleNamespace(ensure_directories=mock.Mock(), put=mock.Mock(return_value='"etag"'))
+            box = SimpleNamespace(account_key=mock.Mock(side_effect=AssertionError("binding key must not be regenerated")), encrypt=lambda _purpose, payload: payload)
+            verified = {"version": 1, "accountKey": key, "accountId": "acct-a", "email": "a@example.test", "revisionId": hashlib.sha256(auth_data).hexdigest()}
+
+            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision"), mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account"):
+                result = cloud.release_account(key, auth_data, identity, "Account A")
+
+            self.assertEqual(result["accountKey"], key)
 
     def test_cloud_release_creates_verified_remote_copy(self):
         with self.account_directory() as directory:
@@ -5697,7 +6636,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision") as upload, mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account") as cache:
                 result = cloud.release_account(key, auth_data, identity, "Account A")
 
-            upload.assert_called_once_with(client, box, key, auth_data, identity, "identity")
+            upload.assert_called_once_with(client, box, key, auth_data, identity, "opaque")
             state = json.loads(client.put.call_args.args[1])
             self.assertEqual(state["accountId"], "acct-a")
             self.assertIsNone(state["boundMachineId"])
@@ -5758,7 +6697,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual([account["id"] for account in status["items"]], [second_id])
             self.assertTrue(auth_path.exists())
 
-    def test_account_manifest_v1_migrates_to_v2_without_rewriting_credentials(self):
+    def test_account_manifest_v1_migrates_to_v3_without_rewriting_credentials(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth = json.dumps(self.account_auth("acct-a", "secret-refresh")).encode()
@@ -5773,8 +6712,9 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
             migrated = AccountManager(auth_path)
 
-            self.assertEqual(migrated.manifest["version"], 2)
+            self.assertEqual(migrated.manifest["version"], 3)
             self.assertFalse(migrated.manifest["cloudBindingEnabled"])
+            self.assertEqual(migrated.active_account()["sessionRefresh"], {"fiveHour": {"enabled": False, "windowsUtc": []}, "sevenDay": {"enabled": False}})
             self.assertEqual(migrated.active_account()["identity"]["idTokenHash"], hashlib.sha256(b"id-acct-a").hexdigest())
             self.assertEqual((migrated.root / "ppl-pro" / "auth.json").read_bytes(), auth)
 
@@ -5926,6 +6866,32 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertEqual(merged[0]["tokens"]["totalTokens"], 120)
         self.assertEqual(conflicts, [])
 
+    def test_usage_sync_keeps_same_session_separate_for_normal_and_api_accounts(self):
+        with self.account_directory() as directory:
+            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
+            history.write_text("", encoding="utf-8")
+            quota.write_text("", encoding="utf-8")
+            monitor_history.write_token_session_history(tokens, [
+                {"sessionId": "shared-session", "updatedAt": "2030-01-01T00:30:00Z", "accountSlotId": "normal", "accountLabel": "Normal", "tokens": empty_token_totals()},
+                {"sessionId": "shared-session", "updatedAt": "2030-01-01T01:30:00Z", "accountSlotId": "api", "accountLabel": "API", "tokens": empty_token_totals()},
+            ])
+            store = UsageDataStore(history, quota, tokens, "machine-a", lambda slot: f"usage-{slot}", threading.Lock())
+
+            records, _ = store.snapshot()
+
+            remote_history, remote_quota, remote_tokens = directory / "remote-history.jsonl", directory / "remote-quota.jsonl", directory / "remote-tokens.jsonl"
+            remote_history.write_text("", encoding="utf-8")
+            remote_quota.write_text("", encoding="utf-8")
+            remote_tokens.write_text("", encoding="utf-8")
+            remote = UsageDataStore(remote_history, remote_quota, remote_tokens, "machine-b", lambda slot: f"usage-{slot}", threading.Lock(), lambda account_id, _slot, _label: {"usage-normal": ("normal-b", "Normal B"), "usage-api": ("api-b", "API B")}.get(account_id))
+            remote.apply([{"action": "upsert", "key": key, "record": record} for key, record in records.items()], operation_origin="machine-a")
+
+        token_records = [record for record in records.values() if record["kind"] == "token"]
+        self.assertEqual(len(token_records), 2)
+        self.assertEqual({record["row"]["sync"]["accountId"] for record in token_records}, {"usage-normal", "usage-api"})
+        self.assertEqual(remote.datasets("local")[2], [])
+        self.assertEqual({row["accountSlotId"] for row in remote.datasets("merged")[2]}, {"normal-b", "api-b"})
+
     def test_usage_store_initial_migration_syncs_quota_and_tokens_but_not_legacy_cost(self):
         with self.account_directory() as directory:
             history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
@@ -6060,7 +7026,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         keys, candidate = [], 0
         while len(keys) < 80:
             key = f"quota:bucket-test-{candidate}"
-            if hashlib.sha256(key.encode()).hexdigest()[0] == "a":
+            if hashlib.sha256(key.encode()).digest()[0] >> (8 - USAGE_PACK_BUCKET_BITS) == 0xA0 >> (8 - USAGE_PACK_BUCKET_BITS):
                 keys.append(key)
             candidate += 1
         records = {key: {"kind": "quota", "row": {"blob": "".join(hashlib.sha256(f"{key}:{index}".encode()).hexdigest() for index in range(48))}} for key in keys}
@@ -6068,14 +7034,31 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         packs = CloudManager._usage_record_packs("machine-a", records)
 
         self.assertGreater(len(packs), 1)
-        self.assertTrue(all(pack_id.startswith("a-") for pack_id in packs))
+        self.assertTrue(all(pack_id.startswith("a0-") for pack_id in packs))
         self.assertTrue(all(pack["bytes"] <= USAGE_PACK_MAX_BYTES for pack in packs.values()))
         self.assertEqual(sum(pack["records"] for pack in packs.values()), len(records))
 
-    def test_usage_sync_interval_is_thirty_minutes(self):
-        self.assertEqual(USAGE_SYNC_INTERVAL_SECONDS, 1800)
+    def test_usage_pack_and_verification_limits_reduce_incremental_transfer(self):
+        self.assertEqual(USAGE_PACK_BUCKET_BITS, 6)
+        self.assertEqual(USAGE_PACK_MAX_BYTES, 16 * 1024)
+        self.assertEqual(USAGE_REGULAR_VERIFY_PACKS, 2)
+        self.assertEqual(USAGE_FULL_VERIFY_INTERVAL_SECONDS, 30 * 24 * 60 * 60)
 
-    def test_usage_auto_sync_retries_at_one_five_and_fifteen_minutes(self):
+    def test_old_v2_usage_pointer_remains_readable_and_requests_format_migration(self):
+        box = SimpleNamespace(decrypt=lambda _purpose, payload, _limit: payload)
+        pointer = {"version": 2, "machineId": "machine-a", "packs": {"a-0000": "a" * 64}, "recordCount": 1}
+
+        self.assertEqual(CloudManager._parse_usage_pointer(box, "machine-a", json.dumps(pointer).encode()), pointer)
+        self.assertTrue(CloudManager._usage_full_verification_due(pointer))
+        pointer["verification"] = {"mode": "sampled", "verifiedPacks": [{}], "fullVerifiedAt": None}
+        with self.assertRaises(CloudError):
+            CloudManager._parse_usage_pointer(box, "machine-a", json.dumps(pointer).encode())
+
+    def test_automatic_cloud_periods_are_one_hour(self):
+        self.assertEqual(AUTO_FETCH_INTERVAL_SECONDS, 60 * 60)
+        self.assertEqual(USAGE_SYNC_INTERVAL_SECONDS, 60 * 60)
+
+    def test_usage_auto_sync_waits_one_hour_after_failure(self):
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
             cloud._config["webdav"].update({"enabled": True, "usageDataAutoSync": True})
@@ -6083,14 +7066,33 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             cloud._next_usage_sync_at = 0
             with mock.patch.object(cloud, "sync_usage_data", side_effect=CloudError("offline")) as sync:
                 self.assertFalse(cloud._auto_usage_sync_if_due(0))
-                self.assertEqual(cloud._next_usage_sync_at, 60)
-                self.assertFalse(cloud._auto_usage_sync_if_due(59))
-                self.assertFalse(cloud._auto_usage_sync_if_due(60))
-                self.assertEqual(cloud._next_usage_sync_at, 360)
-                self.assertFalse(cloud._auto_usage_sync_if_due(360))
-                self.assertEqual(cloud._next_usage_sync_at, 1260)
+                self.assertEqual(cloud._next_usage_sync_at, USAGE_SYNC_INTERVAL_SECONDS)
+                self.assertFalse(cloud._auto_usage_sync_if_due(USAGE_SYNC_INTERVAL_SECONDS - 1))
+                self.assertFalse(cloud._auto_usage_sync_if_due(USAGE_SYNC_INTERVAL_SECONDS))
+                self.assertEqual(cloud._next_usage_sync_at, 2 * USAGE_SYNC_INTERVAL_SECONDS)
 
-            self.assertEqual(sync.call_count, 3)
+            self.assertEqual(sync.call_count, 2)
+
+    def test_usage_sync_schedule_uses_last_attempt_over_last_success(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            cloud._state["usage"].update({"lastSuccessAt": "2030-01-01T00:00:00Z", "lastAttemptAt": "2030-01-01T00:30:00Z"})
+            now = datetime(2030, 1, 1, 1, 0, tzinfo=timezone.utc).timestamp()
+            with mock.patch("monitor_cloud.time.time", return_value=now), mock.patch("monitor_cloud.time.monotonic", return_value=1000):
+                cloud.configure_usage_sync(object())
+
+            self.assertEqual(cloud._next_usage_sync_at, 1000 + 30 * 60)
+
+    def test_usage_sync_records_attempt_before_failure(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            cloud._usage_data = object()
+            with mock.patch.object(cloud, "_require_conditional_writes", side_effect=CloudError("offline")):
+                with self.assertRaises(CloudError):
+                    cloud.sync_usage_data()
+
+            self.assertIsNotNone(cloud._state["usage"]["lastAttemptAt"])
+            self.assertIsNone(cloud._state["usage"]["lastSuccessAt"])
 
     def test_new_delta_processing_records_source_interval_for_reaggregation(self):
         state = {"windows": {}}
@@ -6111,12 +7113,16 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
     def test_usage_cloud_pack_manifest_fetches_each_missing_hash_and_updates_only_changed_buckets(self):
         class Client:
             def __init__(self):
-                self.files, self.revision = {}, 0
+                self.files, self.revision, self.get_paths, self.list_paths = {}, 0, [], []
+                self.fail_pointer_put_once = False
 
             def ensure_directories(self, path):
                 pass
 
             def put(self, path, data, etag=None, create=False):
+                if self.fail_pointer_put_once and path.startswith("usage/machines/"):
+                    self.fail_pointer_put_once = False
+                    raise CloudError("simulated pointer write failure", 502)
                 if create and path in self.files or etag is not None and (path not in self.files or self.files[path][1] != etag):
                     raise CloudError("HTTP 412", 409)
                 self.revision += 1
@@ -6125,11 +7131,13 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 return current
 
             def get(self, path):
+                self.get_paths.append(path)
                 if path not in self.files:
                     raise CloudError("HTTP 404", 502)
                 return self.files[path]
 
             def list_details(self, path):
+                self.list_paths.append(path)
                 prefix = path.rstrip("/") + "/"
                 return [{"name": name[len(prefix):], "etag": value[1]} for name, value in self.files.items() if name.startswith(prefix) and "/" not in name[len(prefix):]]
 
@@ -6185,6 +7193,13 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             files_after_snapshot = set(client.files)
             unchanged = clouds[0].sync_usage_data()
             manifest = clouds[0]._usage_pointer(client, box, clouds[0].machine_id)[0]["packs"]
+            client.get_paths.clear()
+            quiet_fetch = clouds[1]._fetch_usage_data(client, box)
+            self.assertEqual(quiet_fetch["payloadsDownloaded"], 0)
+            self.assertNotIn(clouds[0]._usage_pointer_path(clouds[0].machine_id), client.get_paths)
+            clouds[1]._state["usage"]["remote"][clouds[0].machine_id]["lastFullVerificationAt"] = "2000-01-01T00:00:00Z"
+            periodic_full_fetch = clouds[1]._fetch_usage_data(client, box)
+            self.assertEqual(periodic_full_fetch["payloadsDownloaded"], len(manifest))
             retained_pack = sorted(manifest)[-1]
             second_store.packs[clouds[0].machine_id] = {retained_pack: manifest[retained_pack]}
             second_store.received.clear()
@@ -6202,6 +7217,44 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertNotEqual(files_after_snapshot, set(client.files))
             self.assertEqual(incremental["published"]["uploaded"], 1)
             self.assertEqual(incremental["published"]["packsUploaded"], 1)
+            client.get_paths.clear()
+            client.list_paths.clear()
+            bucket_keys, candidate = {}, 0
+            while len(bucket_keys) < 5:
+                key = f"quota:sampled-{candidate}"
+                bucket = hashlib.sha256(key.encode()).digest()[0] >> (8 - USAGE_PACK_BUCKET_BITS)
+                bucket_keys.setdefault(bucket, key)
+                candidate += 1
+            for index, key in enumerate(bucket_keys.values()):
+                first_store.records[key] = {"kind": "quota", "row": {
+                    "checkedAt": f"2030-01-01T02:{index:02}:00Z", "windows": {"5h": {"usedPercent": 40 + index}},
+                    "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": key},
+                }}
+            sampled = clouds[0].sync_usage_data()
+            pack_gets = [path for path in client.get_paths if path.startswith(f"usage/packs/{clouds[0].machine_id}/")]
+            self.assertGreaterEqual(sampled["published"]["packsUploaded"], 5)
+            self.assertEqual(sampled["published"]["packsVerified"], USAGE_REGULAR_VERIFY_PACKS)
+            self.assertFalse(sampled["published"]["fullVerification"])
+            self.assertEqual(len(pack_gets), USAGE_REGULAR_VERIFY_PACKS)
+            self.assertEqual(client.get_paths.count(clouds[0]._usage_pointer_path(clouds[0].machine_id)), 1)
+            self.assertNotIn(f"usage/packs/{clouds[0].machine_id}", client.list_paths)
+            pointer_path = clouds[0]._usage_pointer_path(clouds[0].machine_id)
+            pointer_before_failure = client.files[pointer_path]
+            first_store.records["quota:failure-retry"] = {"kind": "quota", "row": {
+                "checkedAt": "2030-01-01T03:00:00Z", "windows": {"5h": {"usedPercent": 50}},
+                "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": "failure-retry"},
+            }}
+            client.fail_pointer_put_once = True
+            with self.assertRaises(CloudError):
+                clouds[0].sync_usage_data()
+            self.assertEqual(client.files[pointer_path], pointer_before_failure)
+            recovered = clouds[0].sync_usage_data()
+            self.assertEqual(recovered["published"]["uploaded"], 1)
+            with mock.patch.object(clouds[0], "_usage_full_verification_due", return_value=True):
+                verified = clouds[0].sync_usage_data()
+            self.assertTrue(verified["published"]["fullVerification"])
+            self.assertEqual(verified["published"]["packsUploaded"], 0)
+            self.assertEqual(verified["published"]["packsVerified"], verified["published"]["packs"])
             full = clouds[0]._push_usage_data(True)
             self.assertTrue(full["fullSnapshot"])
             self.assertEqual(full["uploaded"], len(first_store.records))

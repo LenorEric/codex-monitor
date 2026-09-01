@@ -4,6 +4,7 @@ import base64
 import binascii
 import json
 import os
+import sys
 import tempfile
 import time
 import urllib.error
@@ -49,6 +50,16 @@ UNKNOWN_EVENT_ACCOUNT_LABEL = "Unknown"
 
 class UsageError(RuntimeError):
     pass
+
+class UsageHttpError(UsageError):
+    def __init__(self, method: str, url: str, status: int, body: str):
+        super().__init__(f"{method} {url} -> HTTP {status}: {body[:500]}")
+        self.status = status
+        self.body = body
+
+    def is_expired_token(self) -> bool:
+        text = self.body.casefold()
+        return self.status == 401 and ("token_expired" in text or "authentication token is expired" in text)
 
 class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
@@ -126,6 +137,21 @@ def jwt_payload(token: str) -> dict:
         return json.loads(base64.urlsafe_b64decode(token.split(".")[1] + "=" * (-len(token.split(".")[1]) % 4)))
     except (binascii.Error, IndexError, json.JSONDecodeError, UnicodeDecodeError):
         return {}
+
+def token_account_id(tokens: dict | None) -> str | None:
+    tokens = tokens if isinstance(tokens, dict) else {}
+    if tokens.get("account_id"):
+        return str(tokens["account_id"])
+    for name in ("id_token", "access_token"):
+        claims = jwt_payload(tokens.get(name) or "")
+        auth_claims = claims.get("https://api.openai.com/auth") if isinstance(claims.get("https://api.openai.com/auth"), dict) else {}
+        account_id = claims.get("chatgpt_account_id") or auth_claims.get("chatgpt_account_id")
+        if account_id:
+            return str(account_id)
+    return None
+
+def auth_account_id(auth: dict | None) -> str | None:
+    return token_account_id((auth or {}).get("tokens") if isinstance(auth, dict) else None)
 
 def token_expired(token: str, skew_seconds: int = TOKEN_REFRESH_FALLBACK_SECONDS, remaining_fraction: float = TOKEN_REFRESH_REMAINING_FRACTION, max_margin_seconds: int = TOKEN_REFRESH_MAX_MARGIN_SECONDS) -> bool:
     payload = jwt_payload(token)
@@ -212,8 +238,9 @@ def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, h
             with opener.open(request, timeout=timeout) as response:
                 return response.status, json.loads(response.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            if attempt >= retries:
-                raise UsageError(f"{method} {url} -> HTTP {exc.code}: {exc.read().decode('utf-8', errors='replace')[:500]}") from exc
+            error = UsageHttpError(method, url, exc.code, exc.read().decode("utf-8", errors="replace"))
+            if error.is_expired_token() or attempt >= retries:
+                raise error from exc
         except (urllib.error.URLError, OSError) as exc:
             if not retry_network_errors_forever and attempt >= retries:
                 raise UsageError(f"{method} {url} -> network error: {exc}") from exc
@@ -223,20 +250,19 @@ def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, h
         attempt += 1
         time.sleep(1)
 
-def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_refresh: bool = True) -> str:
+def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_refresh: bool = True, force_refresh: bool = False) -> str:
     tokens = auth.get("tokens") or {}
     access_token = tokens.get("access_token")
-    if access_token and not (token_expired(access_token) if allow_refresh else token_expired(access_token, 0, 0, 0)):
+    if not force_refresh and access_token and not (token_expired(access_token) if allow_refresh else token_expired(access_token, 0, 0, 0)):
         return access_token
-    if not allow_refresh:
-        raise UsageError("Waiting for Codex to refresh the active account credentials")
     if auth_lock is not None:
         with auth_lock:
             auth.clear()
             auth.update(load_json(auth_path))
-            return refresh_access_token(auth, opener, auth_path, timeout, retries, refreshed_callback=refreshed_callback, allow_refresh=allow_refresh)
+            return refresh_access_token(auth, opener, auth_path, timeout, retries, refreshed_callback=refreshed_callback, allow_refresh=allow_refresh, force_refresh=force_refresh)
     if not tokens.get("refresh_token"):
         raise UsageError("access token is expired and auth.json has no refresh_token")
+    old_account_id = token_account_id(tokens)
     payload = jwt_payload(tokens.get("access_token") or tokens.get("id_token") or "")
     try:
         status, refreshed = request_json(opener, "POST", "https://auth.openai.com/oauth/token", {}, {
@@ -248,6 +274,10 @@ def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth
         raise UsageError(f"token refresh failed without retry because rotating-token requests are not safely repeatable: {exc}") from exc
     if status != 200 or not refreshed.get("access_token"):
         raise UsageError(f"token refresh did not return access_token: HTTP {status}")
+    new_account_id = token_account_id(refreshed)
+    if not old_account_id or new_account_id != old_account_id:
+        print("Token refresh ignored because the refreshed account_id does not match the recorded account_id.", file=sys.stderr, flush=True)
+        raise UsageError("token refresh returned credentials for an unverifiable or different account")
     tokens.update({k: refreshed[k] for k in ("access_token", "id_token", "refresh_token") if refreshed.get(k)})
     auth["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     write_json(auth_path, auth)
