@@ -4,7 +4,7 @@
 
 **一个本地优先的 Codex 配额、Token、成本、账号、技能与加密同步仪表盘，并提供 VS Code 集成。**
 
-[![Version](https://img.shields.io/badge/version-1.2.0-4f8cff)](#快速开始)
+[![Version](https://img.shields.io/badge/version-1.3.0-4f8cff)](#快速开始)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#运行要求)
@@ -27,7 +27,7 @@ Codex Usage Monitor 将 Codex 服务返回的权威 5 小时和 7 天额度，�
 | Token 与成本分析 | 新鲜输入、缓存输入、缓存写入、输出、缓存命中率、按模型统计、Standard/Fast 归因和预估成本。 |
 | 多 Codex 账号 | 安全的本地账号切换、登录槽创建、重命名与删除、身份一致性校验，以及按账号归因的历史。 |
 | 技能管理 | 发现 Codex 和 Gemini 技能，将其移动到统一的私有托管目录，使用严格链接或托管回退进行分配，并同步变更。 |
-| 多机加密同步 | 通过 WebDAV 保存 AES-256-GCM 加密技能包、仅移动式账号传输和增量使用记录。 |
+| 多机加密同步 | 通过 WebDAV 保存 AES-256-GCM 加密技能包、复制式 API 账号、移动式 OpenAI 账号和增量使用记录。 |
 | 本地优先隐私 | 凭据与原始记录保留在 `~/.codex-switch`；仪表盘接口会脱敏，云端下载的历史不会污染本地记录文件。 |
 | 稳健运行 | 原子本地写入、增量会话日志扫描、基于修订版本的响应缓存、条件云端更新、可回滚的密钥轮换，以及完整的单元测试。 |
 
@@ -42,7 +42,7 @@ flowchart LR
     M <--> W[可选的加密 WebDAV]
 ```
 
-Python 监控服务是权威数据源。扩展在可见时轮询 `/api/status`，仅在修订版本变化后重新读取 `/api/series`；只有无法获取实时页面时，才使用扩展内置的仪表盘。
+Python 监控服务是权威数据源。仪表盘首次连接时从 `/api/series` 一次取得相互独立的完整本地和合并数据集，之后每五秒携带 ETag 轮询 `/api/status`。本地可见数据发生变化时，会为两个视图传输连续编号的增量补丁；云端补充数据可能改写历史点，因此其语义变化会替换整个合并视图。服务重启或保留的索引不完整时，会自动通过完整快照恢复。
 
 ## 运行要求
 
@@ -76,7 +76,7 @@ python monitor_codex_usage.py
 
 ### 2. 安装 VS Code 扩展
 
-在 VS Code 中安装 `release/codex-usage-monitor-1.2.0.vsix`：
+在 VS Code 中安装 `release/codex-usage-monitor-1.3.0.vsix`：
 
 1. 打开 **扩展**。
 2. 选择 **视图和更多操作 (…) → 从 VSIX 安装…**。
@@ -85,7 +85,7 @@ python monitor_codex_usage.py
 也可以使用命令行：
 
 ```console
-code --install-extension release/codex-usage-monitor-1.2.0.vsix
+code --install-extension release/codex-usage-monitor-1.3.0.vsix
 ```
 
 ### 3. 完成首次设置
@@ -136,7 +136,7 @@ code --install-extension release/codex-usage-monitor-1.2.0.vsix
 - **Rename** 会同步重写已保存监控历史中的本地标签。
 - **Delete** 仅影响本机，并且不能删除当前账号或唯一剩余的本地账号。
 - 保存已登录的离开账号前，实时与保险库中的 `id_token` 和 `account_id` 必须完全一致。
-- 同一个已认证身份不能占用两个可用的本地槽位。
+- 同一个 API 密钥不能占用两个可用的本地槽位；同一个 OpenAI 身份可以有多个独立凭据配置。
 
 ### 重置后刷新
 
@@ -144,16 +144,21 @@ code --install-extension release/codex-usage-monitor-1.2.0.vsix
 
 编辑器按浏览器当前时区显示时间，并提示检测到的时区和 UTC 偏移。保存时浏览器会把每个区间转换成固定且不带时区的后端日内位置；监控服务既不保存时区也不保存偏移，只把这些位置与当前时间戳直接比较。任何浏览器都会使用自己的当前偏移把后端位置转换成显示时间。因此，切换用户、旅行或夏令时变化可能改变本地显示时间，但不会改变已保存窗口的实际执行时刻。若在允许窗口之外检测到 5 小时配额重置，刷新会排队等待到下一个允许窗口；7 天刷新不受时间窗口限制，会在重置后立即执行。
 
-### 在机器之间移动账号
+### 在机器之间传输账号
 
-账号云存储采用“移动”而非“备份”语义：
+普通 OpenAI 账号采用移动语义：
 
 - **Release** 上传并验证最新本地账号文件，成功后才删除本地保险库记录。
 - **Bind** 下载并校验已释放文件，提交到本地后才删除并验证云端副本。
-- **Push** 与 **Fetch** 永远不会上传本地账号凭据。
-- **Rename** 与 **Delete** 永远不会修改云端账号文件。
 
-Bind 或 Release 失败时会至少保留一份已验证副本。等待登录的空槽也可以正常 Release 和 Bind。
+API 账号采用复制语义：
+
+- **Share** 上传并验证 API 密钥、显示名称和账号专用 Header TOML，同时保留本地副本。
+- **Link** 下载并校验 API 配置，同时保留云端副本。
+- API 密钥相同即视为同一个账号；目标位置已有该密钥时，不显示重复传输操作。
+- 后续本地名称或 Header 修改只影响本机，不会创建第二个 API 账号，也不会自动覆盖另一份副本。
+
+**Push** 与 **Fetch** 永远不会传输账号凭据。本地与云端 **Delete** 只删除所选副本，Rename 不修改云端文件。Bind 或 Release 失败时会至少保留一份已验证副本。等待登录的 OpenAI 空槽也可以正常 Release 和 Bind。
 
 ## 管理技能
 
@@ -192,7 +197,7 @@ Bind 或 Release 失败时会至少保留一份已验证副本。等待登录的
 
 Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.jianguoyun.com/dav/` 与应用密码。
 
-手动 **Push** 始终发布托管技能变更和本机记录的使用数据。手动 **Fetch** 始终刷新已释放账号的元数据、合并托管技能变更，并下载其他机器记录的使用数据；即使关闭对应的自动选项，这些手动传输仍会执行。账号凭据继续采用仅移动模型，只能通过显式 **Release** 和 **Bind** 操作传输。
+手动 **Push** 始终发布托管技能变更和本机记录的使用数据。手动 **Fetch** 始终刷新远端账号元数据、合并托管技能变更，并下载其他机器记录的使用数据；即使关闭对应的自动选项，这些手动传输仍会执行。账号凭据只能通过显式 **Share**、**Link**、**Release** 和 **Bind** 操作传输。
 
 加密口令会通过 scrypt 转换，并立即从暂存字段清除。确定性盐由规范化后的 WebDAV URL 和用户名生成，使另一台机器能够派生同一个密钥。修改已有口令时，程序会下载、认证、重新加密、上传并验证所有已知加密对象；只有整个远端轮换成功后才提交本地配置，失败时会回滚已经写入的远端对象。
 
@@ -212,9 +217,9 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 - 上传失败不会暴露部分清单：不可变的内容寻址包会先上传，最后才通过 `If-Match`/`If-None-Match` 提交指针。后续尝试可以复用指针提交前失败所留下的数据包，再次尝试提交指针。
 - Fetch 会重建发现的每个旧版检查点/分块流，上传并验证版本 2 数据包，以条件写入替换清单，并且只在验证成功后删除旧版数据。
 - 下载的记录及其按机器保存的数据包哈希会原子写入 `usage_monitor_sync_cache.json`，绝不替换或追加到本地记录文件。
-- 仪表盘会维护 `usage_monitor_dashboard_cache.json` 作为仅用于显示的缓存：最近三天保持无损，较早图表点按时间逐级合并；不会修改原始记录文件或 Token/会话汇总。
+- 仪表盘会维护 `usage_monitor_dashboard_cache.json`，保存完整的本地和合并显示数据集：最近三天保持无损，较早图表点按时间逐级合并；不会修改原始记录文件或 Token/会话汇总。缓存构建时间和按小时计算的维护期限本身不会触发 API 数据更新，除非可见数据确实改变。
 
-每 60 分钟的周期 Fetch 还会检查权威技能索引并刷新已释放账号列表。强指针 ETag 会跳过未变化的使用数据清单，但本地缺少数据包哈希时仍会强制修复。每 30 天会完整获取并验证所有活跃远端数据包。没有记录上次尝试，或记录的尝试已超过一小时后，第一次周期 Fetch 会立即执行。
+每 60 分钟的周期 Fetch 还会检查权威技能索引并刷新远端账号列表。强指针 ETag 会跳过未变化的使用数据清单，但本地缺少数据包哈希时仍会强制修复。每 30 天会完整获取并验证所有活跃远端数据包。没有记录上次尝试，或记录的尝试已超过一小时后，第一次周期 Fetch 会立即执行。
 
 ## 数据与隐私
 
@@ -223,7 +228,7 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 | 路径 | 内容 | 是否同步到云端 |
 | --- | --- | --- |
 | `config.json` | 服务器设置、明文 WebDAV 登录密码、Cookie 密钥、密码校验值和派生加密密钥 | 否 |
-| `accounts/` | 敏感 Codex 账号保险库与清单 | 仅通过显式 Release/Bind 移动 |
+| `accounts/` | 敏感 Codex 账号保险库与清单 | 仅通过 API Share/Link 或 OpenAI Release/Bind 显式传输 |
 | `skills/` | 私有托管技能源 | 可选的加密技能包 |
 | `usage_monitor_history.jsonl` | 本地原始成本/百分比区间 | 仅同步派生记录 |
 | `usage_monitor_quota_history.jsonl` | 完整的本地已接受额度读数 | 仅同步压缩后的派生记录 |
@@ -232,7 +237,7 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 | `usage_monitor_samples.jsonl` | 本地详细诊断样本 | 永不 |
 | `usage_monitor_state.json` | 运行基线和游标 | 永不 |
 | `usage_monitor_sync_cache.json` | 下载记录和每台机器的完整数据包哈希清单 | 不作为记录文件上传 |
-| `usage_monitor_dashboard_cache.json` | 后端维护的分级仪表盘图表显示缓存 | 永不 |
+| `usage_monitor_dashboard_cache.json` | 后端维护的完整本地/合并显示快照及分级图表点 | 永不 |
 
 Token 账本在价格时期首次使用时写入一次完整定义，后续用量记录仅引用其 `pricingId`。现有会话汇总只会被导入一次并形成精简的旧数据基线，之后逐会话历史文件均由账本重新生成。
 
@@ -329,7 +334,7 @@ npm run release
 | --- | --- |
 | `monitor_codex_usage.py` | CLI 入口与监控服务启动。 |
 | `monitor_dashboard.py` | 轮询循环、仪表盘/API 服务、响应缓存、控制认证与 UI 数据集。 |
-| `monitor_accounts.py` | 本地凭据保险库、身份安全切换与仅移动式账号传输。 |
+| `monitor_accounts.py` | 本地凭据保险库、身份安全切换、API 复制传输与 OpenAI 移动传输。 |
 | `monitor_cloud.py` | 配置、WebDAV、加密、串行云操作、软件包与使用记录。 |
 | `monitor_skills.py` | 技能发现、托管存储、验证、分配与投影。 |
 | `monitor_tokens.py` | 增量会话日志解析、Token 聚合、Fast 归因与成本计算。 |

@@ -134,6 +134,31 @@ def atomic_write_json(path: Path, data: dict) -> None:
     atomic_write_bytes(path, (json.dumps(data, indent=2, ensure_ascii=False) + "\n").encode("utf-8"))
 
 
+def _make_writable_and_retry(function, path, exc_info) -> None:
+    try:
+        os.chmod(path, 0o700)
+    except OSError:
+        pass
+    function(path)
+
+
+def remove_directory(path: Path) -> None:
+    path = Path(path)
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+        return
+    for attempt in range(5):
+        try:
+            shutil.rmtree(path, onerror=_make_writable_and_retry)
+            return
+        except FileNotFoundError:
+            return
+        except OSError:
+            if attempt == 4:
+                raise
+            time.sleep(0.05 * (attempt + 1))
+
+
 def parse_auth_bytes(data: bytes) -> dict:
     try:
         auth = json.loads(data.decode("utf-8"))
@@ -160,6 +185,13 @@ def auth_identity(auth: dict) -> dict:
         "email": str(email) if email else None,
         "accountType": "account",
     }
+
+
+def api_identity_id(identity: dict | None) -> str | None:
+    id_token_hash = (identity or {}).get("idTokenHash")
+    if (identity or {}).get("accountType") != "api" or not id_token_hash:
+        return None
+    return hashlib.sha256(f"codex-monitor-api-account-v1:{id_token_hash}".encode()).hexdigest()
 
 
 def same_auth_identity(left: dict | None, right: dict | None) -> bool:
@@ -237,7 +269,7 @@ class AccountManager:
             "sessionRefresh": default_session_refresh(),
             "configHeader": {},
             "fingerprint": auth_fingerprint(data) if data is not None else None,
-            "cloud": {"state": "local-only", "accountKey": None, "boundMachineId": None},
+            "cloud": {"accountKey": None, "keyType": None},
         }
 
     def _validate_label(self, label: str) -> str:
@@ -259,9 +291,8 @@ class AccountManager:
             changed = manifest.get("version") in {1, 2}
             if manifest.get("version") == 1:
                 manifest["version"] = 2
-                manifest["cloudBindingEnabled"] = False
                 for account in manifest["accounts"]:
-                    account["cloud"] = {"state": "local-only", "accountKey": None, "boundMachineId": None}
+                    account["cloud"] = {"accountKey": None, "keyType": None}
             if manifest.get("version") == 2:
                 manifest["version"] = 3
             for account in manifest["accounts"]:
@@ -304,7 +335,6 @@ class AccountManager:
         manifest = {
             "version": 3,
             "activeAccountId": "ppl-pro" if live is not None else None,
-            "cloudBindingEnabled": False,
             "commonAccountHeaderToml": "",
             "accounts": [self._new_record("ppl-pro", "Current account", ready, live if ready else None)] if live is not None else [],
             "activationHistory": [{"checkedAt": timestamp(), "accountSlotId": "ppl-pro", "accountLabel": "Current account"}] if live is not None else [],
@@ -638,6 +668,24 @@ class AccountManager:
     def _find_identity(self, identity: dict, exclude_id: str | None = None) -> dict | None:
         return next((account for account in self.manifest["accounts"] if account.get("id") != exclude_id and same_auth_identity(account.get("identity"), identity)), None)
 
+    def _find_disallowed_duplicate(self, identity: dict, exclude_id: str | None = None) -> dict | None:
+        return self._find_identity(identity, exclude_id) if identity.get("accountType") == "api" else None
+
+    def _find_cloud_key(self, account_key: str) -> dict | None:
+        return next((account for account in self.manifest["accounts"] if (account.get("cloud") or {}).get("accountKey") == account_key), None)
+
+    def api_identity_ids(self) -> dict[str, str]:
+        with self.lock:
+            return {account["id"]: identity_id for account in self.manifest["accounts"] if (identity_id := api_identity_id(account.get("identity"))) is not None}
+
+    def cloud_account_keys(self) -> set[str]:
+        with self.lock:
+            return {key for account in self.manifest["accounts"] if (key := (account.get("cloud") or {}).get("accountKey"))}
+
+    def _ensure_account_changes_allowed(self) -> None:
+        if self.cloud is not None:
+            self.cloud.ensure_no_pending_account_operation()
+
     def active_account(self) -> dict:
         account = self._find(self.manifest.get("activeAccountId"))
         if account is None:
@@ -647,7 +695,8 @@ class AccountManager:
     def attribution_for_auth(self, auth: dict) -> dict:
         with self.lock:
             identity = auth_identity(auth)
-            account = self._find_identity(identity)
+            matches = [account for account in self.manifest["accounts"] if same_auth_identity(account.get("identity"), identity)]
+            account = next((account for account in matches if account["id"] == self.manifest.get("activeAccountId")), matches[0] if matches else None)
             if account is None and identity.get("email"):
                 matches = [account for account in self.manifest["accounts"] if (account.get("identity") or {}).get("email") == identity["email"]]
                 account = matches[0] if len(matches) == 1 else None
@@ -695,7 +744,7 @@ class AccountManager:
             raise AccountError("Live auth.json belongs to a different account; use New account before replacing the current login", 409)
         if account.get("ready") and not is_api_auth(auth) and tokens and (not isinstance(tokens.get("refresh_token"), str) or not tokens["refresh_token"].strip()):
             return False
-        if duplicate := self._find_identity(identity, account["id"]):
+        if duplicate := self._find_disallowed_duplicate(identity, account["id"]):
             raise AccountError(f"Account change refused: this login is already managed as {duplicate['label']}", 409)
         fingerprint = auth_fingerprint(data)
         if account.get("ready") and account.get("fingerprint") == fingerprint and self._account_path(account["id"]).exists():
@@ -783,6 +832,7 @@ class AccountManager:
             return credentials
 
     def set_session_refresh(self, account_id: str, session_refresh: object) -> dict:
+        self._ensure_account_changes_allowed()
         with self.lock:
             account = self._find(str(account_id or ""))
             if account is None:
@@ -795,6 +845,8 @@ class AccountManager:
             return self.status()
 
     def commit_polled_credentials(self, account_id: str, expected_fingerprint: str, data: bytes) -> bool:
+        if self.cloud is not None and self.cloud.account_transition_targets(account_id):
+            return False
         fingerprint = auth_fingerprint(data)
         if fingerprint == expected_fingerprint:
             return True
@@ -808,7 +860,7 @@ class AccountManager:
                 return False
             identity = auth_identity(auth)
             identity_matches = same_auth_identity(account.get("identity"), identity) if account.get("accountType") == "api" else bool(auth_account_id(auth) and auth_account_id(auth) == (account.get("identity") or {}).get("accountId"))
-            if not identity_matches or self._find_identity(identity, account_id):
+            if not identity_matches or self._find_disallowed_duplicate(identity, account_id):
                 return False
             if account_id == self.manifest.get("activeAccountId"):
                 if not self.auth_path.exists() or auth_fingerprint(self.auth_path.read_bytes()) != expected_fingerprint:
@@ -824,6 +876,9 @@ class AccountManager:
             if self.manifest.get("activeAccountId") is None:
                 return False
             active = self.active_account()
+            if self.cloud is not None and self.cloud.account_transition_targets(active["id"]):
+                self.error = "Waiting for the pending cloud account transfer to recover before accepting login credentials"
+                return False
             if active.get("ready") or not self.auth_path.exists():
                 return False
             try:
@@ -834,7 +889,7 @@ class AccountManager:
                     self.message = None
                     return False
                 identity = auth_identity(auth)
-                duplicate = self._find_identity(identity, active["id"])
+                duplicate = self._find_disallowed_duplicate(identity, active["id"])
                 if duplicate:
                     credential_path = self._account_path(duplicate["id"])
                     old_credential = credential_path.read_bytes() if credential_path.exists() else None
@@ -870,6 +925,7 @@ class AccountManager:
                 return False
 
     def create_account(self, label: str, account_type: str = "account", api_key: str | None = None, external_update_callback=None) -> dict:
+        self._ensure_account_changes_allowed()
         label = self._validate_label(label)
         account_type = str(account_type or "account").strip().lower()
         if account_type not in {"account", "api"}:
@@ -921,6 +977,7 @@ class AccountManager:
             return self.status()
 
     def rename(self, account_id: str, label: str, update_local_data=None) -> dict:
+        self._ensure_account_changes_allowed()
         label = self._validate_label(label)
         with self.lock:
             account = self._find(str(account_id or ""))
@@ -949,6 +1006,7 @@ class AccountManager:
             return self.status()
 
     def delete(self, account_id: str) -> dict:
+        self._ensure_account_changes_allowed()
         with self.lock:
             target = self._find(str(account_id or ""))
             if target is None:
@@ -964,10 +1022,7 @@ class AccountManager:
             old_credential = credential_path.read_bytes() if credential_path.exists() else None
             try:
                 self.manifest["accounts"] = [account for account in self.manifest["accounts"] if account["id"] != target["id"]]
-                if credential_path.exists():
-                    credential_path.unlink()
-                if credential_path.parent.exists():
-                    credential_path.parent.rmdir()
+                remove_directory(credential_path.parent)
                 self._save_manifest()
             except Exception as exc:
                 self.manifest = old_manifest
@@ -986,6 +1041,7 @@ class AccountManager:
             return self.status()
 
     def switch(self, account_id: str, external_update_callback=None) -> dict:
+        self._ensure_account_changes_allowed()
         with self.lock:
             self.sync_config_from_disk()
             target = self._find(str(account_id or ""))
@@ -1077,6 +1133,7 @@ class AccountManager:
             return self.status()
 
     def update_api_config(self, account_id: str, header_toml: str) -> dict:
+        self._ensure_account_changes_allowed()
         if not isinstance(header_toml, str):
             raise AccountError("Header configuration must be TOML text")
         try:
@@ -1153,8 +1210,6 @@ class AccountManager:
                     "email": identity.get("email"),
                     "ready": bool(account.get("ready")),
                     "active": account["id"] == active_id,
-                    "cloudState": (account.get("cloud") or {}).get("state", "local-only"),
-                    "accountKey": (account.get("cloud") or {}).get("accountKey"),
                     "accountType": account.get("accountType") or (account.get("identity") or {}).get("accountType", "account"),
                     "isApiAccount": (account.get("accountType") or (account.get("identity") or {}).get("accountType")) == "api",
                     "sessionRefresh": normalize_session_refresh(account.get("sessionRefresh")),
@@ -1165,55 +1220,109 @@ class AccountManager:
             return {
                 "activeAccountId": active_id,
                 "awaitingLogin": not bool(active and active.get("ready")),
-                "cloudBindingEnabled": bool(self.manifest.get("cloudBindingEnabled")),
                 "error": self.error,
                 "message": self.message,
                 "items": items,
             }
 
-    def bind_cloud_account(self, cloud, account_key: str, record_transition: bool = True) -> dict:
-        account_key = str(account_key or "")
-        if record_transition:
-            cloud.begin_account_transition("bind", accountKey=account_key)
-        try:
-            state, data, etag = cloud.bind_account(account_key)
-        except Exception:
-            if record_transition:
-                cloud.clear_account_transition()
-            raise
+    @staticmethod
+    def _downloaded_cloud_identity(state: dict, data: bytes) -> tuple[bool, dict, str]:
         ready = state.get("ready", True) is not False
-        identity = auth_identity(parse_auth_bytes(data)) if ready else {"accountId": None, "idTokenHash": None, "email": None}
+        identity = auth_identity(parse_auth_bytes(data)) if ready else {"accountId": None, "idTokenHash": None, "email": None, "accountType": "account"}
+        account_type = state.get("accountType", identity.get("accountType", "account"))
+        if ready and state.get("accountType") and state["accountType"] != identity.get("accountType"):
+            raise AccountError("Cloud account type does not match its credential payload", 409)
         if not identity.get("accountId") and state.get("accountId"):
             identity["accountId"] = state["accountId"]
         if not identity.get("email") and state.get("email"):
             identity["email"] = state["email"]
+        return ready, identity, account_type
+
+    def _commit_downloaded_cloud_account(self, state: dict, data: bytes, identity: dict, ready: bool, account_type: str, account_id: str, error_action: str) -> None:
         with self.lock:
-            duplicate = self._find_identity(identity)
-        if duplicate is not None:
-            if record_transition:
-                cloud.clear_account_transition()
-            raise AccountError(f"Bind blocked: this authenticated account is already managed as {duplicate['label']}. One authenticated account can have only one managed account on this machine.", 409)
-        with self.lock:
-            account_id = uuid.uuid4().hex
+            if self._find(account_id) is not None:
+                raise AccountError(f"{error_action} recovery blocked: the intended local credential slot is already in use", 409)
+            if duplicate_key := self._find_cloud_key(state["accountKey"]):
+                raise AccountError(f"{error_action} blocked: this cloud credential profile is already managed as {duplicate_key['label']}", 409)
+            if account_type == "api" and (duplicate := self._find_identity(identity)):
+                raise AccountError(f"This API account is already linked as {duplicate['label']}", 409)
             account = self._new_record(account_id, state.get("label") or "Cloud account", ready, data if ready else None)
+            if identity.get("accountId") or identity.get("idTokenHash"):
+                account["identity"] = identity
+            account["accountType"] = account_type
             account["configHeader"] = dict(state.get("configHeader") or {})
             account["configHeaderToml"] = state.get("configHeaderToml", "")
-            account["cloud"] = {"state": "shared", "accountKey": state["accountKey"], "keyType": state.get("keyType", "identity"), "boundMachineId": cloud.machine_id}
-            if ready:
-                atomic_write_bytes(self._account_path(account_id), data)
-            self.manifest["accounts"].append(account)
-            self.manifest["cloudBindingEnabled"] = True
-            if self.manifest.get("activeAccountId") is None:
-                self.manifest["activeAccountId"] = account_id
-                self._record_activation(account_id)
+            account["cloud"] = {"accountKey": state["accountKey"], "keyType": state.get("keyType", "opaque")}
+            old_live = self.auth_path.read_bytes() if self.auth_path.exists() else None
+            old_manifest = json.loads(json.dumps(self.manifest))
+            try:
                 if ready:
-                    atomic_write_bytes(self.auth_path, data)
-            self._save_manifest()
+                    atomic_write_bytes(self._account_path(account_id), data)
+                self.manifest["accounts"].append(account)
+                if self.manifest.get("activeAccountId") is None:
+                    self.manifest["activeAccountId"] = account_id
+                    self._record_activation(account_id)
+                    if ready:
+                        atomic_write_bytes(self.auth_path, data)
+                self._save_manifest()
+            except Exception as exc:
+                self.manifest = old_manifest
+                shutil.rmtree(self._account_path(account_id).parent, ignore_errors=True)
+                if old_live is None:
+                    self.auth_path.unlink(missing_ok=True)
+                else:
+                    atomic_write_bytes(self.auth_path, old_live)
+                raise AccountError(f"Cloud account {error_action.lower()} failed before the local credential profile was committed: {exc}", getattr(exc, "status", 500)) from exc
+
+    def _link_downloaded_api_account(self, cloud, state: dict, data: bytes, etag: str, intended_account_id: str | None = None) -> dict:
+        ready, identity, account_type = self._downloaded_cloud_identity(state, data)
+        if account_type != "api" or identity.get("accountType") != "api" or not ready:
+            raise AccountError("Only API accounts can be linked", 409)
+        with self.lock:
+            if duplicate := self._find_identity(identity):
+                raise AccountError(f"This API account is already linked as {duplicate['label']}", 409)
+            if duplicate_key := self._find_cloud_key(state["accountKey"]):
+                raise AccountError(f"This API account is already linked as {duplicate_key['label']}", 409)
+        cloud.cache_remote_account(state, etag, data)
+        self._commit_downloaded_cloud_account(state, data, identity, ready, account_type, str(intended_account_id or uuid.uuid4().hex), "Link")
+        self.error = None
+        self.message = None
+        return self.status()
+
+    def link_cloud_account(self, cloud, account_key: str) -> dict:
+        state, data, etag = cloud.bind_account(str(account_key or ""))
+        return self._link_downloaded_api_account(cloud, state, data, etag)
+
+    def bind_cloud_account(self, cloud, account_key: str, record_transition: bool = True, intended_account_id: str | None = None) -> dict:
+        account_key = str(account_key or "")
+        with self.lock:
+            if duplicate_key := self._find_cloud_key(account_key):
+                raise AccountError(f"Bind blocked: this cloud credential profile is already managed as {duplicate_key['label']}", 409)
+        state, data, etag = cloud.bind_account(account_key)
+        ready, identity, account_type = self._downloaded_cloud_identity(state, data)
+        if account_type == "api":
+            return self._link_downloaded_api_account(cloud, state, data, etag, intended_account_id)
+        account_id = str(intended_account_id or uuid.uuid4().hex)
+        with self.lock:
+            if duplicate_key := self._find_cloud_key(account_key):
+                raise AccountError(f"Bind blocked: this cloud credential profile is already managed as {duplicate_key['label']}", 409)
+        if record_transition:
+            cloud.begin_account_transition("bind", accountId=account_id, accountKey=account_key, revisionId=auth_fingerprint(data), etag=etag)
+        try:
+            self._commit_downloaded_cloud_account(state, data, identity, ready, account_type, account_id, "Bind")
+        except Exception:
             if record_transition:
                 cloud.clear_account_transition()
-            self.error = None
-            self.message = None
-            return self.status()
+            raise
+        try:
+            cloud.delete_account_payloads(account_key, etag)
+        except Exception as exc:
+            raise AccountError(f"The credential profile is safely stored locally, but its cloud payload could not be removed; restart the monitor to retry cleanup: {exc}", getattr(exc, "status", 500)) from exc
+        if record_transition:
+            cloud.clear_account_transition()
+        self.error = None
+        self.message = None
+        return self.status()
 
     def release_cloud_account(self, cloud, account_id: str) -> dict:
         with self.lock:
@@ -1229,9 +1338,9 @@ class AccountManager:
             stored_identity = target.get("identity") if isinstance(target.get("identity"), dict) else {}
             cloud_binding = target.get("cloud") or {}
             account_key = cloud_binding.get("accountKey")
-            key_type = cloud_binding.get("keyType", "identity") if account_key else "identity" if stored_identity.get("accountId") else "opaque"
+            key_type = cloud_binding.get("keyType", "opaque") if account_key else "opaque"
             if not account_key:
-                account_key = cloud.account_key(stored_identity["accountId"]) if stored_identity.get("accountId") else cloud.new_placeholder_account_key()
+                account_key = cloud.new_account_key()
             credential_path = self._account_path(target["id"])
             if not target.get("ready"):
                 data, auth = b"{}", {}
@@ -1267,14 +1376,17 @@ class AccountManager:
                 raise AccountError("Local account not found", 404)
             if target.get("accountType") != "api":
                 raise AccountError("Only API accounts can be shared", 409)
-            stored_identity = target.get("identity") if isinstance(target.get("identity"), dict) else {}
-            account_key = (target.get("cloud") or {}).get("accountKey") or (cloud.account_key(stored_identity["accountId"]) if stored_identity.get("accountId") else cloud.new_placeholder_account_key())
             credential_path = self._account_path(target["id"])
             data = self.auth_path.read_bytes() if target["id"] == self.manifest.get("activeAccountId") else credential_path.read_bytes()
             auth = parse_auth_bytes(data)
             identity = auth_identity(auth)
-            cloud.release_account(account_key, data, {"accountId": identity.get("accountId"), "email": identity.get("email")}, target["label"], ready=bool(target.get("ready")), key_type=(target.get("cloud") or {}).get("keyType"), config_header=target.get("configHeader"), account_type=target.get("accountType", "account"), config_header_toml=target.get("configHeaderToml", ""))
-            target["cloud"] = {**(target.get("cloud") or {}), "state": "shared", "accountKey": account_key}
+            if identity.get("accountType") != "api" or not api_identity_id(identity):
+                raise AccountError("The selected API account credential is incomplete", 409)
+            if cloud.find_remote_api_accounts(api_identity_id(identity)):
+                raise AccountError("This API account is already shared", 409)
+            account_key = (target.get("cloud") or {}).get("accountKey") or cloud.api_account_key(identity)
+            cloud.release_account(account_key, data, identity, target["label"], ready=bool(target.get("ready")), key_type=(target.get("cloud") or {}).get("keyType") or "api-identity", config_header=target.get("configHeader"), account_type="api", config_header_toml=target.get("configHeaderToml", ""), reject_existing=True)
+            target["cloud"] = {"accountKey": account_key, "keyType": (target.get("cloud") or {}).get("keyType") or "api-identity"}
             self._save_manifest()
             return self.status()
 

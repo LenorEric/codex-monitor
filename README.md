@@ -4,7 +4,7 @@
 
 **A local-first Codex quota, token, cost, account, skill, and encrypted-sync dashboard for VS Code.**
 
-[![Version](https://img.shields.io/badge/version-1.2.0-4f8cff)](#quick-start)
+[![Version](https://img.shields.io/badge/version-1.3.0-4f8cff)](#quick-start)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#requirements)
@@ -28,7 +28,7 @@ A lightweight Python service owns the data, dashboard, account vault, managed sk
 | Token and cost analytics | Fresh input, cached input, cache writes, output, cache-hit rate, per-model totals, Standard/Fast attribution, and estimated cost. |
 | Multiple Codex accounts | Safe local account switching, login-slot creation, rename/delete controls, identity validation, and per-account history attribution. |
 | Skill management | Discover Codex and Gemini skills, move them into one private managed store, assign them with strict links or managed fallbacks, and synchronize changes. |
-| Encrypted multi-machine sync | AES-256-GCM WebDAV packages for skills, move-only account transfer, and incremental usage journals with verified writes. |
+| Encrypted multi-machine sync | AES-256-GCM WebDAV packages for copied API accounts, moved OpenAI accounts, and incremental usage journals with verified writes. |
 | Local-first privacy | Credentials and raw recorder data stay under `~/.codex-switch`; dashboard payloads redact secrets and cloud-downloaded history never contaminates local recorder files. |
 | Resilient operation | Atomic local writes, bounded incremental session-log scanning, revision-keyed response caches, conditional cloud updates, rollback-aware key rotation, and extensive unit coverage. |
 
@@ -43,7 +43,7 @@ flowchart LR
     M <--> W[Optional encrypted WebDAV]
 ```
 
-The monitor is authoritative. The extension polls `/api/status` while visible, reloads `/api/series` only when its revision changes, and uses its bundled dashboard only when the live page cannot be reached.
+The monitor is authoritative. The dashboard receives complete, independent local and merged datasets from `/api/series` on its first connection, then polls `/api/status` every five seconds with an ETag. Local semantic changes are transferred as consecutive indexed patches for both views. Cloud supplemental-data changes replace the complete merged view because a cloud merge may revise historical points. A restart or missing retained index automatically recovers with another complete snapshot.
 
 ## Requirements
 
@@ -77,7 +77,7 @@ python monitor_codex_usage.py
 
 ### 2. Install the VS Code extension
 
-Install `release/codex-usage-monitor-1.2.0.vsix` from VS Code:
+Install `release/codex-usage-monitor-1.3.0.vsix` from VS Code:
 
 1. Open **Extensions**.
 2. Select **Views and More Actions (…) → Install from VSIX…**.
@@ -86,7 +86,7 @@ Install `release/codex-usage-monitor-1.2.0.vsix` from VS Code:
 The command line is also supported:
 
 ```console
-code --install-extension release/codex-usage-monitor-1.2.0.vsix
+code --install-extension release/codex-usage-monitor-1.3.0.vsix
 ```
 
 ### 3. Complete first-run setup
@@ -137,7 +137,7 @@ Restart existing Codex terminals after switching accounts because a running proc
 - **Rename** rewrites the local label across persisted monitor history.
 - **Delete** is local-only and cannot delete the active account or the sole remaining local account.
 - Before an outgoing signed-in account is saved, its live and vaulted `id_token` and `account_id` must match exactly.
-- The same authenticated identity cannot occupy two ready local slots.
+- The same API key cannot occupy two ready local slots. Multiple normal OpenAI credential profiles may use the same authenticated account identity.
 
 ### Refresh after reset
 
@@ -145,16 +145,21 @@ Each normal account has a **Refresh after reset…** editor with independent 5h 
 
 The editor displays times in the browser's current time zone and shows the detected zone and UTC offset. On save, the browser converts each range to a fixed, timezone-free backend day position; the monitor stores neither the time zone nor its offset and compares those positions directly with the current timestamp. Any browser converts the saved positions through its own current offset for display. Consequently, switching users, travel, or daylight-saving changes can alter the displayed local hours without changing the saved execution windows. A 5h reset detected outside the allowed ranges remains queued until the next range opens, while 7d automation runs immediately after its reset.
 
-### Move an account between machines
+### Transfer accounts between machines
 
-Account cloud storage uses move semantics:
+Normal OpenAI accounts use move semantics:
 
 - **Release** uploads and verifies the newest local account payload, then removes the local vault record.
 - **Bind** downloads and integrity-checks a released payload, commits it locally, then removes and verifies removal of the cloud copy.
-- **Push** and **Fetch** never upload local account credentials.
-- **Rename** and **Delete** never mutate a cloud account payload.
 
-At least one verified copy is preserved when a Bind or Release operation fails. Empty awaiting-login slots can also be released and bound.
+API accounts use copy semantics:
+
+- **Share** uploads and verifies the API key, display name, and account-specific header settings while retaining the local copy.
+- **Link** downloads and integrity-checks the API profile while retaining the cloud copy.
+- API-key equality defines account equality. When the key already exists at the destination, the account is already shared or linked and no duplicate transfer action is shown.
+- Later local name or header edits remain local; they do not create a second API account or automatically overwrite the other copy.
+
+**Push** and **Fetch** never transfer account credentials. Local and cloud **Delete** actions remove only the selected copy, and Rename never mutates a cloud payload. At least one verified copy is preserved when a Bind or Release operation fails. Empty awaiting-login OpenAI slots can also be released and bound.
 
 ## Managing skills
 
@@ -195,7 +200,7 @@ Open **Manage skills & accounts → Config file**. Configure the remote without 
 
 Use **Test WebDAV** before Push. Jianguoyun/Nutstore users can use `https://dav.jianguoyun.com/dav/` with an application password.
 
-Manual **Push** always publishes managed-skill changes and local recorded usage data. Manual **Fetch** always refreshes released-account metadata, merges managed-skill changes, and downloads recorded usage data from other machines. These manual transfers run even when their automatic options are disabled. Account credentials remain move-only and are transferred exclusively through explicit **Release** and **Bind** actions.
+Manual **Push** always publishes managed-skill changes and local recorded usage data. Manual **Fetch** always refreshes remote-account metadata, merges managed-skill changes, and downloads recorded usage data from other machines. These manual transfers run even when their automatic options are disabled. Account credentials are transferred only through explicit **Share**, **Link**, **Release**, and **Bind** actions.
 
 The encryption passphrase is converted with scrypt and immediately cleared from the staging field. Its deterministic salt is derived from the normalized WebDAV URL and username so another machine can derive the same key.
 Changing an existing passphrase downloads, authenticates, re-encrypts, uploads, and verifies every known encrypted object; local configuration is committed only after the whole remote rotation succeeds, and partial remote writes are rolled back on failure.
@@ -219,9 +224,9 @@ Automatic usage synchronization supplements the directional manual Push and Fetc
   A later attempt can reuse packs left by a failure before retrying the pointer commit.
 - Fetch reconstructs every legacy checkpoint/chunk stream it finds, uploads verified version-2 packs, conditionally replaces the manifest, and deletes the legacy payloads only after verification.
 - Downloaded records and their per-machine pack hashes are stored atomically by origin in `usage_monitor_sync_cache.json`; they never replace or append to local recorder files.
-- The dashboard maintains `usage_monitor_dashboard_cache.json` as a display-only cache. It keeps the newest three days lossless and progressively groups older chart points; raw recorder files and token/session totals are not changed.
+- The dashboard maintains `usage_monitor_dashboard_cache.json` as a display-only cache of complete local and merged chart datasets. It keeps the newest three days lossless and progressively groups older chart points; raw recorder files and token/session totals are not changed. Cache build timestamps and hourly maintenance deadlines do not publish an API update unless the visible data changes.
 
-Every 60 minutes, periodic Fetch also checks the authoritative skill index and refreshes the released-account list. Strong pointer ETags skip unchanged usage manifests, while missing local pack hashes still force repair.
+Every 60 minutes, periodic Fetch also checks the authoritative skill index and refreshes the remote-account list. Strong pointer ETags skip unchanged usage manifests, while missing local pack hashes still force repair.
 Every 30 days a full fetch verifies all active remote packs. The first periodic Fetch runs immediately when no previous attempt is recorded or when the recorded attempt is at least one hour old.
 
 ## Data and privacy
@@ -231,7 +236,7 @@ The canonical data root is `~/.codex-switch`:
 | Path | Contents | Cloud synchronized? |
 | --- | --- | --- |
 | `config.json` | Server settings, plaintext WebDAV login password, cookie secret, password verifier, and derived encryption key | No |
-| `accounts/` | Sensitive Codex account vault and manifest | Only explicit move-only Release/Bind |
+| `accounts/` | Sensitive Codex account vault and manifest | Explicit API Share/Link or OpenAI Release/Bind only |
 | `skills/` | Private managed skill source | Optional encrypted packages |
 | `usage_monitor_history.jsonl` | Local raw cost/delta intervals | Derived records only |
 | `usage_monitor_quota_history.jsonl` | Complete local accepted quota readings | Compacted derived records only |
@@ -240,7 +245,7 @@ The canonical data root is `~/.codex-switch`:
 | `usage_monitor_samples.jsonl` | Detailed local diagnostic samples | Never |
 | `usage_monitor_state.json` | Runtime baselines and cursors | Never |
 | `usage_monitor_sync_cache.json` | Downloaded records and complete per-machine pack-hash inventories | Never uploaded as a recorder file |
-| `usage_monitor_dashboard_cache.json` | Backend-maintained display cache for tiered dashboard chart points | Never |
+| `usage_monitor_dashboard_cache.json` | Backend-maintained complete local/merged display snapshots with tiered chart points | Never |
 
 The token ledger writes a complete price epoch once when it is first used; subsequent usage rows reference its `pricingId`. Existing session totals are imported once as compact legacy baselines, and the session-history file is then regenerated from the ledger.
 
@@ -343,7 +348,7 @@ Credentials, local history, caches, tests, reference sources, and development-on
 | --- | --- |
 | `monitor_codex_usage.py` | CLI entry point and monitor startup. |
 | `monitor_dashboard.py` | Polling loops, dashboard/API server, response caches, control authorization, and UI datasets. |
-| `monitor_accounts.py` | Local credential vault, identity-safe switching, and move-only account transfer. |
+| `monitor_accounts.py` | Local credential vault, identity-safe switching, API copy transfer, and OpenAI move transfer. |
 | `monitor_cloud.py` | Configuration, WebDAV, encryption, serialized cloud operations, packages, and usage journal. |
 | `monitor_skills.py` | Skill discovery, managed storage, validation, assignments, and projections. |
 | `monitor_tokens.py` | Incremental session-log parsing, token aggregation, Fast attribution, and cost calculation. |

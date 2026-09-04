@@ -323,7 +323,13 @@ def event_model(event: dict) -> str:
     return normalize_codex_model(model) if isinstance(model, str) and model else DEFAULT_EVENT_MODEL
 
 def event_account(event: dict) -> dict:
-    return {"accountSlotId": event.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID, "accountLabel": event.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL}
+    account = {
+        "accountSlotId": event.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID,
+        "accountLabel": event.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL,
+    }
+    if usage_account_id := event.get("usageAccountId") or (event.get("sync") or {}).get("accountId"):
+        account["usageAccountId"] = usage_account_id
+    return account
 
 def record_special_event(state: dict, reason: str, sample: dict, label: str, previous: dict, current: dict, extra: dict | None = None) -> None:
     if not (extra or any(previous.get(key) != value for key, value in current.items())):

@@ -1,6 +1,7 @@
 const fs = require("fs");
 const http = require("http");
 const path = require("path");
+const zlib = require("zlib");
 const vscode = require("vscode");
 
 const API_POLL_INTERVAL_MS = 5000;
@@ -28,10 +29,13 @@ const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/manage/skills/assign", { url: new URL("http://127.0.0.1:8765/api/manage/skills/assign"), method: "POST" }],
     ["/api/manage/cloud/test", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/test"), method: "POST" }],
     ["/api/manage/cloud/fetch", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/fetch"), method: "POST" }],
+    ["/api/manage/cloud/fetch-all", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/fetch-all"), method: "POST" }],
     ["/api/manage/cloud/push", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/push"), method: "POST" }],
+    ["/api/manage/cloud/push-all", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/push-all"), method: "POST" }],
     ["/api/manage/cloud/restore", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/restore"), method: "POST" }],
     ["/api/manage/cloud/overwrite", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/overwrite"), method: "POST" }],
     ["/api/manage/accounts/bind", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/bind"), method: "POST" }],
+    ["/api/manage/accounts/link", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/link"), method: "POST" }],
     ["/api/manage/accounts/release", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/release"), method: "POST" }],
     ["/api/manage/accounts/share", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/share"), method: "POST" }],
     ["/api/manage/accounts/header", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/header"), method: "POST" }],
@@ -51,7 +55,9 @@ class PythonMonitor {
     constructor(statusBar) {
         this.statusBar = statusBar;
         this.pendingStatusRequest = null;
-        this.pendingSeriesRequests = new Map();
+        this.pendingSeriesRequest = null;
+        this.cachedStatus = null;
+        this.statusEtag = null;
         this.pollTimer = null;
         this.lastTooltip = null;
     }
@@ -64,32 +70,48 @@ class PythonMonitor {
         this.pollTimer = setInterval(() => this.update(), API_POLL_INTERVAL_MS);
     }
 
-    async getStatus() {
+    async getStatusResponse() {
         if (this.pendingStatusRequest) return this.pendingStatusRequest;
-        this.pendingStatusRequest = requestJson(STATUS_API_URL).catch(error => {
-            if (error.statusCode === 404) return this.getSeries();
-            throw error;
+        this.pendingStatusRequest = requestJson(STATUS_API_URL, { etag: this.statusEtag, responseMetadata: true }).then(response => {
+            if (response.notModified) {
+                if (!this.cachedStatus) throw new Error("Python monitor returned 304 before a status snapshot was available");
+                return { ...response, payload: this.cachedStatus };
+            }
+            this.cachedStatus = response.payload;
+            this.statusEtag = response.etag;
+            return response;
         }).finally(() => {
             this.pendingStatusRequest = null;
         });
         return this.pendingStatusRequest;
     }
 
-    async getSeries(view = "local") {
-        view = view === "merged" ? "merged" : "local";
-        if (this.pendingSeriesRequests.has(view)) return this.pendingSeriesRequests.get(view);
+    async getStatus() {
+        return (await this.getStatusResponse()).payload;
+    }
+
+    async getSeries(cursor = {}) {
+        if (this.pendingSeriesRequest) return this.pendingSeriesRequest;
         const url = new URL(SERIES_API_URL);
-        url.searchParams.set("view", view);
-        const request = requestJson(url).finally(() => this.pendingSeriesRequests.delete(view));
-        this.pendingSeriesRequests.set(view, request);
-        return request;
+        for (const name of ("streamId" in cursor ? ["streamId", "includedIndex", "mergedRevision"] : [])) url.searchParams.set(name, cursor[name]);
+        this.pendingSeriesRequest = requestJson(url).then(payload => {
+            if (payload.mode === "snapshot" && payload.status) {
+                this.cachedStatus = payload.status;
+                this.statusEtag = payload.statusEtag || null;
+            }
+            return payload;
+        }).finally(() => {
+            this.pendingSeriesRequest = null;
+        });
+        return this.pendingSeriesRequest;
     }
 
     async update() {
         try {
-            const display = (await this.getStatus()).display || {};
+            const status = await this.getStatus();
+            const display = status.display || {};
             this.statusBar.text = `$(pulse) ${display.statusBarText || "Codex usage"}`;
-            const tooltip = stableTooltip(display);
+            const tooltip = stableTooltip(status);
             if (tooltip !== this.lastTooltip) {
                 this.lastTooltip = tooltip;
                 this.statusBar.tooltip = tooltip;
@@ -116,12 +138,22 @@ function secondsAgo(value) {
     return Number.isFinite(timestamp) ? `${Math.max(0, Math.floor((Date.now() - timestamp) / 1000) + TOOLTIP_HOVER_DELAY_SECONDS)}s ago` : "-";
 }
 
-function stableTooltip(display) {
+function remainingTime(value) {
+    const seconds = Math.max(0, Math.floor((Date.parse(value || "") - Date.now()) / 1000));
+    if (!Number.isFinite(seconds)) return "-";
+    const days = Math.floor(seconds / 86400), hours = Math.floor(seconds % 86400 / 3600), minutes = Math.floor(seconds % 3600 / 60);
+    return days ? `${days}d ${hours}h` : hours ? `${hours}h ${minutes}m` : `${minutes}m`;
+}
+
+function stableTooltip(status) {
+    const display = status.display || {};
     const windows = display.windows || {};
+    const sampleWindows = status.lastSample?.windows || {};
+    const resetText = label => sampleWindows[label]?.resetAt ? `${new Date(sampleWindows[label].resetAt).toLocaleString()} (${remainingTime(sampleWindows[label].resetAt)} remaining)` : windows[label]?.resetText || "-";
     return [
         "Codex Usage",
-        `5h: ${windows["5h"]?.usageText || "-"} used, resets ${windows["5h"]?.resetText || "-"}`,
-        `7d: ${windows["7d"]?.usageText || "-"} used, resets ${windows["7d"]?.resetText || "-"}`,
+        `5h: ${windows["5h"]?.usageText || "-"} used, resets ${resetText("5h")}`,
+        `7d: ${windows["7d"]?.usageText || "-"} used, resets ${resetText("7d")}`,
         `Last update ${secondsAgo(display.percentCheckedAt)}`,
     ].join("\n");
 }
@@ -133,21 +165,26 @@ function requestJson(url, options = {}) {
             method: options.method || "GET",
             headers: {
                 Accept: "application/json",
+                "Accept-Encoding": "gzip",
+                ...(options.etag ? { "If-None-Match": options.etag } : {}),
                 ...(options.cookie ? { Cookie: options.cookie } : {}),
                 ...(body === undefined ? {} : { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(body) }),
             },
         }, response => {
-            let body = "";
-            response.setEncoding("utf8");
-            response.on("data", chunk => {
-                body += chunk;
-            });
+            const chunks = [];
+            response.on("data", chunk => chunks.push(Buffer.from(chunk)));
             response.on("end", () => {
+                const etag = response.headers.etag || options.etag || null;
+                if (response.statusCode === 304) {
+                    resolve(options.responseMetadata ? { payload: null, etag, notModified: true } : null);
+                    return;
+                }
                 let payload;
                 try {
                     const setCookie = response.headers["set-cookie"]?.[0]?.split(";", 1)[0];
                     if (setCookie) options.onSetCookie?.(setCookie);
-                    payload = JSON.parse(body);
+                    const encoded = Buffer.concat(chunks);
+                    payload = JSON.parse((response.headers["content-encoding"] === "gzip" ? zlib.gunzipSync(encoded) : encoded).toString("utf8"));
                 } catch (error) {
                     const responseError = new Error(response.statusCode !== 200 ? `Python monitor returned HTTP ${response.statusCode}` : `Invalid Python monitor response: ${error.message}`);
                     responseError.statusCode = response.statusCode;
@@ -161,7 +198,7 @@ function requestJson(url, options = {}) {
                     error.decryptFailed = payload.decryptFailed;
                     reject(error);
                 }
-                else resolve(payload);
+                else resolve(options.responseMetadata ? { payload, etag, notModified: false } : payload);
             });
         });
         request.setTimeout(options.timeoutMs ?? 10000, () => request.destroy(new Error("Python monitor request timed out")));
@@ -264,18 +301,17 @@ function activate(context) {
                 }
                 if (message.type === "getCodexUsageStatus") {
                     try {
-                        target.webview.postMessage({ type: "codexUsageStatus", payload: await monitor.getStatus() });
+                        target.webview.postMessage({ type: "codexUsageStatus", response: await monitor.getStatusResponse() });
                     } catch (error) {
                         target.webview.postMessage({ type: "codexUsageStatus", error: error.message || String(error) });
                     }
                     return;
                 }
                 if (message.type === "getCodexUsageSeries") {
-                    const view = message.view === "merged" ? "merged" : "local";
                     try {
-                        target.webview.postMessage({ type: "codexUsageSeries", view, payload: await monitor.getSeries(view) });
+                        target.webview.postMessage({ type: "codexUsageSeries", payload: await monitor.getSeries(message.cursor || {}) });
                     } catch (error) {
-                        target.webview.postMessage({ type: "codexUsageSeries", view, error: error.message || String(error) });
+                        target.webview.postMessage({ type: "codexUsageSeries", error: error.message || String(error) });
                     }
                 }
             });

@@ -8,9 +8,9 @@ import os
 import tempfile
 from pathlib import Path
 
-from monitor_common import MIN_DELTA_COST_PER_PERCENT_USD, RESET_TIME_JITTER_SECONDS, coerce_float, parse_timestamp
+from monitor_common import MIN_DELTA_COST_PER_PERCENT_USD, RESET_TIME_JITTER_SECONDS, coerce_float, empty_token_totals, parse_timestamp
 from monitor_history import compact_quota_history_rows
-from monitor_tokens import normalize_codex_model
+from monitor_tokens import normalize_codex_model, sum_cost_totals
 
 
 SYNC_META_KEY = "sync"
@@ -270,6 +270,7 @@ def aggregate_cost_intervals(rows: list[dict]) -> list[dict]:
                 model_percent = delta_percent - used_percent if index == len(models) - 1 else delta_percent * model_cost / total_cost
                 aggregated.append({
                     "checkedAt": checked_at, "window": representative["window"], "model": model, "accountSlotId": representative.get("accountSlotId"), "accountLabel": representative.get("accountLabel"),
+                    "usageAccountId": intervals[0]["cycleKey"][0],
                     "deltaPercent": round(model_percent, 8), "deltaCostUsd": round(model_cost, 8), "costPercentRatio": round(total_cost / delta_percent, 8),
                 })
                 used_percent += model_percent
@@ -351,6 +352,39 @@ class UsageDataStore:
 
     def _account_id(self, row: dict) -> str:
         return sync_meta(row).get("accountId") or self.account_id_resolver(row.get("accountSlotId"))
+
+    @staticmethod
+    def _sum_token_totals(rows: list[dict], field: str = "tokens") -> dict:
+        totals = empty_token_totals()
+        for row in rows:
+            for key in totals:
+                totals[key] += int(((row.get(field) or {}).get(key)) or 0)
+        return totals
+
+    def _merge_profile_token_rows(self, rows: list[dict]) -> list[dict]:
+        groups = {}
+        for row in rows:
+            groups.setdefault((self._account_id(row), str(row.get("sessionId") or "")), []).append(row)
+        merged_rows = []
+        for (account_id, _), group in groups.items():
+            if len({row.get("accountSlotId") for row in group}) <= 1:
+                merged_rows.extend(group)
+                continue
+            merged = dict(max(group, key=lambda row: parse_timestamp(row.get("updatedAt")) or 0))
+            started = [row.get("startedAt") for row in group if parse_timestamp(row.get("startedAt")) is not None]
+            merged["startedAt"] = min(started, key=lambda value: parse_timestamp(value)) if started else None
+            merged["tokens"] = self._sum_token_totals(group)
+            merged["cost"] = sum_cost_totals(*(row.get("cost") for row in group))
+            merged["byModel"] = {}
+            for model in sorted({model for row in group for model in (row.get("byModel") or {})}):
+                values = [(row.get("byModel") or {}).get(model) for row in group]
+                values = [value for value in values if isinstance(value, dict)]
+                merged["byModel"][model] = {"tokens": self._sum_token_totals(values), "cost": sum_cost_totals(*(value.get("cost") for value in values))}
+                if any(isinstance(value.get("fastTokens"), dict) for value in values):
+                    merged["byModel"][model]["fastTokens"] = self._sum_token_totals(values, "fastTokens")
+            merged.pop(SYNC_META_KEY, None)
+            merged_rows.append(add_record_provenance("token", merged, self.machine_id, account_id))
+        return sorted(merged_rows, key=lambda row: (parse_timestamp(row.get("updatedAt")) or 0, row.get("sessionId") or ""))
 
     @staticmethod
     def _history_bytes(rows: list[dict]) -> bytes:
@@ -474,7 +508,7 @@ class UsageDataStore:
             return add_record_provenance(kind, row, self.machine_id, account_id, local_only) if not sync_meta(row).get("recordId") else row
         normalized_history = [normalized for row in history if (normalized := normalize("cost", row, not is_cost_interval_row(row))) is not None]
         normalized_quota = [normalized for row in quota if (normalized := normalize("quota", row)) is not None]
-        normalized_tokens = [normalized for row in tokens if (normalized := normalize("token", row)) is not None]
+        normalized_tokens = self._merge_profile_token_rows([normalized for row in tokens if (normalized := normalize("token", row)) is not None])
         if cache_changed or (normalized_history, normalized_quota, normalized_tokens) != (history, quota, tokens):
             self._write(normalized_history, normalized_quota, normalized_tokens, cache, packs)
             self._cache_repair_needed = False

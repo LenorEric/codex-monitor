@@ -20,7 +20,7 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from monitor_accounts import atomic_write_json, auth_identity, parse_auth_bytes
+from monitor_accounts import api_identity_id, atomic_write_json, auth_identity, parse_auth_bytes
 from monitor_common import SafeRedirectHandler
 from monitor_skills import SkillError
 from monitor_usage_sync import canonical_json, content_hash, validate_sync_operation
@@ -684,9 +684,12 @@ class CloudManager:
     def local_usage_account(self, usage_account_id: str, fallback_slot_id: str | None, fallback_label: str | None) -> tuple[str, str] | None:
         if self.accounts is not None:
             with self.accounts.lock:
-                for account in self.accounts.manifest.get("accounts", []):
-                    if self.usage_account_id(account.get("id")) == usage_account_id:
-                        return account["id"], account.get("label") or fallback_label or "Unknown"
+                matches = [account for account in self.accounts.manifest.get("accounts", []) if self.usage_account_id(account.get("id")) == usage_account_id]
+                if matches:
+                    match_ids = {account["id"] for account in matches}
+                    primary_id = next((row.get("accountSlotId") for row in reversed(self.accounts.manifest.get("activationHistory") or []) if row.get("accountSlotId") in match_ids), self.accounts.manifest.get("activeAccountId") if self.accounts.manifest.get("activeAccountId") in match_ids else matches[0]["id"])
+                    primary = next(account for account in matches if account["id"] == primary_id)
+                    return primary["id"], primary.get("label") or fallback_label or "Unknown"
         return None
 
     def usage_account_revision(self) -> tuple:
@@ -734,6 +737,41 @@ class CloudManager:
     def _cache_remote_account(self, account: dict, etag: str) -> None:
         self._state["remote"]["accounts"][account["accountKey"]] = {"etag": etag, "state": {**account, "etag": etag}}
         self._save_state()
+
+    @staticmethod
+    def _validated_api_identity(state: dict, data: bytes) -> tuple[dict, str]:
+        identity = auth_identity(parse_auth_bytes(data))
+        identity_id = api_identity_id(identity)
+        if state.get("accountType", identity.get("accountType")) != "api" or identity_id is None:
+            raise CloudError("Remote API account metadata does not match its credential payload", 409)
+        if state.get("apiIdentityId") and state["apiIdentityId"] != identity_id:
+            raise CloudError("Remote API account identity check failed", 409)
+        return identity, identity_id
+
+    def cache_remote_account(self, state: dict, etag: str, data: bytes | None = None) -> None:
+        cached = dict(state)
+        if cached.get("accountType") == "api":
+            if data is None:
+                _, data, etag = self.bind_account(cached["accountKey"])
+            _, cached["_apiIdentityId"] = self._validated_api_identity(cached, data)
+        self._cache_remote_account(cached, etag)
+
+    def find_remote_api_accounts(self, identity_id: str) -> list[dict]:
+        matches = []
+        listed_accounts = self.list_accounts()
+        remote_keys = {listed.get("accountKey") for listed in listed_accounts}
+        for listed in listed_accounts:
+            if listed.get("accountType") != "api":
+                continue
+            state, data, etag = self.bind_account(listed["accountKey"])
+            _, resolved_identity_id = self._validated_api_identity(state, data)
+            self._cache_remote_account({**state, "_apiIdentityId": resolved_identity_id}, etag)
+            if resolved_identity_id == identity_id:
+                matches.append(state)
+        for key in set(self._state.get("remote", {}).get("accounts", {})) - remote_keys:
+            self._state["remote"]["accounts"].pop(key, None)
+        self._save_state()
+        return matches
 
     def _account_state_with(self, client: WebDavClient, box: CryptoBox, key: str) -> tuple[dict, str]:
         data, etag = client.get(self._account_paths(key)[0])
@@ -803,12 +841,21 @@ class CloudManager:
             key = item["name"][:-4]
             previous = cached_accounts.get(key)
             if not force_full and item.get("etag") and isinstance(previous, dict) and previous.get("etag") == item["etag"] and isinstance(previous.get("state"), dict):
+                if previous["state"].get("accountType") == "api" and not previous["state"].get("_apiIdentityId"):
+                    data = self._download_account_revision_with(client, box, previous["state"])
+                    _, previous["state"]["_apiIdentityId"] = self._validated_api_identity(previous["state"], data)
                 accounts[key] = previous
                 continue
             try:
                 account, etag = self._account_state_with(client, box, key)
             except CloudError:
                 continue
+            if account.get("accountType") == "api":
+                if account.get("apiIdentityId"):
+                    account["_apiIdentityId"] = account["apiIdentityId"]
+                else:
+                    data = self._download_account_revision_with(client, box, account)
+                    _, account["_apiIdentityId"] = self._validated_api_identity(account, data)
             account["etag"] = etag
             accounts[key] = {"etag": etag, "state": account}
             changed.append(key)
@@ -857,14 +904,45 @@ class CloudManager:
         self._state["pendingAccountOperation"] = None
         self._save_state()
 
+    def ensure_no_pending_account_operation(self) -> None:
+        if self._state.get("pendingAccountOperation"):
+            raise CloudError("Finish the pending account transfer recovery before changing accounts", 409)
+
+    def account_transition_targets(self, account_id: str) -> bool:
+        return (self._state.get("pendingAccountOperation") or {}).get("accountId") == account_id
+
     def recover_account_transition(self) -> str | None:
         pending = self._state.get("pendingAccountOperation")
         if not isinstance(pending, dict):
             return None
         if pending.get("operation") == "bind":
-            existing = next((account for account in self.accounts.manifest["accounts"] if (account.get("cloud") or {}).get("accountKey") == pending.get("accountKey")), None)
-            if existing is None:
-                self.accounts.bind_cloud_account(self, pending.get("accountKey"), record_transition=False)
+            with self.accounts.lock:
+                existing = next((account for account in self.accounts.manifest["accounts"] if account.get("id") == pending.get("accountId") and (account.get("cloud") or {}).get("accountKey") == pending.get("accountKey")), None)
+                conflicting = next((account for account in self.accounts.manifest["accounts"] if (account.get("cloud") or {}).get("accountKey") == pending.get("accountKey") and account.get("id") != pending.get("accountId")), None)
+            if conflicting is not None:
+                raise CloudError("Pending cloud bind key belongs to a different local credential profile", 409)
+            if existing is not None:
+                credential_path = self.accounts._account_path(existing["id"])
+                data = credential_path.read_bytes() if existing.get("ready") and credential_path.exists() else b"{}"
+                if pending.get("revisionId") and hashlib.sha256(data).hexdigest() != pending["revisionId"]:
+                    raise CloudError("Pending cloud bind does not match the committed local credential revision", 409)
+                if existing.get("accountType") == "api":
+                    identity = auth_identity(parse_auth_bytes(data))
+                    try:
+                        state, remote_data, etag = self.bind_account(pending.get("accountKey"))
+                    except CloudError as exc:
+                        if "HTTP 404" not in str(exc):
+                            raise
+                        self.release_account(pending.get("accountKey"), data, identity, existing.get("label") or "API account", key_type=(existing.get("cloud") or {}).get("keyType") or "api-identity", config_header=existing.get("configHeader"), account_type="api", config_header_toml=existing.get("configHeaderToml", ""))
+                    else:
+                        _, remote_identity_id = self._validated_api_identity(state, remote_data)
+                        if remote_identity_id != api_identity_id(identity):
+                            raise CloudError("Pending API link does not match the retained cloud credential", 409)
+                        self._cache_remote_account({**state, "_apiIdentityId": remote_identity_id}, etag)
+                else:
+                    self.delete_account_payloads(pending.get("accountKey"), pending.get("etag"))
+            else:
+                self.accounts.bind_cloud_account(self, pending.get("accountKey"), record_transition=False, intended_account_id=pending.get("accountId"))
         elif pending.get("operation") == "release":
             try:
                 state, data, _ = self.bind_account(pending.get("accountKey"))
@@ -873,7 +951,7 @@ class CloudManager:
                     raise
                 self.accounts.rollback_recovered_release(pending.get("accountId"))
             else:
-                if pending.get("revisionId") is None and state.get("boundMachineId") is None or state.get("revisionId") == pending.get("revisionId") and hashlib.sha256(data).hexdigest() == pending.get("revisionId"):
+                if pending.get("revisionId") is None or state.get("revisionId") == pending.get("revisionId") and hashlib.sha256(data).hexdigest() == pending.get("revisionId"):
                     self.accounts.finalize_recovered_release(pending.get("accountId"))
                 else:
                     self.accounts.rollback_recovered_release(pending.get("accountId"))
@@ -1261,26 +1339,37 @@ class CloudManager:
 
     @_serialized_cloud_operation
     def bind_local_account(self, account_key: str) -> dict:
+        self.ensure_no_pending_account_operation()
         return self.accounts.bind_cloud_account(self, account_key)
 
     @_serialized_cloud_operation
+    def link_local_account(self, account_key: str) -> dict:
+        self.ensure_no_pending_account_operation()
+        return self.accounts.link_cloud_account(self, account_key)
+
+    @_serialized_cloud_operation
     def release_local_account(self, account_id: str) -> dict:
+        self.ensure_no_pending_account_operation()
         return self.accounts.release_cloud_account(self, account_id)
 
     @_serialized_cloud_operation
     def share_local_account(self, account_id: str) -> dict:
+        self.ensure_no_pending_account_operation()
         return self.accounts.share_cloud_account(self, account_id)
 
     @_serialized_cloud_operation
     def delete_remote_account(self, account_key: str) -> list[dict]:
+        self.ensure_no_pending_account_operation()
         return self.delete_account_payloads(str(account_key or ""))
 
     @_serialized_cloud_operation
     def delete_local_account(self, account_id: str) -> dict:
+        self.ensure_no_pending_account_operation()
         return self.accounts.delete(account_id)
 
     @_serialized_cloud_operation
     def rename_local_account(self, account_id: str, label: str) -> dict:
+        self.ensure_no_pending_account_operation()
         return self.accounts.rename(account_id, label)
 
     def delete_account_payloads(self, key: str, expected_etag: str | None = None) -> dict:
@@ -1323,7 +1412,7 @@ class CloudManager:
         client.delete(revisions_path)
         self._state["remote"]["accounts"].pop(key, None)
         self._save_state()
-        return {"accountKey": key, "deleted": True}
+        return {"accountKey": key, "deleted": True, "alreadyDeleted": state is None and not revisions}
 
     @staticmethod
     def _usage_pointer_path(machine_id: str) -> str:
@@ -1766,8 +1855,17 @@ class CloudManager:
     def account_key(self, account_id: str) -> str:
         return self._connection()[1].account_key(account_id)
 
-    def new_placeholder_account_key(self) -> str:
+    @staticmethod
+    def api_account_key(identity: dict) -> str:
+        if not api_identity_id(identity):
+            raise CloudError("Cannot create a cloud key for an incomplete API account", 409)
+        return hashlib.sha256(f"codex-monitor-api-cloud-key-v1:{identity['idTokenHash']}".encode()).hexdigest()
+
+    def new_account_key(self) -> str:
         return self._connection()[1].placeholder_account_key()
+
+    def new_placeholder_account_key(self) -> str:
+        return self.new_account_key()
 
     def _require_conditional_writes(self) -> None:
         if not self._state.get("conditionalWritesVerified") and not self.config()["webdav"].get("allowOptimisticWrites", True):
@@ -1889,10 +1987,14 @@ class CloudManager:
         state, etag = self.account_state(key)
         return state, self._download_account_revision_with(client, box, state), etag
 
-    def release_account(self, key: str, auth_data: bytes, identity: dict, label: str, ready: bool = True, key_type: str | None = None, config_header: dict | None = None, account_type: str = "account", config_header_toml: str = "") -> dict:
+    def release_account(self, key: str, auth_data: bytes, identity: dict, label: str, ready: bool = True, key_type: str | None = None, config_header: dict | None = None, account_type: str = "account", config_header_toml: str = "", reject_existing: bool = False) -> dict:
         self._require_conditional_writes()
         client, box = self._connection()
         key_type = key_type or "opaque"
+        payload_identity = auth_identity(parse_auth_bytes(auth_data)) if ready else identity
+        identity_id = api_identity_id(payload_identity) if account_type == "api" else None
+        if account_type == "api" and identity_id is None:
+            raise CloudError("The API account credential is incomplete", 409)
         try:
             state, etag = self.account_state(key)
         except CloudError as exc:
@@ -1901,6 +2003,11 @@ class CloudManager:
             state, etag = None, None
         revision = hashlib.sha256(auth_data).hexdigest()
         if state is not None:
+            if reject_existing:
+                _, existing_identity_id = self._validated_api_identity(state, self._download_account_revision_with(client, box, state))
+                if existing_identity_id == identity_id:
+                    raise CloudError("This API account is already shared", 409)
+                raise CloudError("The API cloud account key belongs to a different credential", 409)
             if state.get("accountId") and state.get("accountId") != identity.get("accountId") or state.get("email") and state.get("email") != identity.get("email"):
                 raise CloudError("Account release identity does not match the local binding", 409)
             if state.get("revisionId") == revision and state.get("accountId") == identity.get("accountId") and state.get("ready", True) == ready and state.get("accountType", "account") == account_type and (state.get("configHeader") or {}) == (config_header or {}) and state.get("configHeaderToml", "") == config_header_toml:
@@ -1913,10 +2020,10 @@ class CloudManager:
         client.ensure_directories(self._account_paths(key)[1])
         existing_revisions = self._encrypted_payloads(client, self._account_paths(key)[1])
         self._upload_revision(client, box, key, auth_data, identity, key_type)
-        state = {"version": 1, "accountKey": key, "keyType": key_type, "accountId": identity.get("accountId"), "label": label, "email": identity.get("email"), "ready": ready, "accountType": account_type, "revisionId": revision, "boundMachineId": None, "updatedAt": _timestamp(), **({"configHeader": config_header} if isinstance(config_header, dict) and config_header else {}), **({"configHeaderToml": config_header_toml} if config_header_toml else {})}
+        state = {"version": 1, "accountKey": key, "keyType": key_type, "accountId": identity.get("accountId"), "label": label, "email": identity.get("email"), "ready": ready, "accountType": account_type, "revisionId": revision, "updatedAt": _timestamp(), **({"apiIdentityId": identity_id} if identity_id else {}), **({"configHeader": config_header} if isinstance(config_header, dict) and config_header else {}), **({"configHeaderToml": config_header_toml} if config_header_toml else {})}
         new_etag = client.put(self._account_paths(key)[0], box.encrypt(f"account-state:{key}", json.dumps(state).encode()), create=True)
         verified, _ = self.account_state(key)
-        if verified.get("accountId") != identity.get("accountId") or verified.get("ready", True) != ready or verified.get("revisionId") != revision:
+        if verified.get("accountId") != identity.get("accountId") or verified.get("ready", True) != ready or verified.get("revisionId") != revision or identity_id and verified.get("apiIdentityId") != identity_id:
             raise CloudError("Account release verification failed", 409)
         self._cleanup_account_revisions(client, box, key, existing_revisions)
         self._cache_remote_account(state, new_etag)

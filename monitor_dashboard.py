@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 
 import base64
+import gzip
 import hashlib
 import hmac
 import http.server
 import ipaddress
 import json
+import math
 import os
 import secrets
 import sys
@@ -15,11 +17,12 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
+from collections import deque
 from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 
-from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_api_auth
+from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_api_auth, remove_directory
 from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
 from monitor_common import DEFAULT_RETRY_LIMIT, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_events import collect_with_bad_remote_usage_retry, compact_delta_event, cost_percent_ratio, derive_history_events, print_ratio_warnings, print_special_events, print_valid_delta_events, process_sample_delta_events, ratio_deviation, ratio_deviation_warning, sample_debug_log_row
@@ -56,11 +59,17 @@ QUOTA_HISTORY_DISPLAY_FULL_SECONDS = 3 * 24 * 60 * 60
 # The x4/x8/x16 tiers mean 4/8/16 source points per display point.
 QUOTA_HISTORY_DISPLAY_X4_SECONDS = 7 * 24 * 60 * 60
 QUOTA_HISTORY_DISPLAY_X8_SECONDS = 30 * 24 * 60 * 60
-DASHBOARD_DISPLAY_CACHE_VERSION = 1
+HOUR_MULTIPLIER = 60 * 60
+DASHBOARD_DISPLAY_CACHE_VERSION = 2
 DASHBOARD_DISPLAY_CACHE_GAP_SECONDS = 4 * 60 * 60
 DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS = 60
+DASHBOARD_SERIES_PROTOCOL_VERSION = 2
+DASHBOARD_SERIES_JOURNAL_MAX_AGE_SECONDS = 24 * 60 * 60
+DASHBOARD_SERIES_JOURNAL_MAX_BATCHES = 512
+DASHBOARD_SERIES_JOURNAL_MAX_BYTES = 16 * 1024 * 1024
+DASHBOARD_GZIP_MIN_BYTES = 1024
 SENSITIVE_DASHBOARD_FIELDS = {
-    "access_token", "account_id", "accountId", "authIdentity", "baseUrl", "boundMachineId", "configPath", "email", "encryptionPassphrase", "fingerprint", "id_token", "identity",
+    "access_token", "account_id", "accountId", "apiIdentityId", "_apiIdentityId", "authIdentity", "baseUrl", "boundMachineId", "configPath", "email", "encryptionPassphrase", "fingerprint", "id_token", "identity",
     "password", "privatePath", "rawResponse", "refresh_token", "remoteRoot", "revisionId", "statePath", "target", "tokens", "user_id", "username",
 }
 
@@ -177,23 +186,55 @@ def dashboard_sample(sample: dict | None) -> dict | None:
     if not isinstance(sample, dict):
         return None
     api_account = bool(sample.get("isApiAccount"))
-    return {
+    projected = {
         "checkedAt": sample.get("checkedAt"),
         "percentCheckedAt": sample.get("percentCheckedAt"),
         "windows": {} if api_account else {label: {"usedPercent": ((sample.get("windows") or {}).get(label) or {}).get("usedPercent"), "resetAt": ((sample.get("windows") or {}).get(label) or {}).get("resetAt"), "plan": ((sample.get("windows") or {}).get(label) or {}).get("plan") or "plus"} for label in ("5h", "7d")},
         "isApiAccount": api_account,
         "cost": sample.get("cost") or empty_cost_totals(),
     }
+    if usage_account_id := sample.get("usageAccountId") or (sample.get("sync") or {}).get("accountId"):
+        projected["usageAccountId"] = usage_account_id
+    return projected
 
-def dashboard_account_status(status: dict) -> dict:
+def dashboard_account_status(status: dict, usage_account_resolver=None, activation_history: list[dict] | None = None) -> dict:
+    items = [{key: account.get(key) for key in ("id", "label", "ready", "active", "pollError", "pollErrorAt", "stale", "accountType", "isApiAccount", "sessionRefresh", "configHeader", "configHeaderToml")} for account in status.get("items", [])]
+    label_counts = {}
+    for account in items:
+        label_counts[str(account.get("label") or "Unknown").casefold()] = label_counts.get(str(account.get("label") or "Unknown").casefold(), 0) + 1
+    for account in items:
+        account["usageAccountId"] = usage_account_resolver(account.get("id")) if usage_account_resolver is not None else account.get("id") or "unknown"
+        account["displayLabel"] = f"{account.get('label') or 'Unknown'} · {str(account.get('id') or 'profile')[-6:]}" if label_counts[str(account.get("label") or "Unknown").casefold()] > 1 else account.get("label") or "Unknown"
+    groups = {}
+    for account in items:
+        groups.setdefault(account["usageAccountId"], []).append(account)
+    activation_ids = [str(row.get("accountSlotId")) for row in reversed(activation_history or []) if row.get("accountSlotId")]
+    usage_groups = []
+    for usage_account_id, profiles in groups.items():
+        profile_ids = {profile["id"] for profile in profiles}
+        primary_id = next((account_id for account_id in activation_ids if account_id in profile_ids), status.get("activeAccountId") if status.get("activeAccountId") in profile_ids else profiles[0]["id"])
+        primary = next((profile for profile in profiles if profile["id"] == primary_id), profiles[0])
+        usage_groups.append({
+            "id": usage_account_id,
+            "label": f"{primary.get('label') or 'Unknown'} ({len(profiles)})" if len(profiles) > 1 else primary.get("label") or "Unknown",
+            "profileCount": len(profiles),
+            "isApiAccount": bool(primary.get("isApiAccount")),
+        })
     return {
         "activeAccountId": status.get("activeAccountId"),
         "awaitingLogin": bool(status.get("awaitingLogin")),
-        "cloudBindingEnabled": bool(status.get("cloudBindingEnabled")),
         "error": "Account operation failed" if status.get("error") else None,
         "message": status.get("message"),
-        "items": [{key: account.get(key) for key in ("id", "label", "ready", "active", "cloudState", "accountKey", "pollError", "pollErrorAt", "stale", "accountType", "isApiAccount", "sessionRefresh", "configHeader", "configHeaderToml")} for account in status.get("items", [])],
+        "items": items,
+        "usageGroups": usage_groups,
     }
+
+def dashboard_accounts(state) -> dict:
+    return dashboard_account_status(
+        state.accounts.status(),
+        getattr(state.cloud, "usage_account_id", None) if hasattr(state, "cloud") else None,
+        state.accounts.attribution_timeline() if hasattr(state.accounts, "attribution_timeline") else [],
+    )
 
 def dashboard_skill_status(status: dict) -> dict:
     return {
@@ -234,15 +275,21 @@ def dashboard_points_from_state(state: dict) -> list[dict]:
     if not isinstance(sample, dict):
         return []
     checked_at = sample.get("checkedAt")
-    return [{
+    point = {
         "checkedAt": checked_at,
         "timestamp": parse_timestamp(checked_at),
         "fiveHour": window_point(sample, "5h"),
         "sevenDay": window_point(sample, "7d"),
         "cost": sample.get("cost") or empty_cost_totals(),
-    }]
+    }
+    if usage_account_id := sample.get("usageAccountId") or (sample.get("sync") or {}).get("accountId"):
+        point["usageAccountId"] = usage_account_id
+    return [point]
 
-def dashboard_quota_point(row: dict) -> dict:
+def dashboard_usage_account_id(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> str:
+    return str(row.get("usageAccountId") or (row.get("sync") or {}).get("accountId") or (slot_usage_accounts or {}).get(str(row.get("accountSlotId") or "")) or row.get("accountSlotId") or row.get("accountLabel") or "unknown")
+
+def dashboard_quota_point(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> dict:
     compaction = row.get("compaction") or {}
     return {
         "checkedAt": row.get("checkedAt"),
@@ -250,6 +297,7 @@ def dashboard_quota_point(row: dict) -> dict:
         "compactedFrom": parse_timestamp(compaction.get("continuousFrom")),
         "accountSlotId": row.get("accountSlotId"),
         "accountLabel": row.get("accountLabel"),
+        "usageAccountId": dashboard_usage_account_id(row, slot_usage_accounts),
         "fiveHour": window_point(row, "5h"),
         "sevenDay": window_point(row, "7d"),
     }
@@ -337,8 +385,20 @@ def _usage_time_continuous_values(records: list[dict], label: str) -> None:
             continue
         previous = current
 
-def dashboard_quota_points(rows: list[dict]) -> list[dict]:
-    points = [dashboard_quota_point(row) for row in rows]
+def dashboard_quota_points(rows: list[dict], slot_usage_accounts: dict[str, str] | None = None) -> list[dict]:
+    merged = {}
+    for row in rows:
+        point = dashboard_quota_point(row, slot_usage_accounts)
+        key = point["usageAccountId"], point.get("checkedAt")
+        if key in merged:
+            previous = merged[key]
+            for label in ("fiveHour", "sevenDay"):
+                if point[label]["raw"] is None and previous[label]["raw"] is not None:
+                    point[label] = previous[label]
+            starts = [value for value in (previous.get("compactedFrom"), point.get("compactedFrom")) if value is not None]
+            point["compactedFrom"] = min(starts) if starts else None
+        merged[key] = point
+    points = list(merged.values())
     for label in USAGE_TIME_WINDOWS:
         groups = {}
         for point in points:
@@ -346,7 +406,7 @@ def dashboard_quota_points(rows: list[dict]) -> list[dict]:
             if point["timestamp"] is None or window["raw"] is None:
                 window["continuous"] = None
                 continue
-            groups.setdefault(point.get("accountSlotId") or point.get("accountLabel") or "unknown", []).append({
+            groups.setdefault(point["usageAccountId"], []).append({
                 "timestamp": point["timestamp"], "raw": window["raw"], "resetAt": parse_timestamp(window.get("resetAt")), "window": window,
             })
         for records in groups.values():
@@ -354,13 +414,14 @@ def dashboard_quota_points(rows: list[dict]) -> list[dict]:
             _usage_time_continuous_values(records, label)
     return points
 
-def dashboard_token_session(row: dict) -> dict:
+def dashboard_token_session(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> dict:
     return {
         "sessionId": row.get("sessionId"),
         "startedAt": row.get("startedAt"),
         "updatedAt": row.get("updatedAt") or row.get("startedAt"),
         "accountSlotId": row.get("accountSlotId"),
         "accountLabel": row.get("accountLabel"),
+        "usageAccountId": dashboard_usage_account_id(row, slot_usage_accounts),
         "byModel": {
             model: {"usageTokens": value.get("tokens") or {}, "cost": value.get("cost") or empty_cost_totals()}
             for model, value in (row.get("byModel") or {}).items()
@@ -449,7 +510,7 @@ def _dashboard_display_timestamp(value: dict) -> float | None:
 
 def _dashboard_display_sort_key(value: dict) -> tuple:
     timestamp = _dashboard_display_timestamp(value)
-    return timestamp is None, timestamp or 0, str(value.get("accountSlotId") or value.get("accountLabel") or "")
+    return timestamp is None, timestamp or 0, str(value.get("usageAccountId") or value.get("accountSlotId") or value.get("accountLabel") or "")
 
 def _dashboard_display_points_are_contiguous(previous: dict | None, current: dict) -> bool:
     previous_timestamp = _dashboard_display_timestamp(previous or {})
@@ -506,7 +567,7 @@ def dashboard_compact_quota_points(points: list[dict], now: float | None = None)
     now = time.time() if now is None else now
     by_account = {}
     for point in points:
-        key = point.get("accountSlotId") or point.get("accountLabel") or "unknown"
+        key = point.get("usageAccountId") or point.get("accountSlotId") or point.get("accountLabel") or "unknown"
         by_account.setdefault(key, []).append(point)
     compacted = [point for points_for_account in by_account.values() for point in _dashboard_compact_quota_account_points(points_for_account, now)]
     return sorted(compacted, key=_dashboard_display_sort_key)
@@ -543,7 +604,7 @@ def _dashboard_compact_event_group(group: list[dict]) -> dict:
 
 def _dashboard_event_sort_key(event: dict) -> tuple:
     timestamp = _dashboard_display_timestamp(event)
-    return timestamp is None, timestamp or 0, str(event.get("accountSlotId") or ""), str(event.get("model") or "")
+    return timestamp is None, timestamp or 0, str(event.get("usageAccountId") or event.get("accountSlotId") or ""), str(event.get("model") or "")
 
 def dashboard_compact_event_series(events: list[dict], now: float | None = None) -> list[dict]:
     now = time.time() if now is None else now
@@ -557,7 +618,7 @@ def dashboard_compact_event_series(events: list[dict], now: float | None = None)
         if timestamp is None:
             standalone.append(event)
             continue
-        key = (event.get("accountSlotId") or "unknown", event.get("model") or "unknown")
+        key = (event.get("usageAccountId") or event.get("accountSlotId") or "unknown", event.get("model") or "unknown")
         streams.setdefault(key, []).append(event)
     compacted = list(standalone)
     for stream in streams.values():
@@ -586,24 +647,31 @@ def dashboard_compact_events(events: dict[str, list[dict]], now: float | None = 
     return {label: dashboard_compact_event_series(values, now) for label, values in events.items()}
 
 def _dashboard_display_next_maintenance_at(quota_points: list[dict], events: dict[str, list[dict]], now: float) -> float | None:
+    current_hour = math.floor(now / HOUR_MULTIPLIER)
     timestamps = [_dashboard_display_timestamp(point) for point in quota_points]
     timestamps.extend(_dashboard_display_timestamp(event) for values in events.values() for event in values)
     candidates = []
     for timestamp in (value for value in timestamps if value is not None):
         for threshold in (QUOTA_HISTORY_DISPLAY_FULL_SECONDS, QUOTA_HISTORY_DISPLAY_X4_SECONDS, QUOTA_HISTORY_DISPLAY_X8_SECONDS):
-            candidate = timestamp + threshold + 1
-            if candidate > now:
-                candidates.append(candidate)
-    return min(candidates, default=None)
+            # Round up so the hour-resolution deadline never falls in the past.
+            candidate_hour = math.ceil((timestamp + threshold + 1) / HOUR_MULTIPLIER)
+            if candidate_hour > current_hour:
+                candidates.append(candidate_hour)
+    return min(candidates, default=None) * HOUR_MULTIPLIER if candidates else None
 
 def _dashboard_display_data(history: list[dict], quota_history: list[dict], token_sessions: list[dict], accounts: dict, now: float | None = None) -> dict:
     now = time.time() if now is None else now
+    slot_usage_accounts = {str(account.get("id")): str(account.get("usageAccountId")) for account in accounts.get("items", []) if account.get("id") and account.get("usageAccountId")}
     events = derive_history_events(history)
+    for values in events.values():
+        for event in values:
+            if not event.get("synthetic"):
+                event["usageAccountId"] = dashboard_usage_account_id(event, slot_usage_accounts)
     active = next((item for item in accounts.get("items", []) if item.get("id") == accounts.get("activeAccountId")), None)
     if active and active.get("isApiAccount"):
         events, quota_points = {"fiveHour": [], "sevenDay": []}, []
     else:
-        quota_points = dashboard_quota_points(quota_history)
+        quota_points = dashboard_quota_points(quota_history, slot_usage_accounts)
     history_stats = {
         "rows": len(history),
         "fiveHourEvents": len(events["fiveHour"]),
@@ -611,12 +679,74 @@ def _dashboard_display_data(history: list[dict], quota_history: list[dict], toke
         "fiveHourRealEvents": sum(1 for event in events["fiveHour"] if not event.get("synthetic")),
         "sevenDayRealEvents": sum(1 for event in events["sevenDay"] if not event.get("synthetic")),
     }
+    compacted_events = dashboard_compact_events(events, now)
     return {
-        "quotaPoints": dashboard_compact_quota_points(quota_points, now),
-        "tokenSessions": [dashboard_token_session(row) for row in token_sessions],
-        "events": dashboard_compact_events(events, now),
+        "quotaPoints": _dashboard_key_rows("quota", dashboard_compact_quota_points(quota_points, now)),
+        "tokenSessions": _dashboard_key_rows("token", [dashboard_token_session(row, slot_usage_accounts) for row in token_sessions]),
+        "events": {name: _dashboard_key_rows("event", values) for name, values in compacted_events.items()},
         "historyStats": history_stats,
         "nextMaintenanceAt": _dashboard_display_next_maintenance_at(quota_points, events, now),
+    }
+
+def _dashboard_row_key(kind: str, identity) -> str:
+    return f"{kind}:{_dashboard_revision(identity)}"
+
+def _dashboard_key_rows(kind: str, rows: list[dict]) -> list[dict]:
+    identities = []
+    for row in rows:
+        if kind == "quota":
+            identity = (row.get("usageAccountId"), row.get("checkedAt"))
+        elif kind == "token":
+            identity = (row.get("usageAccountId"), row.get("sessionId"))
+        elif row.get("synthetic"):
+            identity = (row.get("window"), "baseline")
+        else:
+            identity = (
+                row.get("window"), row.get("usageAccountId") or row.get("accountSlotId"), row.get("model"),
+                row.get("mergedFrom") or row.get("checkedAt"), row.get("mergedTo") or row.get("checkedAt"),
+                coerce_float(row.get("deltaPercent")), coerce_float(row.get("deltaCostUsd")),
+            )
+        identities.append(identity)
+    occurrences = {}
+    keyed = []
+    for row, identity in zip(rows, identities):
+        ordinal = occurrences.get(identity, 0)
+        occurrences[identity] = ordinal + 1
+        keyed.append(row | {"_key": _dashboard_row_key(kind, (identity, ordinal))})
+    return keyed
+
+def _dashboard_collection_changes(before: list[dict], after: list[dict]) -> dict | None:
+    old = {row.get("_key"): row for row in before if row.get("_key")}
+    new = {row.get("_key"): row for row in after if row.get("_key")}
+    upsert = [row for row in after if row.get("_key") and old.get(row["_key"]) != row]
+    deleted = [key for key in old if key not in new]
+    return {"upsert": upsert, "delete": deleted} if upsert or deleted else None
+
+def dashboard_view_changes(before: dict, after: dict) -> dict:
+    changes = {}
+    for name in ("quotaPoints", "tokenSessions"):
+        if collection := _dashboard_collection_changes(before.get(name) or [], after.get(name) or []):
+            changes[name] = collection
+    event_changes = {}
+    for name in ("fiveHour", "sevenDay"):
+        if collection := _dashboard_collection_changes((before.get("events") or {}).get(name) or [], (after.get("events") or {}).get(name) or []):
+            event_changes[name] = collection
+    if event_changes:
+        changes["events"] = event_changes
+    if before.get("historyStats") != after.get("historyStats"):
+        changes["historyStats"] = after.get("historyStats") or {}
+    return changes
+
+def dashboard_transfer_view(display: dict | None) -> dict:
+    display = display or {}
+    return {
+        "quotaPoints": display.get("quotaPoints") or [],
+        "tokenSessions": display.get("tokenSessions") or [],
+        "events": {
+            "fiveHour": (display.get("events") or {}).get("fiveHour") or [],
+            "sevenDay": (display.get("events") or {}).get("sevenDay") or [],
+        },
+        "historyStats": display.get("historyStats") or {},
     }
 
 class DashboardDisplayCache:
@@ -733,7 +863,6 @@ class UsageDashboardState:
         self.session_refresh_suppressed_reset_at = {}
         self.external_auth_validation_threads = set()
         self.external_auth_validation_fingerprints = set()
-        self._series_cache = {}
         self._series_build_lock = threading.Lock()
         self.dashboard_cache_event.set()
         self.runtime_state = reset_runtime_baselines(load_state(args.state))
@@ -780,14 +909,23 @@ class UsageDashboardState:
         candidate = self.last_sample or getattr(self, "runtime_state", {}).get("lastSample")
         if self.account_statuses.get(active_id) is None and isinstance(candidate, dict) and candidate.get("activeAccountSlotId") == active_id:
             self._update_account_status_locked(active_id, candidate)
-        return self.account_statuses.get(active_id)
+        active = next((account for account in accounts["items"] if account["id"] == active_id), None)
+        shared = [
+            self.account_statuses.get(account["id"])
+            for account in accounts["items"]
+            if active is not None and account.get("usageAccountId") == active.get("usageAccountId") and isinstance(self.account_statuses.get(account["id"]), dict)
+        ]
+        if not shared:
+            return None
+        latest = max(shared, key=lambda sample: parse_timestamp(sample.get("percentCheckedAt") or sample.get("checkedAt")) or 0)
+        return latest | {"activeAccountSlotId": active_id, "accountSlotId": active_id, "accountLabel": active.get("label") or "Unknown"}
 
     def _dashboard_accounts_locked(self) -> dict:
-        status = self.accounts.status()
+        status = dashboard_accounts(self)
         for account in status["items"]:
             if error := getattr(self, "inactive_account_poll_errors", {}).get(account["id"]):
                 account.update({"pollError": True, "pollErrorAt": error["at"], "stale": True})
-        return dashboard_account_status(status)
+        return status
 
     def _series_source_revision_locked(self, accounts: dict) -> str:
         token_ledger = getattr(self.args, "token_ledger", default_token_ledger_path(self.args.history))
@@ -796,64 +934,92 @@ class UsageDashboardState:
             "accounts": accounts,
         })
 
-    def _series_revision_locked(self, accounts: dict) -> str:
-        source_revision = self._series_source_revision_locked(accounts)
-        cache = getattr(self, "dashboard_cache", None)
-        display_revision = cache.revision(source_revision, time.time()) if cache is not None else "unavailable"
-        return _dashboard_revision({"source": source_revision, "display": display_revision})
+    def _ensure_series_stream_state_locked(self) -> None:
+        if hasattr(self, "_series_stream_id"):
+            return
+        self._series_stream_id = secrets.token_hex(10)
+        self._series_index = 0
+        self._series_journal = deque()
+        self._series_journal_bytes = 0
+        cached_views = ((getattr(self, "dashboard_cache", None).payload or {}).get("views") or {}) if getattr(self, "dashboard_cache", None) is not None else {}
+        self._series_views = {name: dashboard_transfer_view(cached_views.get(name)) for name in ("local", "merged")} if all(isinstance(cached_views.get(name), dict) for name in ("local", "merged")) else None
+        self._series_initialized = self._series_views is not None
+        self._merged_revision = _dashboard_revision({"streamId": self._series_stream_id, "merged": (self._series_views or {}).get("merged")})
+        self._dashboard_cache_reasons = set()
+
+    def _append_series_batch_locked(self, local_changes: dict, merged_changes: dict, now: float) -> None:
+        self._series_index += 1
+        batch = {"index": self._series_index, "createdAt": now, "local": local_changes, "merged": merged_changes}
+        batch["bytes"] = len(json.dumps(dashboard_safe_json(batch), ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        self._series_journal.append(batch)
+        self._series_journal_bytes += batch["bytes"]
+        self._prune_series_journal_locked(now)
+
+    def _prune_series_journal_locked(self, now: float) -> None:
+        cutoff = now - DASHBOARD_SERIES_JOURNAL_MAX_AGE_SECONDS
+        while self._series_journal and (
+            len(self._series_journal) > DASHBOARD_SERIES_JOURNAL_MAX_BATCHES
+            or self._series_journal_bytes > DASHBOARD_SERIES_JOURNAL_MAX_BYTES
+            or self._series_journal[0]["createdAt"] < cutoff
+        ):
+            self._series_journal_bytes -= self._series_journal.popleft()["bytes"]
+
+    def _series_snapshot_locked(self, status: dict | None = None) -> dict:
+        status = status or self.status_payload()
+        return {
+            "protocolVersion": DASHBOARD_SERIES_PROTOCOL_VERSION,
+            "mode": "snapshot",
+            "streamId": self._series_stream_id,
+            "includedIndex": self._series_index,
+            "mergedRevision": self._merged_revision,
+            "status": status,
+            "statusEtag": f'W/"status-{status["revision"]}"',
+            "views": self._series_views or {"local": dashboard_transfer_view(None), "merged": dashboard_transfer_view(None)},
+        }
 
     def status_payload(self) -> dict:
         with self.lock:
+            self._ensure_series_stream_state_locked()
+            self._prune_series_journal_locked(time.time())
             accounts = self._dashboard_accounts_locked()
             if not accounts["awaitingLogin"] and self.last_error and self.last_error.startswith("Waiting for Codex login"):
                 self.wake_event.set()
             last_sample = self._active_account_status_locked(accounts)
             sample = dashboard_sample(last_sample)
+            control_password_configured = control_password_is_configured(self.cloud.config()["control"]) if hasattr(self, "cloud") else True
+            stream = {"streamId": self._series_stream_id, "newestIndex": self._series_index, "mergedRevision": self._merged_revision}
             return {
-                "revision": _dashboard_revision({"sample": sample, "accounts": accounts, "error": self.last_error}),
-                "seriesRevision": self._series_revision_locked(accounts),
-                "controlPasswordConfigured": control_password_is_configured(self.cloud.config()["control"]) if hasattr(self, "cloud") else True,
+                "revision": _dashboard_revision({"sample": sample, "accounts": accounts, "error": self.last_error, "controlPasswordConfigured": control_password_configured, "stream": stream}),
+                **stream,
+                "controlPasswordConfigured": control_password_configured,
                 "lastSample": sample,
                 "display": dashboard_display(last_sample),
                 "accounts": accounts,
             }
 
-    def cached_series_response(self, view: str = "local") -> tuple[dict, bytes, str]:
-        view = "merged" if view == "merged" else "local"
-        with self._series_build_lock:
-            with self.lock:
-                accounts = self._dashboard_accounts_locked()
-                if not accounts["awaitingLogin"] and self.last_error and self.last_error.startswith("Waiting for Codex login"):
-                    self.wake_event.set()
-                revision = self._series_revision_locked(accounts)
-                cache = getattr(self, "_series_cache", {})
-                if view in cache and cache[view][0] == revision:
-                    return cache[view][1], cache[view][2], revision
-                source_revision = self._series_source_revision_locked(accounts)
-                now = time.time()
-                display_data = getattr(self, "dashboard_cache", None)
-                display_data = display_data.entry(view, source_revision, now) if display_data is not None else None
-                if display_data is None:
-                    if hasattr(self, "dashboard_cache_event"):
-                        self.dashboard_cache_event.set()
-                    if hasattr(self, "usage_data"):
-                        history, quota_history, token_sessions = self.usage_data.datasets(view)
-                    else:
-                        history, quota_history, token_sessions = load_history(self.args.history), load_quota_history(self.args.quota_history), load_token_session_history(self.args.token_session_history)
-                else:
-                    history = quota_history = token_sessions = None
-                current_state = load_state(self.args.state)
-                last_sample = self._active_account_status_locked(accounts)
-                if last_sample is None:
-                    current_state = current_state | {"lastSample": None}
-                else:
-                    current_state = current_state | {"lastSample": last_sample}
-            payload = _dashboard_series_from_snapshot(history, quota_history, current_state, token_sessions, last_sample, accounts, revision, view, display_data)
-            body = json.dumps(dashboard_safe_json(payload), ensure_ascii=False).encode("utf-8")
-            with self.lock:
-                self._series_cache = {key: value for key, value in getattr(self, "_series_cache", {}).items() if value[0] == revision}
-                self._series_cache[view] = (revision, payload, body)
-            return payload, body, revision
+    def series_response(self, stream_id: str | None = None, included_index: int | None = None, merged_revision: str | None = None) -> dict:
+        self.refresh_dashboard_cache()
+        status = self.status_payload()
+        with self.lock:
+            self._ensure_series_stream_state_locked()
+            if stream_id is None and included_index is None and merged_revision is None:
+                return self._series_snapshot_locked(status)
+            if stream_id != self._series_stream_id or included_index is None or included_index < 0 or included_index > self._series_index:
+                return self._series_snapshot_locked(status)
+            batches = [batch for batch in self._series_journal if batch["index"] > included_index]
+            if included_index < self._series_index and (not batches or batches[0]["index"] != included_index + 1 or batches[-1]["index"] != self._series_index):
+                return self._series_snapshot_locked(status)
+            replace_merged = merged_revision != self._merged_revision
+            return {
+                "protocolVersion": DASHBOARD_SERIES_PROTOCOL_VERSION,
+                "mode": "update",
+                "streamId": self._series_stream_id,
+                "fromIndex": included_index,
+                "includedIndex": self._series_index,
+                "mergedRevision": self._merged_revision,
+                "batches": [{"index": batch["index"], "local": batch["local"], **({} if replace_merged else {"merged": batch["merged"]})} for batch in batches],
+                **({"mergedSnapshot": self._series_views["merged"]} if replace_merged else {}),
+            }
 
     def refresh_dashboard_cache(self, force: bool = False, now: float | None = None) -> bool:
         cache = getattr(self, "dashboard_cache", None)
@@ -862,10 +1028,13 @@ class UsageDashboardState:
         now = time.time() if now is None else now
         with self._series_build_lock:
             with self.lock:
+                self._ensure_series_stream_state_locked()
                 accounts = self._dashboard_accounts_locked()
                 source_revision = self._series_source_revision_locked(accounts)
                 if not force and cache.entry("local", source_revision, now) is not None and cache.entry("merged", source_revision, now) is not None:
+                    self._dashboard_cache_reasons.clear()
                     return False
+                reasons = set(self._dashboard_cache_reasons) or {"local"}
                 display_data = {}
                 for view in ("local", "merged"):
                     history, quota_history, token_sessions = self.usage_data.datasets(view) if hasattr(self, "usage_data") else (load_history(self.args.history), load_quota_history(self.args.quota_history), load_token_session_history(self.args.token_session_history))
@@ -878,11 +1047,24 @@ class UsageDashboardState:
                     "sourceRevision": source_revision,
                     "builtAt": now,
                     "nextMaintenanceAt": next_maintenance,
-                    "displayRevision": _dashboard_revision({"version": DASHBOARD_DISPLAY_CACHE_VERSION, "sourceRevision": source_revision, "builtAt": now, "nextMaintenanceAt": next_maintenance}),
+                    "displayRevision": _dashboard_revision({"version": DASHBOARD_DISPLAY_CACHE_VERSION, "views": {name: dashboard_transfer_view(value) for name, value in display_data.items()}}),
                     "views": display_data,
                 }
+                views = {name: dashboard_transfer_view(value) for name, value in display_data.items()}
+                previous = self._series_views
                 cache.replace(payload)
-                self._series_cache = {}
+                self._series_views = views
+                self._dashboard_cache_reasons.difference_update(reasons)
+                if not self._series_initialized:
+                    self._series_initialized = True
+                    self._merged_revision = _dashboard_revision({"streamId": self._series_stream_id, "merged": views["merged"]})
+                else:
+                    local_changes = dashboard_view_changes(previous["local"], views["local"])
+                    merged_changes = dashboard_view_changes(previous["merged"], views["merged"])
+                    if "cloud" in reasons and merged_changes:
+                        self._merged_revision = _dashboard_revision({"streamId": self._series_stream_id, "previous": self._merged_revision, "merged": views["merged"]})
+                    if local_changes or (merged_changes and "cloud" not in reasons):
+                        self._append_series_batch_locked(local_changes, merged_changes, now)
                 return True
 
     def dashboard_cache_wait_seconds(self, now: float | None = None) -> float:
@@ -894,14 +1076,17 @@ class UsageDashboardState:
 
     def run_dashboard_cache_maintenance(self) -> None:
         while self.running:
+            self.dashboard_cache_event.wait(self.dashboard_cache_wait_seconds())
+            self.dashboard_cache_event.clear()
             try:
                 self.refresh_dashboard_cache()
             except Exception as exc:
                 print(f"Dashboard display cache maintenance failed: {exc}", file=sys.stderr, flush=True)
-            self.dashboard_cache_event.wait(self.dashboard_cache_wait_seconds())
-            self.dashboard_cache_event.clear()
 
-    def _signal_dashboard_cache(self) -> None:
+    def _signal_dashboard_cache(self, reason: str = "local") -> None:
+        with self.lock:
+            self._ensure_series_stream_state_locked()
+            self._dashboard_cache_reasons.add("cloud" if reason == "cloud" else "local")
         event = getattr(self, "dashboard_cache_event", None)
         if event is not None:
             event.set()
@@ -1207,6 +1392,28 @@ class UsageDashboardState:
             self.session_refresh_suppressed_reset_at.pop(key)
         return due
 
+    def _refresh_session_for_account(self, credential: dict) -> tuple[bool, bytes | None, float | None]:
+        if credential["active"]:
+            return refresh_session(self.args.codex_home)
+        for _ in range(5):
+            refresh_home = self.accounts.root / f".session-refresh-{secrets.token_hex(16)}"
+            try:
+                refresh_home.mkdir()
+                if os.name != "nt":
+                    os.chmod(refresh_home, 0o700)
+                break
+            except FileExistsError:
+                continue
+        else:
+            raise OSError("Could not create a unique session refresh workspace")
+        try:
+            return refresh_session(refresh_home, credential["data"])
+        finally:
+            try:
+                remove_directory(refresh_home)
+            except OSError as exc:
+                print(f"Session refresh workspace cleanup failed: {exc}", file=sys.stderr, flush=True)
+
     def run_session_refreshing(self) -> None:
         while self.running:
             due = self._due_session_refreshes()
@@ -1236,7 +1443,7 @@ class UsageDashboardState:
                 if not self._session_refresh_window_allows(credential, label, time.time()):
                     continue
                 try:
-                    refreshed, auth_data, refresh_cost = refresh_session(self.args.codex_home if credential["active"] else self.accounts.root / credential["id"] / "session-refresh", None if credential["active"] else credential["data"])
+                    refreshed, auth_data, refresh_cost = self._refresh_session_for_account(credential)
                     current_cost = self.session_refresh_costs.get(key, 0.0)
                     if refresh_cost is None or current_cost is None:
                         self.session_refresh_costs[key] = None
@@ -1295,7 +1502,7 @@ class UsageDashboardState:
                 if any(result.values()):
                     self.cloud_maintenance_connection_failed = False
                 if result.get("usageSynced"):
-                    self._signal_dashboard_cache()
+                    self._signal_dashboard_cache("cloud")
             self.cloud_maintenance_event.wait(5)
             self.cloud_maintenance_event.clear()
 
@@ -1308,12 +1515,13 @@ class UsageDashboardState:
             self.config_monitor_event.wait(5)
             self.config_monitor_event.clear()
 
-    def _account_changed(self) -> None:
+    def _account_changed(self, refresh_usage_data: bool = False) -> None:
         with self.lock:
             self.last_sample = None
             self.last_error = None
             self.inactive_account_poll_errors.pop(self.accounts.status()["activeAccountId"], None)
-            self.usage_data.refresh_accounts()
+            if refresh_usage_data:
+                self.usage_data.refresh_accounts()
             self._signal_dashboard_cache()
         self.wake_event.set()
         self.inactive_account_poll_event.set()
@@ -1356,7 +1564,8 @@ class UsageDashboardState:
                 data = temp_path.read_bytes()
                 if not self.accounts.commit_polled_credentials(external_update["id"], expected_fingerprint, data):
                     raise UsageError("recorded credentials changed during external auth validation")
-                output.update({"checkedAt": now_iso(), "accountSlotId": external_update["id"], "accountLabel": external_update["label"]})
+                usage_account_id = self.cloud.usage_account_id(external_update["id"])
+                output.update({"checkedAt": now_iso(), "accountSlotId": external_update["id"], "accountLabel": external_update["label"], "usageAccountId": usage_account_id, "sync": {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": usage_account_id}})
                 sample = make_history_sample(output, None)
                 with self.lock:
                     append_quota_history_sample(self.args.quota_history, sample)
@@ -1390,7 +1599,7 @@ class UsageDashboardState:
     def create_account(self, label: str, account_type: str = "account", api_key: str | None = None) -> dict:
         previous = self.accounts.status()
         result = self.accounts.create_account(label, account_type, api_key, self._start_external_auth_validation)
-        self._account_changed()
+        self._account_changed(refresh_usage_data=True)
         if previous["activeAccountId"] is None:
             print(f"Account event: prepared {str(label).strip()!r} for sign-in.", flush=True)
         else:
@@ -1443,68 +1652,60 @@ def dashboard_html() -> str:
 def management_html() -> str:
     return MANAGEMENT_HTML_PATH.read_text(encoding="utf-8")
 
+def dashboard_remote_accounts(accounts: list[dict], local_api_identity_ids: set[str] | None = None, local_cloud_keys: set[str] | None = None) -> list[dict]:
+    local_api_identity_ids, local_cloud_keys = local_api_identity_ids or set(), local_cloud_keys or set()
+    rows = [{
+        "accountKey": item.get("accountKey"), "label": item.get("label"), "accountType": item.get("accountType", "account"),
+        **({"canLink": (item.get("_apiIdentityId") or item.get("apiIdentityId")) not in local_api_identity_ids} if item.get("accountType") == "api" else {"canBind": item.get("accountKey") not in local_cloud_keys}),
+    } for item in accounts]
+    label_counts = {}
+    for account in rows:
+        label_counts[str(account.get("label") or "Cloud account").casefold()] = label_counts.get(str(account.get("label") or "Cloud account").casefold(), 0) + 1
+    for account in rows:
+        label = account.get("label") or "Cloud account"
+        account["displayLabel"] = f"{label} · {str(account.get('accountKey') or 'profile')[:6]}" if label_counts[label.casefold()] > 1 else label
+    return rows
+
 def management_payload(state: UsageDashboardState, include_remote: bool = False, refresh_scan: bool = False) -> dict:
+    remote_accounts = state.cloud.cached_remote_accounts()
+    api_identity_ids = state.accounts.api_identity_ids() if hasattr(state.accounts, "api_identity_ids") else {}
+    accounts = dashboard_accounts(state)
+    remote_api_identity_ids = {item.get("_apiIdentityId") or item.get("apiIdentityId") for item in remote_accounts if item.get("accountType") == "api"}
+    for account in accounts["items"]:
+        if account.get("isApiAccount"):
+            account["canShare"] = bool(account.get("ready")) and api_identity_ids.get(account["id"]) not in remote_api_identity_ids
     payload = {
         "server": state.cloud.config()["server"],
         "editableConfig": state.cloud.editable_config(),
         "skills": dashboard_skill_status(state.skills.status()),
         "scan": [{**{key: item.get(key) for key in ("name", "sources", "authoritativeSource", "defaultAssignments")}, **({"error": "Skill scan error"} if item.get("error") else {})} for item in state.skills.scan(refresh_scan)],
         "cloud": dashboard_cloud_status(state.cloud.redacted_status()),
-        "accounts": dashboard_account_status(state.accounts.status()),
-        "apiConfig": state.accounts.config_editor_payload(),
+        "accounts": accounts,
+        "apiConfig": state.accounts.config_editor_payload() if hasattr(state.accounts, "config_editor_payload") else {},
     }
     if include_remote and payload["cloud"]["webdav"].get("enabled"):
         state.cloud.fetch(include_usage=False)
-    payload["remoteAccounts"] = [{"accountKey": item.get("accountKey"), "label": item.get("label"), "accountType": item.get("accountType", "account"), "bindingState": "released"} for item in state.cloud.cached_remote_accounts()]
+        remote_accounts = state.cloud.cached_remote_accounts()
+        remote_api_identity_ids = {item.get("_apiIdentityId") or item.get("apiIdentityId") for item in remote_accounts if item.get("accountType") == "api"}
+        for account in accounts["items"]:
+            if account.get("isApiAccount"):
+                account["canShare"] = bool(account.get("ready")) and api_identity_ids.get(account["id"]) not in remote_api_identity_ids
+    payload["remoteAccounts"] = dashboard_remote_accounts(remote_accounts, set(api_identity_ids.values()), state.accounts.cloud_account_keys() if hasattr(state.accounts, "cloud_account_keys") else set())
     return payload
-
-def _dashboard_series_from_snapshot(
-    history: list[dict] | None, quota_history: list[dict] | None, current_state: dict, token_sessions: list[dict] | None, last_sample: dict | None, accounts: dict,
-    revision: str | None = None, view: str = "local", display_data: dict | None = None,
-) -> dict:
-    if display_data is None:
-        display_data = _dashboard_display_data(history or [], quota_history or [], token_sessions or [], accounts)
-    return {
-        "seriesRevision": revision,
-        "dataView": view,
-        "quotaDataView": view,
-        "points": dashboard_points_from_state(current_state),
-        "quotaPoints": display_data["quotaPoints"],
-        "tokenSessions": display_data["tokenSessions"],
-        "events": display_data["events"],
-        "historyStats": display_data["historyStats"],
-        "lastSample": dashboard_sample(last_sample),
-        "display": dashboard_display(last_sample),
-        "accounts": accounts,
-    }
-
-def dashboard_series_payload(args, state: UsageDashboardState, view: str = "local") -> dict:
-    if hasattr(state, "cached_series_response"):
-        return state.cached_series_response(view)[0]
-    if hasattr(state, "usage_data"):
-        history, quota_history, token_sessions = state.usage_data.datasets(view)
-    else:
-        history, quota_history = state.history(), state.quota_history()
-        token_sessions = state.token_session_history() if hasattr(state, "token_session_history") else load_token_session_history(getattr(args, "token_session_history", default_token_session_history_path(args.history)))
-    current_state = state.state()
-    accounts = dashboard_account_status(state.accounts.status())
-    last_sample = state.last_sample or current_state.get("lastSample")
-    if accounts["awaitingLogin"] or not isinstance(last_sample, dict) or last_sample.get("activeAccountSlotId") != accounts["activeAccountId"]:
-        last_sample = None
-        current_state = current_state | {"lastSample": None}
-    return _dashboard_series_from_snapshot(history, quota_history, current_state, token_sessions, last_sample, accounts, view=view)
 
 def dashboard_status_payload(state: UsageDashboardState) -> dict:
     if hasattr(state, "status_payload"):
         return state.status_payload()
-    accounts = dashboard_account_status(state.accounts.status())
+    accounts = dashboard_accounts(state)
     last_sample = state.last_sample
     if accounts["awaitingLogin"] or not isinstance(last_sample, dict) or last_sample.get("activeAccountSlotId") != accounts["activeAccountId"]:
         last_sample = None
     sample = dashboard_sample(last_sample)
     return {
         "revision": _dashboard_revision({"sample": sample, "accounts": accounts}),
-        "seriesRevision": None,
+        "streamId": None,
+        "newestIndex": 0,
+        "mergedRevision": None,
         "controlPasswordConfigured": control_password_is_configured(state.cloud.config()["control"]) if hasattr(state, "cloud") else True,
         "lastSample": sample,
         "display": dashboard_display(last_sample),
@@ -1528,6 +1729,10 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
         print("Cannot start dashboard: another monitor instance is already running.", file=sys.stderr, flush=True)
         return 1
 
+    serialized_body_cache = {}
+    compressed_body_cache = {}
+    response_body_cache_lock = threading.Lock()
+
     class Handler(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
             self.handle_get()
@@ -1536,23 +1741,49 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             self.handle_post()
 
         def send_json_body(self, status: int, body: bytes, headers: dict | None = None):
+            response_headers = dict(headers or {})
+            if len(body) >= DASHBOARD_GZIP_MIN_BYTES and "gzip" in (self.headers.get("Accept-Encoding") or "").lower():
+                cache_key = hashlib.sha256(body).digest()
+                with response_body_cache_lock:
+                    compressed = compressed_body_cache.get(cache_key)
+                if compressed is None:
+                    compressed = gzip.compress(body)
+                    with response_body_cache_lock:
+                        if len(compressed_body_cache) >= 32:
+                            compressed_body_cache.pop(next(iter(compressed_body_cache)))
+                        compressed_body_cache[cache_key] = compressed
+                body = compressed
+                response_headers["Content-Encoding"] = "gzip"
+            response_headers["Vary"] = "Accept-Encoding"
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
-            if not headers or "Cache-Control" not in headers:
+            if "Cache-Control" not in response_headers:
                 self.send_header("Cache-Control", "no-store")
-            for key, value in (headers or {}).items():
+            for key, value in response_headers.items():
                 self.send_header(key, value)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
 
-        def send_json(self, status: int, payload: dict, headers: dict | None = None, *, sanitize: bool = True):
-            self.send_json_body(status, json.dumps(dashboard_safe_json(payload) if sanitize else payload, ensure_ascii=False).encode("utf-8"), headers)
+        def send_json(self, status: int, payload: dict, headers: dict | None = None, *, sanitize: bool = True, cache_key: str | None = None):
+            body = None
+            if cache_key:
+                with response_body_cache_lock:
+                    body = serialized_body_cache.get(cache_key)
+            if body is None:
+                body = json.dumps(dashboard_safe_json(payload) if sanitize else payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+                if cache_key:
+                    with response_body_cache_lock:
+                        if len(serialized_body_cache) >= 32:
+                            serialized_body_cache.pop(next(iter(serialized_body_cache)))
+                        serialized_body_cache[cache_key] = body
+            self.send_json_body(status, body, headers)
 
         def send_not_modified(self, etag: str):
             self.send_response(304)
             self.send_header("Cache-Control", "no-cache")
             self.send_header("ETag", etag)
+            self.send_header("Vary", "Accept-Encoding")
             self.end_headers()
 
         def control_token(self) -> str | None:
@@ -1604,21 +1835,27 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                 self.wfile.write(management_html().encode("utf-8"))
                 return
             if path == "/api/series":
-                view = "merged" if urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query).get("view") == ["merged"] else "local"
-                _, body, revision = state.cached_series_response(view)
-                etag = f'"series-{view}-{revision}"'
-                if self.headers.get("If-None-Match") == etag:
-                    self.send_not_modified(etag)
-                else:
-                    self.send_json_body(200, body, {"Cache-Control": "no-cache", "ETag": etag})
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                try:
+                    if not query:
+                        payload = state.series_response()
+                    elif set(query) == {"streamId", "includedIndex", "mergedRevision"} and all(len(query[key]) == 1 for key in query):
+                        payload = state.series_response(query["streamId"][0], int(query["includedIndex"][0]), query["mergedRevision"][0])
+                    else:
+                        raise ValueError
+                except ValueError:
+                    self.send_json(400, {"error": "Expected streamId, includedIndex, and mergedRevision together"})
+                    return
+                etag = f'W/"series-{payload["streamId"]}-{payload.get("fromIndex", "snapshot")}-{payload["includedIndex"]}-{payload["mergedRevision"]}-{payload["mode"]}"'
+                self.send_json(200, payload, {"Cache-Control": "no-cache", "ETag": etag}, cache_key=etag)
                 return
             if path == "/api/status":
                 payload = dashboard_status_payload(state)
-                etag = f'"status-{payload["revision"]}"'
+                etag = f'W/"status-{payload["revision"]}"'
                 if self.headers.get("If-None-Match") == etag:
                     self.send_not_modified(etag)
                 else:
-                    self.send_json(200, payload, {"Cache-Control": "no-cache", "ETag": etag})
+                    self.send_json(200, payload, {"Cache-Control": "no-cache", "ETag": etag}, cache_key=etag)
                 return
             if path == "/api/manage/status":
                 if not self.require_control_auth():
@@ -1637,7 +1874,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             allowed = {
                 "/api/control/login", "/api/control/setup",
                 "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/accounts/session-refresh", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign",
-                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/push", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
+                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/fetch-all", "/api/manage/cloud/push", "/api/manage/cloud/push-all", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/link", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
             }
             allowed.add("/api/manage/accounts/common")
             if path not in allowed:
@@ -1703,9 +1940,19 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                     self.send_json(200, state.cloud.test())
                     return
                 elif path == "/api/manage/cloud/fetch":
-                    self.send_json(200, state.cloud.fetch(include_usage=True, force_full=True))
+                    result = state.cloud.fetch(include_usage=True)
+                    state._signal_dashboard_cache("cloud")
+                    self.send_json(200, result)
+                    return
+                elif path == "/api/manage/cloud/fetch-all":
+                    result = state.cloud.fetch(include_usage=True, force_full=True)
+                    state._signal_dashboard_cache("cloud")
+                    self.send_json(200, result)
                     return
                 elif path == "/api/manage/cloud/push":
+                    self.send_json(200, state.cloud.push())
+                    return
+                elif path == "/api/manage/cloud/push-all":
                     self.send_json(200, state.cloud.push(force_full=True))
                     return
                 elif path == "/api/manage/cloud/overwrite":
@@ -1715,16 +1962,27 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                     self.send_json(200, state.cloud.restore_skills(body.get("snapshotId")))
                     return
                 elif path == "/api/manage/accounts/bind":
-                    self.send_json(200, {"accounts": state.cloud.bind_local_account(body.get("accountKey"))})
+                    result = state.cloud.bind_local_account(body.get("accountKey"))
+                    state._signal_dashboard_cache("cloud")
+                    self.send_json(200, {"accounts": result})
+                    return
+                elif path == "/api/manage/accounts/link":
+                    result = state.cloud.link_local_account(body.get("accountKey"))
+                    state._signal_dashboard_cache("cloud")
+                    self.send_json(200, {"accounts": result})
                     return
                 elif path == "/api/manage/accounts/release":
-                    self.send_json(200, {"accounts": state.cloud.release_local_account(body.get("accountId"))})
+                    result = state.cloud.release_local_account(body.get("accountId"))
+                    state._signal_dashboard_cache("cloud")
+                    self.send_json(200, {"accounts": result})
                     return
                 elif path == "/api/manage/accounts/share":
                     self.send_json(200, {"accounts": state.cloud.share_local_account(body.get("accountId"))})
                     return
                 elif path == "/api/manage/accounts/delete-remote":
-                    self.send_json(200, {"remoteAccounts": state.cloud.delete_remote_account(body.get("accountKey"))})
+                    result = state.cloud.delete_remote_account(body.get("accountKey"))
+                    state._signal_dashboard_cache("cloud")
+                    self.send_json(200, {"remoteAccounts": result})
                     return
                 elif path == "/api/manage/accounts/header":
                     self.send_json(200, {"accounts": state.accounts.update_api_config(body.get("accountId"), body.get("headerToml"))})

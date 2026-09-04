@@ -28,7 +28,7 @@ import monitor_quota
 import monitor_session_refresh
 import monitor_token_ledger
 import monitor_tokens
-from monitor_accounts import AccountError, AccountManager, atomic_write_json, normalize_session_refresh, normalize_session_refresh_windows
+from monitor_accounts import AccountError, AccountManager, api_identity_id, atomic_write_json, auth_fingerprint, auth_identity, normalize_session_refresh, normalize_session_refresh_windows, parse_auth_bytes
 from monitor_cloud import (
     AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_FULL_VERIFY_INTERVAL_SECONDS, USAGE_PACK_BUCKET_BITS, USAGE_PACK_MAX_BYTES,
     USAGE_REGULAR_VERIFY_PACKS, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
@@ -784,6 +784,32 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(state.accounts.status()["activeAccountId"], second_id)
             self.assertIsNone(state.last_sample)
 
+    def test_account_switch_does_not_refresh_unchanged_usage_datasets(self):
+        state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
+        previous = {"activeAccountId": "account-a", "items": [{"id": "account-a", "label": "A"}, {"id": "account-b", "label": "B"}]}
+        current = previous | {"activeAccountId": "account-b"}
+        state.accounts = SimpleNamespace(status=mock.Mock(side_effect=(previous, current)), switch=mock.Mock(return_value=current))
+        state.lock = threading.RLock()
+        state.last_sample = {"activeAccountSlotId": "account-a"}
+        state.last_error = "old error"
+        state.inactive_account_poll_errors = {"account-b": {"at": "2030-01-01T00:00:00Z"}}
+        state.usage_data = SimpleNamespace(refresh_accounts=mock.Mock(side_effect=AssertionError("account switch must not reload unchanged history")))
+        state.dashboard_cache_event = threading.Event()
+        state.wake_event = threading.Event()
+        state.inactive_account_poll_event = threading.Event()
+
+        with mock.patch("builtins.print"):
+            result = state.switch_account("account-b")
+
+        self.assertEqual(result["activeAccountId"], "account-b")
+        state.usage_data.refresh_accounts.assert_not_called()
+        self.assertIsNone(state.last_sample)
+        self.assertIsNone(state.last_error)
+        self.assertNotIn("account-b", state.inactive_account_poll_errors)
+        self.assertTrue(state.dashboard_cache_event.is_set())
+        self.assertTrue(state.wake_event.is_set())
+        self.assertTrue(state.inactive_account_poll_event.is_set())
+
     def test_inactive_local_account_usage_is_recorded_every_ten_minutes(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
@@ -831,7 +857,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertIsNone(state.last_sample)
             self.assertEqual(cached_status["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
             self.assertEqual(cached_status["lastSample"]["windows"]["5h"]["resetAt"], "2030-01-01T00:00:00Z")
-            self.assertEqual(state.cached_series_response()[0]["lastSample"]["windows"]["7d"]["usedPercent"], 34.0)
+            self.assertEqual(state.series_response()["status"]["lastSample"]["windows"]["7d"]["usedPercent"], 34.0)
             self.assertTrue(state.wake_event.is_set())
             self.assertFalse(any(state.accounts.root.glob(".inactive-usage-*.json")))
 
@@ -1069,6 +1095,45 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertFalse(refreshed)
         self.assertIsNone(auth_data)
         self.assertIsNone(cost)
+
+    def test_inactive_session_refresh_uses_disposable_home_outside_account_slot(self):
+        with self.account_directory() as directory:
+            account_root = directory / "accounts"
+            account_root.mkdir()
+            account_slot = account_root / "account"
+            account_slot.mkdir()
+            (account_slot / "auth.json").write_bytes(b"saved")
+            credential = {"id": "account", "label": "Account", "active": False, "data": b"auth"}
+            state = object.__new__(monitor_dashboard.UsageDashboardState)
+            state.running = True
+            state.accounts = SimpleNamespace(root=account_root)
+            state.account_statuses = {"account": {"windows": {"5h": {"usedPercent": 0, "resetAt": "2030-01-01T05:00:00Z"}}}}
+            state.session_refresh_attempts = {}
+            state.session_refresh_costs = {}
+            state.session_refresh_reset_at = {}
+            state.session_refresh_procedures = set()
+            state.session_refresh_failed = {}
+            state.session_refresh_suppressed_reset_at = {}
+            state.session_refresh_event = SimpleNamespace(wait=lambda _timeout: setattr(state, "running", False), clear=lambda: None)
+            state._due_session_refreshes = mock.Mock(return_value=[(credential, "5h")])
+            state._retrieve_session_refresh_reset_at = mock.Mock(return_value=monitor_dashboard.parse_timestamp("2030-01-01T05:00:01Z"))
+            refresh_homes = []
+
+            def fake_refresh(refresh_home, auth_data):
+                refresh_home = Path(refresh_home)
+                refresh_homes.append(refresh_home)
+                (refresh_home / "nested").mkdir()
+                (refresh_home / "nested" / "state.json").write_bytes(auth_data)
+                return False, None, None
+
+            with mock.patch.object(monitor_dashboard, "refresh_session", side_effect=fake_refresh):
+                state.run_session_refreshing()
+
+            self.assertEqual(len(refresh_homes), 1)
+            self.assertEqual(refresh_homes[0].parent, account_root)
+            self.assertNotEqual(refresh_homes[0], account_slot / "session-refresh")
+            self.assertFalse(refresh_homes[0].exists())
+            self.assertEqual((account_slot / "auth.json").read_bytes(), b"saved")
 
     def test_session_refresh_suppresses_matching_confirmation_reset_time(self):
         reset_at = "2030-01-01T05:00:00Z"
@@ -1485,7 +1550,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             manager.switch("ppl-pro")
 
             cloud = SimpleNamespace(
-                new_placeholder_account_key=mock.Mock(return_value="placeholder-key"), begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(),
+                new_account_key=mock.Mock(return_value="placeholder-key"), begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(),
                 release_account=mock.Mock(return_value={}),
             )
 
@@ -1494,9 +1559,32 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(status["activeAccountId"], "ppl-pro")
             self.assertEqual([account["id"] for account in status["items"]], ["ppl-pro"])
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
-            cloud.new_placeholder_account_key.assert_called_once_with()
+            cloud.new_account_key.assert_called_once_with()
             cloud.begin_account_transition.assert_called_once_with("release", accountId=empty_id, accountKey="placeholder-key", revisionId=hashlib.sha256(b"{}").hexdigest())
-            cloud.release_account.assert_called_once_with("placeholder-key", b"{}", {"accountId": None, "email": None}, "Empty", ready=False, key_type="opaque")
+            cloud.release_account.assert_called_once_with("placeholder-key", b"{}", {"accountId": None, "email": None}, "Empty", ready=False, key_type="opaque", config_header={}, account_type="account", config_header_toml="")
+
+    def test_duplicate_openai_profiles_release_to_distinct_opaque_cloud_keys(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            second_id = manager.create_account("Second A")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-b")), encoding="utf-8")
+            manager.status()
+            third_id = manager.create_account("Third")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-c")), encoding="utf-8")
+            manager.status()
+            cloud = SimpleNamespace(
+                new_account_key=mock.Mock(side_effect=("key-a", "key-b")), begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), release_account=mock.Mock(return_value={}),
+            )
+
+            manager.release_cloud_account(cloud, "ppl-pro")
+            status = manager.release_cloud_account(cloud, second_id)
+
+            self.assertEqual([account["id"] for account in status["items"]], [third_id])
+            self.assertEqual([call.args[0] for call in cloud.release_account.call_args_list], ["key-a", "key-b"])
+            self.assertEqual([call.kwargs["key_type"] for call in cloud.release_account.call_args_list], ["opaque", "opaque"])
+            self.assertEqual([json.loads(call.args[1])["tokens"]["refresh_token"] for call in cloud.release_account.call_args_list], ["refresh-a", "refresh-b"])
 
     def test_empty_cloud_account_binds_as_login_placeholder(self):
         with self.account_directory() as directory:
@@ -1508,7 +1596,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             status = manager.bind_cloud_account(cloud, "placeholder-key")
 
-            bound = next(account for account in status["items"] if account["accountKey"] == "placeholder-key")
+            bound_record = manager._find_cloud_key("placeholder-key")
+            bound = next(account for account in status["items"] if account["id"] == bound_record["id"])
             self.assertFalse(bound["ready"])
             self.assertFalse((manager.root / bound["id"] / "auth.json").exists())
             cloud.delete_account_payloads.assert_called_once_with("placeholder-key", '"etag"')
@@ -1620,7 +1709,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(manager.attribution_for_auth(self.account_auth("acct-a", "another-refresh")), {"accountSlotId": "ppl-pro", "accountLabel": "Recorded Account"})
             self.assertEqual(manager.attribution_for_auth(self.account_auth("not-registered", "refresh-x")), {"accountSlotId": "unknown", "accountLabel": "Unknown"})
 
-    def test_duplicate_pending_login_refreshes_existing_account_and_leaves_new_slot_empty(self):
+    def test_duplicate_pending_openai_login_creates_an_independent_credential_profile(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -1630,15 +1719,50 @@ class MonitorCodexUsageTests(unittest.TestCase):
             status = manager.status()
 
             self.assertEqual(status["activeAccountId"], pending_id)
-            self.assertTrue(status["awaitingLogin"])
+            self.assertFalse(status["awaitingLogin"])
             self.assertIsNone(status["error"])
-            self.assertIn("already belongs to Current account", status["message"])
-            self.assertIn("remains empty", status["message"])
+            self.assertIsNone(status["message"])
+            self.assertTrue(auth_path.exists())
+            self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
+            self.assertEqual(json.loads(manager._account_path(pending_id).read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-new")
+            self.assertTrue(manager._find(pending_id)["ready"])
+            self.assertEqual(manager._find("ppl-pro")["identity"]["accountId"], manager._find(pending_id)["identity"]["accountId"])
+            self.assertEqual(manager.attribution_for_auth(self.account_auth("acct-a", "another-refresh"))["accountSlotId"], pending_id)
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
+            self.assertEqual(cloud.usage_account_id("ppl-pro"), cloud.usage_account_id(pending_id))
+
+    def test_duplicate_openai_profiles_refresh_credentials_independently(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            second_id = manager.create_account("Second")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-b")), encoding="utf-8")
+            manager.status()
+            first_path = manager._account_path("ppl-pro")
+            original_fingerprint = auth_fingerprint(first_path.read_bytes())
+
+            self.assertTrue(manager.commit_polled_credentials("ppl-pro", original_fingerprint, json.dumps(self.account_auth("acct-a", "refresh-a-new")).encode()))
+            self.assertEqual(json.loads(first_path.read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a-new")
+            self.assertEqual(json.loads(manager._account_path(second_id).read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-b")
+
+    def test_duplicate_api_key_is_rejected_for_create_and_pending_login(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
+            manager = AccountManager(auth_path)
+
+            with self.assertRaises(AccountError) as raised:
+                manager.create_account("Duplicate API", "api", "sk-api")
+            self.assertEqual(raised.exception.status, 409)
+
+            pending_id = manager.create_account("Pending")["activeAccountId"]
+            auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
+            status = manager.status()
+            self.assertEqual(status["activeAccountId"], pending_id)
+            self.assertTrue(status["awaitingLogin"])
             self.assertFalse(auth_path.exists())
-            self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-new")
             self.assertFalse(manager._find(pending_id)["ready"])
-            self.assertEqual(monitor_dashboard.dashboard_account_status(status)["message"], status["message"])
-            self.assertIn('showMessage("Existing Account Update Completed"', Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8"))
 
     def test_pending_login_requires_account_id_even_when_id_token_matches(self):
         with self.account_directory() as directory:
@@ -1798,6 +1922,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(manager.status()["activeAccountId"], second_id)
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-b")
             self.assertTrue((manager.root / "ppl-pro" / "auth.json").exists())
+
+    def test_account_delete_removes_nested_legacy_session_refresh_workspace(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            second_id = manager.create_account("Second")["activeAccountId"]
+            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
+            manager.status()
+            legacy_home = manager.root / "ppl-pro" / "session-refresh" / "nested"
+            legacy_home.mkdir(parents=True)
+            (legacy_home / "state.json").write_text("legacy", encoding="utf-8")
+
+            status = manager.delete("ppl-pro")
+
+            self.assertEqual(status["activeAccountId"], second_id)
+            self.assertFalse((manager.root / "ppl-pro").exists())
 
     def test_deleting_bound_local_account_never_calls_cloud(self):
         with self.account_directory() as directory:
@@ -3490,7 +3631,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('updateAccountControls([...fiveInRange,...sevenInRange,...quotaInRange])', html)
         self.assertIn('quota=accountFilteredQuotaPoints(quotaInRange)', html)
         self.assertIn('rows.push(`Model ${modelDisplayName(p.model)}`)', html)
-        self.assertIn('rows.push(`Account ${accountDisplayName(p.accountSlotId,p.accountLabel)}`)', html)
+        self.assertIn('rows.push(`Account ${accountDisplayName(usageAccountId(p),p.accountLabel)}`)', html)
         self.assertIn("const chartStates={}, usageTimeChartStates={}, NODE_RADIUS=5, CHART_MARGINS={l:48,r:18,t:16,b:34}", html)
         self.assertIn("function denseMergeMetrics(id,list)", html)
         self.assertIn("maxPercent:maxPercent*1.03||1,maxCost:maxCost*1.08||1,minDistance:NODE_RADIUS*4", html)
@@ -3592,7 +3733,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn('| raw cost ${usd(latest.cost.totalCostUsd)}', html)
         self.assertIn('let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date())', html)
         self.assertIn('const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null', html)
-        self.assertIn('vscode.postMessage({type:"getCodexUsageSeries",view})', html)
+        self.assertIn('vscode.postMessage({type:"getCodexUsageSeries",cursor})', html)
         self.assertNotIn('id="refresh"', html)
         self.assertIn("function selectedDateBounds()", html)
         self.assertIn("const [year,month,day]=parts, start=new Date(year,month-1,day), end=new Date(year,month-1,day+1)", html)
@@ -3711,11 +3852,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             "tokens": {"freshInputTokens": 123}, "cost": {"totalCostUsd": 0.5}, "byModel": {"gpt-5.5": {"tokens": {"freshInputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}}},
         }
         accounts = {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "Account A"}]}
-        state = SimpleNamespace(
-            history=lambda: [], quota_history=lambda: [], token_session_history=lambda: [session], state=lambda: {}, accounts=SimpleNamespace(status=lambda: accounts), last_error=None, last_sample=None, wake_event=SimpleNamespace(set=lambda: None),
-        )
-
-        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard.dashboard_series_payload(SimpleNamespace(history=Path("history.jsonl"), quota_history=Path("quota.jsonl"), state=Path("state.json")), state))
+        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard._dashboard_display_data([], [], [session], monitor_dashboard.dashboard_account_status(accounts)))
 
         model = payload["tokenSessions"][0]["byModel"]["gpt-5.5"]
         self.assertEqual(model["usageTokens"], {"freshInputTokens": 123, "outputTokens": 45})
@@ -3740,39 +3877,105 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(payload["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
         self.assertEqual(payload["lastSample"]["cost"]["totalCostUsd"], 1.5)
         self.assertEqual(len(payload["revision"]), 20)
-        self.assertEqual(len(payload["seriesRevision"]), 20)
+        self.assertEqual(len(payload["streamId"]), 20)
+        self.assertEqual(payload["newestIndex"], 0)
+        self.assertEqual(len(payload["mergedRevision"]), 20)
 
-    def test_dashboard_series_cache_reuses_serialized_payload_until_file_revision_changes(self):
+    def test_dashboard_series_stream_indexes_semantic_local_changes_only(self):
         with self.account_directory() as directory:
             args = SimpleNamespace(
-                history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", token_session_history=directory / "tokens.jsonl", state=directory / "state.json",
+                history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", token_session_history=directory / "tokens.jsonl", token_ledger=directory / "ledger.jsonl",
+                state=directory / "state.json", dashboard_cache=directory / "dashboard-cache.json", usage_sync_cache=directory / "sync.json",
             )
-            args.history.write_text("", encoding="utf-8")
-            args.quota_history.write_text("", encoding="utf-8")
-            args.token_session_history.write_text("", encoding="utf-8")
-            args.state.write_text("{}", encoding="utf-8")
+            for path, contents in ((args.history, ""), (args.quota_history, ""), (args.token_session_history, ""), (args.token_ledger, ""), (args.state, "{}"), (args.usage_sync_cache, "{}")):
+                path.write_text(contents, encoding="utf-8")
+            quota = []
             state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
             state.args = args
-            state.lock = threading.Lock()
+            state.lock = threading.RLock()
             state._series_build_lock = threading.Lock()
-            state._series_cache_revision = state._series_cache_payload = state._series_cache_body = None
+            state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
             state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
+            state.usage_data = SimpleNamespace(datasets=lambda _view: ([], quota, []))
             state.last_sample = state.last_error = None
+            state.runtime_state = {}
             state.wake_event = threading.Event()
 
-            with mock.patch.object(monitor_dashboard, "load_history", wraps=monitor_dashboard.load_history) as history_load:
-                first_payload, first_body, first_revision = state.cached_series_response()
-                second_payload, second_body, second_revision = state.cached_series_response()
-                args.history.write_text('{"checkedAt":"2030-01-01T00:00:00Z"}\n', encoding="utf-8")
-                third_payload, third_body, third_revision = state.cached_series_response()
+            snapshot = state.series_response()
+            quota.append({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": 12}}})
+            args.quota_history.write_text("changed\n", encoding="utf-8")
+            update = state.series_response(snapshot["streamId"], snapshot["includedIndex"], snapshot["mergedRevision"])
+            args.quota_history.write_text("rewritten without a semantic change\n", encoding="utf-8")
+            unchanged = state.series_response(update["streamId"], update["includedIndex"], update["mergedRevision"])
 
-            self.assertIs(first_payload, second_payload)
-            self.assertIs(first_body, second_body)
-            self.assertEqual(first_revision, second_revision)
-            self.assertNotEqual(first_revision, third_revision)
-            self.assertNotEqual(first_body, third_body)
-            self.assertIsNot(first_payload, third_payload)
-            self.assertEqual(history_load.call_count, 2)
+            self.assertEqual(snapshot["mode"], "snapshot")
+            self.assertEqual(update["mode"], "update")
+            self.assertEqual([batch["index"] for batch in update["batches"]], [1])
+            self.assertEqual(len(update["batches"][0]["local"]["quotaPoints"]["upsert"]), 1)
+            self.assertEqual(update["batches"][0]["local"], update["batches"][0]["merged"])
+            self.assertEqual(unchanged["includedIndex"], 1)
+            self.assertEqual(unchanged["batches"], [])
+
+    def test_dashboard_series_replaces_complete_merged_view_after_cloud_history_change(self):
+        with self.account_directory() as directory:
+            args = SimpleNamespace(
+                history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", token_session_history=directory / "tokens.jsonl", token_ledger=directory / "ledger.jsonl",
+                state=directory / "state.json", dashboard_cache=directory / "dashboard-cache.json", usage_sync_cache=directory / "sync.json",
+            )
+            for path, contents in ((args.history, ""), (args.quota_history, ""), (args.token_session_history, ""), (args.token_ledger, ""), (args.state, "{}"), (args.usage_sync_cache, "{}")):
+                path.write_text(contents, encoding="utf-8")
+            local_quota = [{"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": 12}}}]
+            supplemental_quota = []
+            state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
+            state.args = args
+            state.lock = threading.RLock()
+            state._series_build_lock = threading.Lock()
+            state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
+            state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
+            state.usage_data = SimpleNamespace(datasets=lambda view: ([], local_quota + supplemental_quota if view == "merged" else local_quota, []))
+            state.last_sample = state.last_error = None
+            state.runtime_state = {}
+            state.wake_event = threading.Event()
+
+            snapshot = state.series_response()
+            previous = snapshot
+            for revision, rows, expected in (
+                ("insert", [{"checkedAt": "2029-12-31T00:00:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": 5}}}], [5.0, 12.0]),
+                ("overwrite", [{"checkedAt": "2029-12-31T00:00:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": 8}}}], [8.0, 12.0]),
+                ("delete", [], [12.0]),
+            ):
+                supplemental_quota[:] = rows
+                args.usage_sync_cache.write_text(json.dumps({"cloud": revision}), encoding="utf-8")
+                state._signal_dashboard_cache("cloud")
+                update = state.series_response(previous["streamId"], previous["includedIndex"], previous["mergedRevision"])
+                self.assertEqual(update["mode"], "update")
+                self.assertEqual(update["includedIndex"], snapshot["includedIndex"])
+                self.assertEqual(update["batches"], [])
+                self.assertNotEqual(update["mergedRevision"], previous["mergedRevision"])
+                self.assertEqual([point["fiveHour"]["raw"] for point in update["mergedSnapshot"]["quotaPoints"]], expected)
+                self.assertEqual([point["fiveHour"]["raw"] for point in state._series_views["local"]["quotaPoints"]], [12.0])
+                previous = update
+
+    def test_dashboard_series_falls_back_to_snapshot_for_stream_mismatch_or_journal_gap(self):
+        state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
+        state.lock = threading.RLock()
+        state._series_stream_id = "current-stream"
+        state._series_index = 2
+        state._series_journal = monitor_dashboard.deque([{"index": 2, "createdAt": monitor_dashboard.time.time(), "local": {}, "merged": {}, "bytes": 1}])
+        state._series_journal_bytes = 1
+        state._series_views = {"local": monitor_dashboard.dashboard_transfer_view(None), "merged": monitor_dashboard.dashboard_transfer_view(None)}
+        state._series_initialized = True
+        state._merged_revision = "merged-current"
+        state._dashboard_cache_reasons = set()
+        status = {"revision": "status"}
+
+        with mock.patch.object(state, "refresh_dashboard_cache"), mock.patch.object(state, "status_payload", return_value=status):
+            wrong_stream = state.series_response("old-stream", 2, "merged-current")
+            journal_gap = state.series_response("current-stream", 0, "merged-current")
+
+        self.assertEqual(wrong_stream["mode"], "snapshot")
+        self.assertEqual(journal_gap["mode"], "snapshot")
+        self.assertEqual(journal_gap["includedIndex"], 2)
 
     def test_dashboard_display_tiers_keep_recent_points_and_compact_older_points(self):
         now = 100 * 24 * 60 * 60
@@ -3832,6 +4035,18 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(compacted[1]["mergedFrom"], events[1]["checkedAt"])
         self.assertEqual(compacted[1]["mergedTo"], events[-1]["checkedAt"])
 
+    def test_dashboard_next_maintenance_at_uses_hour_resolution(self):
+        hour = monitor_dashboard.HOUR_MULTIPLIER
+        now = 100 * hour + 30 * 60 + 12
+        timestamp = now - monitor_dashboard.QUOTA_HISTORY_DISPLAY_FULL_SECONDS + 15 * 60
+        next_maintenance = monitor_dashboard._dashboard_display_next_maintenance_at(
+            [{"timestamp": timestamp}], {"fiveHour": [], "sevenDay": []}, now,
+        )
+
+        self.assertEqual(next_maintenance, (int(now / hour) + 1) * hour)
+        self.assertEqual(next_maintenance % hour, 0)
+        self.assertGreater(next_maintenance, now)
+
     def test_dashboard_display_cache_round_trips_and_expires_at_next_tier(self):
         with self.account_directory() as directory:
             path = directory / "dashboard-cache.json"
@@ -3870,9 +4085,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             self.assertTrue(state.refresh_dashboard_cache(now=2000000000.0))
             with mock.patch.object(state.usage_data, "datasets", side_effect=AssertionError("persistent cache should avoid dataset loading")):
-                payload, _, _ = state.cached_series_response()
+                payload = state.series_response()
 
-            self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 12.0)
+            self.assertEqual(payload["views"]["local"]["quotaPoints"][0]["fiveHour"]["raw"], 12.0)
             self.assertTrue(args.dashboard_cache.exists())
 
     def test_dashboard_exposes_independent_local_and_merged_data_views(self):
@@ -3881,26 +4096,20 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertIn('<button data-data-view="local">Local</button><button data-data-view="merged">Merged</button>', html)
         self.assertIn('dataView="merged"', html)
-        self.assertIn('fetch(`/api/series?view=${encodeURIComponent(view)}`', html)
-        self.assertIn('vscode.postMessage({type:"getCodexUsageSeries",view})', html)
+        self.assertIn('fetch(`/api/series${query}`', html)
+        self.assertIn('vscode.postMessage({type:"getCodexUsageSeries",cursor})', html)
         self.assertIn('button.classList.toggle("active",button.dataset.dataView===dataView)', html)
-        self.assertIn('async getSeries(view = "local")', extension)
-        self.assertIn('url.searchParams.set("view", view)', extension)
-        self.assertIn('target.webview.postMessage({ type: "codexUsageSeries", view, payload: await monitor.getSeries(view) })', extension)
+        self.assertIn('async getSeries(cursor = {})', extension)
+        self.assertIn('["streamId", "includedIndex", "mergedRevision"]', extension)
+        self.assertIn('target.webview.postMessage({ type: "codexUsageSeries", payload: await monitor.getSeries(message.cursor || {}) })', extension)
+        self.assertNotIn('searchParams.set("view"', extension)
 
     def test_dashboard_local_view_uses_only_local_quota_tokens_and_cost(self):
         local_quota = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}
         merged_quota = {"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 2}}}
         local_session = {"sessionId": "local", "tokens": {}, "byModel": {}}
-        state = SimpleNamespace(
-            usage_data=SimpleNamespace(datasets=lambda view: ([], [merged_quota], [{"sessionId": "merged", "tokens": {}, "byModel": {}}]) if view == "merged" else ([], [local_quota], [local_session])),
-            state=lambda: {}, accounts=SimpleNamespace(status=lambda: {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]}), last_sample=None,
-        )
+        payload = monitor_dashboard._dashboard_display_data([], [local_quota], [local_session], {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]})
 
-        payload = monitor_dashboard.dashboard_series_payload(SimpleNamespace(history=Path("history.jsonl")), state, "local")
-
-        self.assertEqual(payload["dataView"], "local")
-        self.assertEqual(payload["quotaDataView"], "local")
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 1)
         self.assertEqual(payload["tokenSessions"][0]["sessionId"], "local")
         self.assertNotIn("<span class=\"rate\">Merged</span>", dashboard_html())
@@ -3910,7 +4119,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = dashboard_html()
         manifest = json.loads(Path(__file__).with_name("package.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["version"], "1.2.0")
+        self.assertEqual(manifest["version"], "1.3.0")
         self.assertIn('const DASHBOARD_URL = new URL("http://127.0.0.1:8765/")', extension)
         self.assertIn("PAGE_ALLOWLIST", extension)
         self.assertIn('asset: "dashboard.html"', extension)
@@ -3924,11 +4133,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('const ACCOUNT_ACTION_TIMEOUT_MS = 300000', extension)
         self.assertIn('timeoutMs: ACCOUNT_ACTION_TIMEOUT_MS', extension)
         self.assertIn('STATUS_API_URL = new URL("http://127.0.0.1:8765/api/status")', extension)
-        self.assertIn("const display = (await this.getStatus()).display || {}", extension)
-        self.assertIn("if (error.statusCode === 404) return this.getSeries()", extension)
+        self.assertIn("const status = await this.getStatus()", extension)
+        self.assertNotIn("if (error.statusCode === 404) return this.getSeries()", extension)
         self.assertIn('message.type === "getCodexUsageStatus"', extension)
-        self.assertIn('fetch("/api/status",{cache:"no-store"})', html)
-        self.assertIn("if(currentSeriesRevision===null||status.seriesRevision!==currentSeriesRevision)await load(true)", html)
+        self.assertIn('fetch("/api/status",{cache:"no-store",headers:statusEtag?', html)
+        self.assertIn('status.newestIndex>includedIndex||status.mergedRevision!==mergedRevision', html)
         self.assertIn("setInterval(pollStatus,5000)", html)
         self.assertIn('addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}})', html)
         self.assertNotIn("setInterval(load,5000)", html)
@@ -3937,7 +4146,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("lastTooltipRevision", extension)
         self.assertIn("const TOOLTIP_HOVER_DELAY_SECONDS = 3", extension)
         self.assertIn("Math.floor((Date.now() - timestamp) / 1000) + TOOLTIP_HOVER_DELAY_SECONDS", extension)
-        self.assertIn("const tooltip = stableTooltip(display)", extension)
+        self.assertIn("const tooltip = stableTooltip(status)", extension)
         self.assertIn("if (tooltip !== this.lastTooltip)", extension)
         self.assertIn('`Last update ${secondsAgo(display.percentCheckedAt)}`', extension)
 
@@ -4003,23 +4212,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_all_slow_cloud_actions_have_progress_messages(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        for path, action in (("/cloud/test", "WebDAV Test"), ("/cloud/push", "Push"), ("/cloud/fetch", "Fetch"), ("/cloud/overwrite", "Cloud Overwrite"), ("/cloud/restore", "Restore"), ("/accounts/bind", "Bind"), ("/accounts/release", "Release"), ("/accounts/share", "Share"), ("/accounts/delete-remote", "Delete Remote"), ("/skills/unmanage", "Unmanage")):
+        for path, action in (("/cloud/test", "WebDAV Test"), ("/cloud/push", "Push"), ("/cloud/push-all", "Push All"), ("/cloud/fetch", "Fetch"), ("/cloud/fetch-all", "Fetch All"), ("/cloud/overwrite", "Cloud Overwrite"), ("/cloud/restore", "Restore"), ("/accounts/bind", "Bind"), ("/accounts/link", "Link"), ("/accounts/release", "Release"), ("/accounts/share", "Share"), ("/accounts/delete-remote", "Delete Remote"), ("/skills/unmanage", "Unmanage")):
             self.assertIn(f'path.endsWith("{path}")?{{name:"{action}"', html)
 
-        for title in ("Cloud Data Overwritten", "The API account is now shared through WebDAV.", "The account was deleted from WebDAV."):
+        for title in ("Cloud Data Overwritten", "The API account is available locally and in WebDAV.", "The account was deleted from WebDAV."):
             self.assertIn(title, html)
-        self.assertIn('showMessage(`${operation.name} Started`', html)
-        self.assertIn('showMessage(`${operation.name} Failed`', html)
+        self.assertIn('showMessage(`${startOperation.name} Started`', html)
+        self.assertIn('showMessage(`${operation} Failed`', html)
 
     def test_bind_messages_explicitly_cover_start_finished_and_error(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn('path.endsWith("/accounts/bind")?{name:"Bind",message:"Moving the selected cloud account to this machine."', html)
+        self.assertIn('path.endsWith("/accounts/bind")?{name:"Bind",message:"Moving the selected cloud OpenAI account to this machine."', html)
         self.assertIn('`${startOperation.name} Started`', html)
         self.assertIn('"WebDAV Test Passed"', html)
         self.assertIn('`${operation.name} Completed`', html)
         self.assertIn('`${operation} Failed`', html)
-        for step in ("Cloud account download and decryption", "Account identity validation", "Local vault commit", "Cloud payload removal"):
+        for step in ("Cloud account download and decryption", "Credential profile validation", "Local vault commit", "Cloud payload removal"):
             self.assertIn(step, html)
 
     def test_bind_and_release_start_without_browser_confirmation(self):
@@ -4027,13 +4236,15 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertIn('button.onclick=()=>run("/api/manage/accounts/release",{accountId:button.dataset.release})', html)
         self.assertIn('button.onclick=()=>run("/api/manage/accounts/bind",{accountKey:button.dataset.bind})', html)
+        self.assertIn('button.onclick=()=>run("/api/manage/accounts/link",{accountKey:button.dataset.link})', html)
         self.assertNotIn('confirm(button.dataset.local===', html)
         self.assertNotIn('confirm("Copy this account to this machine', html)
 
     def test_manual_push_reports_noop_and_lists_changed_items_in_detail(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn('showMessage("Push Completed"', html)
+        self.assertIn('name=full?"Push All":"Push"', html)
+        self.assertIn('showMessage(`${name} Completed`', html)
         self.assertIn('"Cloud skills and recorded usage were already current."', html)
         self.assertIn('`Added skills:\\n${added.map(name=>`- ${name}`).join("\\n")}`', html)
         self.assertIn('`Updated skills:\\n${updated.map(name=>`- ${name}`).join("\\n")}`', html)
@@ -4366,20 +4577,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_dashboard_series_returns_quota_points_for_all_accounts(self):
         accounts = {"awaitingLogin": False, "activeAccountId": "account-a", "items": [{"id": "account-a", "label": "Account A"}, {"id": "account-b", "label": "Account B"}]}
-        state = SimpleNamespace(
-            history=lambda: [],
-            quota_history=lambda: [
+        quota_history = [
                 {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 12, "resetAt": None, "plan": "plus"}}},
                 {"checkedAt": "2030-01-01T00:01:30Z", "accountSlotId": "account-b", "accountLabel": "Account B", "windows": {"7d": {"usedPercent": 34, "resetAt": None}}, "compaction": {"continuousFrom": "2029-12-31T12:00:00Z", "omittedSamples": 3}},
-            ],
-            state=lambda: {},
-            accounts=SimpleNamespace(status=lambda: accounts),
-            last_error=None,
-            last_sample=None,
-            wake_event=SimpleNamespace(set=lambda: None),
-        )
+            ]
 
-        payload = monitor_dashboard.dashboard_series_payload(SimpleNamespace(history=Path("history.jsonl"), quota_history=Path("quota.jsonl"), state=Path("state.json")), state)
+        payload = monitor_dashboard._dashboard_display_data([], quota_history, [], accounts)
 
         self.assertNotIn("quotaHistoryPath", payload)
         self.assertEqual([point["accountSlotId"] for point in payload["quotaPoints"]], ["account-a", "account-b"])
@@ -4488,11 +4691,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             "remoteUsage": {"rawResponse": {"email": "private@example.test", "account_id": "acct-secret", "user_id": "user-secret"}, "authIdentity": {"account_id": "acct-secret"}},
             "tokenUsage": {"totals": {"requests": 1}},
         }
-        state = SimpleNamespace(
-            history=lambda: [], quota_history=lambda: [], state=lambda: {"lastSample": sample}, accounts=SimpleNamespace(status=lambda: accounts), last_error=None, last_sample=sample, wake_event=SimpleNamespace(set=lambda: None),
-        )
-
-        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard.dashboard_series_payload(SimpleNamespace(history=Path("history.jsonl"), quota_history=Path("quota.jsonl"), state=Path("state.json")), state))
+        payload = monitor_dashboard.dashboard_safe_json({"status": {"sample": monitor_dashboard.dashboard_sample(sample), "accounts": monitor_dashboard.dashboard_account_status(accounts)}, "views": {"local": monitor_dashboard._dashboard_display_data([], [], [], accounts)}})
         serialized = json.dumps(payload)
 
         self.assertIn("Account A", serialized)
@@ -4500,6 +4699,94 @@ class MonitorCodexUsageTests(unittest.TestCase):
         for sensitive in ("private@example.test", "acct-secret", "user-secret", "rawResponse", "authIdentity", "tokenUsage", "rate_limit.primary"):
             self.assertNotIn(sensitive, serialized)
         self.assertEqual(monitor_dashboard.dashboard_safe_json({"password": True, "email": "private@example.test", "tokens": {"refresh_token": "secret"}}), {"password": True})
+
+    def test_dashboard_groups_duplicate_profiles_by_usage_identity_and_last_used_label(self):
+        status = {
+            "activeAccountId": "profile-bbbbb2",
+            "items": [
+                {"id": "profile-aaaaa1", "label": "Primary", "ready": True},
+                {"id": "profile-bbbbb2", "label": "Secondary", "ready": True},
+            ],
+        }
+        projected = monitor_dashboard.dashboard_account_status(status, lambda _account_id: "usage-shared", [
+            {"accountSlotId": "profile-aaaaa1"}, {"accountSlotId": "profile-bbbbb2"},
+        ])
+
+        self.assertEqual(projected["usageGroups"], [{"id": "usage-shared", "label": "Secondary (2)", "profileCount": 2, "isApiAccount": False}])
+        self.assertEqual({account["usageAccountId"] for account in projected["items"]}, {"usage-shared"})
+
+        collided = monitor_dashboard.dashboard_account_status({**status, "items": [{**account, "label": "Shared"} for account in status["items"]]}, lambda _account_id: "usage-shared")
+        self.assertEqual([account["displayLabel"] for account in collided["items"]], ["Shared · aaaaa1", "Shared · bbbbb2"])
+        remote = monitor_dashboard.dashboard_remote_accounts([
+            {"accountKey": "aaaaaa111111", "label": "Shared"}, {"accountKey": "bbbbbb222222", "label": "shared"},
+        ])
+        self.assertEqual([account["displayLabel"] for account in remote], ["Shared · aaaaaa", "shared · bbbbbb"])
+        self.assertTrue(all(account["canBind"] for account in remote))
+
+    def test_management_account_actions_follow_api_identity_and_not_binding_state(self):
+        accounts = SimpleNamespace(
+            status=lambda: {"activeAccountId": "local-api", "items": [{"id": "local-api", "label": "Local API", "ready": True, "active": True, "accountType": "api", "isApiAccount": True, "cloudState": "shared", "accountKey": "legacy-local"}]},
+            api_identity_ids=lambda: {"local-api": "same-api"}, cloud_account_keys=lambda: {"legacy-local"}, config_editor_payload=lambda: {}, attribution_timeline=lambda: [],
+        )
+        cloud = SimpleNamespace(
+            usage_account_id=lambda account_id: account_id, config=lambda: {"server": {"host": "127.0.0.1"}}, editable_config=lambda: {}, redacted_status=lambda: {"webdav": {"enabled": True}},
+            cached_remote_accounts=lambda: [
+                {"accountKey": "remote-api", "label": "Remote API", "accountType": "api", "_apiIdentityId": "same-api", "bindingState": "released"},
+                {"accountKey": "remote-other", "label": "Other API", "accountType": "api", "_apiIdentityId": "other-api"},
+                {"accountKey": "legacy-local", "label": "Normal", "accountType": "account", "bindingState": "bound-local"},
+            ],
+        )
+        state = SimpleNamespace(accounts=accounts, cloud=cloud, skills=SimpleNamespace(status=lambda: {"items": []}, scan=lambda _refresh: []))
+
+        payload = monitor_dashboard.management_payload(state)
+
+        self.assertFalse(payload["accounts"]["items"][0]["canShare"])
+        self.assertEqual([account["canLink"] for account in payload["remoteAccounts"][:2]], [False, True])
+        self.assertFalse(payload["remoteAccounts"][2]["canBind"])
+        serialized = json.dumps(payload)
+        self.assertNotIn("cloudState", serialized)
+        self.assertNotIn("bindingState", serialized)
+        self.assertNotIn("same-api", serialized)
+
+    def test_dashboard_statistics_merge_duplicate_profiles_under_one_usage_account(self):
+        accounts = monitor_dashboard.dashboard_account_status({
+            "activeAccountId": "profile-a",
+            "items": [{"id": "profile-a", "label": "A", "ready": True}, {"id": "profile-b", "label": "B", "ready": True}],
+        }, lambda _account_id: "usage-shared")
+        display = monitor_dashboard._dashboard_display_data(
+            [
+                {"checkedAt": "2030-01-01T00:01:00Z", "window": "5h", "model": "gpt-5", "accountSlotId": "profile-a", "accountLabel": "A", "deltaPercent": 1, "deltaCostUsd": 1, "sync": {"accountId": "usage-shared"}},
+                {"checkedAt": "2030-01-01T00:02:00Z", "window": "5h", "model": "gpt-5", "accountSlotId": "profile-b", "accountLabel": "B", "deltaPercent": 2, "deltaCostUsd": 2, "sync": {"accountId": "usage-shared"}},
+            ],
+            [
+                {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "profile-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 10}}, "sync": {"accountId": "usage-shared"}},
+                {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "profile-b", "accountLabel": "B", "windows": {"7d": {"usedPercent": 20}}, "sync": {"accountId": "usage-shared"}},
+            ],
+            [{"sessionId": "session-b", "accountSlotId": "profile-b", "accountLabel": "B", "sync": {"accountId": "usage-shared"}, "byModel": {}}],
+            accounts,
+            now=1893456000,
+        )
+
+        self.assertEqual(len(display["quotaPoints"]), 1)
+        self.assertEqual((display["quotaPoints"][0]["fiveHour"]["raw"], display["quotaPoints"][0]["sevenDay"]["raw"]), (10.0, 20.0))
+        self.assertEqual({event["usageAccountId"] for event in display["events"]["fiveHour"] if not event.get("synthetic")}, {"usage-shared"})
+        self.assertEqual(display["tokenSessions"][0]["usageAccountId"], "usage-shared")
+        self.assertEqual(monitor_dashboard.dashboard_sample({"sync": {"accountId": "usage-shared"}})["usageAccountId"], "usage-shared")
+
+    def test_switching_duplicate_profiles_reuses_the_newest_shared_quota_status(self):
+        accounts = monitor_dashboard.dashboard_account_status({
+            "activeAccountId": "profile-a",
+            "items": [{"id": "profile-a", "label": "A", "ready": True}, {"id": "profile-b", "label": "B", "ready": True}],
+        }, lambda _account_id: "usage-shared")
+        state = SimpleNamespace(last_sample=None, runtime_state={}, account_statuses={
+            "profile-a": {"checkedAt": "2030-01-01T00:00:00Z", "windows": {"5h": {"usedPercent": 10}}},
+            "profile-b": {"checkedAt": "2030-01-01T00:01:00Z", "windows": {"5h": {"usedPercent": 20}}},
+        })
+
+        status = monitor_dashboard.UsageDashboardState._active_account_status_locked(state, accounts)
+
+        self.assertEqual(status["windows"]["5h"]["usedPercent"], 20)
+        self.assertEqual((status["activeAccountSlotId"], status["accountSlotId"], status["accountLabel"]), ("profile-a", "profile-a", "A"))
 
     def test_management_payload_exposes_only_non_sensitive_status_fields(self):
         state = SimpleNamespace(
@@ -4727,6 +5014,7 @@ if(trailing.length!==1||trailing[0].kind!=="mixed"||Math.abs(1000-trailingScale.
     def test_dashboard_clips_compacted_quota_plateaus_to_selected_time_span(self):
         html = dashboard_html()
         script = html[html.index("function eventTimestamp"):html.index("function updateWindowTime")] + html[html.index("function quotaPointsInRange"):html.index("function sameLocalDate")] + r'''
+const usageAccountId=value=>value.usageAccountId||value.accountSlotId||"unknown";
 const point=(timestamp,compactedFrom=null)=>({checkedAt:new Date(timestamp*1000).toISOString(),timestamp,compactedFrom,accountSlotId:"a",fiveHour:{continuous:5}});
 const timestamps=points=>points.map(eventTimestamp);
 const endpointInside=quotaPointsInRange([point(90),point(180,90)],[100,200]);
@@ -5622,10 +5910,37 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             with mock.patch.object(cloud, "_connection", return_value=(client, box)):
                 result = cloud.delete_account_payloads(key)
 
-            self.assertEqual(result, {"accountKey": key, "deleted": True})
+            self.assertEqual(result, {"accountKey": key, "deleted": True, "alreadyDeleted": False})
             self.assertEqual(client.deleted[0], (f"accounts/states/{key}.enc", '"state-etag"'))
             self.assertIn((f"accounts/revisions/{key}/old.enc", None), client.deleted)
             self.assertIn((f"accounts/revisions/{key}/current.enc", None), client.deleted)
+            self.assertNotIn(key, cloud._state["remote"]["accounts"])
+
+    def test_cloud_account_payload_delete_reports_already_deleted_when_remote_payload_is_missing(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            key = "missing-account-key"
+
+            class Client:
+                def __init__(self):
+                    self.deleted = []
+
+                def get(self, path):
+                    raise CloudError("WebDAV GET failed with HTTP 404", 502)
+
+                def list(self, path):
+                    raise CloudError("WebDAV LIST failed with HTTP 404", 502)
+
+                def delete(self, path, etag=None):
+                    self.deleted.append((path, etag))
+
+            client = Client()
+            cloud._state["remote"]["accounts"][key] = {"state": {"accountKey": key}}
+            with mock.patch.object(cloud, "_connection", return_value=(client, SimpleNamespace())):
+                result = cloud.delete_account_payloads(key)
+
+            self.assertEqual(result, {"accountKey": key, "deleted": True, "alreadyDeleted": True})
+            self.assertEqual(client.deleted, [(f"accounts/revisions/{key}", None)])
             self.assertNotIn(key, cloud._state["remote"]["accounts"])
 
     def test_skill_upload_removes_only_preexisting_unreferenced_packages(self):
@@ -6025,6 +6340,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertNotIn('Config:', html)
         self.assertIn('<button data-action="cloud-fetch">Fetch</button>', html)
         self.assertIn('<button id="pushButton" data-action="cloud-push" class="primary">Push</button>', html)
+        self.assertIn('<button data-action="cloud-push-all">Push All</button>', html)
+        self.assertIn('<button data-action="cloud-fetch-all">Fetch All</button>', html)
         self.assertIn('pushWarning?"Push (!)":"Push"', html)
         self.assertIn('showMessage("Automatic Push Failed",`Automatic skill upload failed: ${failure.message}`', html)
         self.assertIn('{name:"Cloud upload",status:"failed",detail:failure.message}', html)
@@ -6042,16 +6359,29 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertNotIn('data-action="scan"', html)
         self.assertIn('setInterval(()=>load(false,true),5000)', html)
         self.assertIn('run("/api/manage/cloud/fetch")', html)
+        self.assertIn('run("/api/manage/cloud/fetch-all")', html)
         self.assertIn('run("/api/manage/cloud/push")', html)
+        self.assertIn('run("/api/manage/cloud/push-all")', html)
+        self.assertIn('run("/api/manage/accounts/link",{accountKey:button.dataset.link})', html)
+        self.assertIn('Remote Account Already Deleted', html)
+        self.assertIn('result.alreadyDeleted', html)
         self.assertIn('run("/api/accounts/delete",{accountId:button.dataset.delete})', html)
         self.assertIn('${account.active?"disabled":""}>Switch</button>', html)
         self.assertIn('"/api/manage/cloud/fetch"', extension)
+        self.assertIn('"/api/manage/cloud/fetch-all"', extension)
         self.assertIn('"/api/manage/cloud/push"', extension)
+        self.assertIn('"/api/manage/cloud/push-all"', extension)
+        self.assertIn('"/api/manage/accounts/link"', extension)
         self.assertIn('["/api/manage/accounts/delete", { url: ACCOUNT_DELETE_URL, method: "POST" }]', extension)
         self.assertIn('elif path == "/api/manage/cloud/fetch":', dashboard)
+        self.assertIn('elif path == "/api/manage/cloud/fetch-all":', dashboard)
         self.assertIn('elif path == "/api/manage/cloud/push":', dashboard)
+        self.assertIn('elif path == "/api/manage/cloud/push-all":', dashboard)
+        self.assertIn('state.cloud.fetch(include_usage=True)', dashboard)
+        self.assertIn('state.cloud.push()', dashboard)
         self.assertIn('state.cloud.fetch(include_usage=True, force_full=True)', dashboard)
         self.assertIn('state.cloud.push(force_full=True)', dashboard)
+        self.assertIn('elif path == "/api/manage/accounts/link":', dashboard)
         self.assertIn('elif path == "/api/manage/accounts/delete":', dashboard)
         self.assertNotIn('/api/manage/cloud/upload', html + extension + dashboard)
         self.assertNotIn('/api/manage/accounts/backup-all', html + extension + dashboard)
@@ -6375,7 +6705,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertIn('await requestControlPassword(true)', dashboard)
         self.assertIn('password=await requestControlPassword(setup)', dashboard)
         self.assertNotIn('prompt("Control password")', dashboard)
-        self.assertIn('load(true);pollStatus(true);setInterval(pollStatus,5000)', dashboard)
+        self.assertIn('load(true);setInterval(pollStatus,5000)', dashboard)
 
     def test_initial_control_password_setup_is_loopback_only(self):
         self.assertTrue(monitor_dashboard.client_host_is_loopback("127.0.0.1"))
@@ -6541,7 +6871,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
             fetch.assert_not_called()
 
-    def test_account_binding_blocks_matching_local_identity_and_keeps_cloud_payload(self):
+    def test_account_binding_allows_matching_normal_identity_as_a_separate_profile(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             data = json.dumps(self.account_auth("acct-a", "remote-refresh")).encode()
@@ -6553,15 +6883,225 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 bind_account=mock.Mock(return_value=({"accountKey": "key-a", "accountId": "acct-a", "label": "A"}, data, '"etag"'))
             )
 
+            status = manager.bind_cloud_account(cloud, "key-a")
+
+            bound_record = manager._find_cloud_key("key-a")
+            bound = next(account for account in status["items"] if account["id"] == bound_record["id"])
+            self.assertNotEqual(bound["id"], "ppl-pro")
+            self.assertEqual(manager._find(bound["id"])["identity"]["accountId"], "acct-a")
+            self.assertEqual(json.loads(manager._account_path(bound["id"]).read_text(encoding="utf-8"))["tokens"]["refresh_token"], "remote-refresh")
+            cloud.delete_account_payloads.assert_called_once_with("key-a", '"etag"')
+            cloud.clear_account_transition.assert_called_once_with()
+            self.assertNotIn("state", manager.active_account()["cloud"])
+            self.assertEqual(auth_path.read_bytes(), local_data)
+
+    def test_account_binding_still_blocks_a_duplicate_api_key(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            cloud = SimpleNamespace(
+                begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), machine_id="machine", delete_account_payloads=mock.Mock(),
+                bind_account=mock.Mock(return_value=({"accountKey": "key-api", "accountType": "api", "label": "API"}, auth_path.read_bytes(), '"etag"')),
+            )
+
+            with self.assertRaises(AccountError) as raised:
+                manager.bind_cloud_account(cloud, "key-api")
+
+            self.assertEqual(raised.exception.status, 409)
+            self.assertIn("already linked as Current account", str(raised.exception))
+            cloud.begin_account_transition.assert_not_called()
+            cloud.delete_account_payloads.assert_not_called()
+
+    def test_api_share_copies_profile_and_retains_local_credentials(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
+            auth_path.write_bytes(data)
+            manager = AccountManager(auth_path)
+            manager.active_account()["label"] = "API profile"
+            manager.active_account()["configHeaderToml"] = 'model_provider = "custom"\n'
+            identity = auth_identity(parse_auth_bytes(data))
+            cloud = SimpleNamespace(
+                find_remote_api_accounts=mock.Mock(return_value=[]), api_account_key=mock.Mock(return_value=api_identity_id(identity)), release_account=mock.Mock(return_value={}),
+            )
+
+            status = manager.share_cloud_account(cloud, "ppl-pro")
+
+            self.assertTrue(auth_path.exists())
+            self.assertTrue(manager._account_path("ppl-pro").exists())
+            self.assertEqual(status["activeAccountId"], "ppl-pro")
+            cloud.find_remote_api_accounts.assert_called_once_with(api_identity_id(identity))
+            self.assertEqual(cloud.release_account.call_args.args[:4], (api_identity_id(identity), data, identity, "API profile"))
+            self.assertEqual(cloud.release_account.call_args.kwargs["config_header_toml"], 'model_provider = "custom"\n')
+            self.assertTrue(cloud.release_account.call_args.kwargs["reject_existing"])
+            self.assertEqual(manager.active_account()["cloud"], {"accountKey": api_identity_id(identity), "keyType": "api-identity"})
+
+    def test_api_share_rejects_an_existing_remote_identity_without_upload(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            cloud = SimpleNamespace(find_remote_api_accounts=mock.Mock(return_value=[{"accountKey": "legacy-key"}]), release_account=mock.Mock())
+
+            with self.assertRaises(AccountError) as raised:
+                manager.share_cloud_account(cloud, "ppl-pro")
+
+            self.assertEqual(raised.exception.status, 409)
+            self.assertIn("already shared", str(raised.exception))
+            cloud.release_account.assert_not_called()
+
+    def test_api_link_copies_profile_settings_and_retains_remote_payload(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
+            state = {"accountKey": "api-key", "keyType": "api-identity", "accountType": "api", "label": "Remote API", "configHeaderToml": 'model_provider = "custom"\n'}
+            cloud = SimpleNamespace(bind_account=mock.Mock(return_value=(state, data, '"etag"')), cache_remote_account=mock.Mock(), delete_account_payloads=mock.Mock())
+
+            status = manager.link_cloud_account(cloud, "api-key")
+
+            linked = manager._find_cloud_key("api-key")
+            self.assertEqual(next(account for account in status["items"] if account["id"] == linked["id"])["label"], "Remote API")
+            self.assertEqual(linked["configHeaderToml"], 'model_provider = "custom"\n')
+            self.assertEqual(manager._account_path(linked["id"]).read_bytes(), data)
+            cloud.cache_remote_account.assert_called_once_with(state, '"etag"', data)
+            cloud.delete_account_payloads.assert_not_called()
+
+    def test_legacy_bind_dispatches_an_api_account_to_non_destructive_link(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
+            state = {"accountKey": "legacy-api", "accountType": "api", "label": "API"}
+            cloud = SimpleNamespace(bind_account=mock.Mock(return_value=(state, data, '"etag"')), cache_remote_account=mock.Mock(), begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), delete_account_payloads=mock.Mock())
+
+            manager.bind_cloud_account(cloud, "legacy-api")
+
+            self.assertIsNotNone(manager._find_cloud_key("legacy-api"))
+            cloud.begin_account_transition.assert_not_called()
+            cloud.delete_account_payloads.assert_not_called()
+
+    def test_api_link_rejects_a_duplicate_local_key_without_deleting_remote(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            data = auth_path.read_bytes()
+            cloud = SimpleNamespace(bind_account=mock.Mock(return_value=({"accountKey": "legacy-api", "accountType": "api", "label": "API"}, data, '"etag"')), cache_remote_account=mock.Mock(), delete_account_payloads=mock.Mock())
+
+            with self.assertRaises(AccountError) as raised:
+                manager.link_cloud_account(cloud, "legacy-api")
+
+            self.assertEqual(raised.exception.status, 409)
+            self.assertIn("already linked", str(raised.exception))
+            cloud.cache_remote_account.assert_not_called()
+            cloud.delete_account_payloads.assert_not_called()
+
+    def test_account_binding_rejects_an_account_key_already_managed_locally(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.active_account()["cloud"] = {"state": "bound-local", "accountKey": "key-a"}
+            cloud = SimpleNamespace(bind_account=mock.Mock())
+
             with self.assertRaises(AccountError) as raised:
                 manager.bind_cloud_account(cloud, "key-a")
 
             self.assertEqual(raised.exception.status, 409)
-            self.assertIn("already managed as Current account", str(raised.exception))
-            cloud.delete_account_payloads.assert_not_called()
-            cloud.clear_account_transition.assert_called_once_with()
-            self.assertEqual(manager.active_account()["cloud"]["state"], "local-only")
-            self.assertEqual(auth_path.read_bytes(), local_data)
+            cloud.bind_account.assert_not_called()
+
+    def test_account_bind_cleanup_failure_keeps_the_verified_local_profile_and_pending_transition(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "local-refresh")), encoding="utf-8")
+            manager = AccountManager(auth_path)
+            data = json.dumps(self.account_auth("acct-a", "remote-refresh")).encode()
+            cloud = SimpleNamespace(
+                begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), machine_id="machine",
+                delete_account_payloads=mock.Mock(side_effect=CloudError("offline", 502)), bind_account=mock.Mock(return_value=({"accountKey": "key-a", "accountId": "acct-a", "label": "Remote"}, data, '"etag"')),
+            )
+
+            with self.assertRaises(AccountError) as raised:
+                manager.bind_cloud_account(cloud, "key-a")
+
+            bound = manager._find_cloud_key("key-a")
+            self.assertEqual(raised.exception.status, 502)
+            self.assertIn("safely stored locally", str(raised.exception))
+            self.assertIsNotNone(bound)
+            self.assertEqual(manager._account_path(bound["id"]).read_bytes(), data)
+            cloud.begin_account_transition.assert_called_once_with("bind", accountId=bound["id"], accountKey="key-a", revisionId=hashlib.sha256(data).hexdigest(), etag='"etag"')
+            cloud.clear_account_transition.assert_not_called()
+
+    def test_recovered_bind_deletes_only_the_committed_profile_payload(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            data = json.dumps(self.account_auth("acct-a", "refresh-a")).encode()
+            auth_path.write_bytes(data)
+            manager = AccountManager(auth_path)
+            manager.active_account()["cloud"] = {"state": "bound-local", "accountKey": "profile-key", "keyType": "opaque", "boundMachineId": "machine"}
+            manager._save_manifest()
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
+            cloud._state["pendingAccountOperation"] = {"operation": "bind", "accountId": "ppl-pro", "accountKey": "profile-key", "revisionId": hashlib.sha256(data).hexdigest(), "etag": '"etag"'}
+
+            with mock.patch.object(cloud, "delete_account_payloads", return_value={"deleted": True}) as delete:
+                self.assertEqual(cloud.recover_account_transition(), "bind")
+
+            delete.assert_called_once_with("profile-key", '"etag"')
+            self.assertIsNone(cloud._state["pendingAccountOperation"])
+
+    def test_recovered_legacy_api_bind_preserves_both_verified_copies(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
+            auth_path.write_bytes(data)
+            manager = AccountManager(auth_path)
+            manager.active_account()["cloud"] = {"accountKey": "legacy-api", "keyType": "opaque"}
+            manager._save_manifest()
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
+            state = {"version": 1, "accountKey": "legacy-api", "accountType": "api", "revisionId": hashlib.sha256(data).hexdigest()}
+            cloud._state["pendingAccountOperation"] = {"operation": "bind", "accountId": "ppl-pro", "accountKey": "legacy-api", "revisionId": hashlib.sha256(data).hexdigest(), "etag": '"etag"'}
+
+            with mock.patch.object(cloud, "bind_account", return_value=(state, data, '"etag"')), mock.patch.object(cloud, "delete_account_payloads") as delete, mock.patch.object(cloud, "release_account") as release, mock.patch.object(cloud, "_cache_remote_account"):
+                self.assertEqual(cloud.recover_account_transition(), "bind")
+
+            delete.assert_not_called()
+            release.assert_not_called()
+            self.assertTrue(manager._account_path("ppl-pro").exists())
+            self.assertIsNone(cloud._state["pendingAccountOperation"])
+
+    def test_recovered_legacy_api_bind_restores_a_cloud_copy_if_old_cleanup_deleted_it(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
+            auth_path.write_bytes(data)
+            manager = AccountManager(auth_path)
+            manager.active_account()["cloud"] = {"accountKey": "legacy-api", "keyType": "opaque"}
+            manager._save_manifest()
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
+            cloud._state["pendingAccountOperation"] = {"operation": "bind", "accountId": "ppl-pro", "accountKey": "legacy-api", "revisionId": hashlib.sha256(data).hexdigest(), "etag": '"etag"'}
+
+            with mock.patch.object(cloud, "bind_account", side_effect=CloudError("WebDAV GET failed with HTTP 404", 502)), mock.patch.object(cloud, "release_account", return_value={}) as release, mock.patch.object(cloud, "delete_account_payloads") as delete:
+                self.assertEqual(cloud.recover_account_transition(), "bind")
+
+            delete.assert_not_called()
+            self.assertEqual(release.call_args.args[:4], ("legacy-api", data, auth_identity(parse_auth_bytes(data)), "Current account"))
+            self.assertEqual(release.call_args.kwargs["account_type"], "api")
+            self.assertIsNone(cloud._state["pendingAccountOperation"])
+
+    def test_recovered_precommit_bind_reuses_the_recorded_local_slot(self):
+        with self.account_directory() as directory:
+            accounts = SimpleNamespace(lock=threading.RLock(), manifest={"accounts": []}, bind_cloud_account=mock.Mock())
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), accounts)
+            cloud._state["pendingAccountOperation"] = {"operation": "bind", "accountId": "intended-slot", "accountKey": "profile-key", "revisionId": "revision", "etag": '"etag"'}
+
+            self.assertEqual(cloud.recover_account_transition(), "bind")
+
+            accounts.bind_cloud_account.assert_called_once_with(cloud, "profile-key", record_transition=False, intended_account_id="intended-slot")
+            self.assertIsNone(cloud._state["pendingAccountOperation"])
 
     def test_usage_sync_identity_uses_id_token_hash_and_ignores_managed_label(self):
         with self.account_directory() as directory:
@@ -6639,10 +7179,67 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             upload.assert_called_once_with(client, box, key, auth_data, identity, "opaque")
             state = json.loads(client.put.call_args.args[1])
             self.assertEqual(state["accountId"], "acct-a")
-            self.assertIsNone(state["boundMachineId"])
+            self.assertNotIn("boundMachineId", state)
             self.assertTrue(client.put.call_args.kwargs["create"])
             cache.assert_called_once_with(state, '"etag"')
             self.assertEqual(result["accountKey"], key)
+
+    def test_cloud_api_account_key_is_deterministic_and_domain_separated(self):
+        first = auth_identity({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-first"})
+        second = auth_identity({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-second"})
+
+        self.assertEqual(CloudManager.api_account_key(first), CloudManager.api_account_key(first))
+        self.assertNotEqual(CloudManager.api_account_key(first), api_identity_id(first))
+        self.assertNotEqual(CloudManager.api_account_key(first), CloudManager.api_account_key(second))
+
+    def test_cloud_api_share_writes_opaque_identity_and_rejects_existing_copy(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            auth_data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
+            identity = auth_identity(parse_auth_bytes(auth_data))
+            identity_id = api_identity_id(identity)
+            client = SimpleNamespace(ensure_directories=mock.Mock(), put=mock.Mock(return_value='"etag"'))
+            box = SimpleNamespace(encrypt=lambda _purpose, payload: payload)
+            verified = {"version": 1, "accountKey": identity_id, "accountId": None, "accountType": "api", "apiIdentityId": identity_id, "revisionId": hashlib.sha256(auth_data).hexdigest()}
+
+            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision"), mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account"):
+                cloud.release_account(identity_id, auth_data, identity, "API", account_type="api", reject_existing=True)
+
+            state = json.loads(client.put.call_args.args[1])
+            self.assertEqual(state["apiIdentityId"], identity_id)
+            self.assertNotIn("OPENAI_API_KEY", json.dumps(state))
+            self.assertNotIn("boundMachineId", state)
+
+            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", return_value=(state, '"etag"')), mock.patch.object(cloud, "_download_account_revision_with", return_value=auth_data):
+                with self.assertRaises(CloudError) as raised:
+                    cloud.release_account(identity_id, auth_data, identity, "API", account_type="api", reject_existing=True)
+
+            self.assertEqual(raised.exception.status, 409)
+            self.assertIn("already shared", str(raised.exception))
+
+    def test_cloud_finds_legacy_api_identity_without_exposing_the_key(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            auth_data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
+            identity_id = api_identity_id(auth_identity(parse_auth_bytes(auth_data)))
+            state = {"version": 1, "accountKey": "legacy-random", "accountType": "api", "revisionId": hashlib.sha256(auth_data).hexdigest()}
+
+            with mock.patch.object(cloud, "list_accounts", return_value=[state]), mock.patch.object(cloud, "bind_account", return_value=(state, auth_data, '"etag"')), mock.patch.object(cloud, "_cache_remote_account") as cache:
+                matches = cloud.find_remote_api_accounts(identity_id)
+
+            self.assertEqual(matches, [state])
+            self.assertEqual(cache.call_args.args[0]["_apiIdentityId"], identity_id)
+            self.assertNotIn("sk-api", json.dumps(cache.call_args.args[0]))
+
+    def test_api_share_identity_scan_removes_stale_remote_cache_entries(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            cloud._state["remote"]["accounts"]["deleted-api"] = {"etag": '"old"', "state": {"accountKey": "deleted-api", "accountType": "api", "_apiIdentityId": "old"}}
+
+            with mock.patch.object(cloud, "list_accounts", return_value=[]):
+                self.assertEqual(cloud.find_remote_api_accounts("wanted"), [])
+
+            self.assertEqual(cloud.cached_remote_accounts(), [])
 
     def test_cloud_release_accepts_empty_opaque_account(self):
         with self.account_directory() as directory:
@@ -6705,7 +7302,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             manager = AccountManager(auth_path)
             manifest = json.loads(manager.manifest_path.read_text(encoding="utf-8"))
             manifest["version"] = 1
-            manifest.pop("cloudBindingEnabled")
+            manifest.pop("cloudBindingEnabled", None)
             for account in manifest["accounts"]:
                 account.pop("cloud")
             manager.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
@@ -6713,7 +7310,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             migrated = AccountManager(auth_path)
 
             self.assertEqual(migrated.manifest["version"], 3)
-            self.assertFalse(migrated.manifest["cloudBindingEnabled"])
+            self.assertNotIn("cloudBindingEnabled", migrated.manifest)
             self.assertEqual(migrated.active_account()["sessionRefresh"], {"fiveHour": {"enabled": False, "windowsUtc": []}, "sevenDay": {"enabled": False}})
             self.assertEqual(migrated.active_account()["identity"]["idTokenHash"], hashlib.sha256(b"id-acct-a").hexdigest())
             self.assertEqual((migrated.root / "ppl-pro" / "auth.json").read_bytes(), auth)
@@ -6865,6 +7462,27 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
         self.assertEqual(merged[0]["tokens"]["totalTokens"], 120)
         self.assertEqual(conflicts, [])
+
+    def test_usage_store_combines_same_session_segments_from_duplicate_profiles(self):
+        with self.account_directory() as directory:
+            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
+            history.write_text("", encoding="utf-8")
+            quota.write_text("", encoding="utf-8")
+            monitor_history.write_token_session_history(tokens, [
+                {"sessionId": "shared-session", "startedAt": "2030-01-01T00:00:00Z", "updatedAt": "2030-01-01T00:01:00Z", "accountSlotId": "profile-a", "accountLabel": "A", "tokens": {"inputTokens": 10}, "cost": {"totalCostUsd": 1}, "byModel": {"gpt-5": {"tokens": {"inputTokens": 10}, "cost": {"totalCostUsd": 1}}}},
+                {"sessionId": "shared-session", "startedAt": "2030-01-01T00:02:00Z", "updatedAt": "2030-01-01T00:03:00Z", "accountSlotId": "profile-b", "accountLabel": "B", "tokens": {"inputTokens": 20}, "cost": {"totalCostUsd": 2}, "byModel": {"gpt-5": {"tokens": {"inputTokens": 20}, "cost": {"totalCostUsd": 2}}}},
+            ])
+            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _slot: "usage-shared", threading.Lock())
+
+            local = store.normalize_local()[2]
+            merged = store.datasets("merged")[2]
+            records, _ = store.snapshot()
+
+            self.assertEqual(len(local), 1)
+            self.assertEqual(len(merged), 1)
+            self.assertEqual((local[0]["tokens"]["totalTokens"], local[0]["cost"]["totalCostUsd"]), (30, 3))
+            self.assertEqual(local[0]["byModel"]["gpt-5"]["tokens"]["totalTokens"], 30)
+            self.assertEqual([record["row"]["sync"]["accountId"] for record in records.values() if record["kind"] == "token"], ["usage-shared"])
 
     def test_usage_sync_keeps_same_session_separate_for_normal_and_api_accounts(self):
         with self.account_directory() as directory:

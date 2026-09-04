@@ -163,8 +163,8 @@ const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null;
 const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
 const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections";
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
-let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],events:{fiveHour:[],sevenDay:[]}};
-let pendingStatusRequest=null, pendingSeriesRequests=new Map(), currentSeriesRevision=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
+let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],events:{fiveHour:[],sevenDay:[]}}, viewPayloads={local:null,merged:null};
+let pendingStatusRequest=null, pendingSeriesRequest=null, streamId=null, includedIndex=-1, mergedRevision=null, statusEtag=null, currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
 const DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50, DATE_PICKER_VIRTUAL_WIDTH=280, DATE_PICKER_VIRTUAL_HEIGHT=360, DATE_PICKER_VIRTUAL_PADDING=8;
@@ -179,6 +179,7 @@ const tokenFmt=n=>{
 const usd=n=>n==null?"N/A":`$${new Intl.NumberFormat(undefined,{minimumFractionDigits:0,maximumFractionDigits:2}).format(Number(n))}`;
 const pct=n=>n==null?"N/A":`${Math.round(n)}%`;
 const secondsAgo=value=>{const timestamp=Date.parse(value||"");return Number.isFinite(timestamp)?`${Math.max(0,Math.floor((Date.now()-timestamp)/1000))}s ago`:"N/A"};
+const remainingTime=value=>{const seconds=Math.max(0,Math.floor((Date.parse(value||"")-Date.now())/1000));if(!Number.isFinite(seconds))return "N/A";const days=Math.floor(seconds/86400),hours=Math.floor(seconds%86400/3600),minutes=Math.floor(seconds%3600/60);return days?`${days}d ${hours}h`:hours?`${hours}h ${minutes}m`:`${minutes}m`};
 const chartEaseInOut=progress=>(1-Math.cos(Math.PI*progress))/2;
 const chartStates={}, usageTimeChartStates={}, NODE_RADIUS=5, CHART_MARGINS={l:48,r:18,t:16,b:34};
 function showMessage(title,summary,details=summary,type="info"){
@@ -215,13 +216,9 @@ function eventTimestamp(p){
 }
 function updateWindowTime(id,display,resetAt,durationSeconds){
   const resetMs=Date.parse(resetAt||""), fill=document.getElementById(`${id}Fill`), value=document.getElementById(`${id}Value`), reset=document.getElementById(`${id}Reset`);
-  if(Number.isFinite(display?.timePercent)){
-    const elapsed=Math.max(0,Math.min(100,display.timePercent));
-    fill.style.width=`${elapsed}%`;value.textContent=display.timeText;reset.textContent=`Reset: ${display.resetText}`;return;
-  }
-  if(!Number.isFinite(resetMs)){fill.style.width="0%";value.textContent="N/A";reset.textContent="Reset: N/A";return}
-  const elapsed=Math.max(0,Math.min(100,(1-(resetMs-Date.now())/(durationSeconds*1000))*100));
-  fill.style.width=`${elapsed}%`;value.textContent=`${elapsed.toFixed(1)}%`;reset.textContent=`Reset: ${new Date(resetMs).toLocaleString()}`;
+  if(Number.isFinite(resetMs)){const elapsed=Math.max(0,Math.min(100,(1-(resetMs-Date.now())/(durationSeconds*1000))*100));fill.style.width=`${elapsed}%`;value.textContent=`${elapsed.toFixed(1)}%`;reset.textContent=`Reset: ${new Date(resetMs).toLocaleString()} (${remainingTime(resetAt)} remaining)`;return}
+  if(Number.isFinite(display?.timePercent)){const elapsed=Math.max(0,Math.min(100,display.timePercent));fill.style.width=`${elapsed}%`;value.textContent=display.timeText;reset.textContent=`Reset: ${display.resetText}`;return}
+  fill.style.width="0%";value.textContent="N/A";reset.textContent="Reset: N/A";
 }
 function updateUsageProgress(id,percent){
   const fill=document.getElementById(`${id}Fill`), value=document.getElementById(`${id}Value`);
@@ -363,12 +360,16 @@ function modelFilteredEvents(list){
   return selectedModels.size?list.filter(p=>p.synthetic||selectedModels.has(p.model)):list;
 }
 function accountDisplayName(accountId,fallback){
-  return ((payload.accounts||{}).items||[]).find(account=>account.id===accountId)?.label||fallback||"Unknown";
+  return ((payload.accounts||{}).usageGroups||[]).find(account=>account.id===accountId)?.label||((payload.accounts||{}).items||[]).find(account=>account.id===accountId)?.displayLabel||fallback||"Unknown";
+}
+function usageAccountId(value){
+  return value.usageAccountId||((payload.accounts||{}).items||[]).find(account=>account.id===value.accountSlotId)?.usageAccountId||value.accountSlotId||"unknown";
 }
 function updateAccountControls(events){
   events=[...events,...visibleTokenSessions];
   const available=new Map();
-  events.filter(p=>!p.synthetic).forEach(p=>available.set(p.accountSlotId||"unknown",accountDisplayName(p.accountSlotId,p.accountLabel)));
+  events.filter(p=>!p.synthetic).forEach(p=>available.set(usageAccountId(p),accountDisplayName(usageAccountId(p),p.accountLabel)));
+  selectedAccounts=new Set([...selectedAccounts].map(accountId=>((payload.accounts||{}).items||[]).find(account=>account.id===accountId)?.usageAccountId||accountId));
   selectedAccounts=new Set([...selectedAccounts].filter(accountId=>available.has(accountId)));
   const container=document.getElementById("eventAccounts");container.replaceChildren();
   const addButton=(label,accountId,active)=>{
@@ -380,10 +381,10 @@ function updateAccountControls(events){
   [...available].sort((a,b)=>a[1].localeCompare(b[1],undefined,{numeric:true})).forEach(([accountId,label])=>addButton(label,accountId,selectedAccounts.has(accountId)));
 }
 function accountFilteredEvents(list){
-  return selectedAccounts.size?list.filter(p=>p.synthetic||selectedAccounts.has(p.accountSlotId||"unknown")):list;
+  return selectedAccounts.size?list.filter(p=>p.synthetic||selectedAccounts.has(usageAccountId(p))):list;
 }
 function accountFilteredQuotaPoints(list){
-  return selectedAccounts.size?list.filter(point=>selectedAccounts.has(point.accountSlotId||"unknown")):list;
+  return selectedAccounts.size?list.filter(point=>selectedAccounts.has(usageAccountId(point))):list;
 }
 function filteredTokenSessions(list){
   if(selected==="All"||!list.length)return list;
@@ -448,28 +449,29 @@ function setupUsageFoldControls(){
   sync();normalize.onclick=()=>{normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)};
 }
 addEventListener("pointermove",updateDateLeavePointer,{passive:true});
-function requestSeries(view=dataView){
-  if(pendingSeriesRequests.has(view))return pendingSeriesRequests.get(view);
-  const request=!vscode?fetch(`/api/series?view=${encodeURIComponent(view)}`,{cache:"no-store"}).then(response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}):new Promise((resolve,reject)=>{
+function requestSeries(cursor=null){
+  if(pendingSeriesRequest)return pendingSeriesRequest;
+  const query=cursor?`?${new URLSearchParams(cursor)}`:"";
+  const request=!vscode?fetch(`/api/series${query}`,{cache:"no-store"}).then(response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}):new Promise((resolve,reject)=>{
     const receive=event=>{
-      if(event.data?.type!=="codexUsageSeries"||event.data.view!==view)return;
+      if(event.data?.type!=="codexUsageSeries")return;
       removeEventListener("message",receive);clearTimeout(timeout);
       event.data.error?reject(new Error(event.data.error)):resolve(event.data.payload);
     };
     const timeout=setTimeout(()=>{removeEventListener("message",receive);reject(new Error("Python monitor did not respond"))},10000);
     addEventListener("message",receive);
-    vscode.postMessage({type:"getCodexUsageSeries",view});
+    vscode.postMessage({type:"getCodexUsageSeries",cursor});
   });
-  pendingSeriesRequests.set(view,request.finally(()=>pendingSeriesRequests.delete(view)));
-  return pendingSeriesRequests.get(view);
+  pendingSeriesRequest=request.finally(()=>pendingSeriesRequest=null);
+  return pendingSeriesRequest;
 }
 function requestStatus(){
   if(pendingStatusRequest)return pendingStatusRequest;
-  const request=!vscode?fetch("/api/status",{cache:"no-store"}).then(response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}):new Promise((resolve,reject)=>{
+  const request=!vscode?fetch("/api/status",{cache:"no-store",headers:statusEtag?{"If-None-Match":statusEtag}:{}}).then(async response=>{if(response.status===304)return {payload:currentStatus,etag:statusEtag,notModified:true};if(!response.ok)throw new Error(`HTTP ${response.status}`);return {payload:await response.json(),etag:response.headers.get("ETag"),notModified:false}}):new Promise((resolve,reject)=>{
     const receive=event=>{
       if(event.data?.type!=="codexUsageStatus")return;
       removeEventListener("message",receive);clearTimeout(timeout);
-      event.data.error?reject(new Error(event.data.error)):resolve(event.data.payload);
+      event.data.error?reject(new Error(event.data.error)):resolve(event.data.response);
     };
     const timeout=setTimeout(()=>{removeEventListener("message",receive);reject(new Error("Python monitor did not respond"))},10000);
     addEventListener("message",receive);
@@ -532,14 +534,14 @@ async function authenticatedAccountAction(action,body){
 function renderAccounts(accounts){
   accounts=accounts||{items:[]};
   const select=document.getElementById("accountSelect");
-  select.replaceChildren(...(accounts.items||[]).map(account=>{const option=document.createElement("option");option.value=account.id;option.textContent=`${account.label}${account.ready?account.pollError?" (poll failed)":"":" (sign in required)"}`;return option}));
+  select.replaceChildren(...(accounts.items||[]).map(account=>{const option=document.createElement("option");option.value=account.id;option.textContent=`${account.displayLabel||account.label}${account.ready?account.pollError?" (poll failed)":"":" (sign in required)"}`;return option}));
   select.value=accounts.activeAccountId||"";
   const active=(accounts.items||[]).find(account=>account.id===accounts.activeAccountId), detail=document.getElementById("accountDetail"), banner=document.getElementById("accountBanner");
   document.querySelectorAll("[data-quota-widget]").forEach(widget=>widget.hidden=Boolean(active?.isApiAccount));
   detail.textContent="";
   const accountError=accounts.error||"", accountMessage=accounts.message||"", awaitingLogin=Boolean(accounts.awaitingLogin), loginDetail=`${active?.label||"New account"} is waiting for login. Run Codex login in a new or restarted terminal; auth.json will be captured automatically.`;
   if(accountError&&accountError!==lastAccountError)showMessage("Account Action Failed",`The requested account change was not completed: ${accountError}`,messageDetailReport("Account action","Failed",[{name:"Requested account change",status:"failed",detail:accountError}],["The previous account state was preserved when rollback was required."]),"error");
-  if(accountMessage&&accountMessage!==lastAccountMessage)showMessage("Existing Account Update Completed","The detected login belonged to an existing managed account and its saved credentials were refreshed.",messageDetailReport("Pending login adoption","Completed",[{name:"Login identity detection",status:"passed",detail:"The authenticated identity matched an existing managed account."},{name:"Existing credential refresh",status:"passed",detail:accountMessage},{name:"New account slot",status:"skipped",detail:"The new slot remains empty because duplicate authenticated identities are not allowed."}]),"success");
+  if(accountMessage&&accountMessage!==lastAccountMessage)showMessage("Existing API Account Update Completed","The detected API key belonged to an existing managed API profile and its saved credentials were refreshed.",messageDetailReport("Pending login adoption","Completed",[{name:"API identity detection",status:"passed",detail:"The API key matched an existing managed profile."},{name:"Existing credential refresh",status:"passed",detail:accountMessage},{name:"New account slot",status:"skipped",detail:"The new slot remains empty because duplicate API keys are not allowed."}]),"success");
   if(awaitingLogin&&!awaitingLoginMessageShown)showMessage("Codex Login Required","Account preparation completed, but usage polling is paused until sign-in.",messageDetailReport("New account sign-in","Waiting for user",[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was saved before auth.json was removed."},{name:"New account slot",status:"passed",detail:`${active?.label||"The new account"} is ready to receive a login.`},{name:"Codex login",status:"pending",detail:"Run Codex login in a new or restarted terminal; auth.json will be captured automatically."}]),"warning");
   lastAccountError=accountError;lastAccountMessage=accountMessage;awaitingLoginMessageShown=awaitingLogin;banner.classList.remove("error");
   if(awaitingLogin){banner.textContent=loginDetail;banner.style.display="block"}
@@ -553,10 +555,10 @@ async function performAccountAction(action,body){
   actionBusy=true;if(payload.accounts)payload.accounts={...payload.accounts,error:null};renderAccounts(payload.accounts);
   const actionName={switch:"Account Switch",rename:"Account Rename",delete:"Account Delete"}[action],workingDetail={switch:"Saving the outgoing account and activating the selected account.",rename:"Updating the account label and persisted local history.",delete:"Removing the inactive account from this machine."}[action],workingSteps={switch:["Verify and save outgoing credentials","Load selected credentials into auth.json"],rename:["Update the account label","Rewrite matching local history labels"],delete:["Validate that deletion is allowed","Remove local credentials and manifest entry"]}[action],workingMessage=showMessage(`${actionName} Started`,workingDetail,messageDetailReport(actionName,"In progress",workingSteps.map((name,index)=>({name,status:index?"pending":"in progress",detail:index?"Waiting for the preceding step.":"The operation is running."}))),"progress");
   let succeeded=false;
-  try{const result=await authenticatedAccountAction(action,body);payload.accounts=result.accounts||payload.accounts;succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(`${actionName} Completed`,{switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(action,"Completed",steps),"success")}
+  try{const result=await authenticatedAccountAction(action,body);payload.accounts=result.accounts||payload.accounts;if(currentStatus)currentStatus={...currentStatus,accounts:payload.accounts};succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(`${actionName} Completed`,{switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(action,"Completed",steps),"success")}
   catch(error){payload.accounts={...(payload.accounts||{}),error:error.message||String(error)}}
   finally{workingMessage.dismiss();actionBusy=false;renderAccounts(payload.accounts)}
-  if(succeeded)load(true);
+  if(succeeded)refreshSeries(true);
 }
 function setupAccountControls(){
   const modal=document.getElementById("renameAccountModal"), input=document.getElementById("renameAccountLabel"), deleteModal=document.getElementById("deleteAccountModal");
@@ -602,28 +604,79 @@ function showRefreshError(error){
   lastUpdateTimestamp=null;const detail=error.message||String(error);document.getElementById("status").textContent=`Dashboard refresh failed; retrying automatically. ${detail}`;
   if(!refreshErrorShown){showMessage("Dashboard Refresh Failed",`Usage data could not be refreshed; retrying automatically: ${detail}`,messageDetailReport("Dashboard refresh","Failed",[{name:"Status or series request",status:"failed",detail},{name:"Automatic retry",status:"in progress",detail:"Polling remains active and will retry without user action."}]),"error");refreshErrorShown=true}
 }
+function cloneValue(value){return JSON.parse(JSON.stringify(value))}
+function validateView(view){
+  if(!view||!Array.isArray(view.quotaPoints)||!Array.isArray(view.tokenSessions)||!Array.isArray(view.events?.fiveHour)||!Array.isArray(view.events?.sevenDay))throw new Error("Invalid dashboard snapshot");
+  for(const row of [...view.quotaPoints,...view.tokenSessions,...view.events.fiveHour,...view.events.sevenDay])if(typeof row?._key!=="string"||!row._key)throw new Error("Dashboard row is missing its key");
+  return view;
+}
+function sortCollection(name,rows){
+  const timestamp=row=>eventTimestamp(row)??(Date.parse(row.updatedAt||row.startedAt||"")/1000||0), account=row=>row.usageAccountId||row.accountSlotId||"";
+  return rows.sort((a,b)=>name==="tokenSessions"?(Date.parse(a.updatedAt||a.startedAt||"")-Date.parse(b.updatedAt||b.startedAt||"")||a._key.localeCompare(b._key)):(Number(Boolean(b.synthetic))-Number(Boolean(a.synthetic))||timestamp(a)-timestamp(b)||account(a).localeCompare(account(b))||a._key.localeCompare(b._key)));
+}
+function applyCollection(name,rows,changes){
+  if(!changes)return rows;
+  if(!Array.isArray(changes.upsert)||!Array.isArray(changes.delete))throw new Error(`Invalid ${name} update`);
+  const values=new Map(rows.map(row=>[row._key,row]));
+  for(const key of changes.delete){if(typeof key!=="string")throw new Error(`Invalid ${name} deletion`);values.delete(key)}
+  for(const row of changes.upsert){if(typeof row?._key!=="string"||!row._key)throw new Error(`Invalid ${name} upsert`);values.set(row._key,row)}
+  return sortCollection(name,[...values.values()]);
+}
+function applyViewChanges(view,changes={}){
+  const next=cloneValue(view);
+  next.quotaPoints=applyCollection("quotaPoints",next.quotaPoints,changes.quotaPoints);
+  next.tokenSessions=applyCollection("tokenSessions",next.tokenSessions,changes.tokenSessions);
+  next.events.fiveHour=applyCollection("events.fiveHour",next.events.fiveHour,changes.events?.fiveHour);
+  next.events.sevenDay=applyCollection("events.sevenDay",next.events.sevenDay,changes.events?.sevenDay);
+  if(Object.prototype.hasOwnProperty.call(changes,"historyStats"))next.historyStats=changes.historyStats;
+  return validateView(next);
+}
+function activateDataView(){
+  const view=viewPayloads[dataView];if(!view)return;
+  payload={...view,points:currentStatus?.lastSample?[pointFromSample(currentStatus.lastSample)]:[],lastSample:currentStatus?.lastSample,display:currentStatus?.display,accounts:currentStatus?.accounts};
+}
+function applySeriesResponse(response){
+  if(response?.protocolVersion!==2||!response.streamId||!Number.isInteger(response.includedIndex))throw new Error("Invalid indexed dashboard response");
+  if(response.mode==="snapshot"){
+    viewPayloads={local:validateView(cloneValue(response.views?.local)),merged:validateView(cloneValue(response.views?.merged))};
+    streamId=response.streamId;includedIndex=response.includedIndex;mergedRevision=response.mergedRevision;currentStatus=response.status;statusEtag=response.statusEtag||null;activateDataView();return;
+  }
+  if(response.mode!=="update"||response.streamId!==streamId||response.fromIndex!==includedIndex||!Array.isArray(response.batches))throw new Error("Dashboard update does not continue the current stream");
+  const next={local:cloneValue(viewPayloads.local),merged:cloneValue(viewPayloads.merged)};let expected=includedIndex+1;
+  for(const batch of response.batches){if(batch.index!==expected++)throw new Error("Dashboard update indexes are not consecutive");next.local=applyViewChanges(next.local,batch.local);if(!response.mergedSnapshot)next.merged=applyViewChanges(next.merged,batch.merged)}
+  if(expected-1!==response.includedIndex)throw new Error("Dashboard update did not reach its included index");
+  if(response.mergedSnapshot)next.merged=validateView(cloneValue(response.mergedSnapshot));
+  viewPayloads=next;includedIndex=response.includedIndex;mergedRevision=response.mergedRevision;activateDataView();
+}
 async function load(force=false){
   if(document.hidden&&!force)return;
-  const requestedView=dataView, sequence=++seriesLoadSequence;
+  const sequence=++seriesLoadSequence;
   try{
-    const nextPayload=await requestSeries(requestedView);
-    if(sequence!==seriesLoadSequence||requestedView!==dataView)return;
-    payload=nextPayload;
-    currentSeriesRevision=payload.seriesRevision??currentSeriesRevision;
+    const response=await requestSeries();
+    if(sequence!==seriesLoadSequence)return;
+    applySeriesResponse(response);
     refreshErrorShown=false;
-    renderCurrentStatus(payload);drawAll();
+    await ensureControlPassword(currentStatus);renderCurrentStatus(currentStatus);drawAll();
   }catch(error){showRefreshError(error)}
 }
+async function refreshSeries(force=false){
+  if(document.hidden&&!force||!streamId)return;
+  const sequence=++seriesLoadSequence;
+  try{const response=await requestSeries({streamId,includedIndex:String(includedIndex),mergedRevision:mergedRevision??""});if(sequence!==seriesLoadSequence)return;applySeriesResponse(response);refreshErrorShown=false;renderCurrentStatus(currentStatus);drawAll()}
+  catch(error){if(sequence===seriesLoadSequence)await load(true)}
+}
 function setupDataView(){
-  document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();currentSeriesRevision=null;setupDataView();load(true)}});
+  document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();activateDataView();setupDataView();if(currentStatus)renderCurrentStatus(currentStatus);drawAll(true)}});
 }
 async function pollStatus(force=false){
   if(document.hidden&&!force)return;
   try{
-    const status=await requestStatus();
-    await ensureControlPassword(status);
+    const response=await requestStatus(), status=response.payload;
+    if(!status)throw new Error("Status response was empty");
+    currentStatus=status;statusEtag=response.etag||statusEtag;activateDataView();await ensureControlPassword(status);
     refreshErrorShown=false;renderCurrentStatus(status);
-    if(currentSeriesRevision===null||status.seriesRevision!==currentSeriesRevision)await load(true);
+    if(status.streamId!==streamId||status.newestIndex<includedIndex)await load(true);
+    else if(status.newestIndex>includedIndex||status.mergedRevision!==mergedRevision)await refreshSeries(true);
   }catch(error){showRefreshError(error)}
 }
 function extent(values){
@@ -666,6 +719,7 @@ function mergeDenseDeltaEvents(list,metrics){
     percent+=pending.deltaPercent||0;cost+=pending.deltaCostUsd||0;
     result[index]={
       ...pending,model:previous.model===pending.model?pending.model:"multiple",
+      usageAccountId:usageAccountId(previous)===usageAccountId(pending)?usageAccountId(pending):"multiple",
       accountSlotId:previous.accountSlotId===pending.accountSlotId?pending.accountSlotId:"multiple",accountLabel:previous.accountSlotId===pending.accountSlotId?pending.accountLabel:"Multiple accounts",
       deltaPercent:(previous.deltaPercent||0)+(pending.deltaPercent||0),deltaCostUsd:(previous.deltaCostUsd||0)+(pending.deltaCostUsd||0),
       cumulativePercent:percent,cumulativeCostUsd:cost,mergedCount:(previous.mergedCount||1)+(pending.mergedCount||1),
@@ -676,6 +730,7 @@ function mergeDenseDeltaEvents(list,metrics){
   for(const p of list.filter(p=>!p.synthetic)){
     pending=pending?{
       ...p,model:pending.model===p.model?p.model:"multiple",
+      usageAccountId:usageAccountId(pending)===usageAccountId(p)?usageAccountId(p):"multiple",
       accountSlotId:pending.accountSlotId===p.accountSlotId?p.accountSlotId:"multiple",accountLabel:pending.accountSlotId===p.accountSlotId?p.accountLabel:"Multiple accounts",
       deltaPercent:(pending.deltaPercent||0)+(p.deltaPercent||0),deltaCostUsd:(pending.deltaCostUsd||0)+(p.deltaCostUsd||0),
       mergedCount:(pending.mergedCount||1)+1,mergedFrom:pending.mergedFrom||pending.checkedAt,mergedTo:p.checkedAt,
@@ -802,7 +857,7 @@ function showTip(e,hit){
   ];
   if(Number.isFinite(p.rawPercent))rows.push(`Raw ${p.window} usage ${pct(p.rawPercent)}`);
   if(p.model)rows.push(`Model ${modelDisplayName(p.model)}`);
-  if(p.accountSlotId)rows.push(`Account ${accountDisplayName(p.accountSlotId,p.accountLabel)}`);
+  if(p.accountSlotId)rows.push(`Account ${accountDisplayName(usageAccountId(p),p.accountLabel)}`);
   if(Number.isFinite(p.costPercentRatio))rows.push(`Cost/percent ratio ${usd(p.costPercentRatio)}/%`);
   if(Number.isFinite(p.normalizedPercent))rows.push(`Plus-normalized usage ${pct(p.normalizedPercent)}`);
   if(p.plan&&p.plan!=="unknown")rows.push(`Plan ${p.plan} (${p.planMultiplier||1}x)`);
@@ -852,7 +907,7 @@ function quotaPointsInRange(points,domain){
   if(!domain)return [];
   const visible=new Map(), add=(point,timestamp,boundary)=>{
     if(timestamp<domain[0]||timestamp>domain[1])return;
-    const key=`${point.accountSlotId||"unknown"}\0${timestamp}`;
+    const key=`${usageAccountId(point)}\0${timestamp}`;
     if(boundary&&visible.has(key))return;
     visible.set(key,boundary?{...point,checkedAt:new Date(timestamp*1000).toISOString(),timestamp,compactedBoundary:true}:point);
   };
@@ -864,7 +919,7 @@ function quotaPointsInRange(points,domain){
     const start=Math.max(domain[0],point.compactedFrom), end=Math.min(domain[1],timestamp);
     if(start<end){add(point,start,true);add(point,end,end!==timestamp)}
   });
-  return [...visible.values()].sort((a,b)=>eventTimestamp(a)-eventTimestamp(b)||(a.accountSlotId||"unknown").localeCompare(b.accountSlotId||"unknown"));
+  return [...visible.values()].sort((a,b)=>eventTimestamp(a)-eventTimestamp(b)||usageAccountId(a).localeCompare(usageAccountId(b)));
 }
 function sameLocalDate(first,second){
   const a=new Date(first*1000), b=new Date(second*1000);
@@ -1020,7 +1075,7 @@ function drawUsageTimeFolds(ctx,folds,top,bottom,part="all"){
   ctx.globalAlpha=1;ctx.restore();
 }
 function accountCurveColor(accountId){
-  const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], points=payload.quotaPoints||[], accountIds=[...new Set(points.map(point=>point.accountSlotId||"unknown"))].sort((a,b)=>accountDisplayName(a,points.find(point=>(point.accountSlotId||"unknown")===a)?.accountLabel).localeCompare(accountDisplayName(b,points.find(point=>(point.accountSlotId||"unknown")===b)?.accountLabel),undefined,{numeric:true})||a.localeCompare(b));
+  const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], points=payload.quotaPoints||[], accountIds=[...new Set(points.map(usageAccountId))].sort((a,b)=>accountDisplayName(a,points.find(point=>usageAccountId(point)===a)?.accountLabel).localeCompare(accountDisplayName(b,points.find(point=>usageAccountId(point)===b)?.accountLabel),undefined,{numeric:true})||a.localeCompare(b));
   return palette[Math.max(0,accountIds.indexOf(accountId))%palette.length];
 }
 function usageTimeAccountTotal(points,valueOf){
@@ -1040,7 +1095,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
   if(!rect.width||!rect.height){delete usageTimeChartStates[id];return}
   c.width=rect.width*dpr;c.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,rect.width,rect.height);
   const w=rect.width,h=rect.height, windowOf=point=>point[label], valueOf=point=>windowOf(point)?.continuous, grouped=new Map();
-  points.filter(point=>Number.isFinite(valueOf(point))).forEach(point=>{const accountId=point.accountSlotId||"unknown";if(!grouped.has(accountId))grouped.set(accountId,[]);grouped.get(accountId).push(point)});
+  points.filter(point=>Number.isFinite(valueOf(point))).forEach(point=>{const accountId=usageAccountId(point);if(!grouped.has(accountId))grouped.set(accountId,[]);grouped.get(accountId).push(point)});
   const groups=[...grouped].filter(([,accountPoints])=>accountPoints.length), valid=groups.flatMap(([,accountPoints])=>accountPoints);
   const renderedValueOf=normalizedUsage?point=>plusEquivalentUsage(point,label,valueOf):valueOf;
   renderUsageLegend(id,groups,renderedValueOf);
@@ -1070,7 +1125,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
       renderTip(tip,[
         {text:new Date(point.checkedAt).toLocaleString(),strong:true},`${label==="fiveHour"?"5h":"7d"} ${normalizedUsage?"normalized ":""}usage ${Number(nearest.value).toFixed(1)}%`,
         normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}% · ${window.plan==="pro_lite"?"Pro Lite":window.plan==="pro"?"Pro":"Plus"} ×${{pro_lite:5,pro:20}[window.plan]||1}`:null,
-        `Account ${accountDisplayName(point.accountSlotId,point.accountLabel)}`,window.resetAt?`Reset ${new Date(window.resetAt).toLocaleString()}`:null,
+        `Account ${accountDisplayName(usageAccountId(point),point.accountLabel)}`,window.resetAt?`Reset ${new Date(window.resetAt).toLocaleString()}`:null,
       ]);
       tip.style.display="block";positionTip(event,tip);
     };
@@ -1151,7 +1206,7 @@ function drawAll(animate=false){
   drawUsageTimeChart("usageTime5h","fiveHour",quota,animate);
   drawUsageTimeChart("usageTime7d","sevenDay",quota,animate);
 }
-restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();load(true);pollStatus(true);setInterval(pollStatus,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}});addEventListener("resize",drawAll);
+restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();load(true);setInterval(pollStatus,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}});addEventListener("resize",drawAll);
 </script>
 </body>
 </html>
