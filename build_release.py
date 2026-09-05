@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -8,6 +9,7 @@ ROOT = Path(__file__).resolve().parent
 RELEASE_DIR = ROOT / "release"
 RUNTIME_DIR = RELEASE_DIR / "runtime"
 VSCE_VERSION = "3.9.2"
+VERSION_PATTERN = re.compile(r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)$")
 RUNTIME_FILES = (
     "LICENSE",
     "dashboard.html",
@@ -29,8 +31,33 @@ RUNTIME_FILES = (
 )
 
 
-def package_version() -> str:
-    return str(json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["version"])
+def next_patch_version(version: str) -> str:
+    match = VERSION_PATTERN.fullmatch(version)
+    if match is None:
+        raise ValueError(f"package.json version must be major.minor.patch, got {version!r}")
+    return f"{match['major']}.{match['minor']}.{int(match['patch']) + 1}"
+
+
+def bump_package_version() -> str:
+    package_path = ROOT / "package.json"
+    with package_path.open(encoding="utf-8", newline="") as package_file:
+        package_text = package_file.read()
+    package = json.loads(package_text)
+    current_version = package.get("version")
+    if not isinstance(current_version, str):
+        raise ValueError("package.json must contain a string version")
+    version = next_patch_version(current_version)
+    updated_text, replacements = re.subn(
+        rf'(?m)^([ \t]*"version"[ \t]*:[ \t]*)"{re.escape(current_version)}"',
+        rf'\g<1>"{version}"',
+        package_text,
+        count=1,
+    )
+    if replacements != 1:
+        raise ValueError("could not update the package.json version field")
+    with package_path.open("w", encoding="utf-8", newline="") as package_file:
+        package_file.write(updated_text)
+    return version
 
 
 def rebuild_runtime(version: str) -> None:
@@ -58,7 +85,7 @@ def build_vsix(output: Path) -> None:
 
 def main() -> None:
     RELEASE_DIR.mkdir(exist_ok=True)
-    version = package_version()
+    version = bump_package_version()
     rebuild_runtime(version)
     for old_package in RELEASE_DIR.glob("codex-usage-monitor-*.vsix"):
         if old_package.name != f"codex-usage-monitor-{version}.vsix":

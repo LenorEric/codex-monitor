@@ -339,7 +339,7 @@ or:
 npm run release
 ```
 
-The builder recreates generated files in `release/`, packages the pinned VSCE version, copies the standalone runtime and GPL license, and removes obsolete versioned VSIX files.
+The builder increments the patch version in `package.json`, recreates generated files in `release/`, packages the pinned VSCE version, copies the standalone runtime and GPL license, and removes obsolete versioned VSIX files.
 Credentials, local history, caches, tests, reference sources, and development-only material are excluded.
 
 ### Repository layout
