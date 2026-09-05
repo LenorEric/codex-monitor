@@ -2,11 +2,13 @@ import json
 import re
 import shutil
 import subprocess
+import zipfile
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent
 RELEASE_DIR = ROOT / "release"
+RELEASE_PACK_DIR = ROOT / "release_pack"
 RUNTIME_DIR = RELEASE_DIR / "runtime"
 VSCE_VERSION = "3.9.2"
 VERSION_PATTERN = re.compile(r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)$")
@@ -83,6 +85,25 @@ def build_vsix(output: Path) -> None:
         temporary_output.unlink(missing_ok=True)
 
 
+def build_release_zip(version: str) -> Path:
+    RELEASE_PACK_DIR.mkdir(exist_ok=True)
+    output = RELEASE_PACK_DIR / f"code-monitor-v{version}.zip"
+    temporary_output = output.with_suffix(".zip.tmp")
+    temporary_output.unlink(missing_ok=True)
+    try:
+        with zipfile.ZipFile(temporary_output, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(RELEASE_DIR.rglob("*")):
+                if path.is_file():
+                    archive.write(path, path.relative_to(RELEASE_DIR))
+        temporary_output.replace(output)
+    finally:
+        temporary_output.unlink(missing_ok=True)
+    for old_package in RELEASE_PACK_DIR.glob("code-monitor-v*.zip"):
+        if old_package.name != output.name:
+            old_package.unlink()
+    return output
+
+
 def main() -> None:
     RELEASE_DIR.mkdir(exist_ok=True)
     version = bump_package_version()
@@ -91,7 +112,9 @@ def main() -> None:
         if old_package.name != f"codex-usage-monitor-{version}.vsix":
             old_package.unlink()
     build_vsix(RELEASE_DIR / f"codex-usage-monitor-{version}.vsix")
+    archive = build_release_zip(version)
     print(f"Release {version} built in {RELEASE_DIR}")
+    print(f"Archive created at {archive}")
 
 
 if __name__ == "__main__":

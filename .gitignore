@@ -1,5 +1,7 @@
 ReferenceSrc/
 cc-switch-main/
+release/
+release_pack/
 vsc-extension-release/
 /*.vsix
 
