@@ -8,6 +8,8 @@ from pathlib import Path
 from monitor_common import empty_cost_totals, empty_token_totals, parse_timestamp
 
 MODEL_PRICES_PER_MILLION = {
+    "gpt-6": {"input": 10.00, "cachedInput": 1.00, "cacheWriteInput": 12.50, "output": 50.00},
+    "gpt-6-astra": {"input": 10.00, "cachedInput": 1.00, "cacheWriteInput": 12.50, "output": 50.00},
     "gpt-5.6": {"input": 5.00, "cachedInput": 0.50, "cacheWriteInput": 6.25, "output": 30.00},
     "gpt-5.6-sol": {"input": 5.00, "cachedInput": 0.50, "cacheWriteInput": 6.25, "output": 30.00},
     "gpt-5.6-terra": {"input": 2.00, "cachedInput": 0.20, "cacheWriteInput": 2.50, "output": 12.00},
@@ -35,6 +37,7 @@ FAST_MODE_COST_MULTIPLIERS = {
     "gpt-5.4": 2.0,
     "gpt-5.5": 2.5,
     "gpt-5.6": 2.0,
+    "gpt-6": 2.0,
 }
 FAST_MODE_COST_MULTIPLIER_HISTORY = {
     "gpt-5.6": ((None, 2.5), (GPT_5_6_PRICE_CHANGE_AT, 2.0)),

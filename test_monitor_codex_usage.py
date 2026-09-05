@@ -2343,6 +2343,15 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(pricing_for_model("GPT-5.6-LUNA"), {"input": 0.2, "cachedInput": 0.02, "cacheWriteInput": 0.25, "output": 1.2})
         self.assertEqual(pricing_for_model("gpt-5.6"), {"input": 5.0, "cachedInput": 0.5, "cacheWriteInput": 6.25, "output": 30.0})
 
+    def test_gpt_6_pricing_accepts_model_family_and_astra_model_ids(self):
+        expected = {"input": 10.0, "cachedInput": 1.0, "cacheWriteInput": 12.5, "output": 50.0}
+        self.assertEqual(pricing_for_model("gpt-6"), expected)
+        self.assertEqual(pricing_for_model("gpt-6-astra"), expected)
+        self.assertEqual(pricing_for_model("openai/gpt-6-astra-20260430"), expected)
+        self.assertEqual(monitor_tokens.fast_mode_cost_multiplier("gpt-6-astra"), 2.0)
+        costs = calculate_token_costs({"byModel": {"gpt-6": {"freshInputTokens": 1_000_000, "cachedInputTokens": 1_000_000, "cacheWriteInputTokens": 1_000_000, "outputTokens": 1_000_000}}})
+        self.assertEqual(costs, {"inputCostUsd": 10.0, "cachedInputCostUsd": 1.0, "cacheWriteInputCostUsd": 12.5, "outputCostUsd": 50.0, "totalCostUsd": 73.5})
+
     def test_gpt_5_6_price_epochs_use_event_time_and_resolved_fast_rates(self):
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-terra", "default", "2026-07-29T23:59:59Z")["rates"]["input"], 2.5)
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-terra", "default", "2026-07-30T00:00:00Z")["rates"]["input"], 2.0)
