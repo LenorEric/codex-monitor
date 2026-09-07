@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import tempfile
 import threading
 import time
@@ -11,6 +12,7 @@ import uuid
 import re
 import tomllib
 from collections.abc import Mapping
+from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,8 +21,9 @@ import tomlkit
 from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, auth_account_id, jwt_payload, parse_timestamp
 
 
-LATEST_SESSION_PROVIDER_UPDATE_LIMIT = 50
+LATEST_SESSION_PROVIDER_UPDATE_LIMIT = 200
 SESSION_PROVIDER_PATTERN = re.compile(rb'(?P<prefix>(?:^|[,{])\s*"(?:model_provider_id|model_provider)"\s*:\s*)"(?:\\.|[^"\\])*"')
+SESSION_ID_PATTERN = re.compile(rb'"session_id"\s*:\s*"(?P<id>[0-9a-fA-F-]{36})"')
 SESSION_REFRESH_TIME_PATTERN = re.compile(r"^(?:[01]\d|2[0-3]):[0-5]\d$")
 
 
@@ -555,30 +558,53 @@ class AccountManager:
             raise AccountError("model_provider must be a string", 409)
         return provider
 
-    def _rewrite_recent_session_model_providers(self, merged_toml: str) -> dict[Path, bytes]:
+    def _rewrite_session_model_providers(self, merged_toml: str, limit: int | None, include_archived: bool = False) -> dict:
         provider = self._model_provider(merged_toml)
-        sessions_dir = self.auth_path.parent / "sessions"
-        if not sessions_dir.is_dir():
-            return {}
-        originals = {}
+        session_paths = []
+        for directory in (self.auth_path.parent / "sessions", self.auth_path.parent / "archived_sessions") if include_archived else (self.auth_path.parent / "sessions",):
+            if directory.is_dir():
+                session_paths.extend(directory.rglob("*.jsonl"))
+        session_paths.sort(key=lambda item: item.stat().st_mtime_ns, reverse=True)
+        if limit is not None:
+            session_paths = session_paths[:limit]
+        migration = {"files": {}, "state": {}, "scanned": len(session_paths), "provider": provider}
         replacement = json.dumps(provider, ensure_ascii=False).encode("utf-8")
+        session_ids = set()
         try:
-            for path in sorted(sessions_dir.rglob("*.jsonl"), key=lambda item: item.stat().st_mtime_ns, reverse=True)[:LATEST_SESSION_PROVIDER_UPDATE_LIMIT]:
+            for path in session_paths:
                 data = path.read_bytes()
+                if match := SESSION_ID_PATTERN.search(data):
+                    session_ids.add(match.group("id").decode("ascii"))
                 updated = SESSION_PROVIDER_PATTERN.sub(lambda match: match.group("prefix") + replacement, data)
                 if updated != data:
-                    originals[path] = data
+                    migration["files"][path] = data
                     atomic_write_bytes(path, updated)
+            state_path = self.auth_path.parent / "state_5.sqlite"
+            if state_path.exists() and session_ids:
+                with closing(sqlite3.connect(state_path, timeout=30)) as database, database:
+                    migration["state"] = {thread_id: old_provider for thread_id, old_provider in database.execute("SELECT id, model_provider FROM threads") if thread_id in session_ids and old_provider != provider}
+                    database.executemany("UPDATE threads SET model_provider = ? WHERE id = ?", ((provider, thread_id) for thread_id in migration["state"]))
         except Exception:
-            for path, data in originals.items():
-                atomic_write_bytes(path, data)
+            self._restore_session_model_providers(migration)
             raise
-        return originals
+        return migration
 
-    @staticmethod
-    def _restore_session_files(originals: dict[Path, bytes]) -> None:
-        for path, data in originals.items():
+    def _rewrite_recent_session_model_providers(self, merged_toml: str) -> dict:
+        return self._rewrite_session_model_providers(merged_toml, LATEST_SESSION_PROVIDER_UPDATE_LIMIT)
+
+    def _restore_session_model_providers(self, migration: dict) -> None:
+        for path, data in migration.get("files", {}).items():
             atomic_write_bytes(path, data)
+        if migration.get("state") and (state_path := self.auth_path.parent / "state_5.sqlite").exists():
+            with closing(sqlite3.connect(state_path, timeout=30)) as database, database:
+                database.executemany("UPDATE threads SET model_provider = ? WHERE id = ?", ((provider, thread_id) for thread_id, provider in migration["state"].items()))
+
+    def migrate_all_session_model_providers(self) -> dict:
+        self._ensure_account_changes_allowed()
+        with self.lock:
+            self.sync_config_from_disk()
+            migration = self._rewrite_session_model_providers(self.config_path.read_text(encoding="utf-8") if self.config_path.exists() else "", None, True)
+            return {"provider": migration["provider"], "sessionsScanned": migration["scanned"], "sessionFilesUpdated": len(migration["files"]), "stateRowsUpdated": len(migration["state"])}
 
     def _save_manifest(self) -> None:
         atomic_write_json(self.manifest_path, self.manifest)
@@ -1087,7 +1113,7 @@ class AccountManager:
                         atomic_write_bytes(self.auth_path, old_live)
                     if old_config is not None:
                         atomic_write_bytes(self.config_path, old_config)
-                    self._restore_session_files(old_sessions)
+                    self._restore_session_model_providers(old_sessions)
                     if isinstance(exc, AccountError):
                         raise
                     raise AccountError(f"Account switch failed and the previous login was restored: {exc}", 500) from exc
@@ -1124,7 +1150,7 @@ class AccountManager:
                     atomic_write_bytes(self.auth_path, old_live)
                 if old_config is not None:
                     atomic_write_bytes(self.config_path, old_config)
-                self._restore_session_files(old_sessions)
+                self._restore_session_model_providers(old_sessions)
                 if isinstance(exc, AccountError):
                     raise
                 raise AccountError(f"Account switch failed and the previous login was restored: {exc}", 500) from exc

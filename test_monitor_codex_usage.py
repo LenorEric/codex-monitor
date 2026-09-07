@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -14,13 +15,14 @@ import uuid
 import zipfile
 import tomllib
 from io import BytesIO, StringIO
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from unittest import mock
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import monitor_common
+import codex_monitor_daemon
 import monitor_codex_usage
 import monitor_dashboard
 import monitor_history
@@ -162,9 +164,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             with (
                 mock.patch.object(sys, "argv", ["monitor_codex_usage.py", "--process-history", "--history", str(directory / "history.jsonl")]),
-                mock.patch.object(monitor_codex_usage, "migrate_account_vault"), mock.patch.object(monitor_codex_usage, "backfill_quota_history"),
-                mock.patch.object(monitor_codex_usage, "load_history", return_value=[]), mock.patch.object(monitor_codex_usage, "load_state", return_value={}),
-                mock.patch.object(monitor_codex_usage, "print_valid_delta_events"), mock.patch.object(monitor_codex_usage, "opener_for") as opener_for,
+                mock.patch.object(codex_monitor_daemon, "migrate_account_vault"), mock.patch.object(codex_monitor_daemon, "backfill_quota_history"),
+                mock.patch.object(codex_monitor_daemon, "load_history", return_value=[]), mock.patch.object(codex_monitor_daemon, "load_state", return_value={}),
+                mock.patch.object(codex_monitor_daemon, "print_valid_delta_events"), mock.patch.object(codex_monitor_daemon, "opener_for") as opener_for,
             ):
                 self.assertEqual(monitor_codex_usage.main(), 0)
         opener_for.assert_not_called()
@@ -173,8 +175,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             with (
                 mock.patch.object(sys, "argv", ["monitor_codex_usage.py", "--local-only", "--history", str(directory / "history.jsonl")]),
-                mock.patch.object(monitor_codex_usage, "migrate_account_vault"), mock.patch.object(monitor_codex_usage, "backfill_quota_history"),
-                mock.patch.object(monitor_codex_usage, "serve_dashboard", return_value=0), mock.patch.object(monitor_codex_usage, "opener_for") as opener_for,
+                mock.patch.object(codex_monitor_daemon, "migrate_account_vault"), mock.patch.object(codex_monitor_daemon, "backfill_quota_history"),
+                mock.patch.object(codex_monitor_daemon, "serve_dashboard", return_value=0), mock.patch.object(codex_monitor_daemon, "opener_for") as opener_for,
             ):
                 self.assertEqual(monitor_codex_usage.main(), 0)
         opener_for.assert_not_called()
@@ -400,7 +402,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(tomllib.loads(config_path.read_text(encoding="utf-8")), {"model": "common"})
             self.assertEqual(manager._find("ppl-pro")["configHeaderToml"], api_header)
 
-    def test_account_switch_updates_model_provider_in_latest_fifty_session_files(self):
+    def test_account_switch_updates_model_provider_in_latest_two_hundred_sessions_and_state(self):
         with self.account_directory() as directory:
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -411,22 +413,78 @@ class MonitorCodexUsageTests(unittest.TestCase):
             manager.switch("ppl-pro")
             sessions_dir = directory / "sessions"
             sessions_dir.mkdir()
-            original = b'{"model_provider":"old","nested":{"model_provider_id":"old"},"text":"\\\"model_provider\\\":\\\"unchanged\\\""}\n'
             paths = []
-            for index in range(51):
-                path = sessions_dir / f"session-{index:02}.jsonl"
-                path.write_bytes(original)
+            session_ids = [str(uuid.UUID(int=index + 1)) for index in range(201)]
+            with closing(sqlite3.connect(directory / "state_5.sqlite")) as database, database:
+                database.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)")
+                database.executemany("INSERT INTO threads VALUES (?, 'old')", ((session_id,) for session_id in session_ids))
+            for index, session_id in enumerate(session_ids):
+                path = sessions_dir / f"session-{index:03}.jsonl"
+                path.write_text(json.dumps({"session_id": session_id, "model_provider": "old", "nested": {"model_provider_id": "old"}, "text": '\"model_provider\":\"unchanged\"'}) + "\n", encoding="utf-8")
                 os.utime(path, (index + 1, index + 1))
                 paths.append(path)
 
             manager.switch(api_id)
 
-            self.assertEqual(paths[0].read_bytes(), original)
+            self.assertEqual(json.loads(paths[0].read_text(encoding="utf-8"))["model_provider"], "old")
             for path in paths[1:]:
                 updated = json.loads(path.read_text(encoding="utf-8"))
                 self.assertEqual(updated["model_provider"], "custom-provider")
                 self.assertEqual(updated["nested"]["model_provider_id"], "custom-provider")
                 self.assertEqual(updated["text"], '"model_provider":"unchanged"')
+            with closing(sqlite3.connect(directory / "state_5.sqlite")) as database, database:
+                providers = dict(database.execute("SELECT id, model_provider FROM threads"))
+            self.assertEqual(providers[session_ids[0]], "old")
+            self.assertTrue(all(providers[session_id] == "custom-provider" for session_id in session_ids[1:]))
+
+    def test_manual_session_provider_migration_includes_live_archived_and_state(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            (directory / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            manager.update_common_account_header('model_provider = "custom-provider"\n')
+            session_ids = [str(uuid.UUID(int=index + 1)) for index in range(2)]
+            paths = [directory / "sessions" / "live.jsonl", directory / "archived_sessions" / "archived.jsonl"]
+            for path, session_id in zip(paths, session_ids):
+                path.parent.mkdir()
+                path.write_text(json.dumps({"session_id": session_id, "model_provider": "old"}) + "\n", encoding="utf-8")
+            with closing(sqlite3.connect(directory / "state_5.sqlite")) as database, database:
+                database.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)")
+                database.executemany("INSERT INTO threads VALUES (?, 'old')", ((session_id,) for session_id in session_ids))
+
+            result = manager.migrate_all_session_model_providers()
+
+            self.assertEqual(result, {"provider": "custom-provider", "sessionsScanned": 2, "sessionFilesUpdated": 2, "stateRowsUpdated": 2})
+            self.assertTrue(all(json.loads(path.read_text(encoding="utf-8"))["model_provider"] == "custom-provider" for path in paths))
+            with closing(sqlite3.connect(directory / "state_5.sqlite")) as database, database:
+                self.assertEqual({provider for provider, in database.execute("SELECT model_provider FROM threads")}, {"custom-provider"})
+
+    def test_account_switch_restores_session_files_and_state_when_commit_fails(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+            (directory / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
+            manager = AccountManager(auth_path)
+            api_id = manager.create_account("API", "api", "sk-api")["activeAccountId"]
+            manager.update_api_config(api_id, 'model_provider = "custom-provider"\n')
+            manager.switch("ppl-pro")
+            session_id = str(uuid.uuid4())
+            session_path = directory / "sessions" / "session.jsonl"
+            session_path.parent.mkdir()
+            original = json.dumps({"session_id": session_id, "model_provider": "old"}) + "\n"
+            session_path.write_text(original, encoding="utf-8")
+            with closing(sqlite3.connect(directory / "state_5.sqlite")) as database, database:
+                database.execute("CREATE TABLE threads (id TEXT PRIMARY KEY, model_provider TEXT NOT NULL)")
+                database.execute("INSERT INTO threads VALUES (?, 'old')", (session_id,))
+
+            with mock.patch.object(manager, "_save_manifest", side_effect=OSError("simulated failure")):
+                with self.assertRaises(AccountError):
+                    manager.switch(api_id)
+
+            self.assertEqual(session_path.read_text(encoding="utf-8"), original)
+            with closing(sqlite3.connect(directory / "state_5.sqlite")) as database, database:
+                self.assertEqual(database.execute("SELECT model_provider FROM threads WHERE id = ?", (session_id,)).fetchone()[0], "old")
 
     def test_account_switch_defaults_session_model_provider_to_openai(self):
         with self.account_directory() as directory:
@@ -4295,7 +4353,18 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('else if(tomlConfigUpdate)showTomlConfigResult(path)', html)
         self.assertIn('else if(path==="/api/accounts"||path.startsWith("/api/accounts/"))showAccountResult(path,body,result)', html)
         self.assertNotIn('else if(path.includes("/accounts"))showAccountResult(path,body,result)', html)
-        self.assertIn('"API Header TOML":"Common TOML"', html)
+        self.assertIn('"API config.toml header":"Common config.toml body"', html)
+
+    def test_management_page_exposes_full_session_provider_migration(self):
+        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
+        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
+        dashboard = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
+
+        self.assertIn('<button data-common="">Common config.toml body</button><button data-common-header="">OpenAI config.toml header</button><button data-migrate-sessions="">Migrate all session</button>', html)
+        self.assertIn('>API config.toml header</button>', html)
+        self.assertIn('run("/api/manage/accounts/migrate-sessions",{})', html)
+        self.assertIn('"/api/manage/accounts/migrate-sessions"', extension)
+        self.assertIn('state.accounts.migrate_all_session_model_providers()', dashboard)
 
     def test_dashboard_exposes_clear_account_controls_without_credentials(self):
         html = dashboard_html()
@@ -5307,10 +5376,10 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual((codex_home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "managed")
 
     def test_python_version_requirement_is_documented_and_checked_before_monitor_imports(self):
-        source = Path("monitor_codex_usage.py").read_text(encoding="utf-8")
-
-        self.assertIn("if sys.version_info < (3, 12):", source)
-        self.assertLess(source.index("if sys.version_info < (3, 12):"), source.index("from monitor_accounts import"))
+        for name, first_import in (("codex_monitor_daemon.py", "from monitor_accounts import"), ("monitor_codex_usage.py", "from codex_monitor_daemon import")):
+            source = Path(name).read_text(encoding="utf-8")
+            self.assertIn("if sys.version_info < (3, 12):", source)
+            self.assertLess(source.index("if sys.version_info < (3, 12):"), source.index(first_import))
         self.assertIn("Python 3.12 or newer on Windows and Linux", Path("README.md").read_text(encoding="utf-8"))
 
     def test_legacy_skill_state_is_normalized_with_empty_deletions(self):
@@ -6564,10 +6633,27 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
 
             control = json.loads((private / "config.json").read_text(encoding="utf-8"))["control"]
-            self.assertNotIn("machineName", json.loads((private / "config.json").read_text(encoding="utf-8")))
+            saved = json.loads((private / "config.json").read_text(encoding="utf-8"))
+            self.assertNotIn("machineName", saved)
             self.assertEqual(control["password"], "")
             self.assertEqual(control["passwordHash"], "")
             self.assertGreaterEqual(len(control["cookieSecret"]), 32)
+            self.assertEqual(saved["autoUpdate"], {"enabled": False})
+
+    def test_auto_update_config_round_trips_through_management_payload(self):
+        with self.account_directory() as directory:
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            result = cloud.update_config({
+                "server": cloud.config()["server"], "autoUpdate": {"enabled": True},
+                "webdav": {**{key: cloud.config()["webdav"][key] for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")}, "password": "", "encryptionPassphrase": ""},
+            })
+
+            self.assertEqual(result["config"]["autoUpdate"], {"enabled": True})
+            self.assertEqual(json.loads(cloud.config_path.read_text(encoding="utf-8"))["autoUpdate"], {"enabled": True})
+            self.assertNotIn("password", result["config"]["webdav"])
+            html = Path("management.html").read_text(encoding="utf-8")
+            self.assertIn('id="autoUpdateEnabled" type="checkbox"', html)
+            self.assertIn('autoUpdate:{enabled:document.getElementById("autoUpdateEnabled").checked}', html)
 
     def test_cloud_config_uses_offline_passphrase_hash_without_adaptation_fields(self):
         with self.account_directory() as directory:

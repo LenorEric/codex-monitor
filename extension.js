@@ -45,6 +45,7 @@ const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/manage/accounts/header", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/header"), method: "POST" }],
     ["/api/manage/accounts/common-header", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/common-header"), method: "POST" }],
     ["/api/manage/accounts/common", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/common"), method: "POST" }],
+    ["/api/manage/accounts/migrate-sessions", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/migrate-sessions"), method: "POST" }],
     ["/api/manage/accounts/delete", { url: ACCOUNT_DELETE_URL, method: "POST" }],
     ["/api/manage/server", { url: new URL("http://127.0.0.1:8765/api/manage/server"), method: "POST" }],
     ["/api/manage/config", { url: new URL("http://127.0.0.1:8765/api/manage/config"), method: "POST" }],
@@ -68,7 +69,7 @@ class PythonMonitor {
 
     start() {
         this.statusBar.text = "$(plug) Codex usage unavailable";
-        this.statusBar.tooltip = "Start the monitor with: python monitor_codex_usage.py";
+        this.statusBar.tooltip = "Start the monitor with: python codex_monitor_daemon.py";
         this.statusBar.show();
         this.update();
         this.pollTimer = setInterval(() => this.update(), API_POLL_INTERVAL_MS);

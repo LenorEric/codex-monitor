@@ -4,7 +4,7 @@
 
 **A local-first Codex quota, token, cost, account, skill, and encrypted-sync dashboard for VS Code.**
 
-[![Version](https://img.shields.io/badge/version-1.3.0-4f8cff)](#quick-start)
+[![Version](https://img.shields.io/badge/version-1.5.0-4f8cff)](#quick-start)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#requirements)
@@ -18,7 +18,7 @@ Codex Usage Monitor combines the authoritative 5-hour and 7-day limits reported 
 A lightweight Python service owns the data, dashboard, account vault, managed skills, and optional encrypted WebDAV synchronization; the VS Code extension adds a status-bar summary and opens the same live dashboard.
 
 > [!IMPORTANT]
-> The extension does not start the Python monitor. Start `python monitor_codex_usage.py` first and keep it running.
+> The extension does not start the Python monitor. Start `python codex_monitor_daemon.py` first and keep it running.
 
 ## Why use it?
 
@@ -66,13 +66,13 @@ Use the matching artifacts from `release/`:
 
 ```console
 python -m pip install -r requirements.txt
-python monitor_codex_usage.py --dashboard
+python codex_monitor_daemon.py --dashboard
 ```
 
 Without `--dashboard`, the service starts normally but does not open a browser:
 
 ```console
-python monitor_codex_usage.py
+python codex_monitor_daemon.py
 ```
 
 ### 2. Install the VS Code extension
@@ -183,6 +183,10 @@ Newly managed skills are local-only by default. Existing managed skills retain t
 Changed shared skills and pending share-deletion tombstones receive independent two-minute stability windows. Stable content is uploaded automatically up to three times, with 30 seconds between failures.
 The five-second observer hashes incrementally and performs a bounded full verification; disabling `skillsAutoUpload` disables this observation.
 
+## Automatic runtime updates
+
+Enable **Automatically update Codex Monitor** on the management Config page to check the published `release/runtime` manifest after startup and every hour. Checks run in the background. A newer verified runtime replaces only files named by the release manifest and then restarts the same entry command with the same arguments; failed checks leave the running installation unchanged. Python dependencies are not installed automatically.
+
 ## WebDAV and encrypted synchronization
 
 Open **Manage skills & accounts → Config file**. Configure the remote without manually editing secrets unless recovery requires it.
@@ -241,7 +245,7 @@ The canonical data root is `~/.codex-switch`:
 
 | Path | Contents | Cloud synchronized? |
 | --- | --- | --- |
-| `config.json` | Server settings, plaintext WebDAV login password, cookie secret, password verifier, and derived encryption key | No |
+| `config.json` | Server and auto-update settings, plaintext WebDAV login password, cookie secret, password verifier, and derived encryption key | No |
 | `accounts/` | Sensitive Codex account vault and manifest | Explicit API Share/Link or OpenAI Release/Bind only |
 | `skills/` | Private managed skill source | Optional encrypted packages |
 | `usage_monitor_history.jsonl` | Local raw cost/delta intervals | Derived records only |
@@ -268,7 +272,7 @@ Direct public-IP access uses unencrypted HTTP, so prefer a trusted VPN or an HTT
 ## Command-line reference
 
 ```console
-python monitor_codex_usage.py --help
+python codex_monitor_daemon.py --help
 ```
 
 | Option | Description |
@@ -295,7 +299,7 @@ python monitor_codex_usage.py --help
 
 ### The VS Code status bar cannot connect
 
-- Confirm `python monitor_codex_usage.py` is still running.
+- Confirm `python codex_monitor_daemon.py` is still running.
 - Confirm `http://127.0.0.1:8765/api/status` opens locally.
 - Check whether another process owns port `8765`.
 - The extension always connects to `127.0.0.1:8765`, even when the server also listens on the LAN.
@@ -328,9 +332,9 @@ Run from the repository root:
 
 ```console
 python -m pip install -r requirements.txt
-python -m unittest test_monitor_codex_usage.py
+python -m unittest test_monitor_codex_usage.py test_monitor_auto_update.py test_cloud_queue.py
 npm run check
-python monitor_codex_usage.py --help
+python codex_monitor_daemon.py --help
 ```
 
 Build a reproducible deployment bundle:
@@ -352,7 +356,9 @@ Credentials, local history, caches, tests, reference sources, and development-on
 
 | Path | Responsibility |
 | --- | --- |
-| `monitor_codex_usage.py` | CLI entry point and monitor startup. |
+| `codex_monitor_daemon.py` | Canonical CLI entry point, monitor startup, automatic update coordination, and restart. |
+| `monitor_codex_usage.py` | Compatibility wrapper for the former entry command. |
+| `monitor_auto_update.py` | Verified background runtime updater. |
 | `monitor_dashboard.py` | Polling loops, dashboard/API server, response caches, control authorization, and UI datasets. |
 | `monitor_accounts.py` | Local credential vault, identity-safe switching, API copy transfer, and OpenAI move transfer. |
 | `monitor_cloud.py` | Configuration, WebDAV, encryption, serialized cloud operations, packages, and usage journal. |

@@ -4,7 +4,7 @@
 
 **一个本地优先的 Codex 配额、Token、成本、账号、技能与加密同步仪表盘，并提供 VS Code 集成。**
 
-[![Version](https://img.shields.io/badge/version-1.3.0-4f8cff)](#快速开始)
+[![Version](https://img.shields.io/badge/version-1.5.0-4f8cff)](#快速开始)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#运行要求)
@@ -17,7 +17,7 @@
 Codex Usage Monitor 将 Codex 服务返回的权威 5 小时和 7 天额度，与本地会话日志解析出的 Token 和预估成本整合到同一个界面。轻量级 Python 服务负责数据、仪表盘、账号保险库、托管技能及可选的 WebDAV 加密同步；VS Code 扩展则提供状态栏摘要并打开同一个实时仪表盘。
 
 > [!IMPORTANT]
-> VS Code 扩展不会自动启动 Python 监控服务。请先运行 `python monitor_codex_usage.py`，并保持进程运行。
+> VS Code 扩展不会自动启动 Python 监控服务。请先运行 `python codex_monitor_daemon.py`，并保持进程运行。
 
 ## 为什么使用它？
 
@@ -65,13 +65,13 @@ Python 监控服务是权威数据源。仪表盘首次连接时从 `/api/series
 
 ```console
 python -m pip install -r requirements.txt
-python monitor_codex_usage.py --dashboard
+python codex_monitor_daemon.py --dashboard
 ```
 
 不使用 `--dashboard` 时，服务仍会正常启动，但不会自动打开浏览器：
 
 ```console
-python monitor_codex_usage.py
+python codex_monitor_daemon.py
 ```
 
 ### 2. 安装 VS Code 扩展
@@ -180,6 +180,10 @@ API 账号采用复制语义：
 
 每个被修改的共享技能和待发布的共享删除墓碑都有独立的两分钟稳定窗口。稳定后最多自动上传三次，失败间隔 30 秒。五秒观察器会增量复用哈希并定期进行完整验证；关闭 `skillsAutoUpload` 也会关闭该观察。
 
+## 自动更新运行时
+
+在管理页的配置中启用 **Automatically update Codex Monitor** 后，程序会在启动后及之后每小时于后台检查已发布的 `release/runtime` 清单。发现较新且校验通过的运行时后，只替换发布清单列出的文件，并使用相同入口命令和参数重启；检查失败不会修改当前运行版本。Python 依赖不会自动安装。
+
 ## WebDAV 与加密同步
 
 打开 **Manage skills & accounts → Config file**。除非执行恢复操作，否则建议通过界面配置远端而不是直接编辑秘密字段。
@@ -233,7 +237,7 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 
 | 路径 | 内容 | 是否同步到云端 |
 | --- | --- | --- |
-| `config.json` | 服务器设置、明文 WebDAV 登录密码、Cookie 密钥、密码校验值和派生加密密钥 | 否 |
+| `config.json` | 服务器与自动更新设置、明文 WebDAV 登录密码、Cookie 密钥、密码校验值和派生加密密钥 | 否 |
 | `accounts/` | 敏感 Codex 账号保险库与清单 | 仅通过 API Share/Link 或 OpenAI Release/Bind 显式传输 |
 | `skills/` | 私有托管技能源 | 可选的加密技能包 |
 | `usage_monitor_history.jsonl` | 本地原始成本/百分比区间 | 仅同步派生记录 |
@@ -255,7 +259,7 @@ Token 账本在价格时期首次使用时写入一次完整定义，后续用�
 ## 命令行参考
 
 ```console
-python monitor_codex_usage.py --help
+python codex_monitor_daemon.py --help
 ```
 
 | 参数 | 说明 |
@@ -282,7 +286,7 @@ python monitor_codex_usage.py --help
 
 ### VS Code 状态栏无法连接
 
-- 确认 `python monitor_codex_usage.py` 仍在运行。
+- 确认 `python codex_monitor_daemon.py` 仍在运行。
 - 确认本机可以打开 `http://127.0.0.1:8765/api/status`。
 - 检查是否有其他进程占用 `8765`。
 - 即使服务器同时监听局域网，扩展也始终连接 `127.0.0.1:8765`。
@@ -315,9 +319,9 @@ python monitor_codex_usage.py --help
 
 ```console
 python -m pip install -r requirements.txt
-python -m unittest test_monitor_codex_usage.py
+python -m unittest test_monitor_codex_usage.py test_monitor_auto_update.py test_cloud_queue.py
 npm run check
-python monitor_codex_usage.py --help
+python codex_monitor_daemon.py --help
 ```
 
 构建可复现的部署包：
@@ -338,7 +342,9 @@ npm run release
 
 | 路径 | 职责 |
 | --- | --- |
-| `monitor_codex_usage.py` | CLI 入口与监控服务启动。 |
+| `codex_monitor_daemon.py` | 标准 CLI 入口、监控服务启动、自动更新协调与重启。 |
+| `monitor_codex_usage.py` | 旧入口命令的兼容包装。 |
+| `monitor_auto_update.py` | 经校验的后台运行时更新器。 |
 | `monitor_dashboard.py` | 轮询循环、仪表盘/API 服务、响应缓存、控制认证与 UI 数据集。 |
 | `monitor_accounts.py` | 本地凭据保险库、身份安全切换、API 复制传输与 OpenAI 移动传输。 |
 | `monitor_cloud.py` | 配置、WebDAV、加密、串行云操作、软件包与使用记录。 |

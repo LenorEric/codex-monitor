@@ -1,6 +1,10 @@
 ReferenceSrc/
 cc-switch-main/
-release/
+release/*
+!release/README.md
+!release/version.json
+!release/runtime/
+!release/runtime/**
 release_pack/
 vsc-extension-release/
 /*.vsix
@@ -19,6 +23,7 @@ usage_monitor_*.json.*
 usage_monitor_*.jsonl.*
 usage-monitor-accounts/
 .account-test-*/
+.codex-monitor-update-*/
 
 # Local Codex Switch state and credentials must never be committed.
 .codex-switch/

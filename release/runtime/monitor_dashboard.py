@@ -23,6 +23,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 
 from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_api_auth, remove_directory
+from monitor_auto_update import AUTO_UPDATE_RESTART, AutoUpdater
 from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
 from monitor_cloud_queue import OperationSkipped
 from monitor_common import DEFAULT_RETRY_LIMIT, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
@@ -1708,6 +1709,8 @@ def enqueue_management_action(state, control_auth, path, body):
     def completed(result):
         if method == "update_config" and result.get("controlPasswordChanged"):
             control_auth.update(state.cloud.config()["control"])
+        if method in {"update_config", "reload_config"} and getattr(state, "auto_updater", None) is not None:
+            state.auto_updater.notify_config_changed()
         state._signal_dashboard_cache("cloud")
         if method in {"bind_local_account", "link_local_account", "release_local_account", "share_local_account"}:
             return {"accounts": result}
@@ -1769,7 +1772,7 @@ def dashboard_status_payload(state: UsageDashboardState) -> dict:
         "accounts": accounts,
     }
 
-def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
+def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_opener_factory=None, runtime_dir: Path | None = None) -> int:
     try:
         server_config = load_server_config(Path(args.data_home) / "config.json")
     except CloudError as exc:
@@ -1935,7 +1938,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             allowed = {
                 "/api/control/login", "/api/control/setup",
                 "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/accounts/session-refresh", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign", "/api/manage/skills/share",
-                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/fetch-all", "/api/manage/cloud/push", "/api/manage/cloud/push-all", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/link", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
+                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/fetch-all", "/api/manage/cloud/push", "/api/manage/cloud/push-all", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/link", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/accounts/migrate-sessions", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
             }
             allowed.add("/api/manage/accounts/common")
             allowed.add("/api/manage/cloud/queue/cancel")
@@ -2003,6 +2006,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                 elif path == "/api/manage/accounts/common":
                     self.send_json(200, {"accounts": state.accounts.update_common_config(body.get("commonToml"))})
                     return
+                elif path == "/api/manage/accounts/migrate-sessions":
+                    self.send_json(200, state.accounts.migrate_all_session_model_providers())
+                    return
                 elif path == "/api/manage/accounts/delete":
                     self.send_json(200, {"accounts": state.delete_account(body.get("accountId"))})
                     return
@@ -2042,15 +2048,21 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
     cloud_thread.start()
     config_thread = threading.Thread(target=state.run_config_monitor, daemon=True)
     config_thread.start()
+    auto_updater = AutoUpdater(runtime_dir or Path(__file__).resolve().parent, lambda: state.cloud.config()["autoUpdate"]["enabled"], update_opener_factory, args.timeout) if update_opener_factory is not None else None
+    state.auto_updater = auto_updater
     url = f"http://127.0.0.1:{DASHBOARD_PORT}/"
     print(f"Dashboard: {url}", flush=True)
     if args.dashboard:
         webbrowser.open(url)
+    if auto_updater is not None:
+        auto_updater.start(server.shutdown)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         pass
     finally:
+        if auto_updater is not None:
+            auto_updater.stop()
         try:
             state.sync_active_account_from_live()
             state.wait_for_external_auth_validations(max(getattr(args, "timeout", 10), 1) + 1)
@@ -2067,4 +2079,4 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
         cloud_thread.join()
         server.server_close()
         instance_lock.release()
-    return 0
+    return AUTO_UPDATE_RESTART if auto_updater is not None and auto_updater.restart_requested else 0

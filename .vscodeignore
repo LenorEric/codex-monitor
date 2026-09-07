@@ -7,6 +7,7 @@ AGENTS.md
 ReferenceSrc/**
 cc-switch-main/**
 release/**
+release_pack/**
 vsc-extension-release/**
 __pycache__/**
 .pytest_cache/**
@@ -18,6 +19,7 @@ release-runtime.md
 release-package.md
 CODE_EFFICIENCY_SECURITY_REVIEW.md
 test_monitor_codex_usage.py
+test_monitor_auto_update.py
 test_cloud_queue.py
 test_management_queue.js
 .test-cloud-queue-*/**
@@ -27,6 +29,7 @@ usage_monitor_*.json.*
 usage_monitor_*.jsonl.*
 usage-monitor-accounts/**
 .account-test-*/**
+.codex-monitor-update-*/**
 .tmp*/**
 node_modules/**
 .venv/**

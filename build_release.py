@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import shutil
@@ -16,7 +17,9 @@ RUNTIME_FILES = (
     "LICENSE",
     "dashboard.html",
     "management.html",
+    "codex_monitor_daemon.py",
     "monitor_accounts.py",
+    "monitor_auto_update.py",
     "monitor_cloud.py",
     "monitor_cloud_queue.py",
     "monitor_codex_usage.py",
@@ -63,14 +66,29 @@ def bump_package_version() -> str:
     return version
 
 
+def write_text_lf(path: Path, text: str) -> None:
+    with path.open("w", encoding="utf-8", newline="\n") as output:
+        output.write(text)
+
+
 def rebuild_runtime(version: str) -> None:
     if RUNTIME_DIR.exists():
         shutil.rmtree(RUNTIME_DIR)
     RUNTIME_DIR.mkdir(parents=True)
     for name in RUNTIME_FILES:
-        shutil.copy2(ROOT / name, RUNTIME_DIR / name)
-    shutil.copy2(ROOT / "release-runtime.md", RUNTIME_DIR / "README.md")
-    (RELEASE_DIR / "README.md").write_text((ROOT / "release-package.md").read_text(encoding="utf-8").replace("{{VERSION}}", version), encoding="utf-8")
+        write_text_lf(RUNTIME_DIR / name, (ROOT / name).read_text(encoding="utf-8"))
+    write_text_lf(RUNTIME_DIR / "README.md", (ROOT / "release-runtime.md").read_text(encoding="utf-8"))
+    write_text_lf(RUNTIME_DIR / "version.json", json.dumps({"version": version}, indent=2) + "\n")
+    write_text_lf(RELEASE_DIR / "README.md", (ROOT / "release-package.md").read_text(encoding="utf-8").replace("{{VERSION}}", version))
+
+
+def write_release_version(version: str) -> None:
+    files = {}
+    for path in sorted(RUNTIME_DIR.iterdir(), key=lambda item: item.name.casefold()):
+        if path.is_file():
+            data = path.read_bytes()
+            files[path.name] = {"size": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+    write_text_lf(RELEASE_DIR / "version.json", json.dumps({"version": version, "files": files}, indent=2) + "\n")
 
 
 def build_vsix(output: Path) -> None:
@@ -105,10 +123,10 @@ def build_release_zip(version: str) -> Path:
     return output
 
 
-def main() -> None:
+def build_release(version: str) -> None:
     RELEASE_DIR.mkdir(exist_ok=True)
-    version = bump_package_version()
     rebuild_runtime(version)
+    write_release_version(version)
     for old_package in RELEASE_DIR.glob("codex-usage-monitor-*.vsix"):
         if old_package.name != f"codex-usage-monitor-{version}.vsix":
             old_package.unlink()
@@ -116,6 +134,10 @@ def main() -> None:
     archive = build_release_zip(version)
     print(f"Release {version} built in {RELEASE_DIR}")
     print(f"Archive created at {archive}")
+
+
+def main() -> None:
+    build_release(bump_package_version())
 
 
 if __name__ == "__main__":

@@ -1,0 +1,2 @@
+release/runtime/* text eol=lf
+release/version.json text eol=lf

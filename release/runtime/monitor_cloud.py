@@ -498,6 +498,7 @@ class CloudManager:
             atomic_write_json(self.config_path, {
                 "version": 1, "control": {"password": "", "passwordHash": "", "passwordSalt": "", "cookieSecret": secrets.token_urlsafe(32)},
                 "server": {"host": "0.0.0.0"},
+                "autoUpdate": {"enabled": False},
                 "webdav": {
                     "enabled": False, "baseUrl": "https://dav.jianguoyun.com/dav/", "username": "", "password": "", "remoteRoot": "codex-switch-sync", "encryptionPassphrase": "", "encryptionPassphraseHash": "",
                     "skillsAutoUpload": True, "usageDataAutoSync": True, "allowOptimisticWrites": True,
@@ -518,6 +519,9 @@ class CloudManager:
                     changed = True
                 if "server" not in config:
                     config["server"] = {"host": "0.0.0.0"}
+                    changed = True
+                if not isinstance(config.get("autoUpdate"), dict) or not isinstance(config["autoUpdate"].get("enabled"), bool):
+                    config["autoUpdate"] = {"enabled": False}
                     changed = True
                 if isinstance(control.get("password"), str) and control["password"]:
                     if control["password"] == "123456":
@@ -611,8 +615,8 @@ class CloudManager:
     def _validate_config(config: dict) -> dict:
         if not isinstance(config, dict):
             raise CloudError("Unsupported WebDAV config", 500)
-        webdav, control, server = config.get("webdav"), config.get("control"), config.get("server")
-        if (config.get("version") != 1 or not isinstance(webdav, dict) or not isinstance(control, dict) or not isinstance(server, dict) or control.get("password") != "" or webdav.get("encryptionPassphrase") != ""
+        webdav, control, server, auto_update = config.get("webdav"), config.get("control"), config.get("server"), config.get("autoUpdate")
+        if (config.get("version") != 1 or not isinstance(webdav, dict) or not isinstance(control, dict) or not isinstance(server, dict) or not isinstance(auto_update, dict) or not isinstance(auto_update.get("enabled"), bool) or control.get("password") != "" or webdav.get("encryptionPassphrase") != ""
                 or not isinstance(control.get("passwordHash"), str) or len(control["passwordHash"]) > 1024 or not isinstance(control.get("passwordSalt"), str)
                 or not isinstance(control.get("cookieSecret"), str) or len(control["cookieSecret"]) < 32):
             raise CloudError("Unsupported WebDAV config", 500)
@@ -643,6 +647,7 @@ class CloudManager:
         webdav = config["webdav"]
         return {
             "server": {"host": config["server"]["host"]},
+            "autoUpdate": {"enabled": config["autoUpdate"]["enabled"]},
             "webdav": {key: webdav.get(key) for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")},
             "secretsConfigured": {"password": bool(webdav.get("password")), "encryptionPassphrase": bool(webdav.get("encryptionPassphraseHash")), "controlPassword": control_password_is_configured(config["control"])},
         }
@@ -700,10 +705,13 @@ class CloudManager:
         if not isinstance(values, dict) or not isinstance(values.get("webdav"), dict) or not isinstance(values.get("server"), dict):
             raise CloudError("Invalid config update")
         current = self.config()
-        webdav_values = values["webdav"]
+        webdav_values, auto_update_values = values["webdav"], values.get("autoUpdate", current["autoUpdate"])
+        if not isinstance(auto_update_values, dict):
+            raise CloudError("Invalid automatic update config")
         config = {
             **current,
             "server": {"host": validate_server_host(values["server"].get("host"))},
+            "autoUpdate": {"enabled": auto_update_values.get("enabled") is True},
             "control": {**current["control"], "password": ""},
             "webdav": {
                 **current["webdav"],
