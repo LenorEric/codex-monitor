@@ -15,12 +15,14 @@ import urllib.parse
 import urllib.request
 import uuid
 import zlib
+from copy import deepcopy
 from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from monitor_accounts import api_identity_id, atomic_write_json, auth_identity, parse_auth_bytes
+from monitor_cloud_queue import CloudOperationQueue, OperationCancelled, OperationSkipped
 from monitor_common import SafeRedirectHandler
 from monitor_skills import SkillError
 from monitor_usage_sync import canonical_json, content_hash, validate_sync_operation
@@ -41,12 +43,10 @@ USAGE_FULL_VERIFY_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 def _serialized_cloud_operation(method):
     @functools.wraps(method)
     def wrapped(self, *args, **kwargs):
-        if not self._operation_lock.acquire(blocking=False):
-            raise CloudError("Another WebDAV operation is already running", 409)
-        try:
-            return method(self, *args, **kwargs)
-        finally:
-            self._operation_lock.release()
+        if self.operation_queue.in_worker():
+            with self._operation_lock:
+                return method(self, *args, **kwargs)
+        return self.operation_queue.wait(self.submit_operation(method.__name__, args, kwargs, source="automatic" if threading.current_thread().name == "cloud-maintenance" else "internal"))
     return wrapped
 
 
@@ -381,6 +381,7 @@ class CloudManager:
         self._state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self._observed_skill_revision = None
         self._operation_lock = threading.RLock()
+        self._queue = CloudOperationQueue()
         self._observed_skill_hashes = None
         self._pending_skill_pushes = {}
         self._auto_push_failures = {}
@@ -390,6 +391,104 @@ class CloudManager:
         self._usage_hmac_key = None
         self._usage_account_ids = {}
         self._next_usage_sync_at = time.monotonic()
+
+    @property
+    def operation_queue(self):
+        return self._queue
+
+    def _queue_generation(self):
+        webdav = getattr(self, "_config", {}).get("webdav", {})
+        return hashlib.sha256(json.dumps({key: webdav.get(key) for key in ("enabled", "baseUrl", "username", "password", "remoteRoot", "encryptionPassphraseHash", "allowOptimisticWrites")}, sort_keys=True).encode()).hexdigest()
+
+    def _queue_sanitize(self, value):
+        if isinstance(value, Exception):
+            return {"message": self._queue_sanitize(str(value)), "status": getattr(value, "status", 500)}
+        if isinstance(value, dict):
+            return {key: self._queue_sanitize(item) for key, item in value.items() if isinstance(item, bool) or key not in {"auth", "rawResponse", "authIdentity"} and not any(secret in key.lower() for secret in ("password", "passphrase", "apikey", "api_key", "token", "authorization", "cookie", "headertoml", "commontoml"))}
+        if isinstance(value, (tuple, list)):
+            return [self._queue_sanitize(item) for item in value]
+        if isinstance(value, str):
+            secret = getattr(self, "_config", {}).get("webdav", {}).get("password", "")
+            if secret:
+                value = value.replace(secret, "[redacted]")
+        return value
+
+    def submit_operation(self, method_name, args=(), kwargs=None, *, source="manual", context=None, on_success=None, validate=None):
+        args, kwargs = deepcopy(args), deepcopy(kwargs or {})
+        generation = self._queue_generation()
+        secrets_to_redact = [self._config.get("webdav", {}).get("password", "")] if hasattr(self, "_config") else []
+        if method_name == "update_config" and args and isinstance(args[0], dict):
+            secrets_to_redact.extend(args[0].get("webdav", {}).get(key, "") for key in ("password", "encryptionPassphrase"))
+            secrets_to_redact.append(args[0].get("controlPassword", ""))
+
+        def sanitize(value):
+            value = self._queue_sanitize(value)
+            if isinstance(value, dict):
+                return {key: sanitize(item) for key, item in value.items()}
+            if isinstance(value, list):
+                return [sanitize(item) for item in value]
+            if isinstance(value, str):
+                for secret in secrets_to_redact:
+                    if isinstance(secret, str) and secret:
+                        value = value.replace(secret, "[redacted]")
+            return value
+
+        def check():
+            if self._queue_generation() != generation:
+                raise OperationSkipped("WebDAV configuration changed while this operation was waiting; submit it again")
+            if source == "automatic":
+                if not self.config()["webdav"].get("enabled") or method_name == "sync_usage_data" and not self.config()["webdav"].get("usageDataAutoSync", True):
+                    raise OperationSkipped("Automatic synchronization is disabled")
+                self.ensure_no_pending_account_operation()
+            if validate:
+                validate()
+
+        def execute():
+            with self._operation_lock:
+                result = getattr(self, method_name)(*args, **kwargs)
+                if on_success:
+                    result = on_success(result)
+                return result
+
+        # Only identical adjacent synchronization requests share execution.
+        combine_key = (method_name, json.dumps([args, kwargs], sort_keys=True), generation, source) if method_name in {"push", "fetch", "sync_usage_data"} else None
+        target = (context or {}).get("body", {})
+        return self.operation_queue.submit(method_name, execute, target=str(target.get("name") or target.get("accountId") or target.get("accountKey") or target.get("snapshotId") or (", ".join(sorted(args[0])) if method_name in {"_upload_due_skills", "upload_skills"} and args and args[0] else "")),
+            source=source, validate=check, combine_key=combine_key, context=context, sanitize=sanitize)
+
+    def validate_queued_action(self, method_name, body, expected_remote=None):
+        if method_name not in {"update_config", "reload_config", "unmanage_skill", "set_skill_shared"} and not self.config()["webdav"].get("enabled"):
+            raise OperationSkipped("WebDAV is disabled")
+        if method_name not in {"update_config", "reload_config", "test"}:
+            self.ensure_no_pending_account_operation()
+        if method_name in {"unmanage_skill", "set_skill_shared"}:
+            if body["name"] not in self.skills.state["skills"] or not (self.skills.skills_root / body["name"] / "SKILL.md").is_file():
+                raise OperationSkipped("The skill is no longer managed")
+        if method_name in {"release_local_account", "share_local_account"}:
+            with self.accounts.lock:
+                account = next((item for item in self.accounts.manifest["accounts"] if item["id"] == body["accountId"]), None)
+                if account is None:
+                    raise OperationSkipped("The local account no longer exists")
+                if method_name == "release_local_account" and (account.get("accountType") == "api" or account["id"] == self.accounts.manifest.get("activeAccountId") or len(self.accounts.manifest["accounts"]) <= 1):
+                    raise OperationSkipped("The account can no longer be released: it is active, the only account, or an API account")
+                if method_name == "share_local_account" and account.get("accountType") != "api":
+                    raise OperationSkipped("Only API accounts can be shared")
+        if method_name in {"bind_local_account", "link_local_account"}:
+            with self.accounts.lock:
+                if any((item.get("cloud") or {}).get("accountKey") == body["accountKey"] for item in self.accounts.manifest["accounts"]):
+                    raise OperationSkipped("This cloud account is already managed locally")
+        if method_name in {"bind_local_account", "link_local_account", "delete_remote_account"}:
+            try:
+                remote, etag = self.account_state(body["accountKey"])
+            except CloudError as exc:
+                if exc.http_status == 404 or "HTTP 404" in str(exc):
+                    raise OperationSkipped("The remote account no longer exists") from exc
+                raise
+            if expected_remote and (expected_remote.get("etag") and etag != expected_remote["etag"] or expected_remote.get("state", {}).get("revisionId") != remote.get("revisionId")):
+                raise OperationSkipped("The remote account changed while this operation was waiting; fetch and submit it again")
+        if method_name == "restore_skills":
+            if self._remote_snapshot()[1] != body["snapshotId"]:
+                raise OperationSkipped("The remote skill snapshot changed before restore")
 
     def _ensure_local_files(self) -> None:
         self.private_root.mkdir(parents=True, exist_ok=True)
@@ -808,14 +907,16 @@ class CloudManager:
         for name, item in sorted(index.get("packages", {}).items()):
             if names is not None and name not in names:
                 continue
-            package_id = item["packageId"]
-            encrypted, _ = client.get(f"skills/packages/{package_id}.enc")
-            data = box.decrypt(f"skill-package:{package_id}", encrypted)
-            packages = self.skills.split_snapshot(data)
-            if set(packages) != {name} or self.skills.skill_package_hash(data) != item["contentSha256"]:
-                raise CloudError("Skill package identity check failed", 409)
-            snapshots.append(data)
+            snapshots.append(self._download_skill_package(client, box, name, item))
         return self.skills.combine_snapshots(snapshots)
+
+    def _download_skill_package(self, client: WebDavClient, box: CryptoBox, name: str, item: dict) -> bytes:
+        package_id = item["packageId"]
+        encrypted, _ = client.get(f"skills/packages/{package_id}.enc")
+        data = box.decrypt(f"skill-package:{package_id}", encrypted)
+        if set(self.skills.split_snapshot(data)) != {name} or self.skills.skill_package_hash(data) != item["contentSha256"]:
+            raise CloudError("Skill package identity check failed", 409)
+        return data
 
     def _skill_packages_needing_fetch(self, index: dict, pointer_changed: bool) -> set[str] | None:
         if index.get("version") == 2:
@@ -915,6 +1016,8 @@ class CloudManager:
         pending = self._state.get("pendingAccountOperation")
         if not isinstance(pending, dict):
             return None
+        if not self.operation_queue.in_worker():
+            return self.operation_queue.wait(self.submit_operation("recover_account_transition", source="recovery"))
         if pending.get("operation") == "bind":
             with self.accounts.lock:
                 existing = next((account for account in self.accounts.manifest["accounts"] if account.get("id") == pending.get("accountId") and (account.get("cloud") or {}).get("accountKey") == pending.get("accountKey")), None)
@@ -1243,7 +1346,7 @@ class CloudManager:
         existing_packages = self._encrypted_payloads(client, "skills/packages")
         existing_snapshots = self._encrypted_payloads(client, "skills/snapshots")
         local_packages = self.skills.skill_snapshots(names)
-        local_hashes = {name: self.skills.skill_package_hash(data) for name, data in local_packages.items()}
+        local_hashes = {}
         added, updated, deleted = [], [], []
         try:
             pointer_data, current_pointer_etag = client.get("skills/current.enc")
@@ -1255,13 +1358,22 @@ class CloudManager:
             remote_index = self._parse_skill_pointer(box, pointer_data, current_pointer_etag)
         packages = dict(remote_index.get("packages", {}))
         migrated = remote_index.get("version") == 1
+        migrated_packages = {}
         if migrated:
             legacy = self.skills.split_snapshot(self._download_skill_snapshot(client, box, remote_index))
             for name, data in legacy.items():
                 content_hash = self.skills.skill_package_hash(data)
                 packages[name] = self._upload_skill_package(client, box, data, content_hash)
+                migrated_packages[name] = data
+        package_changed = False
         for name, data in local_packages.items():
             previous = packages.get(name)
+            original_hash = self.skills.skill_package_hash(data)
+            if previous and previous.get("contentSha256") != original_hash:
+                data = self.skills.snapshot_merged_with_remote(migrated_packages.get(name) or self._download_skill_package(client, box, name, previous), data)[0]
+                if self.skills.skill_package_hash(data) != original_hash:
+                    self.skills.merge(data)
+            local_hashes[name] = self.skills.skill_package_hash(data)
             unchanged = previous and previous.get("contentSha256") == local_hashes[name]
             if unchanged and not force:
                 continue
@@ -1273,8 +1385,9 @@ class CloudManager:
                     updated.append(name)
                 else:
                     deleted.append(name)
+                package_changed = True
             packages[name] = self._upload_skill_package(client, box, data, local_hashes[name])
-        changed = bool(added or updated or deleted)
+        changed = package_changed
         if not changed and not migrated:
             baseline = self._state.get("skills", {}).get("localSha256", {})
             baseline = dict(baseline) if isinstance(baseline, dict) else {}
@@ -1317,8 +1430,25 @@ class CloudManager:
     @_serialized_cloud_operation
     def unmanage_skill(self, name: str) -> dict:
         result = self.skills.unmanage(name)
-        result["cloud"] = self.upload_skills({name})
+        result["cloud"] = self._publish_skill_change(name)
         return result
+
+    @_serialized_cloud_operation
+    def set_skill_shared(self, name: str, shared: bool) -> dict:
+        result = self.skills.set_shared(name, shared)
+        result["cloud"] = self._publish_skill_change(name) if result["changed"] else {"changed": False, "pending": False}
+        return result
+
+    def _publish_skill_change(self, name: str) -> dict:
+        current_hash = self.skills.content_hashes({name}).get(name)
+        if current_hash is None:
+            return {"changed": False, "pending": False}
+        try:
+            return {**self.upload_skills({name}), "pending": False}
+        except (CloudError, OSError) as exc:
+            self._schedule_skill_push(name, current_hash, time.monotonic())
+            self._record_decrypt_failure(exc, "push")
+            return {"changed": False, "pending": True, "error": str(exc)}
 
     def _remote_snapshot(self) -> tuple[bytes, str, str]:
         client, box = self._connection()
@@ -1358,9 +1488,9 @@ class CloudManager:
         return self.accounts.share_cloud_account(self, account_id)
 
     @_serialized_cloud_operation
-    def delete_remote_account(self, account_key: str) -> list[dict]:
+    def delete_remote_account(self, account_key: str, expected_etag: str | None = None) -> list[dict]:
         self.ensure_no_pending_account_operation()
-        return self.delete_account_payloads(str(account_key or ""))
+        return self.delete_account_payloads(str(account_key or ""), expected_etag) if expected_etag is not None else self.delete_account_payloads(str(account_key or ""))
 
     @_serialized_cloud_operation
     def delete_local_account(self, account_id: str) -> dict:
@@ -1807,21 +1937,51 @@ class CloudManager:
         return True
 
     @_serialized_cloud_operation
+    def _upload_due_skills(self, names):
+        if not self.config()["webdav"].get("enabled") or not self.config()["webdav"].get("skillsAutoUpload", True):
+            raise OperationSkipped("Automatic skill upload is disabled")
+        errors = {}
+        try:
+            self.upload_skills(names)
+        except Exception as exc:
+            if len(names) == 1:
+                errors[next(iter(names))] = exc
+            else:
+                # Each attempt rebuilds against the latest pointer and local content.
+                for name in sorted(names):
+                    try:
+                        self.upload_skills({name})
+                    except Exception as failure:
+                        errors[name] = failure
+        return {"errors": errors, "skills": sorted(names)}
+
     def maintenance_tick(self, now: float | None = None) -> dict:
         now = time.monotonic() if now is None else now
         config = self.config()
         if not config["webdav"].get("enabled") or self._state.get("pendingAccountOperation"):
             return {"pushed": False, "fetched": False, "usageSynced": False}
-        if config["webdav"].get("skillsAutoUpload", True):
-            self._observe_skill_content(now)
+        with self._operation_lock:
+            if config["webdav"].get("skillsAutoUpload", True):
+                self._observe_skill_content(now)
+            due = {name for name, pending in self._pending_skill_pushes.items() if config["webdav"].get("skillsAutoUpload", True) and name not in self._auto_push_failures and now >= pending["nextAttemptAt"]}
+            before_hashes = dict(self._observed_skill_hashes or {})
+        errors = {}
+        if due:
+            try:
+                errors = self._upload_due_skills(due)["errors"]
+            except OperationSkipped:
+                for name in due:
+                    self._pending_skill_pushes.pop(name, None)
+                due = set()
         pushed = False
-        for name in sorted(self._pending_skill_pushes):
+        for name in sorted(due):
             pending = self._pending_skill_pushes.get(name)
             if not pending or not config["webdav"].get("skillsAutoUpload", True) or name in self._auto_push_failures or now < pending["nextAttemptAt"]:
                 continue
-            before_hash = (self._observed_skill_hashes or {}).get(name)
+            before_hash = before_hashes.get(name)
             try:
-                self.upload_skills({name})
+                if name in errors:
+                    raise errors[name]
                 pushed = True
             except Exception as exc:
                 self._record_decrypt_failure(exc, "push")

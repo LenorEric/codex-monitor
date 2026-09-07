@@ -19,6 +19,9 @@ const CONTROL_SETUP_URL = new URL("http://127.0.0.1:8765/api/control/setup");
 const ACCOUNT_ACTION_TIMEOUT_MS = 300000;
 const PAGE_ALLOWLIST = Object.freeze({ dashboard: { url: DASHBOARD_URL, asset: "dashboard.html", title: "Codex Usage Details" }, manage: { url: MANAGEMENT_URL, asset: "management.html", title: "Codex Monitor Management" } });
 const MANAGEMENT_ACTION_ALLOWLIST = new Map([
+    ["/api/manage/cloud/queue", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/queue"), method: "GET" }],
+    ["/api/manage/cloud/queue/cancel", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/queue/cancel"), method: "POST" }],
+    ["/api/manage/accounts/delete-remote", { url: new URL("http://127.0.0.1:8765/api/manage/accounts/delete-remote"), method: "POST" }],
     ["/api/control/login", { url: CONTROL_LOGIN_URL, method: "POST" }],
     ["/api/control/setup", { url: CONTROL_SETUP_URL, method: "POST" }],
     ["/api/manage/status", { url: new URL("http://127.0.0.1:8765/api/manage/status"), method: "GET" }],
@@ -27,6 +30,7 @@ const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/manage/skills/manage", { url: new URL("http://127.0.0.1:8765/api/manage/skills/manage"), method: "POST" }],
     ["/api/manage/skills/unmanage", { url: new URL("http://127.0.0.1:8765/api/manage/skills/unmanage"), method: "POST" }],
     ["/api/manage/skills/assign", { url: new URL("http://127.0.0.1:8765/api/manage/skills/assign"), method: "POST" }],
+    ["/api/manage/skills/share", { url: new URL("http://127.0.0.1:8765/api/manage/skills/share"), method: "POST" }],
     ["/api/manage/cloud/test", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/test"), method: "POST" }],
     ["/api/manage/cloud/fetch", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/fetch"), method: "POST" }],
     ["/api/manage/cloud/fetch-all", { url: new URL("http://127.0.0.1:8765/api/manage/cloud/fetch-all"), method: "POST" }],

@@ -18,6 +18,9 @@ release-runtime.md
 release-package.md
 CODE_EFFICIENCY_SECURITY_REVIEW.md
 test_monitor_codex_usage.py
+test_cloud_queue.py
+test_management_queue.js
+.test-cloud-queue-*/**
 usage_monitor_*.json
 usage_monitor_*.jsonl
 usage_monitor_*.json.*

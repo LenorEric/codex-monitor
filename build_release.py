@@ -18,6 +18,7 @@ RUNTIME_FILES = (
     "management.html",
     "monitor_accounts.py",
     "monitor_cloud.py",
+    "monitor_cloud_queue.py",
     "monitor_codex_usage.py",
     "monitor_common.py",
     "monitor_dashboard.py",

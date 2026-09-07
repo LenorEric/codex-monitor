@@ -202,8 +202,17 @@ class SkillManager:
             raise SkillError("Unsupported skill assignment state", 500)
         if not isinstance(state.get("deletions", {}), dict):
             raise SkillError("Unsupported skill deletion state", 500)
+        changed = False
         if "deletions" not in state:
             state["deletions"] = {}
+            changed = True
+        for record in state["skills"].values():
+            if not isinstance(record, dict):
+                raise SkillError("Unsupported skill assignment state", 500)
+            if "shared" not in record:
+                record["shared"] = True
+                changed = True
+        if changed:
             atomic_write_json(self.state_path, state)
         return state
 
@@ -326,7 +335,7 @@ class SkillManager:
 
     def _create_projection_copy(self, name: str, app: str) -> None:
         target = self.paths[app] / name
-        record = self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp()})
+        record = self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp(), "shared": True})
         token = uuid.uuid4().hex
         try:
             manifest = _copy_verified(self.skills_root / name, target)
@@ -405,7 +414,7 @@ class SkillManager:
         name = _safe_name(name)
         if app not in self.paths or not (self.skills_root / name / "SKILL.md").is_file():
             raise SkillError("Unknown managed skill or application", 404)
-        record = self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp()})
+        record = self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp(), "shared": True})
         projection = self._projection(name, app)
         if enabled:
             if projection["state"] == "conflict":
@@ -443,8 +452,7 @@ class SkillManager:
                     os.replace(original, quarantine)
                     quarantines.append(quarantine)
                 os.replace(stage, final)
-                self.state["skills"][name] = {"codex": False, "gemini": False, "managedAt": _timestamp(), "sourceApps": item["sources"], "manifestSha256": hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()}
-                self.state["skills"][name]["clearedDeletions"] = [row["id"] for row in self.state["deletions"].get(name, [])]
+                self.state["skills"][name] = {"codex": False, "gemini": False, "managedAt": _timestamp(), "sourceApps": item["sources"], "manifestSha256": hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest(), "shared": False}
                 self._save()
                 errors = []
                 for app in item["defaultAssignments"]:
@@ -468,6 +476,23 @@ class SkillManager:
                 raise
         self._invalidate_status(scan=True, content=bool(results))
         return {"results": results, **self.status()}
+
+    def set_shared(self, name: str, shared: bool) -> dict:
+        name = _safe_name(name)
+        if not (self.skills_root / name / "SKILL.md").is_file() or name not in self.state["skills"]:
+            raise SkillError(f"Managed skill not found: {name}", 404)
+        record = self.state["skills"][name]
+        shared = bool(shared)
+        if bool(record.get("shared")) == shared:
+            return {"name": name, "shared": shared, "changed": False, **self.status()}
+        record["shared"] = shared
+        if shared:
+            record["clearedDeletions"] = [row["id"] for row in self.state["deletions"].get(name, [])]
+        else:
+            self.state["deletions"].setdefault(name, []).append({"id": uuid.uuid4().hex, "deletedAt": _timestamp()})
+        self._save()
+        self._invalidate_status(content=True)
+        return {"name": name, "shared": shared, "changed": True, **self.status()}
 
     def unmanage(self, name: str) -> dict:
         name = _safe_name(name)
@@ -523,7 +548,7 @@ class SkillManager:
         errors = []
         for path in self.skills_root.iterdir():
             if not path.name.startswith(".") and path.is_dir() and (path / "SKILL.md").is_file():
-                self.state["skills"].setdefault(path.name, {"codex": False, "gemini": False, "managedAt": None})
+                self.state["skills"].setdefault(path.name, {"codex": False, "gemini": False, "managedAt": None, "shared": True})
         for name, record in list(self.state["skills"].items()):
             if not (self.skills_root / name / "SKILL.md").is_file():
                 errors.append({"name": name, "error": "Managed source is missing"})
@@ -550,10 +575,10 @@ class SkillManager:
         for path in sorted(self.skills_root.iterdir(), key=lambda item: item.name.lower()):
             if path.name.startswith(".") or not path.is_dir() or not (path / "SKILL.md").is_file():
                 continue
-            record = self.state["skills"].setdefault(path.name, {"codex": False, "gemini": False, "managedAt": None})
+            record = self.state["skills"].setdefault(path.name, {"codex": False, "gemini": False, "managedAt": None, "shared": True})
             for app in self.paths:
                 self._refresh_projection_copy(path.name, app)
-            items.append({"name": path.name, "assignments": {app: bool(record.get(app)) for app in self.paths}, "projections": {app: self._projection(path.name, app) for app in self.paths}, "errors": {app: record.get(f"{app}Error") for app in self.paths if record.get(f"{app}Error")}})
+            items.append({"name": path.name, "shared": bool(record.get("shared")), "assignments": {app: bool(record.get(app)) for app in self.paths}, "projections": {app: self._projection(path.name, app) for app in self.paths}, "errors": {app: record.get(f"{app}Error") for app in self.paths if record.get(f"{app}Error")}})
         self._status_cache = {"version": 1, "privatePath": str(self.skills_root), "items": items}
         return self._status_cache
 
@@ -568,7 +593,7 @@ class SkillManager:
 
     def skill_snapshots(self, names: set[str] | None = None) -> dict[str, bytes]:
         self._invalidate_status()
-        current = {item["name"] for item in self.status()["items"]}
+        current = {item["name"] for item in self.status()["items"] if item["shared"]}
         available = current | set(self.state["deletions"])
         if names is not None:
             available &= names
@@ -622,7 +647,7 @@ class SkillManager:
 
     def content_hashes(self, names: set[str] | None = None) -> dict[str, str]:
         self._invalidate_status()
-        current = {item["name"] for item in self.status()["items"]}
+        current = {item["name"] for item in self.status()["items"] if item["shared"]}
         available = current | set(self.state["deletions"])
         if names is not None:
             available &= names
@@ -658,7 +683,7 @@ class SkillManager:
         added = sorted(skills.keys() - remote_manifest["skills"].keys())
         updated = sorted(name for name in skills.keys() & remote_manifest["skills"].keys() if skills[name] != remote_manifest["skills"][name])
         removed = sorted(remote_manifest["skills"].keys() - skills.keys())
-        data = self._build_snapshot(skills, files, deletions, {name: cleared[name] for name in skills if cleared.get(name)})
+        data = self._build_snapshot(skills, files, deletions, {name: cleared.get(name, []) for name in skills})
         self.inspect_snapshot(data)
         return data, added, updated, removed
 
@@ -730,12 +755,12 @@ class SkillManager:
     def merge(self, data: bytes) -> dict:
         manifest, files = self.inspect_snapshot(data)
         local = {item["name"]: _tree_manifest(self.skills_root / item["name"]) for item in self.status()["items"]}
+        local_only = {name for name in local if not self.state["skills"].get(name, {}).get("shared")}
         self.state["deletions"] = self._merge_deletions(self.state["deletions"], manifest.get("deletions", {}))
         remote_cleared = manifest.get("clearedDeletions", {})
-        deletions = sorted(name for name in local if self._active_deletion_ids(self.state["deletions"], name) - set(self.state["skills"].get(name, {}).get("clearedDeletions", [])) - set(remote_cleared.get(name, [])))
-        additions = sorted(manifest["skills"].keys() - local.keys())
-        updates = sorted(name for name in manifest["skills"].keys() & local.keys() if manifest["skills"][name] != local[name])
-        additions = [name for name in additions if name not in deletions]
+        deletions = sorted(name for name in local if name not in local_only and self._active_deletion_ids(self.state["deletions"], name) - set(self.state["skills"].get(name, {}).get("clearedDeletions", [])) - set(remote_cleared.get(name, [])))
+        additions = sorted(name for name in manifest["skills"].keys() - local.keys() if not self._active_deletion_ids(self.state["deletions"], name) - set(remote_cleared.get(name, [])))
+        updates = sorted(name for name in manifest["skills"].keys() & local.keys() if name not in local_only and manifest["skills"][name] != local[name])
         updates = [name for name in updates if name not in deletions]
         if not additions and not updates and not deletions:
             self._save()
@@ -765,8 +790,9 @@ class SkillManager:
                         self._remove_projection(name, app)
                 self.state["skills"].pop(name, None)
             for name in additions:
-                self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp(), "sourceApps": ["cloud"]})
+                self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp(), "sourceApps": ["cloud"], "shared": True})
             for name in additions + updates:
+                self.state["skills"][name]["shared"] = True
                 if remote_cleared.get(name):
                     self.state["skills"][name]["clearedDeletions"] = remote_cleared[name]
             self._save()
@@ -788,8 +814,14 @@ class SkillManager:
         safety_path.write_bytes(self.snapshot())
         stage = self.private_root / f".skills.{uuid.uuid4().hex}.tmp"
         old = self.private_root / f".skills.{uuid.uuid4().hex}.old"
+        local_only = {name for name, record in self.state["skills"].items() if not record.get("shared") and (self.skills_root / name / "SKILL.md").is_file()}
         try:
+            stage.mkdir()
+            for name in local_only:
+                shutil.copytree(self.skills_root / name, stage / name, symlinks=False)
             for name, entries in files.items():
+                if name in local_only:
+                    continue
                 for path, content in entries.items():
                     target = stage / name / Path(*PurePosixPath(path).parts)
                     target.parent.mkdir(parents=True, exist_ok=True)
@@ -798,7 +830,7 @@ class SkillManager:
                 _tree_manifest(stage / name)
             _replace_with_retry(self.skills_root, old)
             _replace_with_retry(stage, self.skills_root)
-            surviving = set(files)
+            surviving = set(files) | local_only
             for name in list(self.state["skills"]):
                 if name not in surviving:
                     for app in self.paths:
@@ -807,8 +839,8 @@ class SkillManager:
                         if projection.get("kind") == "copy" or _is_link(target) and target.resolve(strict=False) == (self.skills_root / name).resolve(strict=False):
                             self._remove_projection(name, app)
                     del self.state["skills"][name]
-            for name in surviving:
-                self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp(), "sourceApps": ["cloud"]})
+            for name in set(files) - local_only:
+                self.state["skills"].setdefault(name, {"codex": False, "gemini": False, "managedAt": _timestamp(), "sourceApps": ["cloud"], "shared": True})["shared"] = True
             self._save()
             shutil.rmtree(old)
             errors = self.reconcile()

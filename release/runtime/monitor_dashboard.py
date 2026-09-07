@@ -24,6 +24,7 @@ from pathlib import Path
 
 from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_api_auth, remove_directory
 from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
+from monitor_cloud_queue import OperationSkipped
 from monitor_common import DEFAULT_RETRY_LIMIT, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_events import collect_with_bad_remote_usage_retry, compact_delta_event, cost_percent_ratio, derive_history_events, print_ratio_warnings, print_special_events, print_valid_delta_events, process_sample_delta_events, ratio_deviation, ratio_deviation_warning, sample_debug_log_row
 from monitor_history import (
@@ -241,6 +242,7 @@ def dashboard_skill_status(status: dict) -> dict:
         "version": status.get("version"),
         "items": [{
             "name": item.get("name"),
+            "shared": bool(item.get("shared")),
             "assignments": item.get("assignments") or {},
             "projections": {app: {"state": projection.get("state")} for app, projection in (item.get("projections") or {}).items()},
             "errors": {app: "Projection error" for app in (item.get("errors") or {})},
@@ -1666,6 +1668,61 @@ def dashboard_remote_accounts(accounts: list[dict], local_api_identity_ids: set[
         account["displayLabel"] = f"{label} · {str(account.get('accountKey') or 'profile')[:6]}" if label_counts[label.casefold()] > 1 else label
     return rows
 
+CLOUD_QUEUE_ACTIONS = {
+    "/api/manage/cloud/test": ("test", (), {}),
+    "/api/manage/cloud/push": ("push", (), {}),
+    "/api/manage/cloud/push-all": ("push", (), {"force_full": True}),
+    "/api/manage/cloud/fetch": ("fetch", (), {"include_usage": True}),
+    "/api/manage/cloud/fetch-all": ("fetch", (), {"include_usage": True, "force_full": True}),
+    "/api/manage/cloud/restore": ("restore_skills", ("snapshotId",), {}),
+    "/api/manage/cloud/overwrite": ("overwrite_cloud_from_local", (), {}),
+    "/api/manage/accounts/bind": ("bind_local_account", ("accountKey",), {}),
+    "/api/manage/accounts/link": ("link_local_account", ("accountKey",), {}),
+    "/api/manage/accounts/release": ("release_local_account", ("accountId",), {}),
+    "/api/manage/accounts/share": ("share_local_account", ("accountId",), {}),
+    "/api/manage/accounts/delete-remote": ("delete_remote_account", ("accountKey",), {}),
+    "/api/manage/skills/share": ("set_skill_shared", ("name", "shared"), {}),
+    "/api/manage/skills/unmanage": ("unmanage_skill", ("name",), {}),
+    "/api/manage/config": ("update_config", (), {}),
+    "/api/manage/config/reload": ("reload_config", (), {}),
+}
+
+
+def enqueue_management_action(state, control_auth, path, body):
+    method, fields, kwargs = CLOUD_QUEUE_ACTIONS[path]
+    kwargs = dict(kwargs)
+    if not isinstance(body, dict):
+        raise CloudError("Expected a JSON object", 400)
+    for field in fields:
+        if field == "shared":
+            if not isinstance(body.get(field), bool):
+                raise CloudError("shared must be a boolean", 400)
+        elif not isinstance(body.get(field), str) or not body[field].strip() or len(body[field]) > 512:
+            raise CloudError(f"{field} must be non-empty text of at most 512 characters", 400)
+    for field in ("name", "accountKey"):
+        if field in fields and (body[field] in {".", ".."} or any(char in body[field] for char in "/\\\x00?#%")):
+            raise CloudError(f"Invalid {field}", 400)
+    if method == "update_config" and (not isinstance(body.get("server"), dict) or not isinstance(body.get("webdav"), dict)):
+        raise CloudError("Invalid config update", 400)
+
+    def completed(result):
+        if method == "update_config" and result.get("controlPasswordChanged"):
+            control_auth.update(state.cloud.config()["control"])
+        state._signal_dashboard_cache("cloud")
+        if method in {"bind_local_account", "link_local_account", "release_local_account", "share_local_account"}:
+            return {"accounts": result}
+        if method == "delete_remote_account":
+            return {"remoteAccounts": result, **({"alreadyDeleted": True} if isinstance(result, dict) and result.get("alreadyDeleted") else {})}
+        return result
+
+    expected_remote = state.cloud._state.get("remote", {}).get("accounts", {}).get(body.get("accountKey"))
+    if method == "delete_remote_account" and expected_remote and expected_remote.get("etag"):
+        kwargs["expected_etag"] = expected_remote["etag"]
+    operation = state.cloud.submit_operation(method, (body,) if method == "update_config" else tuple(body[field] for field in fields), kwargs,
+        context={"path": path, "body": {field: body[field] for field in fields}}, on_success=completed, validate=lambda: state.cloud.validate_queued_action(method, body, expected_remote))
+    return {"operationId": operation["public"]["id"], "sessionId": state.cloud.operation_queue.session_id, "status": "queued"}
+
+
 def management_payload(state: UsageDashboardState, include_remote: bool = False, refresh_scan: bool = False) -> dict:
     remote_accounts = state.cloud.cached_remote_accounts()
     api_identity_ids = state.accounts.api_identity_ids() if hasattr(state.accounts, "api_identity_ids") else {}
@@ -1857,13 +1914,17 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                 else:
                     self.send_json(200, payload, {"Cache-Control": "no-cache", "ETag": etag}, cache_key=etag)
                 return
+            if path == "/api/manage/cloud/queue":
+                if self.require_control_auth():
+                    self.send_json(200, state.cloud.operation_queue.snapshot(), sanitize=False)
+                return
             if path == "/api/manage/status":
                 if not self.require_control_auth():
                     return
                 try:
                     query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                     self.send_json(200, management_payload(state, query.get("remote") == ["1"], query.get("scan") == ["1"]), sanitize=False)
-                except (AccountError, SkillError, CloudError) as exc:
+                except (AccountError, SkillError, CloudError, OperationSkipped) as exc:
                     self.send_json(exc.status, {"error": str(exc)})
                 return
             self.send_response(404)
@@ -1873,10 +1934,11 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
             path = urllib.parse.urlparse(self.path).path
             allowed = {
                 "/api/control/login", "/api/control/setup",
-                "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/accounts/session-refresh", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign",
+                "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/accounts/session-refresh", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign", "/api/manage/skills/share",
                 "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/fetch-all", "/api/manage/cloud/push", "/api/manage/cloud/push-all", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/link", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
             }
             allowed.add("/api/manage/accounts/common")
+            allowed.add("/api/manage/cloud/queue/cancel")
             if path not in allowed:
                 self.send_json(404, {"error": "Not found"})
                 return
@@ -1904,6 +1966,14 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                     return
                 if not self.require_control_auth():
                     return
+                if path == "/api/manage/cloud/queue/cancel":
+                    if not isinstance(body, dict) or not isinstance(body.get("operationId"), str):
+                        raise CloudError("operationId is required", 400)
+                    self.send_json(200, state.cloud.operation_queue.cancel(body["operationId"]))
+                    return
+                if path in CLOUD_QUEUE_ACTIONS:
+                    self.send_json(202, enqueue_management_action(state, control_auth, path, body))
+                    return
                 if path == "/api/accounts":
                     result = state.create_account(body.get("label"), body.get("accountType", "account"), body.get("apiKey"))
                 elif path == "/api/accounts/switch":
@@ -1918,71 +1988,11 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                 elif path == "/api/manage/skills/manage":
                     self.send_json(200, state.skills.manage(body.get("names") if isinstance(body.get("names"), list) else []))
                     return
-                elif path == "/api/manage/skills/unmanage":
-                    self.send_json(200, state.cloud.unmanage_skill(body.get("name")))
-                    return
                 elif path == "/api/manage/skills/assign":
                     self.send_json(200, state.skills.assign(body.get("name"), body.get("app"), body.get("enabled") is True))
                     return
                 elif path == "/api/manage/server":
                     self.send_json(200, state.cloud.update_server_config(body.get("host")))
-                    return
-                elif path == "/api/manage/config":
-                    result = state.cloud.update_config(body)
-                    if result["controlPasswordChanged"]:
-                        control_auth.update(state.cloud.config()["control"])
-                    self.send_json(200, result)
-                    return
-                elif path == "/api/manage/config/reload":
-                    self.send_json(200, state.cloud.reload_config())
-                    return
-                elif path == "/api/manage/cloud/test":
-                    self.send_json(200, state.cloud.test())
-                    return
-                elif path == "/api/manage/cloud/fetch":
-                    result = state.cloud.fetch(include_usage=True)
-                    state._signal_dashboard_cache("cloud")
-                    self.send_json(200, result)
-                    return
-                elif path == "/api/manage/cloud/fetch-all":
-                    result = state.cloud.fetch(include_usage=True, force_full=True)
-                    state._signal_dashboard_cache("cloud")
-                    self.send_json(200, result)
-                    return
-                elif path == "/api/manage/cloud/push":
-                    self.send_json(200, state.cloud.push())
-                    return
-                elif path == "/api/manage/cloud/push-all":
-                    self.send_json(200, state.cloud.push(force_full=True))
-                    return
-                elif path == "/api/manage/cloud/overwrite":
-                    self.send_json(200, state.cloud.overwrite_cloud_from_local())
-                    return
-                elif path == "/api/manage/cloud/restore":
-                    self.send_json(200, state.cloud.restore_skills(body.get("snapshotId")))
-                    return
-                elif path == "/api/manage/accounts/bind":
-                    result = state.cloud.bind_local_account(body.get("accountKey"))
-                    state._signal_dashboard_cache("cloud")
-                    self.send_json(200, {"accounts": result})
-                    return
-                elif path == "/api/manage/accounts/link":
-                    result = state.cloud.link_local_account(body.get("accountKey"))
-                    state._signal_dashboard_cache("cloud")
-                    self.send_json(200, {"accounts": result})
-                    return
-                elif path == "/api/manage/accounts/release":
-                    result = state.cloud.release_local_account(body.get("accountId"))
-                    state._signal_dashboard_cache("cloud")
-                    self.send_json(200, {"accounts": result})
-                    return
-                elif path == "/api/manage/accounts/share":
-                    self.send_json(200, {"accounts": state.cloud.share_local_account(body.get("accountId"))})
-                    return
-                elif path == "/api/manage/accounts/delete-remote":
-                    result = state.cloud.delete_remote_account(body.get("accountKey"))
-                    state._signal_dashboard_cache("cloud")
-                    self.send_json(200, {"remoteAccounts": result})
                     return
                 elif path == "/api/manage/accounts/header":
                     self.send_json(200, {"accounts": state.accounts.update_api_config(body.get("accountId"), body.get("headerToml"))})
@@ -1997,7 +2007,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
                     self.send_json(200, {"accounts": state.delete_account(body.get("accountId"))})
                     return
                 self.send_json(200, {"accounts": result})
-            except (AccountError, SkillError, CloudError) as exc:
+            except (AccountError, SkillError, CloudError, OperationSkipped) as exc:
                 self.send_json(exc.status, {"error": str(exc), **({"details": exc.details} if getattr(exc, "details", None) else {}), **({"decryptFailed": True} if getattr(exc, "decrypt_failed", False) else {})})
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
                 self.send_json(400, {"error": "Request body is not valid JSON"})
@@ -2028,7 +2038,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
     session_refresh_thread.start()
     dashboard_cache_thread = threading.Thread(target=state.run_dashboard_cache_maintenance, daemon=True)
     dashboard_cache_thread.start()
-    cloud_thread = threading.Thread(target=state.run_cloud_maintenance, daemon=True)
+    cloud_thread = threading.Thread(target=state.run_cloud_maintenance, name="cloud-maintenance", daemon=True)
     cloud_thread.start()
     config_thread = threading.Thread(target=state.run_config_monitor, daemon=True)
     config_thread.start()
@@ -2053,6 +2063,8 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None) -> int:
         state.dashboard_cache_event.set()
         state.cloud_maintenance_event.set()
         state.config_monitor_event.set()
+        state.cloud.operation_queue.close()
+        cloud_thread.join()
         server.server_close()
         instance_lock.release()
     return 0

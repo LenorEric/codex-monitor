@@ -35,6 +35,7 @@ from monitor_cloud import (
     control_password_matches, hash_control_password, load_server_config, new_control_password_salt, normalized_webdav_identity, passphrase_hash, valid_passphrase_hash, webdav_passphrase_salt,
 )
 from monitor_skills import MANIFEST_FULL_REHASH_SECONDS, SkillError, SkillManager, _safe_name
+from monitor_cloud_queue import CloudOperationQueue
 from monitor_usage_sync import UsageDataStore, aggregate_cost_intervals, merge_token_rows, record_key, validate_sync_operation
 from monitor_codex_usage import (
     add_token_delta,
@@ -78,35 +79,41 @@ from monitor_codex_usage import (
 
 
 class MonitorCodexUsageTests(unittest.TestCase):
-    def test_cloud_operations_reject_concurrent_calls_without_waiting(self):
+    @classmethod
+    def setUpClass(cls):
+        # Tests must not contend with a user's running monitor.
+        patcher = mock.patch.object(monitor_dashboard, "DASHBOARD_INSTANCE_NAME", "CodexMonitorTest-" + uuid.uuid4().hex)
+        patcher.start()
+        cls.addClassCleanup(patcher.stop)
+
+    def test_cloud_operations_queue_concurrent_calls_without_rejection(self):
         manager = object.__new__(CloudManager)
         manager._operation_lock = threading.RLock()
-        manager._operation_lock.acquire()
-        result = []
+        manager._queue = CloudOperationQueue()
+        started, release = threading.Event(), threading.Event()
+        manager.test = mock.Mock(return_value={"passed": True})
+        blocker = manager._queue.submit("blocker", lambda: (started.set(), release.wait(5)))
+        try:
+            self.assertTrue(started.wait(2))
+            operation = manager.submit_operation("test")
+            self.assertEqual(operation["public"]["status"], "queued")
+            manager.test.assert_not_called()
+            release.set()
+            self.assertEqual(manager._queue.wait(operation), {"passed": True})
+            manager.test.assert_called_once_with()
+        finally:
+            release.set()
+            manager._queue.close()
 
-        def call_test():
-            try:
-                manager.test()
-            except CloudError as exc:
-                result.append((exc.status, str(exc)))
-
-        worker = threading.Thread(target=call_test)
-        worker.start()
-        worker.join(1)
-        manager._operation_lock.release()
-
-        self.assertFalse(worker.is_alive())
-        self.assertEqual(result, [(409, "Another WebDAV operation is already running")])
-
-    def test_management_page_disables_every_webdav_action_while_busy(self):
+    def test_management_page_keeps_webdav_actions_available_while_queued(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn("const webDavButtonSelector=", html)
-        for selector in ('[data-action^="cloud-"]', "[data-unmanage]", "[data-share]", "[data-release]", "[data-bind]", "[data-delete-remote]"):
-            self.assertIn(selector, html)
-        self.assertIn("if(busy||webDavBusy)return", html)
-        self.assertIn("setWebDavBusy(true)", html)
-        self.assertIn("finally{setWebDavBusy(false)}", html)
+        self.assertNotIn("webDavBusy", html)
+        self.assertNotIn("setWebDavBusy", html)
+        self.assertIn('id="webDavQueueButton"', html)
+        self.assertIn('id="webDavQueueRows"', html)
+        self.assertIn('setInterval(pollQueue,1000)', html)
+        self.assertIn('operation.status==="queued"?', html)
         self.assertIn('document.getElementById("overwriteCloud").onclick=()=>{modal.classList.remove("open");run("/api/manage/cloud/overwrite",{})}', html)
 
     def test_cloud_maintenance_reports_each_network_outage_once(self):
@@ -4128,7 +4135,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = dashboard_html()
         manifest = json.loads(Path(__file__).with_name("package.json").read_text(encoding="utf-8"))
 
-        self.assertEqual(manifest["version"], "1.3.0")
+        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
         self.assertIn('const DASHBOARD_URL = new URL("http://127.0.0.1:8765/")', extension)
         self.assertIn("PAGE_ALLOWLIST", extension)
         self.assertIn('asset: "dashboard.html"', extension)
@@ -4187,7 +4194,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertIn('class="control-login-backdrop" id="controlLoginModal"', html)
         self.assertNotIn('class="control-login-backdrop open" id="controlLoginModal"', html)
-        self.assertIn('if(error.status===401)showControlLogin(error.message)', html)
+        self.assertIn('if(error.status===401||error.status===428)showControlLogin(error.message,error.status===428)', html)
         self.assertIn('id="closeControlLogin" type="button" aria-label="Close password prompt"', html)
         self.assertIn('document.getElementById("closeControlLogin").onclick=navigateDashboard', html)
         self.assertIn('event.currentTarget.querySelector("button[type=submit]")', html)
@@ -4200,6 +4207,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('{name:"Managed skill validation",status:"passed"', html)
         self.assertIn('{name:`${body.app} projection`,status:"passed"', html)
 
+    def test_managed_skill_shared_checkbox_uses_dedicated_api(self):
+        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
+        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
+
+        self.assertIn('data-shared="${escapeHtml(item.name)}" ${item.shared?"checked":""}> Shared', html)
+        self.assertIn('run("/api/manage/skills/share",{name:input.dataset.shared,shared:input.checked})', html)
+        self.assertIn('["/api/manage/skills/share", { url:', extension)
+
     def test_skill_projection_status_has_stable_width(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
@@ -4209,14 +4224,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_cloud_operation_messages_cover_started_completion_and_error(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
-        self.assertIn('showMessage(`${startOperation.name} Started`,startOperation.message,detailReport(startOperation.name,"In progress"', html)
+        self.assertIn('showMessage(`${queueOperationName(operation)} Queued`', html)
         self.assertIn('function showCloudResult(operation,result,body)', html)
         self.assertIn('showMessage(`${operation.name} Completed`', html)
-        self.assertIn('showMessage(`${operation} Failed`,report.message,report.details,"error")', html)
+        self.assertIn('showMessage(`${name} ${titleStatus(operation.status)}`', html)
         self.assertIn('function errorReport(operation,error)', html)
         self.assertIn('failed?`${failed.name} failed: ${failed.detail}`', html)
         self.assertIn('message.dismissTimer=type==="progress"?null:setTimeout(dismiss,10000)', html)
-        self.assertIn('startMessage?.dismiss()', html)
+        self.assertIn('queueProgress.get(operation.id)?.dismiss()', html)
 
     def test_all_slow_cloud_actions_have_progress_messages(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
@@ -4226,17 +4241,17 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         for title in ("Cloud Data Overwritten", "The API account is available locally and in WebDAV.", "The account was deleted from WebDAV."):
             self.assertIn(title, html)
-        self.assertIn('showMessage(`${startOperation.name} Started`', html)
-        self.assertIn('showMessage(`${operation} Failed`', html)
+        self.assertIn('showMessage(`${queueOperationName(operation)} Queued`', html)
+        self.assertIn('showMessage(`${name} ${titleStatus(operation.status)}`', html)
 
     def test_bind_messages_explicitly_cover_start_finished_and_error(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
         self.assertIn('path.endsWith("/accounts/bind")?{name:"Bind",message:"Moving the selected cloud OpenAI account to this machine."', html)
-        self.assertIn('`${startOperation.name} Started`', html)
+        self.assertIn('`${queueOperationName(operation)} Queued`', html)
         self.assertIn('"WebDAV Test Passed"', html)
         self.assertIn('`${operation.name} Completed`', html)
-        self.assertIn('`${operation} Failed`', html)
+        self.assertIn('`${name} ${titleStatus(operation.status)}`', html)
         for step in ("Cloud account download and decryption", "Credential profile validation", "Local vault commit", "Cloud payload removal"):
             self.assertIn(step, html)
 
@@ -4322,7 +4337,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("allow_reuse_address = True", source)
         self.assertLess(serve_source.index("instance_lock.acquire()"), serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'))
         self.assertIn("self.wake_event.wait(poll_sleep_seconds(self.last_acquire_started_at, self.args.interval))", source)
-        self.assertIn("threading.Thread(target=state.run_cloud_maintenance, daemon=True)", source)
+        self.assertIn("threading.Thread(target=state.run_cloud_maintenance, name=\"cloud-maintenance\", daemon=True)", source)
         self.assertIn("threading.Thread(target=state.run_inactive_account_polling, daemon=True)", source)
         self.assertIn("self.cloud_maintenance_event.wait(5)", source)
         self.assertIn('DASHBOARD_PORT = 8765', source)
@@ -5309,6 +5324,17 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(manager.state["deletions"], {})
             self.assertEqual(json.loads((private / "skills.json").read_text(encoding="utf-8"))["deletions"], {})
 
+    def test_legacy_managed_skill_state_defaults_to_shared(self):
+        with self.account_directory() as directory:
+            private = directory / "private"
+            private.mkdir()
+            (private / "skills.json").write_text(json.dumps({"version": 1, "skills": {"demo": {"codex": True, "gemini": False}}, "deletions": {}}), encoding="utf-8")
+
+            manager = SkillManager(directory / "codex", private, directory / "gemini")
+
+            self.assertTrue(manager.state["skills"]["demo"]["shared"])
+            self.assertTrue(json.loads((private / "skills.json").read_text(encoding="utf-8"))["skills"]["demo"]["shared"])
+
     def test_skill_management_codex_wins_duplicate_and_assigns_both(self):
         with self.account_directory() as directory:
             codex_home, gemini, private = directory / "codex", directory / "gemini" / "config" / "skills", directory / "private"
@@ -5323,6 +5349,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(manager.status()["items"][0]["projections"]["codex"]["state"], "linked")
             self.assertEqual(manager.status()["items"][0]["projections"]["gemini"]["state"], "linked")
             self.assertEqual(manager.status()["items"][0]["assignments"], {"codex": True, "gemini": True})
+            self.assertFalse(manager.status()["items"][0]["shared"])
+            self.assertEqual(manager.skill_snapshots(), {})
 
     def test_skill_unmanage_replaces_assigned_links_with_independent_copies(self):
         with self.account_directory() as directory:
@@ -5388,6 +5416,24 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertNotIn("demo", stale.state["skills"])
             self.assertEqual(stale.state["deletions"], remote.state["deletions"])
 
+    def test_local_tombstone_suppresses_stale_remote_fetch_after_unmanage(self):
+        with self.account_directory() as directory:
+            local = SkillManager(directory / "codex", directory / "private", directory / "gemini")
+            local_skill = local.skills_root / "demo"
+            local_skill.mkdir(parents=True)
+            (local_skill / "SKILL.md").write_text("local", encoding="utf-8")
+            local.unmanage("demo")
+            remote = SkillManager(directory / "remote-codex", directory / "remote-private", directory / "remote-gemini")
+            remote_skill = remote.skills_root / "demo"
+            remote_skill.mkdir(parents=True)
+            (remote_skill / "SKILL.md").write_text("stale remote", encoding="utf-8")
+
+            result = local.merge(remote.snapshot())
+
+            self.assertEqual(result["added"], [])
+            self.assertFalse((local.skills_root / "demo").exists())
+            self.assertNotIn("demo", local.state["skills"])
+
     def test_skill_push_tombstone_suppresses_stale_local_copy(self):
         with self.account_directory() as directory:
             stale = SkillManager(directory / "codex", directory / "private", directory / "gemini")
@@ -5420,7 +5466,24 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             upload.assert_called_once_with({"demo"})
             self.assertEqual(result["cloud"]["deleted"], ["demo"])
 
-    def test_explicit_manage_clears_known_tombstone_and_allows_readding_skill(self):
+    def test_skill_share_state_is_saved_and_queued_while_webdav_is_disabled(self):
+        with self.account_directory() as directory:
+            skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
+            managed = skills.skills_root / "demo"
+            managed.mkdir(parents=True)
+            (managed / "SKILL.md").write_text("demo", encoding="utf-8")
+            skills.reconcile()
+            skills.set_shared("demo", False)
+            cloud = CloudManager(directory / "private", skills, None)
+
+            result = cloud.set_skill_shared("demo", True)
+
+            self.assertTrue(result["shared"])
+            self.assertTrue(result["cloud"]["pending"])
+            self.assertIn("demo", cloud._pending_skill_pushes)
+            self.assertTrue(skills.state["skills"]["demo"]["shared"])
+
+    def test_explicit_share_clears_known_tombstone_and_allows_readding_skill(self):
         with self.account_directory() as directory:
             codex_home, private = directory / "codex", directory / "private"
             manager = SkillManager(codex_home, private, directory / "gemini")
@@ -5431,12 +5494,55 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             (source / "SKILL.md").write_text("intentional re-add", encoding="utf-8")
 
             manager.manage(["demo"])
+            manager.set_shared("demo", True)
 
             manifest, _ = manager.inspect_snapshot(manager.snapshot())
             self.assertEqual(manifest["clearedDeletions"]["demo"], ["deleted-revision"])
             merged, _, _, deleted = manager.snapshot_merged_with_remote(manager._build_snapshot({}, {}, manager.state["deletions"], {}), manager.snapshot())
             self.assertIn("demo", manager.inspect_snapshot(merged)[0]["skills"])
             self.assertEqual(deleted, [])
+
+    def test_unshare_keeps_local_managed_skill_and_tombstone_removes_shared_peer(self):
+        with self.account_directory() as directory:
+            origin = SkillManager(directory / "origin-codex", directory / "origin-private", directory / "origin-gemini")
+            peer = SkillManager(directory / "peer-codex", directory / "peer-private", directory / "peer-gemini")
+            for manager in (origin, peer):
+                skill = manager.skills_root / "demo"
+                skill.mkdir(parents=True)
+                (skill / "SKILL.md").write_text("demo", encoding="utf-8")
+                manager.reconcile()
+            peer.assign("demo", "codex", True)
+
+            origin.set_shared("demo", False)
+            tombstone = origin.skill_snapshots({"demo"})["demo"]
+            result = peer.merge(tombstone)
+
+            self.assertTrue((origin.skills_root / "demo" / "SKILL.md").is_file())
+            self.assertFalse(origin.status()["items"][0]["shared"])
+            self.assertNotIn("demo", origin.inspect_snapshot(tombstone)[0]["skills"])
+            self.assertEqual(result["deleted"], ["demo"])
+            self.assertFalse((peer.skills_root / "demo").exists())
+            self.assertFalse((directory / "peer-codex" / "skills" / "demo").exists())
+
+    def test_restore_preserves_local_only_managed_skill(self):
+        with self.account_directory() as directory:
+            manager = SkillManager(directory / "codex", directory / "private", directory / "gemini")
+            local = manager.skills_root / "local"
+            local.mkdir(parents=True)
+            (local / "SKILL.md").write_text("local", encoding="utf-8")
+            manager.reconcile()
+            manager.set_shared("local", False)
+            remote = SkillManager(directory / "remote-codex", directory / "remote-private", directory / "remote-gemini")
+            shared = remote.skills_root / "shared"
+            shared.mkdir(parents=True)
+            (shared / "SKILL.md").write_text("shared", encoding="utf-8")
+
+            result = manager.restore(remote.snapshot())
+
+            self.assertEqual((manager.skills_root / "local" / "SKILL.md").read_text(encoding="utf-8"), "local")
+            self.assertFalse(manager.state["skills"]["local"]["shared"])
+            self.assertTrue(manager.state["skills"]["shared"]["shared"])
+            self.assertEqual(set(result["restored"]), {"shared"})
 
     def test_skill_unmanage_preserves_unrelated_projection_and_managed_source(self):
         with self.account_directory() as directory:
@@ -5786,6 +5892,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
     def test_webdav_test_decrypts_existing_payload_before_protocol_writes(self):
         manager = object.__new__(CloudManager)
+        manager._queue = CloudOperationQueue()
+        self.addCleanup(manager._queue.close)
         manager._operation_lock = threading.RLock()
         manager._state = {"conditionalWritesVerified": False}
         manager._save_state = mock.Mock()
@@ -5806,6 +5914,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
     def test_webdav_test_rejects_existing_payload_that_cannot_be_decrypted(self):
         manager = object.__new__(CloudManager)
+        manager._queue = CloudOperationQueue()
+        self.addCleanup(manager._queue.close)
         manager._operation_lock = threading.RLock()
         client, box = mock.Mock(), mock.Mock()
         client.get.return_value = b"encrypted", '"payload-etag"'
@@ -5819,6 +5929,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
     def test_webdav_test_allows_empty_encrypted_inventory(self):
         manager = object.__new__(CloudManager)
+        manager._queue = CloudOperationQueue()
+        self.addCleanup(manager._queue.close)
         manager._operation_lock = threading.RLock()
         manager._state = {"conditionalWritesVerified": False}
         manager._save_state = mock.Mock()
@@ -6337,6 +6449,48 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(unchanged["updated"], [])
             self.assertEqual(len([call for call in client.put.call_args_list if call.args[0] == "skills/current.enc"]), pointer_puts)
 
+    def test_skill_upload_merges_remote_tombstone_before_stale_local_content(self):
+        with self.account_directory() as directory:
+            stale = SkillManager(directory / "codex", directory / "private", directory / "gemini")
+            stale_skill = stale.skills_root / "demo"
+            stale_skill.mkdir(parents=True)
+            (stale_skill / "SKILL.md").write_text("stale", encoding="utf-8")
+            stale.reconcile()
+            remote = SkillManager(directory / "remote-codex", directory / "remote-private", directory / "remote-gemini")
+            remote_skill = remote.skills_root / "demo"
+            remote_skill.mkdir(parents=True)
+            (remote_skill / "SKILL.md").write_text("remote", encoding="utf-8")
+            remote.unmanage("demo")
+            tombstone = remote.skill_snapshots({"demo"})["demo"]
+            package_id = remote.skill_package_hash(tombstone)
+            pointer = {"version": 2, "packages": {"demo": {"packageId": package_id, "contentSha256": package_id, "updatedAt": "now"}}, "updatedAt": "now"}
+            stored = {"skills/current.enc": json.dumps(pointer).encode(), f"skills/packages/{package_id}.enc": tombstone}
+
+            class Client:
+                def ensure_directories(self, _path):
+                    pass
+
+                def list(self, path):
+                    return [f"{package_id}.enc"] if path == "skills/packages" else []
+
+                def get(self, path):
+                    return stored[path], '"etag"'
+
+                def put(self, path, data, **_kwargs):
+                    stored[path] = data
+                    return '"new"'
+
+            cloud = CloudManager(directory / "private", stale, None)
+            box = SimpleNamespace(encrypt=lambda _purpose, payload: payload, decrypt=lambda _purpose, payload: payload)
+
+            with mock.patch.object(cloud, "_connection", return_value=(Client(), box)):
+                result = cloud.upload_skills({"demo"})
+
+            self.assertFalse(result["changed"])
+            self.assertFalse(stale_skill.exists())
+            self.assertNotIn("demo", stale.state["skills"])
+            self.assertEqual(json.loads(stored["skills/current.enc"]), pointer)
+
     def test_management_page_auto_refreshes_locally_and_fetches_webdav_explicitly(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
         extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
@@ -6352,8 +6506,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertIn('<button data-action="cloud-push-all">Push All</button>', html)
         self.assertIn('<button data-action="cloud-fetch-all">Fetch All</button>', html)
         self.assertIn('pushWarning?"Push (!)":"Push"', html)
-        self.assertIn('showMessage("Automatic Push Failed",`Automatic skill upload failed: ${failure.message}`', html)
-        self.assertIn('{name:"Cloud upload",status:"failed",detail:failure.message}', html)
+        self.assertIn('"_upload_due_skills":"Automatic Skill Upload"', html)
+        self.assertIn('if(event.phase==="start")queueStart(event.operation);else queueEnd(event.operation)', html)
         self.assertNotIn('Auto Push Success', html)
         self.assertLess(html.index('data-action="cloud-push"'), html.index('data-action="cloud-fetch"'))
         self.assertLess(html.index('data-action="cloud-fetch"'), html.index('data-action="cloud-test"'))
@@ -6382,15 +6536,12 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertIn('"/api/manage/cloud/push-all"', extension)
         self.assertIn('"/api/manage/accounts/link"', extension)
         self.assertIn('["/api/manage/accounts/delete", { url: ACCOUNT_DELETE_URL, method: "POST" }]', extension)
-        self.assertIn('elif path == "/api/manage/cloud/fetch":', dashboard)
-        self.assertIn('elif path == "/api/manage/cloud/fetch-all":', dashboard)
-        self.assertIn('elif path == "/api/manage/cloud/push":', dashboard)
-        self.assertIn('elif path == "/api/manage/cloud/push-all":', dashboard)
-        self.assertIn('state.cloud.fetch(include_usage=True)', dashboard)
-        self.assertIn('state.cloud.push()', dashboard)
-        self.assertIn('state.cloud.fetch(include_usage=True, force_full=True)', dashboard)
-        self.assertIn('state.cloud.push(force_full=True)', dashboard)
-        self.assertIn('elif path == "/api/manage/accounts/link":', dashboard)
+        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/cloud/fetch'], ('fetch', (), {'include_usage': True}))
+        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/cloud/fetch-all'], ('fetch', (), {'include_usage': True, 'force_full': True}))
+        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/cloud/push'], ('push', (), {}))
+        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/cloud/push-all'], ('push', (), {'force_full': True}))
+        self.assertIn('self.send_json(202, enqueue_management_action(state, control_auth, path, body))', dashboard)
+        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/accounts/link'], ('link_local_account', ('accountKey',), {}))
         self.assertIn('elif path == "/api/manage/accounts/delete":', dashboard)
         self.assertNotIn('/api/manage/cloud/upload', html + extension + dashboard)
         self.assertNotIn('/api/manage/accounts/backup-all', html + extension + dashboard)

@@ -168,19 +168,19 @@ The backend scans `CODEX_HOME/skills` and `~/.gemini/config/skills` for director
 1. Open **Manage skills & accounts**.
 2. Select **Scan skills** when you need a fresh discovery pass.
 3. Select skills and choose **Manage selected**.
-4. Assign each managed skill to Codex, Gemini, or both.
+4. Assign each managed skill to Codex, Gemini, or both, and select **Shared** only for skills that should synchronize through WebDAV.
 
 Managed content is moved into `~/.codex-switch/skills`.
 The monitor creates strict per-skill symbolic links; Windows uses native directory junctions when symlinks are unavailable, while non-Windows systems use an ownership-marked managed copy as a fallback. Scanning preserves existing same-name target paths as unassigned conflicts; explicitly selecting **link to** replaces the conflicting path with the managed projection.
 
-Cloud behavior is name-based:
+Newly managed skills are local-only by default. Existing managed skills retain their previous shared behavior when `skills.json` is upgraded. Cloud behavior is name-based for shared skills:
 
 - **Push:** local same-name content wins, remote-only skills remain, and accounts are never included.
-- **Fetch:** remote same-name content wins, local-only skills remain, and existing assignments are preserved.
-- **Unmanage:** immediately publishes a tombstone when cloud synchronization is configured.
-- **Restore:** exact API restore creates a local safety ZIP before replacing the managed set.
+- **Fetch:** remote same-name shared content wins, local-only skills remain, and existing assignments are preserved.
+- **Unshare / Unmanage:** publishes a durable tombstone so stale machines remove the shared skill instead of uploading it again. Unsharing keeps the managed source on the initiating machine; unmanaging keeps independent assigned copies.
+- **Restore:** exact API restore creates a local safety ZIP before replacing the shared managed set; local-only managed skills remain untouched.
 
-Changed managed skills receive independent two-minute stability windows. Stable content is uploaded automatically up to three times, with 30 seconds between failures.
+Changed shared skills and pending share-deletion tombstones receive independent two-minute stability windows. Stable content is uploaded automatically up to three times, with 30 seconds between failures.
 The five-second observer hashes incrementally and performs a bounded full verification; disabling `skillsAutoUpload` disables this observation.
 
 ## WebDAV and encrypted synchronization
@@ -199,6 +199,12 @@ Open **Manage skills & accounts → Config file**. Configure the remote without 
 | Allow optimistic writes | Permits servers that ignore conditional writes; account exclusivity then becomes best-effort. |
 
 Use **Test WebDAV** before Push. Jianguoyun/Nutstore users can use `https://dav.jianguoyun.com/dav/` with an application password.
+
+Manual and automatic WebDAV operations share a server-side queue and run one at a time. The management page shows a spinner and the running-plus-waiting count in the bottom-right corner. Click it to inspect operations or remove waiting work.
+Share/Unshare Skill and Unmanage apply their local changes when execution starts, so removing waiting work prevents those changes too. Each operation has one queued/start notification and one outcome notification, including skipped, cancelled, and partially completed work.
+The queue survives page reloads and closed tabs, but waiting operations are discarded when the monitor stops. Targets and configuration are revalidated before execution. Identical adjacent sync requests and compatible automatic skill uploads can share work; other actions retain their order.
+
+Queued management POSTs return HTTP `202` with `operationId` and `sessionId`. Authenticated clients read progress and recent results from `GET /api/manage/cloud/queue` and remove waiting work with `POST /api/manage/cloud/queue/cancel` and an `operationId` JSON field.
 
 Manual **Push** always publishes managed-skill changes and local recorded usage data. Manual **Fetch** always refreshes remote-account metadata, merges managed-skill changes, and downloads recorded usage data from other machines. These manual transfers run even when their automatic options are disabled. Account credentials are transferred only through explicit **Share**, **Link**, **Release**, and **Bind** actions.
 
