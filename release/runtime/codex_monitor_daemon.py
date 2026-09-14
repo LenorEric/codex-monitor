@@ -7,7 +7,7 @@ if sys.version_info < (3, 12):
     raise SystemExit("Codex Usage Monitor requires Python 3.12 or newer.")
 
 from monitor_accounts import migrate_account_vault
-from monitor_auto_update import AUTO_UPDATE_RESTART, migrate_installed_usage_data, restart_process
+from monitor_auto_update import AUTO_UPDATE_RESTART, installed_version, migrate_installed_usage_data, restart_process
 from monitor_cloud import CloudManager
 from monitor_common import *
 from monitor_dashboard import *
@@ -20,6 +20,7 @@ from monitor_tokens import *
 
 
 def main() -> int:
+    print(f"Codex Usage Monitor v{installed_version(Path(__file__).resolve().parent)}", flush=True)
     parser = argparse.ArgumentParser(description="Poll Codex ChatGPT-account usage/rate-limit data and local Codex session token usage.")
     parser.add_argument("--auth", type=Path, default=codex_home() / "auth.json")
     parser.add_argument("--codex-home", type=Path, default=codex_home(), help="Codex config directory containing sessions/. Defaults to CODEX_HOME or ~/.codex.")

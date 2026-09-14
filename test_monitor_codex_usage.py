@@ -82,6 +82,14 @@ from monitor_codex_usage import (
 
 
 class MonitorCodexUsageTests(unittest.TestCase):
+    def test_script_prints_current_version_at_startup(self):
+        root = Path(__file__).resolve().parent
+        completed = subprocess.run([sys.executable, str(root / "codex_monitor_daemon.py"), "--help"], cwd=root, capture_output=True, text=True)
+        version = json.loads((root / "package.json").read_text(encoding="utf-8"))["version"]
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(completed.stdout.splitlines()[0], f"Codex Usage Monitor v{version}")
+
     @classmethod
     def setUpClass(cls):
         # Tests must not contend with a user's running monitor.

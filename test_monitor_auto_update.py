@@ -275,17 +275,17 @@ class AutoUpdateTests(unittest.TestCase):
             self.assertEqual(list(manifest["files"]), ["A.py", "b.py"])
             self.assertEqual(manifest["files"]["A.py"], descriptor(b"a"))
 
-    def test_current_release_is_complete_version_1_5_1_and_next_build_is_patch(self):
+    def test_current_release_is_complete_version_1_5_2_and_next_build_is_patch(self):
         package = json.loads((build_release.ROOT / "package.json").read_text(encoding="utf-8"))
         manifest = json.loads((build_release.RELEASE_DIR / "version.json").read_text(encoding="utf-8"))
         actual = {path.name: descriptor(path.read_bytes()) for path in build_release.RUNTIME_DIR.iterdir() if path.is_file()}
 
-        self.assertEqual(package["version"], "1.5.1")
+        self.assertEqual(package["version"], "1.5.2")
         self.assertEqual(package["dataContractVersion"], monitor_auto_update.DATA_CONTRACT_VERSION)
-        self.assertEqual(manifest, {"version": "1.5.1", "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
-        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": "1.5.1", "dataContractVersion": 4})
+        self.assertEqual(manifest, {"version": "1.5.2", "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
+        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": "1.5.2", "dataContractVersion": 4})
         self.assertTrue(all((build_release.ROOT / name).read_text(encoding="utf-8") == (build_release.RUNTIME_DIR / name).read_text(encoding="utf-8") for name in build_release.RUNTIME_FILES))
-        self.assertEqual(build_release.next_patch_version("1.5.1"), "1.5.2")
+        self.assertEqual(build_release.next_patch_version("1.5.2"), "1.5.3")
         ignore = (build_release.ROOT / ".vscodeignore").read_text(encoding="utf-8").splitlines()
         self.assertIn("release/**", ignore)
         self.assertIn("release_pack/**", ignore)

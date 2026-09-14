@@ -1,9 +1,9 @@
 {
-  "version": "1.5.2",
+  "version": "1.5.3",
   "files": {
     "codex_monitor_daemon.py": {
-      "size": 4695,
-      "sha256": "9165778c1e88839bbd4924593ce2678111398c8e507b1f76c415116cdefea8eb"
+      "size": 4814,
+      "sha256": "ec230599c51912793df1a6186de1fefb9cb7cf1857c27b29d7bf7890563c3dd1"
     },
     "dashboard.html": {
       "size": 104254,
@@ -91,7 +91,7 @@
     },
     "version.json": {
       "size": 53,
-      "sha256": "4fc415e0692adf734c3f818ec110b55328d87919911b1a52068a4d8d3d5635cb"
+      "sha256": "022f648ba8cc45e9d6c297141b23911f08afad60ea08ad56c9ab380b57b05b5a"
     }
   }
 }
