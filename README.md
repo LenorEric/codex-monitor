@@ -222,18 +222,19 @@ If authentication works but decryption fails, the management page can reload loc
 Automatic usage synchronization supplements the directional manual Push and Fetch actions:
 
 - It runs every 60 minutes when `usageDataAutoSync` is enabled. The one-hour interval is measured from the last attempted sync, so both successful and failed attempts delay the next attempt by one hour.
-- It synchronizes delta/cost intervals, quota history, and token-session history.
+- It synchronizes quota history and every event-level token-ledger record. Cost/usage chart points and token-session summaries are rebuilt locally and are never synchronized.
 - Local quota history keeps every accepted poll. Cloud synchronization removes only redundant interior samples from unchanged quota plateaus and marks the retained endpoint with the covered range;
   gaps over four hours remain separate and unmarked so charts can distinguish compaction from a real monitoring outage.
 - It excludes credentials, skill contents, detailed sample logs, and runtime state.
 - Each machine publishes an encrypted manifest containing every logical usage-pack ID and content hash. Fetch compares that complete inventory with `usage_monitor_sync_cache.json`, so one known pack can never cause earlier or missing packs to be skipped.
-- Records are assigned to 64 stable key-hash buckets, then split at 16 KiB of compressed data. Updating an active record normally replaces only its small bucket pack instead of rewriting a time sequence or a large checkpoint.
+- Records are assigned to 64 key-hash buckets and subdivided by additional hash bits when a pack exceeds 16 KiB compressed; an indivisible oversized record stays in its own pack. Changes remain within the affected hash branch; full Push keeps the same compacted quota dataset and forces upload and verification.
 - Ordinary publishing verifies at most two deterministically rotated changed packs and commits the manifest with a strong conditional ETag. It does not list the pack directory.
   A full verification reads every referenced pack and verifies the committed pointer every 30 days, on format migration, and for an explicit full Push.
 - A failed upload cannot expose a partial manifest: immutable content-addressed packs are uploaded first, and the pointer is committed last with `If-Match`/`If-None-Match`.
   A later attempt can reuse packs left by a failure before retrying the pointer commit.
-- Fetch reconstructs every legacy checkpoint/chunk stream it finds, uploads verified version-2 packs, conditionally replaces the manifest, and deletes the legacy payloads only after verification.
-- Downloaded records and their per-machine pack hashes are stored atomically by origin in `usage_monitor_sync_cache.json`; they never replace or append to local recorder files.
+- Fetch reads legacy checkpoint/chunk streams while retaining quota records and ignoring obsolete derived cost/session records. Current packs are published through a conditional manifest commit.
+- Downloaded records are stored in immutable pack shards under `usage_monitor_sync_cache.json.d/`; `usage_monitor_sync_cache.json` is the small manifest committed after its shards are durable. Fetch reconciles removed machine origins after reading the complete remote inventory.
+- Usage account IDs are domain-separated hashes of account identity and stay unchanged when the encryption passphrase changes. Compatible legacy aliases keep older synchronized records associated with their account.
 - The dashboard maintains `usage_monitor_dashboard_cache.json` as a display-only cache of complete local and merged chart datasets. It keeps the newest three days lossless and progressively groups older chart points; raw recorder files and token/session totals are not changed. Cache build timestamps and hourly maintenance deadlines do not publish an API update unless the visible data changes.
 
 Every 60 minutes, periodic Fetch also checks the authoritative skill index and refreshes the remote-account list. Strong pointer ETags skip unchanged usage manifests, while missing local pack hashes still force repair.
@@ -248,16 +249,16 @@ The canonical data root is `~/.codex-switch`:
 | `config.json` | Server and auto-update settings, plaintext WebDAV login password, cookie secret, password verifier, and derived encryption key | No |
 | `accounts/` | Sensitive Codex account vault and manifest | Explicit API Share/Link or OpenAI Release/Bind only |
 | `skills/` | Private managed skill source | Optional encrypted packages |
-| `usage_monitor_history.jsonl` | Local raw cost/delta intervals | Derived records only |
-| `usage_monitor_quota_history.jsonl` | Complete local accepted quota readings | Compacted derived records only |
-| `usage_monitor_token_sessions.jsonl` | Local per-session token and cost totals | Derived records only |
-| `usage_monitor_token_ledger.jsonl` | Append-only usage records and deduplicated price epochs; authoritative for local token cost | Never |
-| `usage_monitor_samples.jsonl` | Detailed local diagnostic samples | Never |
+| `usage_monitor_quota_readings.jsonl` | Complete local accepted quota readings | Compacted derived records only |
+| `usage_monitor_token_events.jsonl` | Append-only usage events with recorded costs and preserved legacy token baselines; authoritative for token and cost totals | Every record, encrypted |
+| `usage_monitor_diagnostic_samples.jsonl` | Detailed local diagnostic samples | Never |
 | `usage_monitor_state.json` | Runtime baselines and cursors | Never |
-| `usage_monitor_sync_cache.json` | Downloaded records and complete per-machine pack-hash inventories | Never uploaded as a recorder file |
+| `usage_monitor_sync_cache.json` / `usage_monitor_sync_cache.json.d/` | Atomic cache manifest and immutable downloaded pack shards | Never uploaded as recorder files |
 | `usage_monitor_dashboard_cache.json` | Backend-maintained complete local/merged display snapshots with tiered chart points | Never |
 
-The token ledger writes a complete price epoch once when it is first used; subsequent usage rows reference its `pricingId`. Existing session totals are imported once as compact legacy baselines, and the session-history file is then regenerated from the ledger.
+Each token event stores its cost calculated using the price effective at the event time. Stored costs remain authoritative after pricing changes; redundant price-epoch records and references are removed by the ordered data-contract migration after verifying totals. Existing session-only totals are preserved as legacy baselines, which contribute to token summaries but not Cost vs Usage charts. Legacy source high-water totals are retained when they cannot be derived equivalently from the baseline.
+
+Derived charts are rebuilt from retained quota history and token-ledger events; obsolete cost-chart records are not converted. Local quota and ledger entries are appended and flushed to disk, runtime state is atomically replaced, and interrupted migrations recover before affected data is loaded.
 
 > [!WARNING]
 > Protect the whole `~/.codex-switch` directory. Never commit it, place it in support bundles, log it, or share screenshots of its contents. Losing the encryption passphrase makes encrypted remote data unrecoverable.
@@ -282,16 +283,13 @@ python codex_monitor_daemon.py --help
 | `--auth PATH` | Override the live authentication file. |
 | `--interval SECONDS` | Set the remote usage polling interval; default is 90 seconds. |
 | `--timeout SECONDS` | Set the per-request timeout; default is 10 seconds. |
-| `--history PATH` | Override local delta-history JSONL. |
 | `--quota-history PATH` | Override per-account quota-history JSONL. |
-| `--token-session-history PATH` | Override per-session token/cost JSONL. |
-| `--token-ledger PATH` | Override the append-only token and price ledger JSONL. |
+| `--token-ledger PATH` | Override the append-only token and recorded-cost ledger JSONL. |
 | `--sample-log PATH` | Override the detailed diagnostic JSONL. |
 | `--sample-log-max-bytes N` | Compact the sample log after this size; default is 50 MiB with an 80% target. |
 | `--local-only` | Scan local session logs without calling ChatGPT usage endpoints. |
 | `--no-token-scan` | Disable local session token scanning. |
-| `--process-history` | Print valid stored delta cost/percentage pairs and exit. |
-| `--compact-history-days N` | Keep only delta and quota history newer than N days and exit. |
+| `--compact-history-days N` | Keep only quota history newer than N days. |
 | `--reencrypt-cloud` | Refresh nonces and verify all encrypted WebDAV payloads using the configured key, then exit. |
 | `--retry-limit N` | Set bounded HTTP/dashboard retries; network outages continue retrying. |
 
@@ -332,7 +330,7 @@ Run from the repository root:
 
 ```console
 python -m pip install -r requirements.txt
-python -m unittest test_monitor_codex_usage.py test_monitor_auto_update.py test_cloud_queue.py
+python -m unittest discover -p "test_*.py"
 npm run check
 python codex_monitor_daemon.py --help
 ```
@@ -364,7 +362,7 @@ Credentials, local history, caches, tests, reference sources, and development-on
 | `monitor_cloud.py` | Configuration, WebDAV, encryption, serialized cloud operations, packages, and usage journal. |
 | `monitor_skills.py` | Skill discovery, managed storage, validation, assignments, and projections. |
 | `monitor_tokens.py` | Incremental session-log parsing, token aggregation, Fast attribution, and cost calculation. |
-| `monitor_token_ledger.py` | Append-only token/price ledger, compact legacy baseline migration, and derived session totals. |
+| `monitor_token_ledger.py` | Append-only token/cost ledger, compact legacy baseline migration, and derived session totals. |
 | `monitor_events.py` / `monitor_quota.py` | Remote usage interpretation, reset handling, and delta validation. |
 | `monitor_history.py` / `monitor_usage_sync.py` | Local persistence, compaction, provenance, synchronized cache, and merged datasets. |
 | `extension.js` / `package.json` | Thin VS Code extension host and manifest. |

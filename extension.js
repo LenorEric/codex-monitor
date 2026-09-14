@@ -54,6 +54,7 @@ const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/accounts/switch", { url: ACCOUNT_SWITCH_URL, method: "POST" }],
     ["/api/accounts/rename", { url: ACCOUNT_RENAME_URL, method: "POST" }],
     ["/api/accounts/session-refresh", { url: new URL("http://127.0.0.1:8765/api/accounts/session-refresh"), method: "POST" }],
+    ["/api/accounts/device-code", { url: new URL("http://127.0.0.1:8765/api/accounts/device-code"), method: "POST" }],
 ]);
 
 class PythonMonitor {

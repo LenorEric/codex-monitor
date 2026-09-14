@@ -8,9 +8,9 @@ from monitor_common import (
 )
 from monitor_history import compact_debug_state, compact_sample_for_state, compact_token_usage_for_state, is_delta_event_row
 from monitor_tokens import normalize_codex_model
-from monitor_usage_sync import COST_INTERVAL_TYPE
 
 DEFAULT_EVENT_MODEL = "gpt-5.5"
+COST_INTERVAL_TYPE = "costInterval"
 MAX_MANUAL_RESET_CONFIRMATION_RESPONSES = 5
 REQUIRED_MANUAL_RESET_CONFIRMATION_RESPONSES = 3
 

@@ -24,6 +24,7 @@ RUNTIME_FILES = (
     "monitor_cloud_queue.py",
     "monitor_codex_usage.py",
     "monitor_common.py",
+    "monitor_device_auth.py",
     "monitor_dashboard.py",
     "monitor_events.py",
     "monitor_history.py",
@@ -78,7 +79,7 @@ def rebuild_runtime(version: str) -> None:
     for name in RUNTIME_FILES:
         write_text_lf(RUNTIME_DIR / name, (ROOT / name).read_text(encoding="utf-8"))
     write_text_lf(RUNTIME_DIR / "README.md", (ROOT / "release-runtime.md").read_text(encoding="utf-8"))
-    write_text_lf(RUNTIME_DIR / "version.json", json.dumps({"version": version}, indent=2) + "\n")
+    write_text_lf(RUNTIME_DIR / "version.json", json.dumps({"version": version, "dataContractVersion": json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["dataContractVersion"]}, indent=2) + "\n")
     write_text_lf(RELEASE_DIR / "README.md", (ROOT / "release-package.md").read_text(encoding="utf-8").replace("{{VERSION}}", version))
 
 

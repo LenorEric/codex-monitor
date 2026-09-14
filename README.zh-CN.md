@@ -218,15 +218,16 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 自动使用数据同步是定向手动 Push 和 Fetch 操作之外的补充：
 
 - 启用 `usageDataAutoSync` 后每 60 分钟执行一次。这个一小时间隔从上次尝试同步开始计算，因此成功和失败都会让下一次尝试延后一小时。
-- 同步成本/百分比区间、额度历史和 Token 会话历史。
+- 同步额度历史以及每一条事件级 Token 账本记录。成本/用量图表点和逐会话汇总由各客户端本地重建，不参与同步。
 - 本地额度历史会保留每次被接受的轮询。云端同步只删除额度不变区间中的冗余中间样本，并在保留的端点上标记其覆盖范围；超过四小时的间隔会保持分离且不添加标记，使图表能够区分数据压缩与真正的监控中断。
 - 不同步凭据、技能内容、详细样本日志和运行状态。
 - 每台机器都会发布包含全部逻辑使用数据包 ID 与内容哈希的加密清单。Fetch 将完整清单与 `usage_monitor_sync_cache.json` 比较，因此不会因为某个靠后的数据包已存在而跳过更早或缺失的数据包。
-- 记录先分配到 64 个稳定的键哈希桶，再按 16 KiB 压缩数据上限拆包。更新活跃记录通常只替换其所在的小数据包，不会重写时间序列或大型检查点。
+- 记录先分配到 64 个键哈希桶，压缩包超过 16 KiB 时按更多哈希位细分；不可再拆分的超大单条记录独占一个包。变更限制在对应哈希分支内；完整 Push 仍使用压缩后的额度数据，只强制上传与验证。
 - 普通发布最多验证两个按清单哈希轮换选出的变更包，并使用强条件 ETag 提交清单，不再列举整个数据包目录。每 30 天、数据包格式迁移以及显式完整 Push 时，会读取并验证所有引用包，同时回读验证已提交的指针。
 - 上传失败不会暴露部分清单：不可变的内容寻址包会先上传，最后才通过 `If-Match`/`If-None-Match` 提交指针。后续尝试可以复用指针提交前失败所留下的数据包，再次尝试提交指针。
-- Fetch 会重建发现的每个旧版检查点/分块流，上传并验证版本 2 数据包，以条件写入替换清单，并且只在验证成功后删除旧版数据。
-- 下载的记录及其按机器保存的数据包哈希会原子写入 `usage_monitor_sync_cache.json`，绝不替换或追加到本地记录文件。
+- Fetch 兼容旧版检查点/分块流，保留额度记录并忽略已废弃的派生成本/会话记录；当前数据包通过条件写入清单提交。
+- 下载记录存放在 `usage_monitor_sync_cache.json.d/` 下的不可变数据包分片中，分片持久化后才原子提交 `usage_monitor_sync_cache.json` 小型清单。Fetch 获取完整远端清单后会清除已移除机器的缓存。
+- 使用账号 ID 由账号身份经过带命名空间的哈希生成，不随加密口令变化；兼容旧标识的映射保留历史同步记录的账号关联。
 - 仪表盘会维护 `usage_monitor_dashboard_cache.json`，保存完整的本地和合并显示数据集：最近三天保持无损，较早图表点按时间逐级合并；不会修改原始记录文件或 Token/会话汇总。缓存构建时间和按小时计算的维护期限本身不会触发 API 数据更新，除非可见数据确实改变。
 
 每 60 分钟的周期 Fetch 还会检查权威技能索引并刷新远端账号列表。强指针 ETag 会跳过未变化的使用数据清单，但本地缺少数据包哈希时仍会强制修复。每 30 天会完整获取并验证所有活跃远端数据包。没有记录上次尝试，或记录的尝试已超过一小时后，第一次周期 Fetch 会立即执行。
@@ -240,16 +241,16 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 | `config.json` | 服务器与自动更新设置、明文 WebDAV 登录密码、Cookie 密钥、密码校验值和派生加密密钥 | 否 |
 | `accounts/` | 敏感 Codex 账号保险库与清单 | 仅通过 API Share/Link 或 OpenAI Release/Bind 显式传输 |
 | `skills/` | 私有托管技能源 | 可选的加密技能包 |
-| `usage_monitor_history.jsonl` | 本地原始成本/百分比区间 | 仅同步派生记录 |
-| `usage_monitor_quota_history.jsonl` | 完整的本地已接受额度读数 | 仅同步压缩后的派生记录 |
-| `usage_monitor_token_sessions.jsonl` | 本地逐会话 Token 与成本 | 仅同步派生记录 |
-| `usage_monitor_token_ledger.jsonl` | 追加式用量记录与去重价格时期；本地 Token 成本的权威数据源 | 从不同步 |
-| `usage_monitor_samples.jsonl` | 本地详细诊断样本 | 永不 |
+| `usage_monitor_quota_readings.jsonl` | 完整的本地已接受额度读数 | 仅同步压缩后的派生记录 |
+| `usage_monitor_token_events.jsonl` | 追加式用量事件及其已记录成本、保留的旧 Token 基线；Token 与成本汇总的权威数据源 | 每条记录均加密同步 |
+| `usage_monitor_diagnostic_samples.jsonl` | 本地详细诊断样本 | 永不 |
 | `usage_monitor_state.json` | 运行基线和游标 | 永不 |
-| `usage_monitor_sync_cache.json` | 下载记录和每台机器的完整数据包哈希清单 | 不作为记录文件上传 |
+| `usage_monitor_sync_cache.json` / `usage_monitor_sync_cache.json.d/` | 原子缓存清单与不可变下载数据包分片 | 不作为记录文件上传 |
 | `usage_monitor_dashboard_cache.json` | 后端维护的完整本地/合并显示快照及分级图表点 | 永不 |
 
-Token 账本在价格时期首次使用时写入一次完整定义，后续用量记录仅引用其 `pricingId`。现有会话汇总只会被导入一次并形成精简的旧数据基线，之后逐会话历史文件均由账本重新生成。
+每条 Token 事件保存按事件发生时价格计算的成本，价格更新后仍以已记录成本为准。按顺序执行的数据契约迁移在验证汇总后移除冗余价格时期记录及引用。旧会话汇总保留为基线，参与 Token 汇总，但不参与 Cost vs Usage 图表。无法从基线等价推导的旧源累计上限仍予保留，避免重复计数。
+
+派生图表从保留的额度历史与 Token 账本事件重建，不转换已废弃的成本图表记录。本地额度与账本逐条追加并刷盘，运行状态通过原子替换保存；中断的迁移在读取相关数据前恢复。
 
 > [!WARNING]
 > 请保护整个 `~/.codex-switch`。不要提交到仓库、放入支持包、写入日志或分享其内容截图。丢失加密口令后，远端加密数据将无法恢复。
@@ -269,16 +270,13 @@ python codex_monitor_daemon.py --help
 | `--auth PATH` | 覆盖实时认证文件。 |
 | `--interval SECONDS` | 设置远端额度轮询间隔，默认 90 秒。 |
 | `--timeout SECONDS` | 设置单次请求超时，默认 10 秒。 |
-| `--history PATH` | 覆盖本地成本区间历史 JSONL。 |
 | `--quota-history PATH` | 覆盖逐账号额度历史 JSONL。 |
-| `--token-session-history PATH` | 覆盖逐会话 Token/成本 JSONL。 |
-| `--token-ledger PATH` | 覆盖追加式 Token 与价格账本 JSONL。 |
+| `--token-ledger PATH` | 覆盖追加式 Token 与已记录成本账本 JSONL。 |
 | `--sample-log PATH` | 覆盖详细诊断 JSONL。 |
 | `--sample-log-max-bytes N` | 超过该大小后压缩样本日志；默认 50 MiB，压缩目标为 80%。 |
 | `--local-only` | 只扫描本地会话日志，不访问 ChatGPT 使用量接口。 |
 | `--no-token-scan` | 禁用本地会话 Token 扫描。 |
-| `--process-history` | 输出已保存的有效成本/百分比数据后退出。 |
-| `--compact-history-days N` | 只保留最近 N 天的成本与额度历史后退出。 |
+| `--compact-history-days N` | 只保留最近 N 天的额度历史。 |
 | `--reencrypt-cloud` | 使用当前密钥刷新随机数并验证所有 WebDAV 加密对象后退出。 |
 | `--retry-limit N` | 设置有限的 HTTP/仪表盘重试次数；网络断线仍会持续重试。 |
 
@@ -319,7 +317,7 @@ python codex_monitor_daemon.py --help
 
 ```console
 python -m pip install -r requirements.txt
-python -m unittest test_monitor_codex_usage.py test_monitor_auto_update.py test_cloud_queue.py
+python -m unittest discover -p "test_*.py"
 npm run check
 python codex_monitor_daemon.py --help
 ```
@@ -350,7 +348,7 @@ npm run release
 | `monitor_cloud.py` | 配置、WebDAV、加密、串行云操作、软件包与使用记录。 |
 | `monitor_skills.py` | 技能发现、托管存储、验证、分配与投影。 |
 | `monitor_tokens.py` | 增量会话日志解析、Token 聚合、Fast 归因与成本计算。 |
-| `monitor_token_ledger.py` | 追加式 Token/价格账本、精简旧数据基线迁移与会话汇总派生。 |
+| `monitor_token_ledger.py` | 追加式 Token/成本账本、精简旧数据基线迁移与会话汇总派生。 |
 | `monitor_events.py` / `monitor_quota.py` | 远端使用量解释、重置处理与增量校验。 |
 | `monitor_history.py` / `monitor_usage_sync.py` | 本地持久化、压缩、来源信息、同步缓存与合并数据集。 |
 | `extension.js` / `package.json` | 轻量 VS Code 扩展宿主与清单。 |

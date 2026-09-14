@@ -24,22 +24,22 @@ MAX_PERCENT_ARBITRATION_RESPONSES = 5
 SAMPLE_LOG_COMPACT_RATIO = 0.8
 QUOTA_HISTORY_DISCONTINUITY_SECONDS = 4 * 60 * 60
 JSONL_COPY_CHUNK_BYTES = 1024 * 1024
-DEFAULT_DATA_FILES = ("usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_sessions.jsonl", "usage_monitor_token_ledger.jsonl", "usage_monitor_samples.jsonl", "usage_monitor_state.json", "usage_monitor_dashboard_cache.json")
+DEFAULT_DATA_FILES = (
+    "usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_sessions.jsonl", "usage_monitor_token_ledger.jsonl", "usage_monitor_samples.jsonl",
+    "usage_monitor_quota_readings.jsonl", "usage_monitor_token_events.jsonl", "usage_monitor_diagnostic_samples.jsonl", "usage_monitor_state.json", "usage_monitor_dashboard_cache.json",
+)
 
 def default_history_path(data_home: Path | None = None) -> Path:
     return (Path(data_home) if data_home is not None else codex_switch_home()) / "usage_monitor_history.jsonl"
 
 def default_sample_log_path(history_path: Path) -> Path:
-    return history_path.with_name("usage_monitor_samples.jsonl") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".samples.jsonl")
+    return history_path.with_name("usage_monitor_diagnostic_samples.jsonl") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".samples.jsonl")
 
 def default_quota_history_path(history_path: Path) -> Path:
-    return history_path.with_name("usage_monitor_quota_history.jsonl") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".quota.jsonl")
-
-def default_token_session_history_path(history_path: Path) -> Path:
-    return history_path.with_name("usage_monitor_token_sessions.jsonl") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".token-sessions.jsonl")
+    return history_path.with_name("usage_monitor_quota_readings.jsonl") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".quota.jsonl")
 
 def default_dashboard_cache_path(history_path: Path) -> Path:
-    return history_path.with_name("usage_monitor_dashboard_cache.json") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".dashboard-cache.json")
+    return history_path.with_name("usage_monitor_dashboard_cache.json") if history_path.name in {"usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_quota_readings.jsonl"} else history_path.with_suffix(".dashboard-cache.json")
 
 def normalize_token_session_row(row: dict) -> dict | None:
     if not isinstance(row, dict) or not row.get("sessionId") or not isinstance(row.get("tokens"), dict):
@@ -72,31 +72,6 @@ def normalize_token_session_row(row: dict) -> dict | None:
     if isinstance(row.get("sync"), dict):
         normalized["sync"] = row["sync"]
     return normalized
-
-def load_token_session_history(path: Path) -> list[dict]:
-    try:
-        rows = parse_history_rows(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, OSError, UnicodeDecodeError, json.JSONDecodeError):
-        return []
-    return [normalized for row in rows if (normalized := normalize_token_session_row(row)) is not None]
-
-def write_token_session_history(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as stream:
-            for row in rows:
-                if normalized := normalize_token_session_row(row):
-                    stream.write(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n")
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temp_name, path)
-    except Exception:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
 
 def migrate_default_monitor_data(legacy_home: Path, data_home: Path | None = None) -> list[str]:
     data_home = Path(data_home) if data_home is not None else codex_switch_home()
@@ -341,9 +316,15 @@ def quota_history_row_from_sample(sample: dict) -> dict | None:
 
 def load_quota_history(path: Path) -> list[dict]:
     try:
-        rows = parse_history_rows(path.read_text(encoding="utf-8"))
+        content = path.read_bytes()
     except FileNotFoundError:
         return []
+    try:
+        rows = parse_history_rows(content.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        if content.endswith((b"\n", b"\r")) or b"\n" not in content:
+            raise
+        rows = parse_history_rows(content[:content.rfind(b"\n") + 1].decode("utf-8"))
     return [normalized for row in rows if (normalized := normalize_quota_history_row(row)) is not None]
 
 def same_quota_history_state(left: dict, right: dict) -> bool:
@@ -441,7 +422,7 @@ def append_quota_history_sample(path: Path, sample: dict) -> bool:
     row = quota_history_row_from_sample(sample)
     if row is None:
         return False
-    write_quota_history(path, load_quota_history(path) + [row])
+    append_jsonl(path, row, durable=True, recover_torn_tail=True)
     return True
 
 
@@ -563,11 +544,43 @@ def append_history(path: Path, sample: dict) -> None:
         return
     append_jsonl(path, sample)
 
-def append_jsonl(path: Path, row: dict) -> None:
+def _repair_jsonl_tail(stream) -> None:
+    size = stream.seek(0, os.SEEK_END)
+    if not size:
+        return
+    stream.seek(-1, os.SEEK_END)
+    if stream.read(1) in {b"\n", b"\r"}:
+        return
+    position = size
+    tail_start = 0
+    while position:
+        chunk_start = max(0, position - 4096)
+        stream.seek(chunk_start)
+        chunk = stream.read(position - chunk_start)
+        if (newline := chunk.rfind(b"\n")) >= 0:
+            tail_start = chunk_start + newline + 1
+            break
+        position = chunk_start
+    stream.seek(tail_start)
+    try:
+        if not isinstance(json.loads(stream.read(size - tail_start).decode("utf-8")), dict):
+            raise ValueError("JSONL row is not an object")
+        stream.seek(0, os.SEEK_END)
+        stream.write(b"\n")
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        stream.seek(tail_start)
+        stream.truncate()
+
+def append_jsonl(path: Path, row: dict, durable: bool = False, recover_torn_tail: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8", newline="\n") as f:
-        f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
-        f.write("\n")
+    with path.open("a+b") as f:
+        if recover_torn_tail:
+            _repair_jsonl_tail(f)
+        f.seek(0, os.SEEK_END)
+        f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
+        if durable:
+            f.flush()
+            os.fsync(f.fileno())
 
 def trim_jsonl_to_size(path: Path, max_bytes: int, current_size: int | None = None) -> None:
     if max_bytes <= 0 or current_size is not None and current_size <= max_bytes:
@@ -714,10 +727,7 @@ def load_state(path: Path) -> dict:
         return {}
 
 def write_state(path: Path, state: dict) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8", newline="\n") as f:
-        json.dump(compact_monitor_state(state), f, ensure_ascii=False, separators=(",", ":"))
-        f.write("\n")
+    _atomic_write_bytes(path, (json.dumps(compact_monitor_state(state), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
 
 def compact_token_usage_for_state(token_usage: dict | None) -> dict | None:
     if not isinstance(token_usage, dict):
@@ -737,9 +747,7 @@ def compact_sample_for_state(sample: dict | None) -> dict | None:
         "usingPreviousWindows": bool(sample.get("usingPreviousWindows")),
         "tokenDelta": normalize_saved_token_totals(sample.get("tokenDelta")),
         "cost": sample.get("cost") or empty_cost_totals(),
-        "costDelta": sample.get("costDelta") or empty_cost_totals(),
         "costByModel": sample.get("costByModel") or {},
-        "costDeltaByModel": sample.get("costDeltaByModel") or {},
     }
     if sample.get("activeAccountSlotId"):
         compact["activeAccountSlotId"] = sample["activeAccountSlotId"]
@@ -757,14 +765,6 @@ def compact_monitor_state(state: dict) -> dict:
         "lastSample": compact_sample_for_state(state.get("lastSample")),
         "updatedAt": state.get("updatedAt"),
     }
-    if "runCostUsd" in state:
-        compact["runCostUsd"] = round(state["runCostUsd"], 8)
-    if "runCostByModelUsd" in state:
-        compact["runCostByModelUsd"] = {model: round(cost, 8) for model, cost in state["runCostByModelUsd"].items()}
-    if "measuredCostIntervals" in state:
-        compact["measuredCostIntervals"] = state["measuredCostIntervals"]
-    if "hasRuntimeCostBaseline" in state:
-        compact["hasRuntimeCostBaseline"] = state["hasRuntimeCostBaseline"]
     if "remoteUsageIdentity" in state:
         compact["remoteUsageIdentity"] = state["remoteUsageIdentity"]
     if "activeAccountSlotId" in state:
@@ -776,23 +776,13 @@ def compact_debug_state(state: dict) -> dict:
         "windows": state.get("windows") or {},
         "updatedAt": state.get("updatedAt"),
     }
-    if "runCostUsd" in state:
-        compact["runCostUsd"] = round(state["runCostUsd"], 8)
-    if "runCostByModelUsd" in state:
-        compact["runCostByModelUsd"] = {model: round(cost, 8) for model, cost in state["runCostByModelUsd"].items()}
-    if "measuredCostIntervals" in state:
-        compact["measuredCostIntervals"] = state["measuredCostIntervals"]
-    if "hasRuntimeCostBaseline" in state:
-        compact["hasRuntimeCostBaseline"] = state["hasRuntimeCostBaseline"]
     if "remoteUsageIdentity" in state:
         compact["remoteUsageIdentity"] = state["remoteUsageIdentity"]
     return compact
 
 def reset_runtime_baselines(state: dict) -> dict:
-    state["runCostUsd"] = 0.0
-    state["runCostByModelUsd"] = {}
-    state["measuredCostIntervals"] = 0
-    state["hasRuntimeCostBaseline"] = False
+    for key in ("runCostUsd", "runCostByModelUsd", "measuredCostIntervals", "hasRuntimeCostBaseline", "_pendingCostIntervals", "_specialEvents"):
+        state.pop(key, None)
     for window_state in (state.get("windows") or {}).values():
         for key in (
             "baselinePercent",
@@ -829,6 +819,8 @@ def make_history_sample(output: dict, previous_token_usage: dict | None, previou
         sample["accountLabel"] = output.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL
     if output.get("remoteUsage"):
         sample["remoteUsage"] = output["remoteUsage"]
+    if isinstance(output.get("sync"), dict):
+        sample["sync"] = output["sync"]
     if output.get("tokenUsage"):
         token_usage = output["tokenUsage"]
         token_usage["progressSinceLastCheck"] = token_progress(token_usage, previous_token_usage)

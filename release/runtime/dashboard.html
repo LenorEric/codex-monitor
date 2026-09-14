@@ -126,13 +126,15 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 </section>
 <section class="card" data-quota-widget>
 <div class="card-title"><h2>5h Cost vs Usage</h2><span class="rate" id="rate5h">Cost / 100%: N/A</span></div>
-<div class="meta"><span>Cumulative delta % on X axis</span><span>Cumulative delta USD on Y axis</span></div>
+<div class="meta"><span>Period midpoint on X axis</span><span>Cost / 100% on Y axis</span></div>
 <canvas class="chart" id="scatter5h"></canvas>
+<div class="legend" id="scatter5hLegend"></div>
 </section>
 <section class="card" data-quota-widget>
 <div class="card-title"><h2>7d Cost vs Usage</h2><span class="rate" id="rate7d">Cost / 100%: N/A</span></div>
-<div class="meta"><span>Cumulative delta % on X axis</span><span>Cumulative delta USD on Y axis</span></div>
+<div class="meta"><span>Period midpoint on X axis</span><span>Cost / 100% on Y axis</span></div>
 <canvas class="chart" id="scatter7d"></canvas>
+<div class="legend" id="scatter7dLegend"></div>
 </section>
 </main>
 <div class="tooltip" id="tip"></div>
@@ -163,7 +165,7 @@ const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null;
 const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
 const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections";
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
-let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],events:{fiveHour:[],sevenDay:[]}}, viewPayloads={local:null,merged:null};
+let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}}, viewPayloads={local:null,merged:null};
 let pendingStatusRequest=null, pendingSeriesRequest=null, streamId=null, includedIndex=-1, mergedRevision=null, statusEtag=null, currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
@@ -199,7 +201,7 @@ document.getElementById("closeMessageDetail").onclick=()=>document.getElementByI
 function bindBackdropDismiss(modal){modal.onpointerdown=event=>{if(event.target===event.currentTarget)modal.classList.remove("open")}}
 bindBackdropDismiss(document.getElementById("messageDetailModal"));
 function css(v){return getComputedStyle(document.documentElement).getPropertyValue(v).trim()}
-function allEvents(){return [...((payload.events||{}).fiveHour||[]),...((payload.events||{}).sevenDay||[])]}
+function allEvents(){return [...((payload.costUsage||{}).fiveHour||[]),...((payload.costUsage||{}).sevenDay||[])]}
 function pointFromSample(sample){
   if(!sample)return null;
   const windowPoint=label=>{
@@ -345,7 +347,7 @@ function toggleScopeSelection(selection,candidate,available){
 }
 function updateModelControls(events){
   const sessions=visibleTokenSessions;
-  const available=[...new Set([...events.filter(p=>!p.synthetic&&p.model).map(p=>p.model),...sessions.flatMap(session=>Object.keys(session.byModel||{}))])].sort((a,b)=>modelDisplayName(a).localeCompare(modelDisplayName(b),undefined,{numeric:true}));
+  const available=[...new Set([...events.flatMap(point=>Object.keys(point.costByModelUsd||{})),...sessions.flatMap(session=>Object.keys(session.byModel||{}))])].sort((a,b)=>modelDisplayName(a).localeCompare(modelDisplayName(b),undefined,{numeric:true}));
   selectedModels=new Set([...selectedModels].filter(model=>available.includes(model)));
   const container=document.getElementById("models");container.replaceChildren();
   const addButton=(label,model,active)=>{
@@ -357,7 +359,14 @@ function updateModelControls(events){
   available.forEach(model=>addButton(modelDisplayName(model),model,selectedModels.has(model)));
 }
 function modelFilteredEvents(list){
-  return selectedModels.size?list.filter(p=>p.synthetic||selectedModels.has(p.model)):list;
+  return list.flatMap(point=>{
+    const allCost=Number(point.totalCostUsd)||0;
+    if(!selectedModels.size)return [{...point,deltaCostUsd:allCost,costPer100PercentUsd:point.deltaPercent>0?allCost/point.deltaPercent*100:null}];
+    const selectedCost=Object.entries(point.costByModelUsd||{}).reduce((sum,[model,cost])=>sum+(selectedModels.has(model)?Number(cost)||0:0),0);
+    if(allCost<=0||selectedCost<=0)return [];
+    const attributedUsage=(Number(point.deltaPercent)||0)*selectedCost/allCost;
+    return attributedUsage>0?[{...point,deltaPercent:attributedUsage,deltaCostUsd:selectedCost,costPer100PercentUsd:selectedCost/attributedUsage*100}]:[];
+  });
 }
 function accountDisplayName(accountId,fallback){
   return ((payload.accounts||{}).usageGroups||[]).find(account=>account.id===accountId)?.label||((payload.accounts||{}).items||[]).find(account=>account.id===accountId)?.displayLabel||fallback||"Unknown";
@@ -606,8 +615,8 @@ function showRefreshError(error){
 }
 function cloneValue(value){return JSON.parse(JSON.stringify(value))}
 function validateView(view){
-  if(!view||!Array.isArray(view.quotaPoints)||!Array.isArray(view.tokenSessions)||!Array.isArray(view.events?.fiveHour)||!Array.isArray(view.events?.sevenDay))throw new Error("Invalid dashboard snapshot");
-  for(const row of [...view.quotaPoints,...view.tokenSessions,...view.events.fiveHour,...view.events.sevenDay])if(typeof row?._key!=="string"||!row._key)throw new Error("Dashboard row is missing its key");
+  if(!view||!Array.isArray(view.quotaPoints)||!Array.isArray(view.tokenSessions)||!Array.isArray(view.costUsage?.fiveHour)||!Array.isArray(view.costUsage?.sevenDay))throw new Error("Invalid dashboard snapshot");
+  for(const row of [...view.quotaPoints,...view.tokenSessions,...view.costUsage.fiveHour,...view.costUsage.sevenDay])if(typeof row?._key!=="string"||!row._key)throw new Error("Dashboard row is missing its key");
   return view;
 }
 function sortCollection(name,rows){
@@ -626,8 +635,8 @@ function applyViewChanges(view,changes={}){
   const next=cloneValue(view);
   next.quotaPoints=applyCollection("quotaPoints",next.quotaPoints,changes.quotaPoints);
   next.tokenSessions=applyCollection("tokenSessions",next.tokenSessions,changes.tokenSessions);
-  next.events.fiveHour=applyCollection("events.fiveHour",next.events.fiveHour,changes.events?.fiveHour);
-  next.events.sevenDay=applyCollection("events.sevenDay",next.events.sevenDay,changes.events?.sevenDay);
+  next.costUsage.fiveHour=applyCollection("costUsage.fiveHour",next.costUsage.fiveHour,changes.costUsage?.fiveHour);
+  next.costUsage.sevenDay=applyCollection("costUsage.sevenDay",next.costUsage.sevenDay,changes.costUsage?.sevenDay);
   if(Object.prototype.hasOwnProperty.call(changes,"historyStats"))next.historyStats=changes.historyStats;
   return validateView(next);
 }
@@ -636,7 +645,7 @@ function activateDataView(){
   payload={...view,points:currentStatus?.lastSample?[pointFromSample(currentStatus.lastSample)]:[],lastSample:currentStatus?.lastSample,display:currentStatus?.display,accounts:currentStatus?.accounts};
 }
 function applySeriesResponse(response){
-  if(response?.protocolVersion!==2||!response.streamId||!Number.isInteger(response.includedIndex))throw new Error("Invalid indexed dashboard response");
+  if(response?.protocolVersion!==3||!response.streamId||!Number.isInteger(response.includedIndex))throw new Error("Invalid indexed dashboard response");
   if(response.mode==="snapshot"){
     viewPayloads={local:validateView(cloneValue(response.views?.local)),merged:validateView(cloneValue(response.views?.merged))};
     streamId=response.streamId;includedIndex=response.includedIndex;mergedRevision=response.mergedRevision;currentStatus=response.status;statusEtag=response.statusEtag||null;activateDataView();return;
@@ -683,62 +692,26 @@ function extent(values){
   const nums=values.filter(Number.isFinite);
   return nums.length?[Math.min(...nums),Math.max(...nums)]:[0,1];
 }
-function rebaseDeltaEvents(list){
-  const events=list.filter(p=>!p.synthetic);
-  if(!events.length)return [];
-  let percent=0, cost=0, window=(events.find(p=>p.window)||{}).window;
-  const result=[{checkedAt:null,timestamp:null,window,deltaPercent:0,deltaCostUsd:0,cumulativePercent:0,cumulativeCostUsd:0,rawKeys:["baseline"],synthetic:true}];
-  for(const p of events){
-    percent+=p.deltaPercent||0;
-    cost+=p.deltaCostUsd||0;
-    result.push({...p,cumulativePercent:percent,cumulativeCostUsd:cost,rawKeys:[p.checkedAt]});
-  }
-  return result;
-}
 function denseMergeMetrics(id,list){
-  const rect=document.getElementById(id).getBoundingClientRect(), maxPercent=Math.max(0,...list.map(p=>p.cumulativePercent||0)), maxCost=Math.max(0,...list.map(p=>p.cumulativeCostUsd||0));
-  return {plotWidth:Math.max(1,rect.width-CHART_MARGINS.l-CHART_MARGINS.r),plotHeight:Math.max(1,rect.height-CHART_MARGINS.t-CHART_MARGINS.b),maxPercent:maxPercent*1.03||1,maxCost:maxCost*1.08||1,minDistance:NODE_RADIUS*4};
+  const rect=document.getElementById(id).getBoundingClientRect(), times=list.map(eventTimestamp).filter(Number.isFinite), values=list.map(p=>p.costPer100PercentUsd).filter(Number.isFinite), [minTime,maxTime]=extent(times), [minValue,maxValue]=extent(values);
+  return {plotWidth:Math.max(1,rect.width-CHART_MARGINS.l-CHART_MARGINS.r),plotHeight:Math.max(1,rect.height-CHART_MARGINS.t-CHART_MARGINS.b),minTime,maxTime,maxValue,minValue,minDistance:NODE_RADIUS*4};
 }
 function denseDeltaDistance(a,b,metrics){
-  return Math.hypot(((b.cumulativePercent||0)-(a.cumulativePercent||0))/metrics.maxPercent*metrics.plotWidth, ((b.cumulativeCostUsd||0)-(a.cumulativeCostUsd||0))/metrics.maxCost*metrics.plotHeight);
+  return Math.hypot((eventTimestamp(b)-eventTimestamp(a))/Math.max(1,metrics.maxTime-metrics.minTime)*metrics.plotWidth, ((b.costPer100PercentUsd||0)-(a.costPer100PercentUsd||0))/Math.max(1e-9,metrics.maxValue-metrics.minValue)*metrics.plotHeight);
 }
 function mergeDenseDeltaEvents(list,metrics){
-  const result=list.filter(p=>p.synthetic);
-  let pending=null, percent=0, cost=0;
+  const result=[];
+  let group=[];
   const flush=()=>{
-    if(!pending)return;
-    percent+=pending.deltaPercent||0;cost+=pending.deltaCostUsd||0;
-    result.push({...pending,cumulativePercent:percent,cumulativeCostUsd:cost});
-    pending=null;
+    if(!group.length)return;
+    const timestamp=group.reduce((sum,p)=>sum+eventTimestamp(p),0)/group.length, ratio=group.reduce((sum,p)=>sum+p.costPer100PercentUsd,0)/group.length;
+    result.push({...group[group.length-1],checkedAt:new Date(timestamp*1000).toISOString(),timestamp,costPer100PercentUsd:ratio,deltaPercent:group.reduce((sum,p)=>sum+(p.deltaPercent||0),0),deltaCostUsd:group.reduce((sum,p)=>sum+(p.deltaCostUsd||0),0),mergedCount:group.length,mergedFrom:group[0].checkedAt,mergedTo:group[group.length-1].checkedAt,rawKeys:group.map(p=>p._key||p.checkedAt)});group=[];
   };
-  const mergeTrailing=()=>{
-    if(!pending)return;
-    const index=result.map(p=>!p.synthetic).lastIndexOf(true);
-    if(index<0)return flush();
-    const previous=result[index];
-    percent+=pending.deltaPercent||0;cost+=pending.deltaCostUsd||0;
-    result[index]={
-      ...pending,model:previous.model===pending.model?pending.model:"multiple",
-      usageAccountId:usageAccountId(previous)===usageAccountId(pending)?usageAccountId(pending):"multiple",
-      accountSlotId:previous.accountSlotId===pending.accountSlotId?pending.accountSlotId:"multiple",accountLabel:previous.accountSlotId===pending.accountSlotId?pending.accountLabel:"Multiple accounts",
-      deltaPercent:(previous.deltaPercent||0)+(pending.deltaPercent||0),deltaCostUsd:(previous.deltaCostUsd||0)+(pending.deltaCostUsd||0),
-      cumulativePercent:percent,cumulativeCostUsd:cost,mergedCount:(previous.mergedCount||1)+(pending.mergedCount||1),
-      mergedFrom:previous.mergedFrom||previous.checkedAt,mergedTo:pending.mergedTo||pending.checkedAt,rawKeys:[...(previous.rawKeys||[previous.checkedAt]),...(pending.rawKeys||[pending.checkedAt])],
-    };
-    pending=null;
-  };
-  for(const p of list.filter(p=>!p.synthetic)){
-    pending=pending?{
-      ...p,model:pending.model===p.model?p.model:"multiple",
-      usageAccountId:usageAccountId(pending)===usageAccountId(p)?usageAccountId(p):"multiple",
-      accountSlotId:pending.accountSlotId===p.accountSlotId?p.accountSlotId:"multiple",accountLabel:pending.accountSlotId===p.accountSlotId?p.accountLabel:"Multiple accounts",
-      deltaPercent:(pending.deltaPercent||0)+(p.deltaPercent||0),deltaCostUsd:(pending.deltaCostUsd||0)+(p.deltaCostUsd||0),
-      mergedCount:(pending.mergedCount||1)+1,mergedFrom:pending.mergedFrom||pending.checkedAt,mergedTo:p.checkedAt,
-      rawKeys:[...(pending.rawKeys||[pending.checkedAt]),...(p.rawKeys||[p.checkedAt])],
-    }:p;
-    if(denseDeltaDistance(result[result.length-1]||{cumulativePercent:0,cumulativeCostUsd:0},{cumulativePercent:percent+(pending.deltaPercent||0),cumulativeCostUsd:cost+(pending.deltaCostUsd||0)},metrics)>metrics.minDistance)flush();
+  for(const point of list.sort((a,b)=>eventTimestamp(a)-eventTimestamp(b))){
+    if(group.length&&denseDeltaDistance(group[group.length-1],point,metrics)>metrics.minDistance)flush();
+    group.push(point);
   }
-  mergeTrailing();
+  flush();
   return result;
 }
 function chart(id, series, opts={}){
@@ -850,20 +823,15 @@ function showTip(e,hit){
   for(const p of hit){const d=Math.hypot(e.offsetX-p.x,e.offsetY-p.y); if(d<bd){bd=d;best=p}}
   if(!best||bd>18)return hideTip();
   const p=best.ref, tip=document.getElementById("tip"), rows=[
-    {text:p.checkedAt?new Date(p.checkedAt).toLocaleString():"Baseline",strong:true},
+    {text:new Date(p.checkedAt).toLocaleString(),strong:true},
     best.s.name,
-    `Delta ${pct(p.deltaPercent)} / ${usd(p.deltaCostUsd)}`,
-    `Cumulative delta ${pct(p.cumulativePercent)} / ${usd(p.cumulativeCostUsd)}`,
+    `Usage ${pct(p.deltaPercent)} / Cost ${usd(p.deltaCostUsd)}`,
+    `Cost / 100% ${usd(p.costPer100PercentUsd)}`,
   ];
-  if(Number.isFinite(p.rawPercent))rows.push(`Raw ${p.window} usage ${pct(p.rawPercent)}`);
-  if(p.model)rows.push(`Model ${modelDisplayName(p.model)}`);
   if(p.accountSlotId)rows.push(`Account ${accountDisplayName(usageAccountId(p),p.accountLabel)}`);
-  if(Number.isFinite(p.costPercentRatio))rows.push(`Cost/percent ratio ${usd(p.costPercentRatio)}/%`);
-  if(Number.isFinite(p.normalizedPercent))rows.push(`Plus-normalized usage ${pct(p.normalizedPercent)}`);
+  if(p.startedAt&&p.endedAt)rows.push(`Period ${new Date(p.startedAt).toLocaleString()} to ${new Date(p.endedAt).toLocaleString()}`);
   if(p.plan&&p.plan!=="unknown")rows.push(`Plan ${p.plan} (${p.planMultiplier||1}x)`);
-  if(Number.isFinite(p.sampleCostUsd))rows.push(`Raw cumulative cost ${usd(p.sampleCostUsd)}`);
   if(p.mergedCount>1)rows.push(`Merged ${p.mergedCount} points from ${new Date(p.mergedFrom).toLocaleString()} to ${new Date(p.mergedTo).toLocaleString()}`);
-  if(p.resetAt)rows.push(`Reset ${p.resetAt}`);
   renderTip(tip,rows);
   tip.style.display="block";
   positionTip(e,tip);
@@ -882,12 +850,16 @@ function positionTip(e,tip){
   tip.style.top=`${Math.min(Math.max(margin,top),Math.max(margin,innerHeight-h-margin))}px`;
 }
 function updateRate(id,list){
-  const real=list.filter(p=>!p.synthetic&&(p.deltaPercent||0)>0), percent=real.reduce((s,p)=>s+(p.deltaPercent||0),0), cost=real.reduce((s,p)=>s+(p.deltaCostUsd||0),0);
+  const percent=list.reduce((sum,p)=>sum+(p.deltaPercent||0),0), cost=list.reduce((sum,p)=>sum+(p.deltaCostUsd||0),0);
   document.getElementById(id).textContent=`Cost / 100%: ${percent>0?usd(cost/percent*100):"N/A"}`;
 }
 function drawDeltaChart(id,name,color,list,animate=false){
-  const rebased=rebaseDeltaEvents(list), merged=mergeDenseDeltaEvents(rebased,denseMergeMetrics(id,rebased)), points=merged.map(p=>({x:p.cumulativePercent,y:p.cumulativeCostUsd,ref:p}));
-  chart(id,[{name,color,points}],{xFmt:pct,yFmt:usd,xDomain:extent(points.map(p=>p.x)),yDomain:extent(points.map(p=>p.y)),minPoints:2,insufficientMessage:"Not enough data for the selected scope",animate});
+  const metrics=denseMergeMetrics(id,list), accounts=[...new Set(list.map(usageAccountId))], series=accounts.map(accountId=>{
+    const merged=mergeDenseDeltaEvents(list.filter(point=>usageAccountId(point)===accountId),metrics);
+    return {name:accountDisplayName(accountId,merged[0]?.accountLabel),color:accountCurveColor(accountId),points:merged.map(point=>({x:eventTimestamp(point),y:point.costPer100PercentUsd,ref:point}))};
+  }), points=series.flatMap(item=>item.points);
+  const legend=document.getElementById(`${id}Legend`);legend.replaceChildren(...series.map(item=>{const entry=document.createElement("span"),dot=document.createElement("span");dot.className="dot";dot.style.background=item.color;entry.append(dot,item.name);return entry}));
+  chart(id,series,{xFmt:value=>new Date(value*1000).toLocaleString(),yFmt:usd,xDomain:extent(points.map(p=>p.x)),yDomain:extent(points.map(p=>p.y)),minPoints:1,insufficientMessage:"No cost and usage period for the selected scope",animate});
 }
 function quotaTimeDomain(points){
   if(selected==="Date"){
@@ -1193,11 +1165,11 @@ function drawUsageTimeChart(id,label,points,animate=false){
   step(started);
 }
 function drawAll(animate=false){
-  const e=payload.events||{}, fiveInRange=filteredEvents(e.fiveHour||[]), sevenInRange=filteredEvents(e.sevenDay||[]), quotaPoints=payload.quotaPoints||[], quotaInRange=quotaPointsInRange(quotaPoints,quotaTimeDomain(quotaPoints)), tokenSessions=filteredTokenSessions(payload.tokenSessions||[]);
+  const e=payload.costUsage||{}, fiveInRange=filteredEvents(e.fiveHour||[]), sevenInRange=filteredEvents(e.sevenDay||[]), quotaPoints=payload.quotaPoints||[], quotaInRange=quotaPointsInRange(quotaPoints,quotaTimeDomain(quotaPoints)), tokenSessions=filteredTokenSessions(payload.tokenSessions||[]);
   visibleTokenSessions=tokenSessions;
   updateModelControls([...fiveInRange,...sevenInRange]);
   updateAccountControls([...fiveInRange,...sevenInRange,...quotaInRange]);
-  const five=accountFilteredEvents(modelFilteredEvents(fiveInRange)), seven=accountFilteredEvents(modelFilteredEvents(sevenInRange)), quota=accountFilteredQuotaPoints(quotaInRange);
+  const five=modelFilteredEvents(accountFilteredEvents(fiveInRange)), seven=modelFilteredEvents(accountFilteredEvents(sevenInRange)), quota=accountFilteredQuotaPoints(quotaInRange);
   const selectedTokenSessions=accountFilteredEvents(tokenSessions);
   updateTokenSummary(selectedTokenSessions);
   updateRate("rate5h",five);updateRate("rate7d",seven);

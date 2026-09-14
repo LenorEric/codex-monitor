@@ -30,6 +30,7 @@ import monitor_quota
 import monitor_session_refresh
 import monitor_token_ledger
 import monitor_tokens
+import monitor_usage_sync
 from monitor_accounts import AccountError, AccountManager, api_identity_id, atomic_write_json, auth_fingerprint, auth_identity, normalize_session_refresh, normalize_session_refresh_windows, parse_auth_bytes
 from monitor_cloud import (
     AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_FULL_VERIFY_INTERVAL_SECONDS, USAGE_PACK_BUCKET_BITS, USAGE_PACK_MAX_BYTES,
@@ -38,7 +39,7 @@ from monitor_cloud import (
 )
 from monitor_skills import MANIFEST_FULL_REHASH_SECONDS, SkillError, SkillManager, _safe_name
 from monitor_cloud_queue import CloudOperationQueue
-from monitor_usage_sync import UsageDataStore, aggregate_cost_intervals, merge_token_rows, record_key, validate_sync_operation
+from monitor_usage_sync import UsageDataStore, record_key, validate_sync_operation
 from monitor_codex_usage import (
     add_token_delta,
     append_capped_jsonl,
@@ -160,26 +161,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         environment_proxy.assert_not_called()
         config_proxy.assert_not_called()
 
-    def test_process_history_does_not_initialize_proxy(self):
-        with self.account_directory() as directory:
-            with (
-                mock.patch.object(sys, "argv", ["monitor_codex_usage.py", "--process-history", "--history", str(directory / "history.jsonl")]),
-                mock.patch.object(codex_monitor_daemon, "migrate_account_vault"), mock.patch.object(codex_monitor_daemon, "backfill_quota_history"),
-                mock.patch.object(codex_monitor_daemon, "load_history", return_value=[]), mock.patch.object(codex_monitor_daemon, "load_state", return_value={}),
-                mock.patch.object(codex_monitor_daemon, "print_valid_delta_events"), mock.patch.object(codex_monitor_daemon, "opener_for") as opener_for,
-            ):
-                self.assertEqual(monitor_codex_usage.main(), 0)
-        opener_for.assert_not_called()
-
-    def test_local_only_does_not_initialize_proxy(self):
-        with self.account_directory() as directory:
-            with (
-                mock.patch.object(sys, "argv", ["monitor_codex_usage.py", "--local-only", "--history", str(directory / "history.jsonl")]),
-                mock.patch.object(codex_monitor_daemon, "migrate_account_vault"), mock.patch.object(codex_monitor_daemon, "backfill_quota_history"),
-                mock.patch.object(codex_monitor_daemon, "serve_dashboard", return_value=0), mock.patch.object(codex_monitor_daemon, "opener_for") as opener_for,
-            ):
-                self.assertEqual(monitor_codex_usage.main(), 0)
-        opener_for.assert_not_called()
 
     def test_codex_home_expands_cross_platform_home_syntax(self):
         with mock.patch.dict("os.environ", {"CODEX_HOME": "~/.custom-codex"}):
@@ -251,9 +232,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             self.assertEqual(moved, list(expected))
             self.assertEqual(monitor_history.default_history_path(data_home), data_home / "usage_monitor_history.jsonl")
-            self.assertEqual(monitor_history.default_quota_history_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_quota_history.jsonl")
+            self.assertEqual(monitor_history.default_quota_history_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_quota_readings.jsonl")
             self.assertEqual(monitor_history.default_quota_history_path(data_home / "custom.jsonl"), data_home / "custom.quota.jsonl")
-            self.assertEqual(monitor_token_ledger.default_token_ledger_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_token_ledger.jsonl")
+            self.assertEqual(monitor_token_ledger.default_token_ledger_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_token_events.jsonl")
             self.assertEqual(monitor_token_ledger.default_token_ledger_path(data_home / "custom.jsonl"), data_home / "custom.token-ledger.jsonl")
             for name, data in expected.items():
                 self.assertFalse((legacy_home / name).exists())
@@ -1395,44 +1376,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertIn("Account event: deleted 'Renamed Second'.", output)
             self.assertNotIn("refresh-secret", output)
 
-    def test_account_rename_updates_all_local_history_and_log_labels(self):
-        with self.account_directory() as directory:
-            auth_path = directory / "auth.json"
-            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            args = SimpleNamespace(
-                auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", sample_log=directory / "samples.jsonl",
-                codex_home=directory, local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
-            )
-            state = monitor_dashboard.UsageDashboardState(args, object())
-            args.history.write_text(json.dumps({"window": "5h", "delta": [{"accountSlotId": "ppl-pro", "accountLabel": "Current account", "deltaPercent": 1}, {"accountSlotId": "other", "accountLabel": "Other"}]}) + "\n", encoding="utf-8")
-            args.quota_history.write_text(json.dumps({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "ppl-pro", "accountLabel": "Current account", "windows": {"5h": {"usedPercent": 1}}}) + "\n", encoding="utf-8")
-            args.sample_log.write_text(json.dumps({"sample": {"accountSlotId": "ppl-pro", "accountLabel": "Current account"}, "events": [{"accountSlotId": "ppl-pro", "accountLabel": "Current account"}, {"accountLabel": "Legacy name"}]}) + "\n", encoding="utf-8")
-            args.state.write_text(json.dumps({"lastSample": {"accountSlotId": "ppl-pro", "accountLabel": "Current account"}}) + "\n", encoding="utf-8")
-            state.runtime_state = {"lastSample": {"accountSlotId": "ppl-pro", "accountLabel": "Current account"}}
-            state.last_sample = {"accountSlotId": "ppl-pro", "accountLabel": "Current account"}
-
-            with mock.patch("builtins.print"):
-                state.rename_account("ppl-pro", "Renamed Pro")
-
-            for path in (args.history, args.quota_history, args.sample_log, args.state):
-                values = monitor_history.parse_json_sequence(path.read_text(encoding="utf-8"))
-                matching_labels = []
-                def collect(value):
-                    if isinstance(value, dict):
-                        if value.get("accountSlotId") == "ppl-pro":
-                            matching_labels.append(value.get("accountLabel"))
-                        for child in value.values():
-                            collect(child)
-                    elif isinstance(value, list):
-                        for child in value:
-                            collect(child)
-                collect(values)
-                self.assertTrue(matching_labels)
-                self.assertEqual(set(matching_labels), {"Renamed Pro"})
-            self.assertEqual(json.loads(args.history.read_text(encoding="utf-8"))["delta"][1]["accountLabel"], "Other")
-            self.assertEqual(json.loads(args.sample_log.read_text(encoding="utf-8"))["events"][1]["accountLabel"], "Legacy name")
-            self.assertEqual(state.runtime_state["lastSample"]["accountLabel"], "Renamed Pro")
-            self.assertEqual(state.last_sample["accountLabel"], "Renamed Pro")
 
     def test_account_rename_rolls_back_local_data_when_manifest_save_fails(self):
         with self.account_directory() as directory:
@@ -2451,9 +2394,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(rows[0]["cost"]["totalCostUsd"], 4.5)
         self.assertEqual(repeated[0]["cost"]["totalCostUsd"], 4.5)
         self.assertEqual(reloaded[0]["cost"]["totalCostUsd"], 4.5)
-        self.assertEqual([row["recordType"] for row in ledger], ["legacyBaseline", "priceEpoch", "usage"])
-        self.assertEqual(ledger[1]["rates"]["input"], 2.0)
-        self.assertEqual(ledger[2]["pricingId"], ledger[1]["pricingId"])
+        self.assertEqual([row["recordType"] for row in ledger], ["legacyBaseline", "usage"])
+        self.assertEqual(ledger[1]["cost"]["totalCostUsd"], 2.0)
+        self.assertNotIn("pricingId", ledger[1])
 
     def test_token_ledger_uses_event_time_price_epochs_without_legacy_data(self):
         with self.account_directory() as directory:
@@ -2467,7 +2410,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
             ledger = monitor_token_ledger.load_token_ledger(path)
 
         self.assertEqual(sessions[0]["cost"]["totalCostUsd"], 1.2)
-        self.assertEqual([row["rates"]["input"] for row in ledger if row["recordType"] == "priceEpoch"], [1.0, 0.2])
+        self.assertEqual([row["cost"]["totalCostUsd"] for row in ledger], [1.0, 0.2])
+        self.assertTrue(all(row["recordType"] == "usage" and "pricingId" not in row for row in ledger))
 
     def test_token_ledger_splits_one_session_across_normal_and_api_account_activations(self):
         with self.account_directory() as directory:
@@ -3644,7 +3588,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         })
 
         self.assertEqual(row["state"]["windows"]["5h"]["baselinePercent"], 1)
-        self.assertEqual(row["state"]["runCostUsd"], 3)
+        self.assertNotIn("runCostUsd", row["state"])
+        self.assertNotIn("measuredCostIntervals", row["state"])
+        self.assertNotIn("hasRuntimeCostBaseline", row["state"])
         self.assertNotIn("lastSample", row["state"])
         self.assertNotIn("tokenUsage", row["state"])
         self.assertNotIn("cost", row["state"])
@@ -3675,74 +3621,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(state["windows"]["5h"]["cumulativePercent"], 2)
         self.assertEqual(state["windows"]["5h"]["cumulativeCostUsd"], 3)
 
-    def test_dashboard_rebases_filtered_delta_charts_from_zero(self):
-        html = dashboard_html()
-
-        self.assertIn("function rebaseDeltaEvents(list)", html)
-        self.assertIn("const events=list.filter(p=>!p.synthetic);", html)
-        self.assertIn("if(!events.length)return [];", html)
-        self.assertIn("for(const p of events){", html)
-        self.assertIn('<div class="model-filter"><span class="model-label">Models</span><div class="model-buttons" id="models"></div></div>', html)
-        self.assertIn('selectedModels=new Set()', html)
-        self.assertIn('function modelDisplayName(model)', html)
-        self.assertIn('part.toLowerCase()==="gpt"?"GPT":/^o\\d/i.test(part)?part.toUpperCase()', html)
-        self.assertIn('function updateModelControls(events)', html)
-        self.assertIn('events.filter(p=>!p.synthetic&&p.model).map(p=>p.model)', html)
-        self.assertIn('function toggleScopeSelection(selection,candidate,available)', html)
-        self.assertIn('if(candidate==="all"){if(selection.size)selection.clear();else for(const value of available)selection.add(value)}', html)
-        self.assertIn('toggleScopeSelection(selectedModels,model,available)', html)
-        self.assertIn('addButton("All","all",selectedModels.size===0)', html)
-        self.assertIn('available.forEach(model=>addButton(modelDisplayName(model),model,selectedModels.has(model)))', html)
-        self.assertIn('function modelFilteredEvents(list)', html)
-        self.assertIn('list.filter(p=>p.synthetic||selectedModels.has(p.model))', html)
-        self.assertIn('updateModelControls([...fiveInRange,...sevenInRange])', html)
-        self.assertIn('<div class="account-filter"><span class="account-label">Accounts</span><div class="account-buttons" id="eventAccounts"></div></div>', html)
-        self.assertIn('selectedAccounts=new Set()', html)
-        self.assertIn('function updateAccountControls(events)', html)
-        self.assertIn('toggleScopeSelection(selectedAccounts,accountId,available.keys())', html)
-        self.assertIn('function accountFilteredEvents(list)', html)
-        self.assertIn('function accountFilteredQuotaPoints(list)', html)
-        self.assertIn('updateAccountControls([...fiveInRange,...sevenInRange,...quotaInRange])', html)
-        self.assertIn('quota=accountFilteredQuotaPoints(quotaInRange)', html)
-        self.assertIn('rows.push(`Model ${modelDisplayName(p.model)}`)', html)
-        self.assertIn('rows.push(`Account ${accountDisplayName(usageAccountId(p),p.accountLabel)}`)', html)
-        self.assertIn("const chartStates={}, usageTimeChartStates={}, NODE_RADIUS=5, CHART_MARGINS={l:48,r:18,t:16,b:34}", html)
-        self.assertIn("function denseMergeMetrics(id,list)", html)
-        self.assertIn("maxPercent:maxPercent*1.03||1,maxCost:maxCost*1.08||1,minDistance:NODE_RADIUS*4", html)
-        self.assertIn("function denseDeltaDistance(a,b,metrics)", html)
-        self.assertIn("Math.hypot(((b.cumulativePercent||0)-(a.cumulativePercent||0))/metrics.maxPercent*metrics.plotWidth", html)
-        self.assertIn("function mergeDenseDeltaEvents(list,metrics)", html)
-        self.assertIn("const mergeTrailing=()=>", html)
-        self.assertIn("if(index<0)return flush()", html)
-        self.assertIn(
-            "if(denseDeltaDistance(result[result.length-1]||{cumulativePercent:0,cumulativeCostUsd:0},"
-            "{cumulativePercent:percent+(pending.deltaPercent||0),cumulativeCostUsd:cost+(pending.deltaCostUsd||0)},metrics)>metrics.minDistance)flush()",
-            html,
-        )
-        self.assertNotIn("function scaleFromZero(values", html)
-        self.assertIn("const left=e.clientX>=innerWidth/2?e.clientX-offset-w:e.clientX+offset", html)
-        self.assertIn("const top=e.clientY>=innerHeight/2?e.clientY-offset-h:e.clientY+offset", html)
-        self.assertIn('button id="prevDate" aria-label="Previous day">&lt;</button>', html)
-        self.assertIn('input class="date-range" id="rangeDate" type="date"', html)
-        self.assertIn('button id="nextDate" aria-label="Next day">&gt;</button>', html)
-        self.assertIn('<span class="date-selector" id="dateSelector">', html)
-        self.assertIn('<div class="quota" data-quota-widget><span id="top5h">5h: N/A</span><span id="top7d">7d: N/A</span></div>', html)
-        self.assertIn("function pointFromSample(sample)", html)
-        self.assertIn('const window=(sample.windows||{})[label]||{}', html)
-        self.assertIn('return {checkedAt:sample.checkedAt,timestamp:eventTimestamp(sample),fiveHour:windowPoint("5h"),sevenDay:windowPoint("7d"),cost:sample.cost||{}}', html)
-        self.assertIn('points=payload.points||[], latest=pointFromSample(status.lastSample)||points[points.length-1]||pointFromSample(payload.lastSample)', html)
-        self.assertIn('document.getElementById("top5h").textContent=`5h: ${displayWindows["5h"]?.usageText??pct(latest?.fiveHour?.raw)}`', html)
-        self.assertIn('document.getElementById("top7d").textContent=`7d: ${displayWindows["7d"]?.usageText??pct(latest?.sevenDay?.raw)}`', html)
-        self.assertIn('<span class="progress-label">5h time</span>', html)
-        self.assertIn('<span class="progress-label">7d time</span>', html)
-        self.assertIn('<span class="progress-label">5h usage</span>', html)
-        self.assertIn('<span class="progress-label">7d usage</span>', html)
-        self.assertIn(".window-progress.weekly .time-fill,.window-progress.weekly .usage-fill{background:var(--green)}", html)
-        self.assertIn("function updateWindowTime(id,display,resetAt,durationSeconds)", html)
-        self.assertIn("if(Number.isFinite(display?.timePercent))", html)
-        self.assertIn('const fmt=n=>n==null?"N/A"', html)
-        self.assertIn('reset.textContent="Reset: N/A"', html)
-        self.assertIn("Math.max(0,Math.min(100,(1-(resetMs-Date.now())/(durationSeconds*1000))*100))", html)
 
     def test_dashboard_restores_button_selections_after_refresh(self):
         html = dashboard_html()
@@ -3769,128 +3647,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         for selection in ("selected", "previousRange", "selectedDate", "selectedModels", "selectedAccounts"):
             self.assertIn(selection, saved)
 
-    def test_dashboard_token_summary_follows_shared_filters_and_precedes_usage_charts(self):
-        html = dashboard_html()
-
-        self.assertLess(html.index("<h2>Token Usage</h2>"), html.index("<h2>5h Usage vs Time</h2>"))
-        self.assertEqual(html.count("data-quota-widget"), 8)
-        self.assertIn('document.querySelectorAll("[data-quota-widget]").forEach(widget=>widget.hidden=Boolean(active?.isApiAccount))', html)
-        self.assertIn(':payload.accounts?.items?.find(account=>account.id===payload.accounts.activeAccountId)?.isApiAccount?"Tracking API token usage from Codex sessions."', html)
-        self.assertNotIn('<section class="card wide" data-quota-widget>', html)
-        self.assertIn('if(!rect.width||!rect.height){if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);delete chartStates[id];return}', html)
-        self.assertIn('if(!rect.width||!rect.height){delete usageTimeChartStates[id];return}', html)
-        for element_id in ("tokenInput", "tokenCachedInput", "tokenOutput", "tokenCacheWrite", "tokenCacheHit", "tokenCost"):
-            self.assertIn(f'id="{element_id}"', html)
-        self.assertIn("function filteredTokenSessions(list)", html)
-        self.assertIn("function selectedTokenModelValues(session)", html)
-        self.assertIn('<span id="tokenTimeSpan" hidden></span><span id="tokenSessionCount">0 sessions</span>', html)
-        self.assertIn("function tokenDateSpan(sessions)", html)
-        self.assertIn("function updateTokenSummary(sessions)", html)
-        self.assertIn("const tokens=value.usageTokens||value.tokens||{}", html)
-        self.assertIn('if(Math.abs(n)<10_000)return fmt(n)', html)
-        self.assertIn('if(Math.abs(n)<1_000_000)return `${new Intl.NumberFormat(undefined,{maximumFractionDigits:0}).format(n/1_000)}K`', html)
-        self.assertIn('Math.abs(n)<1_000_000_000?[1_000_000,"M"]:[1_000_000_000,"B"]', html)
-        self.assertIn('Math.abs(scaled)<1_000?{maximumSignificantDigits:3}:{maximumFractionDigits:0}', html)
-        for element_id, total in (("tokenInput", "freshInputTokens"), ("tokenCachedInput", "cachedInputTokens"), ("tokenOutput", "outputTokens"), ("tokenCacheWrite", "cacheWriteInputTokens")):
-            self.assertIn(f'document.getElementById("{element_id}").textContent=tokenFmt(totals.{total})', html)
-        self.assertIn("totals.cachedInputTokens/cacheable*100", html)
-        self.assertIn('timeSpan.textContent=tokenDateSpan(included);timeSpan.hidden=selected!=="All"||!timeSpan.textContent', html)
-        self.assertIn("const selectedTokenSessions=accountFilteredEvents(tokenSessions)", html)
-        self.assertIn('updateWindowTime("time5h",displayWindows["5h"],latest?.fiveHour?.resetAt,5*3600)', html)
-        self.assertIn('updateWindowTime("time7d",displayWindows["7d"],latest?.sevenDay?.resetAt,7*24*3600)', html)
-        self.assertIn("function updateUsageProgress(id,percent)", html)
-        self.assertIn('updateUsageProgress("usage5h",latest?.fiveHour?.raw)', html)
-        self.assertIn('updateUsageProgress("usage7d",latest?.sevenDay?.raw)', html)
-        self.assertIn('lastUpdateTimestamp=!payload.accounts?.awaitingLogin&&latest?(display.percentCheckedAt||latest.checkedAt):null', html)
-        self.assertIn('function updateLastUpdateAge(){if(lastUpdateTimestamp&&!document.hidden)', html)
-        self.assertIn('setInterval(updateLastUpdateAge,1000)', html)
-        self.assertNotIn('| raw cost ${usd(latest.cost.totalCostUsd)}', html)
-        self.assertIn('let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date())', html)
-        self.assertIn('const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null', html)
-        self.assertIn('vscode.postMessage({type:"getCodexUsageSeries",cursor})', html)
-        self.assertNotIn('id="refresh"', html)
-        self.assertIn("function selectedDateBounds()", html)
-        self.assertIn("const [year,month,day]=parts, start=new Date(year,month-1,day), end=new Date(year,month-1,day+1)", html)
-        self.assertIn("return {startMs:start.getTime(),endMs:end.getTime()}", html)
-        self.assertIn("function localDateValue(date)", html)
-        self.assertIn('return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`', html)
-        self.assertIn("function latestSelectableDate()", html)
-        self.assertIn("date.setDate(date.getDate()+1);return localDateValue(date)", html)
-        self.assertIn("function shiftSelectedDate(days)", html)
-        self.assertIn("date.setDate(date.getDate()+days)", html)
-        self.assertIn('selectedDate=localDateValue(date);if(selectedDate>latestSelectableDate())selectedDate=latestSelectableDate();selected="Date";saveSelections();setupControls();drawAll(true)', html)
-        self.assertIn("function syncControls()", html)
-        self.assertIn('document.querySelectorAll("[data-range]").forEach(b=>b.classList.toggle("active",b.dataset.range===selected))', html)
-        self.assertIn('date.max=latest', html)
-        self.assertIn('date.classList.toggle("active",selected==="Date")', html)
-        self.assertIn('document.getElementById("nextDate").disabled=selectedDate>=latest', html)
-        self.assertIn("function activateDateInput()", html)
-        self.assertIn("if(!selectedDate)selectedDate=localDateValue(new Date())", html)
-        self.assertIn('if(selected==="Date"){syncControls();return}', html)
-        self.assertIn('selected="Date";saveSelections();syncControls();drawAll(true)', html)
-        self.assertIn('if(selected==="Date")', html)
-
-        self.assertIn("p.synthetic||(eventTimestamp(p)!=null&&eventTimestamp(p)*1000>=bounds.startMs&&eventTimestamp(p)*1000<bounds.endMs)", html)
-        self.assertIn("return hasRealEvents(filtered)?filtered:[]", html)
-        self.assertIn("date.onclick=activateDateInput", html)
-        self.assertIn("date.onfocus=activateDateInput", html)
-        self.assertIn('date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}saveSelections();setupControls();drawAll(true)}', html)
-        self.assertIn('function datePickerIsOpen(date)', html)
-        self.assertIn('try{return date.matches(":open")}catch{return false}', html)
-        self.assertIn('DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50', html)
-        self.assertIn('function pointInsideDateJudgeArea(rect)', html)
-        self.assertIn('rect.left-DATE_LEAVE_DISTANCE', html)
-        self.assertIn('function virtualDatePickerRect(dateRect)', html)
-        self.assertIn('DATE_PICKER_VIRTUAL_WIDTH=280, DATE_PICKER_VIRTUAL_HEIGHT=360', html)
-        self.assertIn('function pointInsideVirtualDatePicker()', html)
-        self.assertIn('(pickerOpen&&(!dateLeaveIntent.pointerMoved||pointInsideVirtualDatePicker()))||(!pickerOpen&&pointInsideDateJudgeArea(dateLeaveIntent.rect))', html)
-        self.assertIn('if(dateLeaveIntent.outsideAt==null){dateLeaveIntent.outsideAt=now', html)
-        self.assertIn('now-dateLeaveIntent.outsideAt<DATE_LEAVE_DELAY_MS', html)
-        self.assertIn('pickerRect:virtualDatePickerRect(date.getBoundingClientRect())', html)
-        self.assertIn('function cancelDateInputSelection()', html)
-        self.assertIn('document.getElementById("rangeDate").blur();cancelDateLeaveTracking()', html)
-        self.assertIn('document.activeElement!==date&&!datePickerIsOpen(date)', html)
-        self.assertIn('selector.onpointerenter=cancelDateLeaveTracking;selector.onpointerleave=startDateLeaveTracking', html)
-        self.assertIn('addEventListener("pointermove",updateDateLeavePointer,{passive:true})', html)
-        self.assertIn('document.getElementById("prevDate").onclick=()=>shiftSelectedDate(-1)', html)
-        self.assertIn('document.getElementById("nextDate").onclick=()=>shiftSelectedDate(1)', html)
-        self.assertIn("rawKeys:[p.checkedAt]", html)
-        self.assertIn("rawKeys:[...(pending.rawKeys||[pending.checkedAt]),...(p.rawKeys||[p.checkedAt])]", html)
-        self.assertIn("const rebased=rebaseDeltaEvents(list), merged=mergeDenseDeltaEvents(rebased,denseMergeMetrics(id,rebased))", html)
-        self.assertIn("xDomain:extent(points.map(p=>p.x))", html)
-        self.assertIn('function extent(values)', html)
-        self.assertIn('yDomain:extent(points.map(p=>p.y)),minPoints:2,insufficientMessage:"Not enough data for the selected scope"', html)
-        self.assertIn('const [x0,x1]=opts.xDomain||extent(xs), [y0,y1]=opts.yDomain||extent(ys)', html)
-        self.assertIn('const X=x=>x0===x1?(m.l+w-m.r)/2:', html)
-        self.assertIn('Y=y=>y0===y1?(m.t+h-m.b)/2:', html)
-        self.assertIn("const chartStates={}", html)
-        self.assertIn("const chartEaseInOut=progress=>(1-Math.cos(Math.PI*progress))/2", html)
-        self.assertEqual(html.count("chartEaseInOut(Math.min(1,(now-started)/duration))"), 2)
-        self.assertNotIn("1-Math.pow(1-t,3)", html)
-        self.assertNotIn("1-Math.pow(1-progress,3)", html)
-        self.assertIn("drawAll(true)", html)
-        self.assertIn("const eventTime=p=>", html)
-        self.assertIn("const pointKey=p=>", html)
-        self.assertIn("const currentSeries=series.map", html)
-        self.assertIn("const makeLineLayer=drawSeries=>", html)
-        self.assertIn("const previousPoints=previousSeries[seriesIndex]?.points||[], oldOwners=new Map(), newOwners=new Map(), moves=new Map()", html)
-        self.assertIn("for(const p of previousPoints)for(const rawKey of p.rawKeys||[p.key])oldOwners.set(rawKey,p)", html)
-        self.assertIn("for(const rawKey of new Set([...oldOwners.keys(),...newOwners.keys()]))", html)
-        self.assertIn("moves.get(key).rawKeys.push(rawKey)", html)
-        self.assertIn("const snapshotSeries=progress=>", html)
-        self.assertIn("const updateLiveLineLayer=progress=>", html)
-        self.assertIn("drawLayer(previousLineLayer,1-progress);drawLayer(currentLineLayer,progress)", html)
-        self.assertIn("const started=performance.now(), duration=820", html)
-        self.assertIn("startX:oldPoint.x", html)
-        self.assertIn("function eventTimestamp(p){", html)
-        self.assertIn("return list.filter(p=>p.synthetic||eventTimestamp(p)==null||eventTimestamp(p)>=max-secs)", html)
-        self.assertNotIn("const withFallback=", html)
-        self.assertIn("requestAnimationFrame(step)", html)
-        self.assertNotIn("dashboardLoading", html)
-        self.assertNotIn("beginDashboardLoading", html)
-        self.assertNotIn("redrawForScope", html)
-        self.assertIn("chartStates[id]={series:snapshotSeries(progress),lineLayer:liveLineLayer,frame:null}", html)
-        self.assertNotIn("const percentLimit=maxPercent*.0075, costLimit=maxCost*.015", html)
 
     def test_dashboard_axis_labels_adapt_to_chart_dimensions(self):
         html = dashboard_html()
@@ -3923,13 +3679,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_dashboard_payload_exposes_usage_tokens_without_exposing_token_fields(self):
         session = {
             "sessionId": "session-a", "startedAt": "2030-01-01T00:00:00Z", "updatedAt": "2030-01-01T00:01:00Z", "accountSlotId": "account-a", "accountLabel": "Account A",
-            "tokens": {"freshInputTokens": 123}, "cost": {"totalCostUsd": 0.5}, "byModel": {"gpt-5.5": {"tokens": {"freshInputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}}},
+            "tokens": {"inputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}, "byModel": {"gpt-5.5": {"tokens": {"inputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}}},
         }
         accounts = {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "Account A"}]}
-        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard._dashboard_display_data([], [], [session], monitor_dashboard.dashboard_account_status(accounts)))
+        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard._dashboard_display_data([], monitor_token_ledger.legacy_baselines_from_sessions([monitor_history.normalize_token_session_row(session)]), monitor_dashboard.dashboard_account_status(accounts)))
 
         model = payload["tokenSessions"][0]["byModel"]["gpt-5.5"]
-        self.assertEqual(model["usageTokens"], {"freshInputTokens": 123, "outputTokens": 45})
+        self.assertEqual(model["usageTokens"], {"inputTokens": 123, "freshInputTokens": 123, "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 45, "totalTokens": 168, "requests": 0})
         self.assertEqual(model["cost"]["totalCostUsd"], 0.5)
         self.assertNotIn('"tokens"', json.dumps(payload))
 
@@ -3945,7 +3701,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.last_sample, state.last_error, state.runtime_state = sample, None, {}
         state.wake_event = threading.Event()
 
-        with mock.patch.object(monitor_dashboard, "load_history", side_effect=AssertionError("status must not load history")):
+        with mock.patch.object(monitor_dashboard, "load_quota_history", side_effect=AssertionError("status must not load history")), mock.patch.object(monitor_dashboard, "load_token_ledger", side_effect=AssertionError("status must not load ledger")):
             payload = state.status_payload()
 
         self.assertEqual(payload["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
@@ -3970,7 +3726,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             state._series_build_lock = threading.Lock()
             state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
             state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
-            state.usage_data = SimpleNamespace(datasets=lambda _view: ([], quota, []))
+            state.usage_data = SimpleNamespace(datasets=lambda _view: (quota, []))
             state.last_sample = state.last_error = None
             state.runtime_state = {}
             state.wake_event = threading.Event()
@@ -4006,7 +3762,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             state._series_build_lock = threading.Lock()
             state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
             state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
-            state.usage_data = SimpleNamespace(datasets=lambda view: ([], local_quota + supplemental_quota if view == "merged" else local_quota, []))
+            state.usage_data = SimpleNamespace(datasets=lambda view: (local_quota + supplemental_quota if view == "merged" else local_quota, []))
             state.last_sample = state.last_error = None
             state.runtime_state = {}
             state.wake_event = threading.Event()
@@ -4087,27 +3843,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(compacted[1]["compactedFrom"], timestamps[6])
         self.assertGreater(compacted[1]["timestamp"] - compacted[0]["timestamp"], monitor_dashboard.DASHBOARD_DISPLAY_CACHE_GAP_SECONDS)
 
-    def test_dashboard_display_event_compaction_preserves_delta_totals_and_filters(self):
-        now = 100 * 24 * 60 * 60
-        events = [{"checkedAt": None, "timestamp": None, "window": "5h", "synthetic": True, "deltaPercent": 0.0, "deltaCostUsd": 0.0, "cumulativePercent": 0.0, "cumulativeCostUsd": 0.0}]
-        for index in range(8):
-            timestamp = now - 10 * 24 * 60 * 60 + index * 60
-            events.append({
-                "checkedAt": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(), "timestamp": timestamp, "window": "5h", "model": "gpt-5.5", "accountSlotId": "account-a", "accountLabel": "A",
-                "deltaPercent": 1.0, "deltaCostUsd": 0.25, "cumulativePercent": index + 1.0, "cumulativeCostUsd": (index + 1) * 0.25,
-            })
-
-        compacted = monitor_dashboard.dashboard_compact_event_series(events, now)
-
-        self.assertEqual(len(compacted), 2)
-        self.assertTrue(compacted[0]["synthetic"])
-        self.assertEqual(compacted[1]["mergedCount"], 8)
-        self.assertEqual(compacted[1]["deltaPercent"], 8.0)
-        self.assertEqual(compacted[1]["deltaCostUsd"], 2.0)
-        self.assertEqual(compacted[1]["cumulativePercent"], 8.0)
-        self.assertEqual(compacted[1]["accountSlotId"], "account-a")
-        self.assertEqual(compacted[1]["mergedFrom"], events[1]["checkedAt"])
-        self.assertEqual(compacted[1]["mergedTo"], events[-1]["checkedAt"])
 
     def test_dashboard_next_maintenance_at_uses_hour_resolution(self):
         hour = monitor_dashboard.HOUR_MULTIPLIER
@@ -4125,7 +3860,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             path = directory / "dashboard-cache.json"
             cache = monitor_dashboard.DashboardDisplayCache(path)
-            entry = {"quotaPoints": [], "tokenSessions": [], "events": {"fiveHour": [], "sevenDay": []}, "historyStats": {"rows": 0}}
+            entry = {"quotaPoints": [], "tokenSessions": [], "costUsage": {"fiveHour": [], "sevenDay": []}, "historyStats": {"rows": 0}}
             cache.replace({
                 "version": monitor_dashboard.DASHBOARD_DISPLAY_CACHE_VERSION, "sourceRevision": "source", "builtAt": 100.0, "nextMaintenanceAt": 200.0,
                 "displayRevision": "display", "views": {"local": entry, "merged": entry},
@@ -4152,7 +3887,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             state._series_cache = {}
             state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
             state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
-            state.usage_data = SimpleNamespace(datasets=lambda _view: ([], quota, []))
+            state.usage_data = SimpleNamespace(datasets=lambda _view: (quota, []))
             state.last_sample = state.last_error = None
             state.runtime_state = {}
             state.wake_event = threading.Event()
@@ -4182,7 +3917,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         local_quota = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}
         merged_quota = {"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 2}}}
         local_session = {"sessionId": "local", "tokens": {}, "byModel": {}}
-        payload = monitor_dashboard._dashboard_display_data([], [local_quota], [local_session], {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]})
+        payload = monitor_dashboard._dashboard_display_data([local_quota], monitor_token_ledger.legacy_baselines_from_sessions([monitor_history.normalize_token_session_row(local_session)]), {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]})
 
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 1)
         self.assertEqual(payload["tokenSessions"][0]["sessionId"], "local")
@@ -4663,10 +4398,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertEqual(merged[0]["windows"]["5h"]["plan"], "plus")
 
-    def test_poll_persists_quota_before_delta_validation(self):
+    def test_poll_persists_raw_ledger_and_quota(self):
         source = Path(monitor_dashboard.__file__).read_text(encoding="utf-8")
-
-        self.assertLess(source.index("append_quota_history_sample(self.args.quota_history, sample)"), source.index("events = process_sample_delta_events(self.runtime_state, sample, history)"))
+        poll = source[source.index("    def poll_once(self)"):source.index("    def _poll_inactive_account", source.index("    def poll_once(self)"))]
+        self.assertIn("sync_token_ledger(", poll)
+        self.assertIn("append_quota_history_sample(self.args.quota_history, sample)", poll)
 
     def test_dashboard_series_returns_quota_points_for_all_accounts(self):
         accounts = {"awaitingLogin": False, "activeAccountId": "account-a", "items": [{"id": "account-a", "label": "Account A"}, {"id": "account-b", "label": "Account B"}]}
@@ -4675,7 +4411,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"checkedAt": "2030-01-01T00:01:30Z", "accountSlotId": "account-b", "accountLabel": "Account B", "windows": {"7d": {"usedPercent": 34, "resetAt": None}}, "compaction": {"continuousFrom": "2029-12-31T12:00:00Z", "omittedSamples": 3}},
             ]
 
-        payload = monitor_dashboard._dashboard_display_data([], quota_history, [], accounts)
+        payload = monitor_dashboard._dashboard_display_data(quota_history, [], accounts)
 
         self.assertNotIn("quotaHistoryPath", payload)
         self.assertEqual([point["accountSlotId"] for point in payload["quotaPoints"]], ["account-a", "account-b"])
@@ -4784,7 +4520,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             "remoteUsage": {"rawResponse": {"email": "private@example.test", "account_id": "acct-secret", "user_id": "user-secret"}, "authIdentity": {"account_id": "acct-secret"}},
             "tokenUsage": {"totals": {"requests": 1}},
         }
-        payload = monitor_dashboard.dashboard_safe_json({"status": {"sample": monitor_dashboard.dashboard_sample(sample), "accounts": monitor_dashboard.dashboard_account_status(accounts)}, "views": {"local": monitor_dashboard._dashboard_display_data([], [], [], accounts)}})
+        payload = monitor_dashboard.dashboard_safe_json({"status": {"sample": monitor_dashboard.dashboard_sample(sample), "accounts": monitor_dashboard.dashboard_account_status(accounts)}, "views": {"local": monitor_dashboard._dashboard_display_data([], [], accounts)}})
         serialized = json.dumps(payload)
 
         self.assertIn("Account A", serialized)
@@ -4841,30 +4577,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("bindingState", serialized)
         self.assertNotIn("same-api", serialized)
 
-    def test_dashboard_statistics_merge_duplicate_profiles_under_one_usage_account(self):
-        accounts = monitor_dashboard.dashboard_account_status({
-            "activeAccountId": "profile-a",
-            "items": [{"id": "profile-a", "label": "A", "ready": True}, {"id": "profile-b", "label": "B", "ready": True}],
-        }, lambda _account_id: "usage-shared")
-        display = monitor_dashboard._dashboard_display_data(
-            [
-                {"checkedAt": "2030-01-01T00:01:00Z", "window": "5h", "model": "gpt-5", "accountSlotId": "profile-a", "accountLabel": "A", "deltaPercent": 1, "deltaCostUsd": 1, "sync": {"accountId": "usage-shared"}},
-                {"checkedAt": "2030-01-01T00:02:00Z", "window": "5h", "model": "gpt-5", "accountSlotId": "profile-b", "accountLabel": "B", "deltaPercent": 2, "deltaCostUsd": 2, "sync": {"accountId": "usage-shared"}},
-            ],
-            [
-                {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "profile-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 10}}, "sync": {"accountId": "usage-shared"}},
-                {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "profile-b", "accountLabel": "B", "windows": {"7d": {"usedPercent": 20}}, "sync": {"accountId": "usage-shared"}},
-            ],
-            [{"sessionId": "session-b", "accountSlotId": "profile-b", "accountLabel": "B", "sync": {"accountId": "usage-shared"}, "byModel": {}}],
-            accounts,
-            now=1893456000,
-        )
-
-        self.assertEqual(len(display["quotaPoints"]), 1)
-        self.assertEqual((display["quotaPoints"][0]["fiveHour"]["raw"], display["quotaPoints"][0]["sevenDay"]["raw"]), (10.0, 20.0))
-        self.assertEqual({event["usageAccountId"] for event in display["events"]["fiveHour"] if not event.get("synthetic")}, {"usage-shared"})
-        self.assertEqual(display["tokenSessions"][0]["usageAccountId"], "usage-shared")
-        self.assertEqual(monitor_dashboard.dashboard_sample({"sync": {"accountId": "usage-shared"}})["usageAccountId"], "usage-shared")
 
     def test_switching_duplicate_profiles_reuses_the_newest_shared_quota_status(self):
         accounts = monitor_dashboard.dashboard_account_status({
@@ -6014,26 +5726,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertFalse(result["encryptedPayloadVerified"])
         self.assertEqual(result["checks"][1], {"name": "Encrypted data decryption", "status": "skipped", "detail": "No encrypted cloud payload exists yet."})
 
-    def test_sync_operations_reject_unbounded_or_inconsistent_remote_records(self):
-        row = {"sessionId": "session", "tokens": {}, "byModel": {"<img src=x onerror=alert(1)>": {}}, "sync": {"recordId": "record", "originMachineId": "machine", "accountId": "account"}}
-        operation = {"action": "upsert", "key": record_key("token", row), "record": {"kind": "token", "row": row}}
-        validate_sync_operation(operation)
-
-        invalid = [
-            operation | {"key": "token:wrong"},
-            {"action": "upsert", "key": operation["key"], "record": {"kind": "token", "row": row | {"accountLabel": "x" * 4097}}},
-            {"action": "upsert", "key": operation["key"], "record": {"kind": "token", "row": row | {"tokens": {"inputTokens": float("inf")}}}},
-            {"action": "upsert", "key": operation["key"], "record": {"kind": "token", "row": row | {"byModel": {f"model-{index}": "x" * 100 for index in range(3000)}}}},
-        ]
-        nested = {}
-        cursor = nested
-        for _ in range(14):
-            cursor["next"] = {}
-            cursor = cursor["next"]
-        invalid.append({"action": "upsert", "key": operation["key"], "record": {"kind": "token", "row": row | {"nested": nested}}})
-        for candidate in invalid:
-            with self.subTest(candidate=list(candidate)), self.assertRaises(ValueError):
-                validate_sync_operation(candidate)
 
     def test_webdav_put_uses_verified_get_etag_when_put_omits_it(self):
         client = object.__new__(WebDavClient)
@@ -6399,7 +6091,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
     def test_cloud_fetch_lists_accounts_without_downloading_or_uploading_them(self):
         with self.account_directory() as directory:
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
-            accounts = SimpleNamespace(overwrite_from_cloud=mock.Mock(return_value={"localWinners": ["local-id"]}), push_bound_accounts=mock.Mock(return_value=[]))
+            accounts = SimpleNamespace(lock=threading.RLock(), manifest={"accounts": []}, overwrite_from_cloud=mock.Mock(return_value={"localWinners": ["local-id"]}), push_bound_accounts=mock.Mock(return_value=[]))
             cloud = CloudManager(directory / "private", skills, accounts)
             state = {"version": 1, "accountKey": "owned", "label": "Owned", "boundMachineId": cloud.machine_id, "revisionId": "revision"}
 
@@ -6446,7 +6138,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 release_delete.wait(2)
                 return {"deleted": True}
 
-            accounts = SimpleNamespace(delete=delete_account, release_cloud_account=lambda _cloud, _account_id: entered_release.set() or {"released": True})
+            accounts = SimpleNamespace(lock=threading.RLock(), manifest={"accounts": []}, delete=delete_account, release_cloud_account=lambda _cloud, _account_id: entered_release.set() or {"released": True})
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), accounts)
             delete_thread = threading.Thread(target=cloud.delete_local_account, args=("account-a",))
             release_thread = threading.Thread(target=cloud.release_local_account, args=("account-b",))
@@ -7065,7 +6757,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
     def test_skill_auto_push_retries_three_times_then_exposes_failure(self):
         with self.account_directory() as directory:
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
-            cloud = CloudManager(directory / "private", skills, SimpleNamespace(manifest={"cloudBindingEnabled": True}))
+            cloud = CloudManager(directory / "private", skills, SimpleNamespace(lock=threading.RLock(), manifest={"cloudBindingEnabled": True, "accounts": []}))
             cloud._config["webdav"]["enabled"] = True
             cloud._observed_skill_hashes = {"alpha": "modified"}
             cloud._pending_skill_pushes = {"alpha": {"hash": "modified", "since": 0, "nextAttemptAt": AUTO_PUSH_STABLE_SECONDS, "attempts": 0}}
@@ -7082,7 +6774,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
     def test_skill_edit_during_failed_upload_restarts_stability_window(self):
         with self.account_directory() as directory:
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
-            cloud = CloudManager(directory / "private", skills, SimpleNamespace(manifest={"cloudBindingEnabled": True}))
+            cloud = CloudManager(directory / "private", skills, SimpleNamespace(lock=threading.RLock(), manifest={"cloudBindingEnabled": True, "accounts": []}))
             cloud._config["webdav"]["enabled"] = True
             cloud._observed_skill_hashes = {"alpha": "before"}
             cloud._pending_skill_pushes = {"alpha": {"hash": "before", "since": 0, "nextAttemptAt": AUTO_PUSH_STABLE_SECONDS, "attempts": 0}}
@@ -7503,7 +7195,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
     def test_recovered_release_finalizes_only_matching_verified_remote_revision(self):
         with self.account_directory() as directory:
-            accounts = SimpleNamespace(finalize_recovered_release=mock.Mock(), rollback_recovered_release=mock.Mock())
+            accounts = SimpleNamespace(lock=threading.RLock(), manifest={"accounts": []}, finalize_recovered_release=mock.Mock(), rollback_recovered_release=mock.Mock())
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), accounts)
             data = b"released-auth"
             revision = hashlib.sha256(data).hexdigest()
@@ -7561,21 +7253,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(migrated.active_account()["identity"]["idTokenHash"], hashlib.sha256(b"id-acct-a").hexdigest())
             self.assertEqual((migrated.root / "ppl-pro" / "auth.json").read_bytes(), auth)
 
-    def test_usage_cost_intervals_sum_machine_cost_without_duplicate_percent(self):
-        def interval(machine, start, end, cost, started_at, checked_at):
-            return {
-                "recordType": "costInterval", "startedAt": started_at, "checkedAt": checked_at, "window": "5h", "accountSlotId": "account-a", "accountLabel": "A",
-                "startPercent": start, "endPercent": end, "plan": "plus", "planMultiplier": 1, "resetAt": "2030-01-01T05:00:00Z", "modelCostsUsd": {"gpt-5.5": cost},
-                "sync": {"originMachineId": machine, "accountId": "usage-account", "recordId": f"{machine}:{checked_at}"},
-            }
-
-        merged = aggregate_cost_intervals([
-            interval("machine-a", 0, 1, 1, "2030-01-01T00:00:00Z", "2030-01-01T00:01:30Z"),
-            interval("machine-b", 0, 1, 1, "2030-01-01T00:00:30Z", "2030-01-01T00:02:00Z"),
-        ])
-
-        self.assertEqual([(row["deltaPercent"], row["deltaCostUsd"], row["costPercentRatio"]) for row in merged], [(1, 2, 2)])
-        self.assertEqual(merged[0]["checkedAt"], "2030-01-01T00:01:30Z")
 
     def test_usage_quota_snapshot_keeps_only_idle_plateau_boundaries(self):
         with self.account_directory() as directory:
@@ -7588,7 +7265,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "sync": {"version": 1, "originMachineId": "machine-a", "accountId": "usage-a", "recordId": f"quota-{index}"},
             } for index in range(6)]
             quota.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _slot: "usage-a", threading.Lock())
+            store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "usage-a", threading.Lock())
 
             records, present = store.snapshot()
             full_records, full_present = store.snapshot(necessary_only=False)
@@ -7608,7 +7285,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             tokens.write_text("", encoding="utf-8")
             make_row = lambda index: {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 5, "resetAt": "2030-01-01T05:00:00Z"}}}
             monitor_history.write_quota_history(quota, [make_row(index) for index in range(3)])
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _slot: "usage-a", threading.Lock())
+            store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "usage-a", threading.Lock())
             first, _ = store.snapshot()
             monitor_history.write_quota_history(quota, monitor_history.load_quota_history(quota) + [make_row(3), make_row(4)])
 
@@ -7632,259 +7309,28 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "windows": {"5h": {"usedPercent": 5, "plan": "plus", "resetAt": "2030-01-01T05:00:00Z"}},
             } for index in range(3)]
             monitor_history.write_quota_history(quota, rows)
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda slot: "usage-a" if slot == "account-a" else "usage-b", threading.Lock())
+            store = UsageDataStore(quota, tokens, "machine-a", lambda slot: "usage-a" if slot == "account-a" else "usage-b", threading.Lock())
 
             records, _ = store.snapshot()
             selected = [(record["row"]["sync"]["accountId"], record["row"]["checkedAt"]) for record in records.values()]
 
             self.assertEqual(selected, [("usage-a", "2030-01-01T00:00:00Z"), ("usage-a", "2030-01-01T00:02:00Z"), ("usage-a", "2030-01-01T00:03:00Z"), ("usage-a", "2030-01-01T00:04:00Z"), ("usage-b", "2030-01-01T00:00:30Z"), ("usage-b", "2030-01-01T00:02:30Z")])
 
-    def test_usage_cost_intervals_reconcile_coarse_and_fine_observations(self):
-        def interval(machine, start, end, cost, started_at, checked_at):
-            return {
-                "recordType": "costInterval", "startedAt": started_at, "checkedAt": checked_at, "window": "5h", "accountSlotId": "account-a", "accountLabel": "A",
-                "startPercent": start, "endPercent": end, "plan": "plus", "planMultiplier": 1, "resetAt": "2030-01-01T05:00:00Z", "modelCostsUsd": {"gpt-5.5": cost},
-                "sync": {"originMachineId": machine, "accountId": "usage-account", "recordId": f"{machine}:{checked_at}"},
-            }
-
-        merged = aggregate_cost_intervals([
-            interval("machine-a", 0, 2, 2, "2030-01-01T00:00:00Z", "2030-01-01T00:03:00Z"),
-            interval("machine-b", 0, 1, 1, "2030-01-01T00:00:30Z", "2030-01-01T00:02:00Z"),
-            interval("machine-b", 1, 2, 1, "2030-01-01T00:02:00Z", "2030-01-01T00:03:30Z"),
-        ])
-
-        self.assertEqual([(row["deltaPercent"], row["deltaCostUsd"]) for row in merged], [(1, 2), (1, 2)])
-        self.assertEqual([row["checkedAt"] for row in merged], ["2030-01-01T00:02:00Z", "2030-01-01T00:03:00Z"])
-
-    def test_usage_cost_intervals_combine_low_cost_and_isolate_reset_cycles(self):
-        rows = []
-        for machine, reset_at in (("machine-a", "2030-01-01T05:00:00Z"), ("machine-b", "2030-01-01T05:00:30Z"), ("machine-c", "2030-01-02T05:00:00Z")):
-            rows.append({
-                "recordType": "costInterval", "startedAt": "2030-01-01T00:00:00Z", "checkedAt": f"2030-01-01T00:0{len(rows) + 1}:00Z", "window": "5h", "accountSlotId": "account-a", "accountLabel": "A",
-                "startPercent": 0, "endPercent": 1, "plan": "plus", "planMultiplier": 1, "resetAt": reset_at, "modelCostsUsd": {"gpt-5.5": 0.006},
-                "sync": {"originMachineId": machine, "accountId": "usage-account", "recordId": machine},
-            })
-
-        merged = aggregate_cost_intervals(rows)
-
-        self.assertEqual(len(merged), 1)
-        self.assertEqual(merged[0]["deltaCostUsd"], 0.012)
-
-    def test_usage_cost_interval_reset_jitter_grouping_is_order_independent(self):
-        def interval(machine, reset_at, cost):
-            return {
-                "recordType": "costInterval", "startedAt": "2030-01-01T00:00:00Z", "checkedAt": "2030-01-01T00:05:00Z", "window": "5h", "accountSlotId": "account-a", "accountLabel": "A",
-                "startPercent": 0, "endPercent": 1, "plan": "plus", "planMultiplier": 1, "resetAt": reset_at, "modelCostsUsd": {"gpt-5.5": cost},
-                "sync": {"originMachineId": machine, "accountId": "usage-account", "recordId": machine},
-            }
-
-        rows = [interval("machine-a", "2030-01-01T05:00:00Z", 0.006), interval("machine-b", "2030-01-01T05:00:50Z", 0.007), interval("machine-c", "2030-01-01T05:01:40Z", 0.02)]
-
-        forward, reverse = aggregate_cost_intervals(rows), aggregate_cost_intervals(list(reversed(rows)))
-
-        self.assertEqual(sorted(row["deltaCostUsd"] for row in forward), sorted(row["deltaCostUsd"] for row in reverse))
-        self.assertEqual(sorted(row["deltaCostUsd"] for row in forward), [0.013, 0.02])
-
-    def test_usage_cost_interval_sweep_normalizes_each_source_row_once(self):
-        rows = [{
-            "recordType": "costInterval", "startedAt": "2030-01-01T00:00:00Z", "checkedAt": "2030-01-01T00:05:00Z", "window": "5h", "accountSlotId": "account-a", "accountLabel": "A",
-            "startPercent": index / 10, "endPercent": (index + 1) / 10, "plan": "plus", "planMultiplier": 1, "resetAt": "2030-01-01T05:00:00Z", "modelCostsUsd": {"gpt-5.5": 0.02},
-            "sync": {"originMachineId": "machine-a", "accountId": "usage-account", "recordId": str(index)},
-        } for index in range(1000)]
-
-        with mock.patch("monitor_usage_sync.coerce_float", wraps=monitor_common.coerce_float) as coerce:
-            merged = aggregate_cost_intervals(rows)
-
-        self.assertEqual(len(merged), len(rows))
-        self.assertLessEqual(coerce.call_count, len(rows) * 5)
-
-    def test_usage_token_merge_uses_timestamp_then_total_then_hash(self):
-        base = {"sessionId": "session-a", "startedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "cost": {}, "byModel": {}, "sync": {"accountId": "usage-a"}}
-        older = base | {"updatedAt": "2030-01-01T00:01:00Z", "tokens": {"totalTokens": 100}}
-        newer = base | {"updatedAt": "2030-01-01T00:02:00Z", "tokens": {"totalTokens": 90}}
-        dominant = base | {"updatedAt": "2030-01-01T00:02:00Z", "tokens": {"totalTokens": 120}}
-
-        merged, conflicts = merge_token_rows([older, newer, dominant])
-
-        self.assertEqual(merged[0]["tokens"]["totalTokens"], 120)
-        self.assertEqual(conflicts, [])
-
-    def test_usage_store_combines_same_session_segments_from_duplicate_profiles(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
-            history.write_text("", encoding="utf-8")
-            quota.write_text("", encoding="utf-8")
-            monitor_history.write_token_session_history(tokens, [
-                {"sessionId": "shared-session", "startedAt": "2030-01-01T00:00:00Z", "updatedAt": "2030-01-01T00:01:00Z", "accountSlotId": "profile-a", "accountLabel": "A", "tokens": {"inputTokens": 10}, "cost": {"totalCostUsd": 1}, "byModel": {"gpt-5": {"tokens": {"inputTokens": 10}, "cost": {"totalCostUsd": 1}}}},
-                {"sessionId": "shared-session", "startedAt": "2030-01-01T00:02:00Z", "updatedAt": "2030-01-01T00:03:00Z", "accountSlotId": "profile-b", "accountLabel": "B", "tokens": {"inputTokens": 20}, "cost": {"totalCostUsd": 2}, "byModel": {"gpt-5": {"tokens": {"inputTokens": 20}, "cost": {"totalCostUsd": 2}}}},
-            ])
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _slot: "usage-shared", threading.Lock())
-
-            local = store.normalize_local()[2]
-            merged = store.datasets("merged")[2]
-            records, _ = store.snapshot()
-
-            self.assertEqual(len(local), 1)
-            self.assertEqual(len(merged), 1)
-            self.assertEqual((local[0]["tokens"]["totalTokens"], local[0]["cost"]["totalCostUsd"]), (30, 3))
-            self.assertEqual(local[0]["byModel"]["gpt-5"]["tokens"]["totalTokens"], 30)
-            self.assertEqual([record["row"]["sync"]["accountId"] for record in records.values() if record["kind"] == "token"], ["usage-shared"])
-
-    def test_usage_sync_keeps_same_session_separate_for_normal_and_api_accounts(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
-            history.write_text("", encoding="utf-8")
-            quota.write_text("", encoding="utf-8")
-            monitor_history.write_token_session_history(tokens, [
-                {"sessionId": "shared-session", "updatedAt": "2030-01-01T00:30:00Z", "accountSlotId": "normal", "accountLabel": "Normal", "tokens": empty_token_totals()},
-                {"sessionId": "shared-session", "updatedAt": "2030-01-01T01:30:00Z", "accountSlotId": "api", "accountLabel": "API", "tokens": empty_token_totals()},
-            ])
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda slot: f"usage-{slot}", threading.Lock())
-
-            records, _ = store.snapshot()
-
-            remote_history, remote_quota, remote_tokens = directory / "remote-history.jsonl", directory / "remote-quota.jsonl", directory / "remote-tokens.jsonl"
-            remote_history.write_text("", encoding="utf-8")
-            remote_quota.write_text("", encoding="utf-8")
-            remote_tokens.write_text("", encoding="utf-8")
-            remote = UsageDataStore(remote_history, remote_quota, remote_tokens, "machine-b", lambda slot: f"usage-{slot}", threading.Lock(), lambda account_id, _slot, _label: {"usage-normal": ("normal-b", "Normal B"), "usage-api": ("api-b", "API B")}.get(account_id))
-            remote.apply([{"action": "upsert", "key": key, "record": record} for key, record in records.items()], operation_origin="machine-a")
-
-        token_records = [record for record in records.values() if record["kind"] == "token"]
-        self.assertEqual(len(token_records), 2)
-        self.assertEqual({record["row"]["sync"]["accountId"] for record in token_records}, {"usage-normal", "usage-api"})
-        self.assertEqual(remote.datasets("local")[2], [])
-        self.assertEqual({row["accountSlotId"] for row in remote.datasets("merged")[2]}, {"normal-b", "api-b"})
-
-    def test_usage_store_initial_migration_syncs_quota_and_tokens_but_not_legacy_cost(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
-            append_history(history, {"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "deltaPercent": 1, "deltaCostUsd": 2, "costPercentRatio": 2})
-            monitor_history.write_quota_history(quota, [{"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}])
-            monitor_history.write_token_session_history(tokens, [{"sessionId": "s", "updatedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "tokens": empty_token_totals()}])
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock())
-
-            records, _ = store.snapshot()
-
-            self.assertEqual(sorted(record["kind"] for record in records.values()), ["quota", "token"])
-            self.assertTrue(load_history(history)[0]["sync"]["localOnly"])
-            self.assertEqual(monitor_history.load_quota_history(quota)[0]["sync"]["accountId"], "usage-a")
-
-    def test_usage_remote_apply_changes_only_sync_cache_and_builds_separate_merged_dataset(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
-            history.write_text("", encoding="utf-8")
-            tokens.write_text("", encoding="utf-8")
-            monitor_history.write_quota_history(quota, [{"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}])
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock(), lambda _usage, _slot, _label: ("a", "A"))
-            store.snapshot()
-            local_bytes = history.read_bytes(), quota.read_bytes(), tokens.read_bytes()
-            remote = {"checkedAt": "2030-01-01T00:01:00Z", "windows": {"5h": {"usedPercent": 2, "resetAt": None, "plan": "unknown"}}, "sync": {"version": 1, "originMachineId": "machine-b", "accountId": "usage-a", "recordId": "remote-quota"}}
-
-            store.apply([{"action": "upsert", "key": record_key("quota", remote), "record": {"kind": "quota", "row": remote}}], operation_origin="machine-b")
-            local, merged = store.datasets("local"), store.datasets("merged")
-
-            self.assertEqual((history.read_bytes(), quota.read_bytes(), tokens.read_bytes()), local_bytes)
-            self.assertEqual(len(local[1]), 1)
-            self.assertEqual(len(merged[1]), 2)
-            self.assertEqual(merged[1][-1]["accountSlotId"], "a")
-            self.assertTrue(store.cache_path.exists())
-
-            with mock.patch.object(store, "_load") as load, mock.patch("monitor_usage_sync.merge_cost_rows") as merge_cost, mock.patch("monitor_usage_sync.merge_quota_rows") as merge_quota, mock.patch("monitor_usage_sync.merge_token_rows") as merge_tokens:
-                store.datasets("local")
-                store.datasets("merged")
-            load.assert_not_called()
-            merge_cost.assert_not_called()
-            merge_quota.assert_not_called()
-            merge_tokens.assert_not_called()
-
-            with mock.patch.object(store, "_materialize_datasets") as materialize:
-                store.apply([{"action": "upsert", "key": record_key("quota", remote), "record": {"kind": "quota", "row": remote}}], operation_origin="machine-b")
-            materialize.assert_not_called()
-
-    def test_usage_merged_dataset_temporarily_ignores_remote_accounts_missing_locally(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
-            for path in (history, quota, tokens):
-                path.write_text("", encoding="utf-8")
-            accounts = {"usage-a": ("a", "Local A")}
-            revision = [1]
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock(), lambda account_id, _slot, _label: accounts.get(account_id), account_revision_resolver=lambda: revision[0])
-            known = {"checkedAt": "2030-01-01T00:01:00Z", "windows": {"5h": {"usedPercent": 2}}, "sync": {"version": 1, "originMachineId": "machine-b", "accountId": "usage-a", "recordId": "known"}}
-            unknown = {"checkedAt": "2030-01-01T00:02:00Z", "windows": {"5h": {"usedPercent": 3}}, "sync": {"version": 1, "originMachineId": "machine-b", "accountId": "usage-b", "recordId": "unknown"}}
-
-            store.apply([{"action": "upsert", "key": record_key("quota", row), "record": {"kind": "quota", "row": row}} for row in (known, unknown)], operation_origin="machine-b")
-
-            self.assertEqual(store.datasets("local")[1], [])
-            self.assertEqual([(row["checkedAt"], row["accountSlotId"], row["accountLabel"]) for row in store.datasets("merged")[1]], [("2030-01-01T00:01:00Z", "a", "Local A")])
-            self.assertEqual(len(json.loads(store.cache_path.read_text(encoding="utf-8"))["records"]), 2)
-            cache_bytes = store.cache_path.read_bytes()
-
-            accounts["usage-b"] = ("b", "Local B")
-            revision[0] += 1
-
-            self.assertEqual([(row["checkedAt"], row["accountSlotId"], row["accountLabel"]) for row in store.datasets("merged")[1]], [("2030-01-01T00:01:00Z", "a", "Local A"), ("2030-01-01T00:02:00Z", "b", "Local B")])
-            self.assertEqual(store.cache_path.read_bytes(), cache_bytes)
-
-    def test_usage_cache_migration_removes_prior_remote_rows_from_local_raw_files(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
-            history.write_text("", encoding="utf-8")
-            tokens.write_text("", encoding="utf-8")
-            rows = [
-                {
-                    "checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "Local", "windows": {"5h": {"usedPercent": 1}},
-                    "sync": {"version": 1, "originMachineId": "machine-a", "accountId": "usage-a", "recordId": "local"},
-                },
-                {
-                    "checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "cloud-a", "accountLabel": "Remote managed name", "windows": {"5h": {"usedPercent": 2}},
-                    "sync": {"version": 1, "originMachineId": "machine-b", "accountId": "usage-a", "recordId": "remote"},
-                },
-            ]
-            monitor_history.write_quota_history(quota, rows)
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock(), lambda account_id, _slot, _label: ("a", "Local") if account_id == "usage-a" else None)
-
-            local = store.normalize_local()
-
-            self.assertTrue(store.needs_remote_rebuild)
-            self.assertEqual([row["checkedAt"] for row in local[1]], ["2030-01-01T00:00:00Z"])
-            self.assertEqual([row["checkedAt"] for row in store.datasets("merged")[1]], ["2030-01-01T00:00:00Z", "2030-01-01T00:01:00Z"])
-            self.assertNotIn("Remote managed name", store.cache_path.read_text(encoding="utf-8"))
 
     def test_usage_cache_namespaces_same_record_key_by_remote_machine(self):
         with self.account_directory() as directory:
             history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
             for path in (history, quota, tokens):
                 path.write_text("", encoding="utf-8")
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock())
+            store = UsageDataStore(quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock())
             for machine in ("machine-b", "machine-c"):
                 row = {"checkedAt": "2030-01-01T00:00:00Z", "windows": {"5h": {"usedPercent": 1, "resetAt": None, "plan": "unknown"}}, "sync": {"version": 1, "originMachineId": machine, "accountId": "usage-a", "recordId": "shared"}}
                 store.apply([{"action": "upsert", "key": record_key("quota", row), "record": {"kind": "quota", "row": row}}], operation_origin=machine)
 
-            self.assertEqual(len(json.loads(store.cache_path.read_text(encoding="utf-8"))["records"]), 2)
+            self.assertEqual(len(store._load_cache()[0]), 2)
             store.apply([{"action": "delete", "key": "quota:shared"}], operation_origin="machine-b")
-            self.assertEqual(json.loads(store.cache_path.read_text(encoding="utf-8"))["records"][0]["sourceMachineId"], "machine-c")
+            self.assertEqual(next(iter(store._load_cache()[0].values()))["sourceMachineId"], "machine-c")
 
-    def test_usage_pack_inventory_drops_hash_when_its_cached_records_are_missing(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
-            for path in (history, quota, tokens):
-                path.write_text("", encoding="utf-8")
-            store = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock())
-            records = {
-                "pack-1": [{"key": "quota:one", "record": {"kind": "quota", "row": {"checkedAt": "2030-01-01T00:00:00Z", "windows": {}, "sync": {"originMachineId": "machine-b", "accountId": "usage-b", "recordId": "one"}}}}],
-                "pack-2": [{"key": "quota:two", "record": {"kind": "quota", "row": {"checkedAt": "2030-01-01T00:01:00Z", "windows": {}, "sync": {"originMachineId": "machine-b", "accountId": "usage-b", "recordId": "two"}}}}],
-            }
-            manifest = {"pack-1": "1" * 64, "pack-2": "2" * 64}
-            store.apply_pack_snapshot("machine-b", manifest, records)
-            payload = json.loads(store.cache_path.read_text(encoding="utf-8"))
-            payload["records"] = [entry for entry in payload["records"] if entry.get("sourcePackId") != "pack-1"]
-            store.cache_path.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
-
-            recovered = UsageDataStore(history, quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock(), cache_path=store.cache_path)
-
-            self.assertEqual(recovered.pack_hashes("machine-b"), {"pack-2": "2" * 64})
-            self.assertTrue(recovered.needs_remote_rebuild)
 
     def test_usage_packs_are_stable_hash_buckets_split_by_compressed_length(self):
         keys, candidate = [], 0
@@ -8031,6 +7477,12 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 self.packs[machine_id] = manifest.copy()
                 return []
 
+            def remove_origins_not_in(self, machine_ids):
+                removed = set(self.packs) - set(machine_ids)
+                for machine_id in removed:
+                    self.packs.pop(machine_id)
+                return len(removed)
+
         with self.account_directory() as directory:
             encryption_hash = passphrase_hash("passphrase", "https://example.test", "user")
             client, box, clouds = Client(), CryptoBox(encryption_hash, CryptoBox.descriptor(encryption_hash)), []
@@ -8120,10 +7572,10 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(verified["published"]["packsUploaded"], 0)
             self.assertEqual(verified["published"]["packsVerified"], verified["published"]["packs"])
             full = clouds[0]._push_usage_data(True)
-            self.assertTrue(full["fullSnapshot"])
+            self.assertFalse(full["fullSnapshot"])
             self.assertEqual(full["uploaded"], len(first_store.records))
             self.assertEqual(full["packsUploaded"], full["packs"])
-            self.assertFalse(first_store.necessary_only)
+            self.assertTrue(first_store.necessary_only)
             received_before_full_fetch = len(second_store.received)
             full_fetch = clouds[1]._fetch_usage_data(client, box, True)
             self.assertEqual(full_fetch["payloadsDownloaded"], full["packs"])
@@ -8132,16 +7584,16 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             legacy_machine = "legacy-machine"
             legacy_records = [{
                 "key": "quota:legacy-a", "record": {"kind": "quota", "row": {
-                    "checkedAt": "2029-12-31T23:58:00Z", "windows": {"5h": {"usedPercent": 1}},
-                    "sync": {"originMachineId": legacy_machine, "accountId": "usage-legacy", "recordId": "legacy-a"},
+                    "checkedAt": "2029-12-31T23:58:00Z", "windows": {"5h": {"usedPercent": 1, "plan": "plus"}},
+                    "sync": {"version": 1, "originMachineId": legacy_machine, "accountId": "usage-legacy", "recordId": "legacy-a"},
                 }},
             }]
             checkpoint_id, _ = clouds[0]._put_usage_payload(client, box, "checkpoints", legacy_machine, {"version": 1, "machineId": legacy_machine, "sequence": 0, "records": legacy_records})
             chunk_id, _ = clouds[0]._put_usage_payload(client, box, "chunks", legacy_machine, {
                 "version": 1, "machineId": legacy_machine, "sequence": 1, "parentChunkId": None,
                 "operations": [{"action": "upsert", "key": "quota:legacy-b", "record": {"kind": "quota", "row": {
-                    "checkedAt": "2029-12-31T23:59:00Z", "windows": {"5h": {"usedPercent": 2}},
-                    "sync": {"originMachineId": legacy_machine, "accountId": "usage-legacy", "recordId": "legacy-b"},
+                    "checkedAt": "2029-12-31T23:59:00Z", "windows": {"5h": {"usedPercent": 2, "plan": "plus"}},
+                    "sync": {"version": 1, "originMachineId": legacy_machine, "accountId": "usage-legacy", "recordId": "legacy-b"},
                 }}}],
             })
             legacy_pointer = {"version": 1, "machineId": legacy_machine, "sequence": 1, "checkpointId": checkpoint_id, "headChunkId": chunk_id}
@@ -8188,6 +7640,79 @@ def with_remote_identity(row, user_id, account_id=None, email=None, plan_type="p
 def with_auth_identity(row, account_id):
     row["remoteUsage"] = {"authIdentity": {"account_id": account_id}}
     return row
+
+
+class RawCostUsageTests(unittest.TestCase):
+    def test_turnpoint_period_uses_exact_event_timestamps(self):
+        quota = []
+        for minute, percent in ((10, 5), (12, 8), (14, 8), (16, 10)):
+            quota.append({
+                "checkedAt": f"2030-01-01T00:{minute:02d}:00Z", "accountSlotId": "a", "accountLabel": "A",
+                "windows": {"5h": {"usedPercent": percent, "resetAt": "2030-01-01T05:00:00Z", "plan": "plus"}},
+            })
+        ledger = [
+            {"schemaVersion": 1, "recordType": "usage", "eventId": f"s:{index}", "sessionId": "s", "occurredAt": timestamp, "rawModel": model, "billingModel": model, "accountSlotId": "a", "tokens": {}, "cost": {"totalCostUsd": cost}}
+            for index, (timestamp, model, cost) in enumerate((("2030-01-01T00:11:00Z", "a", 2), ("2030-01-01T00:13:00Z", "b", 3), ("2030-01-01T00:15:00Z", "a", 100)), 1)
+        ]
+        result = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "usage-a"}), ledger, {"a": "usage-a"})["fiveHour"]
+        self.assertEqual(len(result), 1)
+        self.assertEqual((result[0]["startedAt"], result[0]["endedAt"], result[0]["checkedAt"]), ("2030-01-01T00:11:00Z", "2030-01-01T00:15:00Z", "2030-01-01T00:13:00Z"))
+        self.assertEqual((result[0]["deltaPercent"], result[0]["totalCostUsd"], result[0]["costByModelUsd"]), (2.5, 5.0, {"a": 2.0, "b": 3.0}))
+
+    def test_raw_ledger_deduplicates_same_logical_event(self):
+        base = {"schemaVersion": 1, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z", "rawModel": "m", "billingModel": "m", "serviceTier": "default", "tokens": monitor_common.empty_token_totals(), "cost": monitor_common.empty_cost_totals() | {"totalCostUsd": 1}}
+        first = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "a"}, "machine-a", "usage-a")
+        second = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "b"}, "machine-b", "usage-a")
+        merged, conflicts = monitor_usage_sync.merge_token_ledger_rows([first, second])
+        self.assertEqual((len(merged), conflicts), (1, []))
+        operation = {"action": "upsert", "key": monitor_usage_sync.record_key("tokenLedger", first), "record": {"kind": "tokenLedger", "row": first}}
+        monitor_usage_sync.validate_sync_operation(operation)
+        with self.assertRaises(ValueError):
+            monitor_usage_sync.validate_sync_operation(operation | {"record": {"kind": "token", "row": first}})
+
+    def test_plan_normalization_and_cycle_breaks(self):
+        quota = [
+            {"checkedAt": f"2030-01-01T00:{minute:02d}:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": percent, "resetAt": reset, "plan": plan}}}
+            for minute, percent, reset, plan in (
+                (0, 1, "2030-01-01T05:00:00Z", "pro"), (2, 2, "2030-01-01T05:00:00Z", "pro"), (4, 3, "2030-01-01T05:00:00Z", "pro"),
+                (6, 4, "2030-01-01T05:00:00Z", "plus"), (8, 5, "2030-01-01T05:00:00Z", "plus"),
+                (10, 1, "2030-01-01T10:00:00Z", "plus"), (12, 2, "2030-01-01T10:00:00Z", "plus"),
+            )
+        ]
+        points = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "usage-a"}), [], {"a": "usage-a"})["fiveHour"]
+        self.assertEqual(len(points), 1)
+        self.assertEqual((points[0]["startUsagePercent"], points[0]["endUsagePercent"], points[0]["deltaPercent"]), (30.0, 50.0, 20.0))
+        self.assertEqual(points[0]["costPer100PercentUsd"], 0.0)
+
+    def test_store_syncs_each_ledger_record_and_ignores_old_derived_records(self):
+        with MonitorCodexUsageTests().account_directory() as directory:
+            quota, ledger = directory / "quota.jsonl", directory / "ledger.jsonl"
+            monitor_history.write_quota_history(quota, [{"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}])
+            rows = [
+                {"schemaVersion": 1, "recordType": "priceEpoch", "pricingId": "p", "rates": {}},
+                {"schemaVersion": 1, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:30Z", "rawModel": "m", "billingModel": "m", "accountSlotId": "a", "tokens": {}, "cost": {"totalCostUsd": 1}},
+                {"schemaVersion": 1, "recordType": "legacyBaseline", "session": {"sessionId": "old", "accountSlotId": "a", "tokens": {}, "byModel": {}, "cost": {}}},
+            ]
+            ledger.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+            store = UsageDataStore(quota, ledger, "machine-a", lambda _slot: "usage-a", threading.Lock(), lambda _account, _slot, _label: ("a", "A"))
+            records, _ = store.snapshot(necessary_only=False)
+            self.assertEqual(sorted(record["row"]["recordType"] for record in records.values() if record["kind"] == "tokenLedger"), ["legacyBaseline", "usage"])
+            old = {"action": "upsert", "key": "cost:old", "record": {"kind": "cost", "row": {"sync": {"originMachineId": "machine-b"}}}}
+            store.apply([old], operation_origin="machine-b")
+            local_rows = store.datasets("local")[1]
+            self.assertEqual([row["recordType"] for row in local_rows], ["usage", "legacyBaseline"])
+            self.assertTrue(all(row["schemaVersion"] == 2 and row["sync"]["accountId"] == "usage-a" for row in local_rows))
+            self.assertEqual(local_rows[0]["cost"], rows[1]["cost"])
+            self.assertEqual(monitor_token_ledger.load_token_ledger(ledger), local_rows)
+            self.assertEqual([row["recordType"] for row in store.datasets("merged")[1]], ["legacyBaseline", "usage"])
+
+    def test_dashboard_uses_weighted_model_attribution_and_average_dense_points(self):
+        html = dashboard_html()
+        self.assertIn("const attributedUsage=(Number(point.deltaPercent)||0)*selectedCost/allCost", html)
+        self.assertIn("usd(cost/percent*100)", html)
+        self.assertIn("group.reduce((sum,p)=>sum+eventTimestamp(p),0)/group.length", html)
+        self.assertIn("group.reduce((sum,p)=>sum+p.costPer100PercentUsd,0)/group.length", html)
+        self.assertNotIn("MIN_DELTA_COST_PER_PERCENT_USD", html)
 
 
 if __name__ == "__main__":
