@@ -35,7 +35,7 @@ from monitor_accounts import AccountError, AccountManager, api_identity_id, atom
 from monitor_cloud import (
     AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_FULL_VERIFY_INTERVAL_SECONDS, USAGE_PACK_BUCKET_BITS, USAGE_PACK_MAX_BYTES,
     USAGE_REGULAR_VERIFY_PACKS, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
-    control_password_matches, hash_control_password, load_server_config, new_control_password_salt, normalized_webdav_identity, passphrase_hash, valid_passphrase_hash, webdav_passphrase_salt,
+    WEBDAV_MKCOL_RETRY_SECONDS, control_password_matches, hash_control_password, load_server_config, new_control_password_salt, normalized_webdav_identity, passphrase_hash, valid_passphrase_hash, webdav_passphrase_salt,
 )
 from monitor_skills import MANIFEST_FULL_REHASH_SECONDS, SkillError, SkillManager, _safe_name
 from monitor_cloud_queue import CloudOperationQueue
@@ -4218,8 +4218,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_management_page_exposes_fixed_port_ip_config_tab(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
+        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
 
         self.assertIn('data-tab="config">Config</button>', html)
+        self.assertIn('id="programVersion"', html)
+        self.assertIn('id="checkForUpdates" type="button">Check for Updates</button>', html)
+        self.assertIn('api("/api/manage/update/check",{})', html)
+        self.assertIn('["/api/manage/update/check",', extension)
         self.assertIn('<option value="127.0.0.1">', html)
         self.assertIn('<option value="0.0.0.0">', html)
         self.assertIn("Port 8765 is fixed.", html)
@@ -5624,6 +5629,22 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
     def test_webdav_list_method_does_not_shadow_annotation_builtin(self):
         self.assertEqual(WebDavClient.list_details.__annotations__["return"], "list[dict]")
+
+    def test_webdav_directory_creation_retries_temporary_failures(self):
+        webdav = WebDavClient({"baseUrl": "https://dav.example/", "remoteRoot": "root", "username": "user", "password": "secret"})
+        webdav.request = mock.Mock(side_effect=(CloudError("unavailable", 502, http_status=503, category="http"), CloudError("offline", 502, category="network"), (b"", None, 201)))
+        with mock.patch("monitor_cloud.time.sleep") as sleep:
+            webdav.ensure_directories("usage")
+        self.assertEqual(webdav.request.call_count, 3)
+        self.assertEqual(sleep.call_args_list, [mock.call(WEBDAV_MKCOL_RETRY_SECONDS), mock.call(WEBDAV_MKCOL_RETRY_SECONDS)])
+
+    def test_webdav_directory_creation_does_not_retry_permanent_failures(self):
+        webdav = WebDavClient({"baseUrl": "https://dav.example/", "remoteRoot": "root", "username": "user", "password": "secret"})
+        webdav.request = mock.Mock(side_effect=CloudError("unauthorized", 502, http_status=401, category="http"))
+        with mock.patch("monitor_cloud.time.sleep") as sleep, self.assertRaisesRegex(CloudError, "unauthorized"):
+            webdav.ensure_directories("usage")
+        webdav.request.assert_called_once_with("MKCOL", "usage", expected=(201, 405))
+        sleep.assert_not_called()
 
     def test_cloud_crypto_initialization_requires_exact_http_404(self):
         manager = object.__new__(CloudManager)

@@ -347,7 +347,7 @@ or:
 npm run release
 ```
 
-The builder increments the patch version in `package.json`, recreates generated files in `release/`, packages the pinned VSCE version, copies the standalone runtime and GPL license, removes obsolete versioned VSIX files, and creates `release_pack/code-monitor-v<VERSION>.zip`.
+The builder increments the patch version in `package.json`, recreates generated files in `release/`, packages the pinned VSCE version, copies the standalone runtime and GPL license, removes obsolete versioned VSIX files, creates `release_pack/code-monitor-v<VERSION>.zip`, stages the complete working tree, and creates a Git commit named `v<VERSION>`. It runs only when explicitly invoked with one of the commands above.
 Credentials, local history, caches, tests, reference sources, and development-only material are excluded.
 
 ### Repository layout

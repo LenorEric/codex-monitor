@@ -50,6 +50,7 @@ const MANAGEMENT_ACTION_ALLOWLIST = new Map([
     ["/api/manage/server", { url: new URL("http://127.0.0.1:8765/api/manage/server"), method: "POST" }],
     ["/api/manage/config", { url: new URL("http://127.0.0.1:8765/api/manage/config"), method: "POST" }],
     ["/api/manage/config/reload", { url: new URL("http://127.0.0.1:8765/api/manage/config/reload"), method: "POST" }],
+    ["/api/manage/update/check", { url: new URL("http://127.0.0.1:8765/api/manage/update/check"), method: "POST" }],
     ["/api/accounts", { url: ACCOUNT_CREATE_URL, method: "POST" }],
     ["/api/accounts/switch", { url: ACCOUNT_SWITCH_URL, method: "POST" }],
     ["/api/accounts/rename", { url: ACCOUNT_RENAME_URL, method: "POST" }],

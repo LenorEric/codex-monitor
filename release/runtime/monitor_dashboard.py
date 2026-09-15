@@ -24,7 +24,7 @@ from http.cookies import SimpleCookie
 from pathlib import Path
 
 from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_api_auth, remove_directory
-from monitor_auto_update import AUTO_UPDATE_RESTART, AutoUpdater
+from monitor_auto_update import AUTO_UPDATE_RESTART, AutoUpdater, installed_version
 from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
 from monitor_cloud_queue import OperationSkipped
 from monitor_common import DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
@@ -1726,6 +1726,7 @@ def management_payload(state: UsageDashboardState, include_remote: bool = False,
         if account.get("isApiAccount"):
             account["canShare"] = bool(account.get("ready")) and api_identity_ids.get(account["id"]) not in remote_api_identity_ids
     payload = {
+        "programVersion": getattr(state, "program_version", installed_version(Path(__file__).resolve().parent)),
         "server": state.cloud.config()["server"],
         "editableConfig": state.cloud.editable_config(),
         "skills": dashboard_skill_status(state.skills.status()),
@@ -1930,7 +1931,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
             allowed = {
                 "/api/control/login", "/api/control/setup",
                 "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/accounts/session-refresh", "/api/accounts/device-code", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign", "/api/manage/skills/share",
-                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/fetch-all", "/api/manage/cloud/push", "/api/manage/cloud/push-all", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/link", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/accounts/migrate-sessions", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload"
+                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/fetch-all", "/api/manage/cloud/push", "/api/manage/cloud/push-all", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/link", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/accounts/migrate-sessions", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload", "/api/manage/update/check"
             }
             allowed.add("/api/manage/accounts/common")
             allowed.add("/api/manage/cloud/queue/cancel")
@@ -1965,6 +1966,20 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                     if not isinstance(body, dict) or not isinstance(body.get("operationId"), str):
                         raise CloudError("operationId is required", 400)
                     self.send_json(200, state.cloud.operation_queue.cancel(body["operationId"]))
+                    return
+                if path == "/api/manage/update/check":
+                    if getattr(state, "auto_updater", None) is None:
+                        self.send_json(503, {"error": "Automatic update support is unavailable"})
+                        return
+                    try:
+                        result = state.auto_updater.check_for_update_details()
+                    except Exception as exc:
+                        self.send_json(502, {"error": f"Update check failed: {exc}"})
+                        return
+                    self.send_json(200, result)
+                    self.wfile.flush()
+                    if result["updated"]:
+                        state.auto_updater.request_restart()
                     return
                 if path in CLOUD_QUEUE_ACTIONS:
                     self.send_json(202, enqueue_management_action(state, control_auth, path, body))
@@ -2043,8 +2058,10 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
     cloud_thread.start()
     config_thread = threading.Thread(target=state.run_config_monitor, daemon=True)
     config_thread.start()
+    runtime_dir = Path(runtime_dir or Path(__file__).resolve().parent).resolve()
+    state.program_version = installed_version(runtime_dir)
     auto_updater = AutoUpdater(
-        runtime_dir or Path(__file__).resolve().parent, lambda: state.cloud.config()["autoUpdate"]["enabled"], update_opener_factory, args.timeout,
+        runtime_dir, lambda: state.cloud.config()["autoUpdate"]["enabled"], update_opener_factory, args.timeout,
     ) if update_opener_factory is not None else None
     state.auto_updater = auto_updater
     state.device_auth.start()

@@ -41,6 +41,7 @@ cloud-state.json
 *.bak
 *.swp
 ~$*
+tmp/
 
 .venv/
 venv/

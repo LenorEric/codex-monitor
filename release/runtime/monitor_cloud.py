@@ -30,6 +30,8 @@ from monitor_usage_sync import canonical_json, content_hash, validate_sync_opera
 AUTO_PUSH_STABLE_SECONDS = 120
 AUTO_PUSH_RETRY_SECONDS = 30
 AUTO_PUSH_MAX_ATTEMPTS = 3
+WEBDAV_MKCOL_MAX_ATTEMPTS = 3
+WEBDAV_MKCOL_RETRY_SECONDS = 1
 AUTO_FETCH_INTERVAL_SECONDS = 60 * 60
 USAGE_SYNC_INTERVAL_SECONDS = 60 * 60
 LEGACY_PASSPHRASE_SALT = b"codex-switch-passphrase-v1"
@@ -309,7 +311,14 @@ class WebDavClient:
         current = ""
         for part in path.strip("/").split("/"):
             current = f"{current}/{part}".strip("/")
-            self.request("MKCOL", current, expected=(201, 405))
+            for attempt in range(WEBDAV_MKCOL_MAX_ATTEMPTS):
+                try:
+                    self.request("MKCOL", current, expected=(201, 405))
+                    break
+                except CloudError as exc:
+                    if attempt + 1 >= WEBDAV_MKCOL_MAX_ATTEMPTS or exc.category != "network" and not (exc.category == "http" and exc.http_status in {408, 425, 429, 500, 502, 503, 504}):
+                        raise
+                    time.sleep(WEBDAV_MKCOL_RETRY_SECONDS)
 
     def get(self, path: str) -> tuple[bytes, str]:
         body, etag, _ = self.request("GET", path)

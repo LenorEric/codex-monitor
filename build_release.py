@@ -137,8 +137,19 @@ def build_release(version: str) -> None:
     print(f"Archive created at {archive}")
 
 
+def commit_release(version: str) -> None:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("git is required to commit the release")
+    subprocess.run([git, "add", "--all"], cwd=ROOT, check=True)
+    subprocess.run([git, "commit", "-m", f"v{version}"], cwd=ROOT, check=True)
+    print(f"Release commit v{version} created")
+
+
 def main() -> None:
-    build_release(bump_package_version())
+    version = bump_package_version()
+    build_release(version)
+    commit_release(version)
 
 
 if __name__ == "__main__":

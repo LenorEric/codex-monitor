@@ -448,6 +448,7 @@ class AutoUpdater:
         self.restart_requested = False
         self._wake = threading.Event()
         self._stop = threading.Event()
+        self._check_lock = threading.Lock()
         self._thread = None
         self._on_update = None
 
@@ -480,8 +481,7 @@ class AutoUpdater:
                 next_check = now + self.interval
                 try:
                     if self.check_for_update():
-                        self.restart_requested = True
-                        self._on_update()
+                        self.request_restart()
                         return
                 except Exception as exc:
                     print(f"Automatic update failed: {exc}", file=sys.stderr, flush=True)
@@ -506,13 +506,24 @@ class AutoUpdater:
         return validate_manifest(value)
 
     def check_for_update(self) -> bool:
-        opener = self.opener_factory()
-        version, files = self._manifest(opener)
-        if parse_version(version) <= parse_version(installed_version(self.runtime_dir)):
-            return False
-        self._install(opener, version, files)
-        print(f"Codex Monitor updated to v{version}; restarting.", flush=True)
-        return True
+        return self.check_for_update_details()["updated"]
+
+    def check_for_update_details(self) -> dict:
+        with self._check_lock:
+            opener = self.opener_factory()
+            version, files = self._manifest(opener)
+            current_version = installed_version(self.runtime_dir)
+            if parse_version(version) <= parse_version(current_version):
+                return {"currentVersion": current_version, "latestVersion": version, "updated": False}
+            self._install(opener, version, files)
+            print(f"Codex Monitor updated to v{version}; restarting.", flush=True)
+            return {"currentVersion": current_version, "latestVersion": version, "updated": True}
+
+    def request_restart(self) -> None:
+        if self.restart_requested:
+            return
+        self.restart_requested = True
+        self._on_update()
 
     def _install(self, opener, version: str, files: dict[str, dict]) -> None:
         work_root = self.runtime_dir / f".codex-monitor-update-{uuid.uuid4().hex}"

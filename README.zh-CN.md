@@ -334,7 +334,7 @@ python build_release.py
 npm run release
 ```
 
-构建器会先将 `package.json` 中的小版本号加一，再重建 `release/` 中的生成文件，使用固定版本 VSCE 打包扩展，复制独立运行时与 GPL 许可证，删除旧版本 VSIX，并在 `release_pack/` 中生成 `code-monitor-v<VERSION>.zip`，同时排除凭据、本地历史、缓存、测试、参考源码和仅用于开发的资料。
+构建器会先将 `package.json` 中的小版本号加一，再重建 `release/` 中的生成文件，使用固定版本 VSCE 打包扩展，复制独立运行时与 GPL 许可证，删除旧版本 VSIX，并在 `release_pack/` 中生成 `code-monitor-v<VERSION>.zip`。成功后，它会暂存整个工作树并创建名为 `v<VERSION>` 的 Git 提交。构建器只会在用户显式运行上述命令时执行，同时排除凭据、本地历史、缓存、测试、参考源码和仅用于开发的资料。
 
 ### 仓库结构
 

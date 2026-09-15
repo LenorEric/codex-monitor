@@ -180,6 +180,27 @@ class AutoUpdateTests(unittest.TestCase):
                 updater.check_for_update()
             self.assertEqual((runtime / "monitor.py").read_bytes(), b"old")
 
+    def test_manual_check_reports_installed_and_published_versions(self):
+        with temporary_directory() as runtime:
+            (runtime / "version.json").write_text('{"version":"1.5.0"}', encoding="utf-8")
+            manifest = json.dumps({"version": "1.5.0", "files": {"monitor.py": descriptor(b"code")}}).encode()
+
+            result = AutoUpdater(runtime, lambda: False, lambda: Opener({RELEASE_VERSION_URL: manifest})).check_for_update_details()
+
+            self.assertEqual(result, {"currentVersion": "1.5.0", "latestVersion": "1.5.0", "updated": False})
+
+    def test_restart_request_runs_callback_once(self):
+        with temporary_directory() as runtime:
+            restarted = []
+            updater = AutoUpdater(runtime, lambda: False, lambda: None)
+            updater._on_update = lambda: restarted.append(True)
+
+            updater.request_restart()
+            updater.request_restart()
+
+            self.assertTrue(updater.restart_requested)
+            self.assertEqual(restarted, [True])
+
     def test_replacement_failure_rolls_back_already_replaced_files(self):
         with temporary_directory() as runtime:
             (runtime / "first.py").write_bytes(b"old-first")
@@ -274,6 +295,29 @@ class AutoUpdateTests(unittest.TestCase):
             self.assertEqual(manifest["version"], "1.5.0")
             self.assertEqual(list(manifest["files"]), ["A.py", "b.py"])
             self.assertEqual(manifest["files"]["A.py"], descriptor(b"a"))
+
+    def test_release_commit_stages_everything_and_uses_version_message(self):
+        with mock.patch.object(build_release.shutil, "which", return_value="C:/Git/git.exe"), mock.patch.object(build_release.subprocess, "run") as run:
+            build_release.commit_release("1.5.5")
+
+        self.assertEqual(run.call_args_list, [
+            mock.call(["C:/Git/git.exe", "add", "--all"], cwd=build_release.ROOT, check=True),
+            mock.call(["C:/Git/git.exe", "commit", "-m", "v1.5.5"], cwd=build_release.ROOT, check=True),
+        ])
+
+    def test_release_main_commits_only_after_successful_explicit_build(self):
+        with mock.patch.object(build_release, "bump_package_version", return_value="1.5.5") as bump, mock.patch.object(build_release, "build_release") as build, mock.patch.object(build_release, "commit_release") as commit:
+            build_release.main()
+
+        bump.assert_called_once_with()
+        build.assert_called_once_with("1.5.5")
+        commit.assert_called_once_with("1.5.5")
+
+    def test_release_main_does_not_commit_a_failed_build(self):
+        with mock.patch.object(build_release, "bump_package_version", return_value="1.5.5"), mock.patch.object(build_release, "build_release", side_effect=RuntimeError("build failed")), mock.patch.object(build_release, "commit_release") as commit, self.assertRaisesRegex(RuntimeError, "build failed"):
+            build_release.main()
+
+        commit.assert_not_called()
 
     def test_current_release_is_complete_version_1_5_2_and_next_build_is_patch(self):
         package = json.loads((build_release.ROOT / "package.json").read_text(encoding="utf-8"))
