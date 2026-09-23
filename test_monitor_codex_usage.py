@@ -2368,6 +2368,18 @@ class MonitorCodexUsageTests(unittest.TestCase):
         costs = calculate_token_costs({"byModel": {"gpt-6": {"freshInputTokens": 1_000_000, "cachedInputTokens": 1_000_000, "cacheWriteInputTokens": 1_000_000, "outputTokens": 1_000_000}}})
         self.assertEqual(costs, {"inputCostUsd": 10.0, "cachedInputCostUsd": 1.0, "cacheWriteInputCostUsd": 12.5, "outputCostUsd": 50.0, "totalCostUsd": 73.5})
 
+    def test_gpt_6_sol_and_luna_use_model_specific_prices(self):
+        for model, prices, total in (
+            ("gpt-6-sol", {"input": 2.0, "cachedInput": 0.2, "cacheWriteInput": 2.5, "output": 10.0}, 14.7),
+            ("gpt-6-luna", {"input": 0.1, "cachedInput": 0.01, "cacheWriteInput": 0.125, "output": 0.5}, 0.735),
+        ):
+            with self.subTest(model=model):
+                self.assertEqual(pricing_for_model(f"openai/{model}-2026-09-22"), prices)
+                self.assertEqual(pricing_for_model(model.upper()), prices)
+                tokens = {"freshInputTokens": 1_000_000, "cachedInputTokens": 1_000_000, "cacheWriteInputTokens": 1_000_000, "outputTokens": 1_000_000}
+                self.assertEqual(calculate_token_costs({"byModel": {model: tokens}})["totalCostUsd"], total)
+                self.assertEqual(monitor_tokens.pricing_epoch_for_model(model, "fast")["rates"], {key: value * 2 for key, value in prices.items()})
+
     def test_gpt_5_6_price_epochs_use_event_time_and_resolved_fast_rates(self):
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-terra", "default", "2026-07-29T23:59:59Z")["rates"]["input"], 2.5)
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-terra", "default", "2026-07-30T00:00:00Z")["rates"]["input"], 2.0)
