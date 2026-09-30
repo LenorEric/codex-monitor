@@ -11,10 +11,11 @@ from monitor_common import empty_cost_totals, empty_token_totals, parse_timestam
 MODEL_PRICES_PER_MILLION = {
     "gpt-6": {"input": 10.00, "cachedInput": 1.00, "cacheWriteInput": 12.50, "output": 50.00},
     "gpt-6-astra": {"input": 10.00, "cachedInput": 1.00, "cacheWriteInput": 12.50, "output": 50.00},
+    "gpt-6.1-sol": {"input": 2.00, "cachedInput": 0.10, "cacheWriteInput": 2.50, "output": 10.00},
     "gpt-6-sol": {"input": 2.00, "cachedInput": 0.20, "cacheWriteInput": 2.50, "output": 10.00},
     "gpt-6-luna": {"input": 0.10, "cachedInput": 0.01, "cacheWriteInput": 0.125, "output": 0.50},
-    "gpt-5.6": {"input": 5.00, "cachedInput": 0.50, "cacheWriteInput": 6.25, "output": 30.00},
-    "gpt-5.6-sol": {"input": 5.00, "cachedInput": 0.50, "cacheWriteInput": 6.25, "output": 30.00},
+    "gpt-5.6": {"input": 4.00, "cachedInput": 0.40, "cacheWriteInput": 5.00, "output": 20.00},
+    "gpt-5.6-sol": {"input": 4.00, "cachedInput": 0.40, "cacheWriteInput": 5.00, "output": 20.00},
     "gpt-5.6-terra": {"input": 2.00, "cachedInput": 0.20, "cacheWriteInput": 2.50, "output": 12.00},
     "gpt-5.6-luna": {"input": 0.20, "cachedInput": 0.02, "cacheWriteInput": 0.25, "output": 1.20},
     "gpt-5.5": {"input": 5.00, "cachedInput": 0.50, "output": 30.00},
@@ -31,7 +32,10 @@ MODEL_PRICES_PER_MILLION = {
 }
 
 GPT_5_6_PRICE_CHANGE_AT = "2026-07-30T00:00:00Z"
+GPT_5_6_SOL_PRICE_CHANGE_AT = "2026-08-21T00:00:00Z"
 MODEL_PRICE_HISTORY_PER_MILLION = {
+    "gpt-5.6": ((None, {"input": 5.00, "cachedInput": 0.50, "cacheWriteInput": 6.25, "output": 30.00}), (GPT_5_6_SOL_PRICE_CHANGE_AT, MODEL_PRICES_PER_MILLION["gpt-5.6"])),
+    "gpt-5.6-sol": ((None, {"input": 5.00, "cachedInput": 0.50, "cacheWriteInput": 6.25, "output": 30.00}), (GPT_5_6_SOL_PRICE_CHANGE_AT, MODEL_PRICES_PER_MILLION["gpt-5.6-sol"])),
     "gpt-5.6-terra": ((None, {"input": 2.50, "cachedInput": 0.25, "cacheWriteInput": 3.125, "output": 15.00}), (GPT_5_6_PRICE_CHANGE_AT, MODEL_PRICES_PER_MILLION["gpt-5.6-terra"])),
     "gpt-5.6-luna": ((None, {"input": 1.00, "cachedInput": 0.10, "cacheWriteInput": 1.25, "output": 6.00}), (GPT_5_6_PRICE_CHANGE_AT, MODEL_PRICES_PER_MILLION["gpt-5.6-luna"])),
 }

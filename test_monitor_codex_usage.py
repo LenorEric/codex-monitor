@@ -1281,7 +1281,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 refreshed, auth_data, cost = monitor_session_refresh.refresh_session(directory)
         self.assertTrue(refreshed)
         self.assertIsNone(auth_data)
-        self.assertEqual(cost, 0.045209)
+        self.assertEqual(cost, 0.0332952)
         self.assertIn("gpt-5.6-sol", run.call_args.args[0])
         self.assertIn("--json", run.call_args.args[0])
         self.assertEqual(run.call_count, 1)
@@ -2320,7 +2320,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_gpt_5_6_family_uses_tier_specific_prices(self):
         expected = {
-            "gpt-5.6-sol": (5.0, 0.5, 6.25, 30.0, 41.75),
+            "gpt-5.6-sol": (4.0, 0.4, 5.0, 20.0, 29.4),
             "gpt-5.6-terra": (2.0, 0.2, 2.5, 12.0, 16.7),
             "gpt-5.6-luna": (0.2, 0.02, 0.25, 1.2, 1.67),
         }
@@ -2337,7 +2337,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         cases = {
             "gpt-5.4": (2.0, 2.5),
             "gpt-5.5": (2.5, 5.0),
-            "gpt-5.6-sol": (2.0, 5.0),
+            "gpt-5.6-sol": (2.0, 4.0),
             "gpt-5.6-terra": (2.0, 2.0),
             "gpt-5.6-luna": (2.0, 0.2),
             "gpt-5.3-codex": (2.0, 1.75),
@@ -2354,10 +2354,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 self.assertEqual(monitor_tokens.fast_mode_cost_multiplier(model), multiplier)
 
     def test_gpt_5_6_pricing_accepts_provider_and_snapshot_model_ids(self):
-        self.assertEqual(pricing_for_model("openai/gpt-5.6-sol-2026-06-26"), {"input": 5.0, "cachedInput": 0.5, "cacheWriteInput": 6.25, "output": 30.0})
+        self.assertEqual(pricing_for_model("openai/gpt-5.6-sol-2026-06-26"), {"input": 4.0, "cachedInput": 0.4, "cacheWriteInput": 5.0, "output": 20.0})
         self.assertEqual(pricing_for_model("gpt-5.6-terra-20260626"), {"input": 2.0, "cachedInput": 0.2, "cacheWriteInput": 2.5, "output": 12.0})
         self.assertEqual(pricing_for_model("GPT-5.6-LUNA"), {"input": 0.2, "cachedInput": 0.02, "cacheWriteInput": 0.25, "output": 1.2})
-        self.assertEqual(pricing_for_model("gpt-5.6"), {"input": 5.0, "cachedInput": 0.5, "cacheWriteInput": 6.25, "output": 30.0})
+        self.assertEqual(pricing_for_model("gpt-5.6"), {"input": 4.0, "cachedInput": 0.4, "cacheWriteInput": 5.0, "output": 20.0})
 
     def test_gpt_6_pricing_accepts_model_family_and_astra_model_ids(self):
         expected = {"input": 10.0, "cachedInput": 1.0, "cacheWriteInput": 12.5, "output": 50.0}
@@ -2368,8 +2368,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         costs = calculate_token_costs({"byModel": {"gpt-6": {"freshInputTokens": 1_000_000, "cachedInputTokens": 1_000_000, "cacheWriteInputTokens": 1_000_000, "outputTokens": 1_000_000}}})
         self.assertEqual(costs, {"inputCostUsd": 10.0, "cachedInputCostUsd": 1.0, "cacheWriteInputCostUsd": 12.5, "outputCostUsd": 50.0, "totalCostUsd": 73.5})
 
-    def test_gpt_6_sol_and_luna_use_model_specific_prices(self):
+    def test_gpt_6_sol_models_and_luna_use_model_specific_prices(self):
         for model, prices, total in (
+            ("gpt-6.1-sol", {"input": 2.0, "cachedInput": 0.1, "cacheWriteInput": 2.5, "output": 10.0}, 14.6),
             ("gpt-6-sol", {"input": 2.0, "cachedInput": 0.2, "cacheWriteInput": 2.5, "output": 10.0}, 14.7),
             ("gpt-6-luna", {"input": 0.1, "cachedInput": 0.01, "cacheWriteInput": 0.125, "output": 0.5}, 0.735),
         ):
@@ -2385,6 +2386,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-terra", "default", "2026-07-30T00:00:00Z")["rates"]["input"], 2.0)
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-sol", "fast", "2026-07-29T23:59:59Z")["rates"]["input"], 12.5)
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-sol", "fast", "2026-07-30T00:00:00Z")["rates"]["input"], 10.0)
+        self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-sol", "fast", "2026-08-20T23:59:59Z")["rates"]["input"], 10.0)
+        self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-sol", "fast", "2026-08-21T00:00:00Z")["rates"]["input"], 8.0)
 
     def test_token_session_history_preserves_recorded_costs_when_prices_change(self):
         recorded_cost = {"inputCostUsd": 2.5, "cachedInputCostUsd": 0.25, "cacheWriteInputCostUsd": 3.125, "outputCostUsd": 15.0, "totalCostUsd": 20.875}
@@ -2471,9 +2474,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         sample = make_history_sample({"checkedAt": "2030-01-01T00:00:00Z", "tokenUsage": token_usage}, None)
 
-        self.assertEqual(sample["costByModel"]["gpt-5.6-sol"]["totalCostUsd"], 5)
+        self.assertEqual(sample["costByModel"]["gpt-5.6-sol"]["totalCostUsd"], 4)
         self.assertEqual(sample["costByModel"]["gpt-5.5"]["totalCostUsd"], 5)
-        self.assertEqual(sample["cost"]["totalCostUsd"], 10)
+        self.assertEqual(sample["cost"]["totalCostUsd"], 9)
 
     def test_parse_token_usage_accepts_cache_write_fields(self):
         self.assertEqual(parse_token_usage({"input_tokens": 100, "cached_input_tokens": 20, "cache_write_input_tokens": 30, "output_tokens": 10}), {"input": 100, "cachedInput": 20, "cacheWriteInput": 30, "output": 10})
@@ -2800,7 +2803,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(row["byModel"]["gpt-5.6-sol"]["tokens"], row["tokens"])
         self.assertNotIn("cachedOutputTokens", row["tokens"])
         self.assertNotIn("freshOutputTokens", row["tokens"])
-        self.assertEqual(row["cost"]["cacheWriteInputCostUsd"], 0.0001875)
+        self.assertEqual(row["cost"]["cacheWriteInputCostUsd"], 0.00015)
 
     def test_cache_write_tokens_are_excluded_from_fresh_input(self):
         totals = empty_token_totals()
