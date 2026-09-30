@@ -5,7 +5,10 @@ import heapq
 import json
 import math
 import os
+import sqlite3
 import tempfile
+from contextlib import closing
+from datetime import datetime, timezone
 from pathlib import Path
 
 from monitor_common import MIN_DELTA_COST_PER_PERCENT_USD, RESET_TIME_JITTER_SECONDS, coerce_float, empty_cost_totals, empty_token_totals, parse_timestamp
@@ -395,12 +398,57 @@ def active_records(quota: list[dict], ledger: list[dict], machine_id: str, accou
     return records
 
 
+def initialize_v4_cache(path: Path) -> None:
+    """Create the local v4 index without altering the original history or legacy cache."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(path)) as db, db:
+        db.execute("CREATE TABLE IF NOT EXISTS local_records (record_key TEXT PRIMARY KEY, period TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL)")
+        db.execute("CREATE INDEX IF NOT EXISTS local_records_period ON local_records(period)")
+        db.execute("CREATE TABLE IF NOT EXISTS remote_days (machine_id TEXT NOT NULL, day TEXT NOT NULL, logical_hash TEXT NOT NULL, layout_json TEXT NOT NULL, PRIMARY KEY(machine_id, day))")
+        db.execute("CREATE TABLE IF NOT EXISTS remote_records (machine_id TEXT NOT NULL, day TEXT NOT NULL, part_id TEXT NOT NULL, record_key TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY(machine_id, record_key))")
+        db.execute("CREATE INDEX IF NOT EXISTS remote_records_day ON remote_records(machine_id, day, part_id)")
+        db.execute("CREATE TABLE IF NOT EXISTS remote_origins (machine_id TEXT PRIMARY KEY)")
+        db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+
+def v4_period(timestamp: float) -> str:
+    observed = datetime.fromtimestamp(timestamp, timezone.utc)
+    return observed.strftime("%Y-%m-%dT%H:") + ("30" if observed.minute >= 30 else "00") + "Z"
+
+
+def v4_record_envelope(machine_id: str, key: str, record: dict, collection_period: str | None = None) -> dict:
+    row = record.get("row") or {}
+    event_at = row.get("checkedAt") if record["kind"] == "quota" else row.get("occurredAt") or (row.get("session") or {}).get("updatedAt") or (row.get("session") or {}).get("startedAt")
+    return {"kind": record["kind"], "schemaVersion": row.get("schemaVersion", record.get("schemaVersion", 1)), "recordKey": key, "sourceMachineId": machine_id, "collectionPeriod": collection_period, "eventAt": event_at or record.get("eventAt"), "contentSha256": content_hash(record), "record": record}
+
+
+def validate_v4_envelope(entry: dict, machine_id: str) -> None:
+    if not isinstance(entry, dict) or entry.get("sourceMachineId") != machine_id or not isinstance(entry.get("recordKey"), str) or not entry["recordKey"] or len(entry["recordKey"]) > 512 or not isinstance(entry.get("kind"), str) or not entry["kind"] or not isinstance(entry.get("schemaVersion"), int) or isinstance(entry["schemaVersion"], bool) or entry["schemaVersion"] < 1 or not isinstance(entry.get("record"), dict) or entry["record"].get("kind") != entry["kind"] or entry.get("contentSha256") != content_hash(entry["record"]) or not isinstance(entry.get("collectionPeriod"), str) or parse_timestamp(entry["collectionPeriod"]) is None or v4_period(parse_timestamp(entry["collectionPeriod"])) != entry["collectionPeriod"]:
+        raise ValueError("Invalid usage v4 record envelope")
+    if entry["kind"] in {"quota", "tokenLedger"}:
+        validate_sync_operation({"action": "upsert", "key": entry["recordKey"], "record": entry["record"]})
+        if sync_meta(entry["record"]["row"]).get("originMachineId") != machine_id or entry["schemaVersion"] != entry["record"]["row"].get("schemaVersion", 1) or entry.get("eventAt") != v4_record_envelope(machine_id, entry["recordKey"], entry["record"])["eventAt"]:
+            raise ValueError("Usage v4 record owner or schema does not match its envelope")
+    else:
+        _validate_sync_value(entry["record"])
+        if len(canonical_json(entry["record"])) > MAX_SYNC_RECORD_BYTES:
+            raise ValueError("Unknown synchronized usage record is too large")
+        if entry.get("eventAt") is not None and (not isinstance(entry["eventAt"], str) or parse_timestamp(entry["eventAt"]) is None):
+            raise ValueError("Unknown synchronized usage record has an invalid event time")
+
+
+def v4_logical_hash(entries: list[dict]) -> str:
+    return content_hash([[entry["recordKey"], content_hash(entry["record"])] for entry in sorted(entries, key=lambda item: item["recordKey"])])
+
+
 
 
 class UsageDataStore:
     def __init__(self, quota_path: Path, token_ledger_path: Path, machine_id: str, account_id_resolver, lock, account_mapper=None, cache_path: Path | None = None, account_revision_resolver=None):
         self.quota_path, self.token_ledger_path = Path(quota_path), Path(token_ledger_path)
         self.cache_path = Path(cache_path) if cache_path is not None else default_usage_sync_cache_path(self.quota_path)
+        self.v4_cache_path = self.cache_path.with_name(f"{self.cache_path.stem}-v4.sqlite3")
         self.machine_id, self.account_id_resolver, self.lock, self.account_mapper = machine_id, account_id_resolver, lock, account_mapper
         self.account_revision_resolver = account_revision_resolver
         self.conflicts = []
@@ -409,6 +457,42 @@ class UsageDataStore:
         self._merged_datasets_cache = None
         self._account_revision = None
         self._cache_repair_needed = False
+        self._v4_source_stats = None
+
+    @staticmethod
+    def _v4_stat(path: Path) -> tuple[int, int, int] | None:
+        try:
+            value = path.stat()
+        except FileNotFoundError:
+            return None
+        return value.st_ino, value.st_size, value.st_mtime_ns
+
+    def _v4_local_sources(self) -> tuple[list[dict], list[dict]]:
+        quota_stat, ledger_stat = self._v4_stat(self.quota_path), self._v4_stat(self.token_ledger_path)
+        previous = self._v4_source_stats
+        if previous and self._local_datasets_cache is not None and (self.account_revision_resolver is None or self.account_revision_resolver() == self._account_revision):
+            if previous == (quota_stat, ledger_stat):
+                return self._local_datasets_cache
+            if previous[1] == ledger_stat and previous[0] and quota_stat and previous[0][0] == quota_stat[0] and quota_stat[1] > previous[0][1]:
+                from monitor_history import normalize_quota_history_row
+                with self.quota_path.open("rb") as source:
+                    source.seek(previous[0][1])
+                    tail = source.read()
+                if tail.endswith(b"\n"):
+                    try:
+                        rows = [normalize_quota_history_row(json.loads(line)) for line in tail.decode("utf-8").splitlines() if line]
+                        if all(row is not None and sync_meta(row).get("originMachineId") == self.machine_id and sync_meta(row).get("accountId") and sync_meta(row).get("recordId") for row in rows):
+                            for key, record in active_records(rows, [], self.machine_id, self.account_id_resolver, False).items():
+                                validate_sync_operation({"action": "upsert", "key": key, "record": record})
+                            local = self._local_datasets_cache[0] + rows, self._local_datasets_cache[1]
+                            self._materialize_datasets(local, self._load_cache()[0])
+                            self._v4_source_stats = quota_stat, ledger_stat
+                            return local
+                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+                        pass
+        local = self._normalize_local()
+        self._v4_source_stats = self._v4_stat(self.quota_path), self._v4_stat(self.token_ledger_path)
+        return local
 
     def _load(self) -> tuple[list[dict], list[dict]]:
         from monitor_history import load_quota_history
@@ -596,7 +680,8 @@ class UsageDataStore:
         return projected | {"accountSlotId": slot_id, "accountLabel": label}
 
     def _materialize_datasets(self, local: tuple[list[dict], list[dict]], cache: dict[tuple[str, str], dict]) -> None:
-        mapped = [(record["kind"], row) for entry in cache.values() if (record := entry["record"]) and (row := self._map_account(record["kind"], record["row"])) is not None]
+        v4_records, v4_origins = self._v4_remote_cache()
+        mapped = [(record["kind"], row) for entry in [*(entry for entry in cache.values() if entry.get("sourceMachineId") not in v4_origins), *v4_records] if entry.get("sourceMachineId") != self.machine_id and (record := entry["record"]) and record.get("kind") in {"quota", "tokenLedger"} and (row := self._map_account(record["kind"], record["row"])) is not None]
         local_ledger = []
         for source in local[1]:
             legacy_schema = source.get("schemaVersion") == 1
@@ -800,3 +885,85 @@ class UsageDataStore:
                 self._store_cache(retained, retained_packs)
                 self._materialize_datasets(local, retained)
             return removed
+
+    def _v4_remote_cache(self) -> tuple[list[dict], set[str]]:
+        initialize_v4_cache(self.v4_cache_path)
+        with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+            origins = {row[0] for row in db.execute("SELECT machine_id FROM remote_origins")}
+            return [{"sourceMachineId": machine_id, "key": key, "record": json.loads(record_json)["record"]} for machine_id, key, record_json in db.execute("SELECT machine_id, record_key, record_json FROM remote_records")], origins
+
+    def v4_local_snapshot(self, now: float | None = None) -> dict[str, dict]:
+        """Assign collection periods once; a later edit keeps its original owner."""
+        with self.lock:
+            current = datetime.now(timezone.utc).timestamp() if now is None else now
+            quota, ledger = self._v4_local_sources()
+            records = active_records(quota, ledger, self.machine_id, self.account_id_resolver, False)
+            initialize_v4_cache(self.v4_cache_path)
+            with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+                existing = {key: (period, digest) for key, period, digest in db.execute("SELECT record_key, period, content_hash FROM local_records")}
+                historical = db.execute("SELECT value FROM metadata WHERE name='localInitialized'").fetchone() is None
+                for key, record in records.items():
+                    validate_sync_operation({"action": "upsert", "key": key, "record": record})
+                    if key in existing:
+                        period = existing[key][0]
+                    else:
+                        row = record["row"]
+                        event_at = row.get("checkedAt") if record["kind"] == "quota" else row.get("occurredAt") or (row.get("session") or {}).get("updatedAt") or (row.get("session") or {}).get("startedAt")
+                        period = v4_period((parse_timestamp(event_at) or current) if historical else current)
+                    digest = content_hash(record)
+                    if existing.get(key) != (period, digest):
+                        db.execute("INSERT INTO local_records(record_key, period, content_hash, record_json) VALUES(?,?,?,?) ON CONFLICT(record_key) DO UPDATE SET content_hash=excluded.content_hash, record_json=excluded.record_json", (key, period, digest, canonical_json(record).decode()))
+                for key in existing.keys() - records.keys():
+                    db.execute("DELETE FROM local_records WHERE record_key=?", (key,))
+                db.execute("INSERT OR IGNORE INTO metadata(name, value) VALUES('localInitialized', '1')")
+                days = {}
+                for key, period, record_json in db.execute("SELECT record_key, period, record_json FROM local_records ORDER BY period, record_key"):
+                    day = days.setdefault(period[:10], {"parts": {}})
+                    day["parts"].setdefault(period, []).append(v4_record_envelope(self.machine_id, key, json.loads(record_json), period))
+                for day in days.values():
+                    day["logicalHash"] = v4_logical_hash([entry for part in day["parts"].values() for entry in part])
+                return days
+
+    def v4_cached_days(self, machine_id: str) -> dict[str, dict]:
+        with self.lock:
+            initialize_v4_cache(self.v4_cache_path)
+            with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+                return {day: {"logicalHash": digest, "layout": json.loads(layout)} for day, digest, layout in db.execute("SELECT day, logical_hash, layout_json FROM remote_days WHERE machine_id=?", (machine_id,))}
+
+    def v4_apply_day(self, machine_id: str, manifest: dict, downloaded: dict[str, list[dict]], force: bool = False) -> None:
+        with self.lock:
+            day, parts = manifest["day"], manifest["parts"]
+            initialize_v4_cache(self.v4_cache_path)
+            with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+                previous = db.execute("SELECT logical_hash, layout_json FROM remote_days WHERE machine_id=? AND day=?", (machine_id, day)).fetchone()
+                old_parts = json.loads(previous[1]) if previous else {}
+                if force or previous is None or previous[0] != manifest["logicalHash"]:
+                    changed = set(parts) if force or "bulk" in parts or "bulk" in old_parts else {part for part, digest in parts.items() if old_parts.get(part) != digest}
+                    if set(downloaded) != changed:
+                        raise ValueError("Downloaded usage parts do not match the changed day manifest")
+                    for part in (set(old_parts) - set(parts)) | changed:
+                        db.execute("DELETE FROM remote_records WHERE machine_id=? AND day=? AND part_id=?", (machine_id, day, part))
+                    for part, entries in downloaded.items():
+                        for entry in entries:
+                            validate_v4_envelope(entry, machine_id)
+                            if entry["collectionPeriod"][:10] != day or part != "bulk" and entry["collectionPeriod"] != part or db.execute("SELECT 1 FROM remote_records WHERE machine_id=? AND record_key=?", (machine_id, entry["recordKey"])).fetchone():
+                                raise ValueError("Usage v4 record is stored outside its owning collection period")
+                            db.execute("INSERT OR REPLACE INTO remote_records(machine_id, day, part_id, record_key, content_hash, record_json) VALUES(?,?,?,?,?,?)", (machine_id, day, part, entry["recordKey"], content_hash(entry["record"]), canonical_json(entry).decode()))
+                    rows = [json.loads(record_json) for (record_json,) in db.execute("SELECT record_json FROM remote_records WHERE machine_id=? AND day=?", (machine_id, day))]
+                    if v4_logical_hash(rows) != manifest["logicalHash"]:
+                        raise ValueError("Usage day logical digest does not match downloaded records")
+                elif downloaded:
+                    raise ValueError("Unchanged usage day unexpectedly downloaded payloads")
+                db.execute("INSERT INTO remote_origins(machine_id) VALUES(?) ON CONFLICT DO NOTHING", (machine_id,))
+                db.execute("INSERT INTO remote_days(machine_id, day, logical_hash, layout_json) VALUES(?,?,?,?) ON CONFLICT(machine_id, day) DO UPDATE SET logical_hash=excluded.logical_hash, layout_json=excluded.layout_json", (machine_id, day, manifest["logicalHash"], canonical_json(parts).decode()))
+            self._materialize_datasets(self._normalize_local(), self._load_cache()[0])
+
+    def v4_remove_days(self, machine_id: str, days: set[str]) -> None:
+        with self.lock:
+            initialize_v4_cache(self.v4_cache_path)
+            with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+                for day in days:
+                    db.execute("DELETE FROM remote_records WHERE machine_id=? AND day=?", (machine_id, day))
+                    db.execute("DELETE FROM remote_days WHERE machine_id=? AND day=?", (machine_id, day))
+                db.execute("INSERT INTO remote_origins(machine_id) VALUES(?) ON CONFLICT DO NOTHING", (machine_id,))
+            self._materialize_datasets(self._normalize_local(), self._load_cache()[0])

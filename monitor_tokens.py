@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import hashlib
 import json
 import threading
 from datetime import datetime, timezone
@@ -262,8 +263,8 @@ def _session_totals() -> dict:
 
 def _new_codex_file_state(path: Path, identity: tuple[int, int]) -> dict:
     return {
-        "identity": identity, "size": 0, "mtimeNs": 0, "offset": 0, "partial": b"", "unterminatedComplete": False, "lineIndex": 0, "sessionId": path.stem, "carriesHistory": False, "replayBoundary": None,
-        "previousTotal": None, "currentModel": "unknown", "currentServiceTier": "default", "eventIndex": 0, "events": [],
+        "identity": identity, "size": 0, "mtimeNs": 0, "offset": 0, "partial": b"", "unterminatedComplete": False, "lineIndex": 0, "sessionId": path.stem, "carriesHistory": False,
+        "previousTotal": None, "currentModel": "unknown", "currentServiceTier": "default", "eventIndex": 0, "events": [], "invalidLines": False, "hasSessionMeta": False,
     }
 
 def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> None:
@@ -272,19 +273,19 @@ def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> Non
     try:
         line = raw_line.decode("utf-8")
     except UnicodeDecodeError:
+        state["invalidLines"] = True
         return
     event = None
-    if "\"session_meta\"" in line or "\"thread_settings_applied\"" in line or "\"inter_agent_communication" in line:
+    if "\"session_meta\"" in line:
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            state["invalidLines"] = True
             return
         event_type = event.get("type")
         if event_type == "session_meta":
             state["sessionId"], state["carriesHistory"] = _codex_session_identity(event.get("payload") or {}, path)
-            return
-        elif str(event_type or "").startswith("inter_agent_communication") or event_type == "event_msg" and (event.get("payload") or {}).get("type") == "thread_settings_applied":
-            state["replayBoundary"] = line_index
+            state["hasSessionMeta"] = True
             return
     if "\"event_msg\"" not in line and "\"turn_context\"" not in line or "\"event_msg\"" in line and "\"token_count\"" not in line:
         return
@@ -292,6 +293,7 @@ def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> Non
         try:
             event = json.loads(line)
         except json.JSONDecodeError:
+            state["invalidLines"] = True
             return
     event_type = event.get("type")
     if event_type == "turn_context":
@@ -315,11 +317,18 @@ def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> Non
     service_tier = info.get("service_tier") or payload.get("service_tier")
     if service_tier is not None:
         state["currentServiceTier"] = normalize_service_tier(service_tier)
+    cumulative = None
     if isinstance(info.get("total_token_usage"), dict):
         current = parse_token_usage(info["total_token_usage"])
         if current is None:
             return
-        delta = token_delta(state["previousTotal"], current)
+        cumulative = current
+        if state["previousTotal"] is None or any(current[key] < state["previousTotal"][key] for key in current):
+            delta = parse_token_usage(info.get("last_token_usage")) if isinstance(info.get("last_token_usage"), dict) else None
+            if delta is None:
+                delta = parse_token_usage({}) if state["carriesHistory"] else current.copy()
+        else:
+            delta = token_delta(state["previousTotal"], current)
         state["previousTotal"] = current
     elif isinstance(info.get("last_token_usage"), dict):
         delta = parse_token_usage(info["last_token_usage"])
@@ -333,7 +342,8 @@ def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> Non
         return
     state["eventIndex"] += 1
     state["events"].append({
-        "index": state["eventIndex"], "lineIndex": line_index, "timestamp": parse_timestamp(event.get("timestamp")), "checkedAt": event.get("timestamp"),
+        "index": state["eventIndex"], "lineIndex": line_index, "cumulative": cumulative,
+        "timestamp": parse_timestamp(event.get("timestamp")), "checkedAt": event.get("timestamp"),
         "model": state["currentModel"], "serviceTier": state["currentServiceTier"], "tokens": delta,
     })
 
@@ -394,7 +404,7 @@ def _update_codex_file_state(path: Path, state: dict | None, retry_race: bool = 
     state["mtimeNs"] = final_stat.st_mtime_ns
     return state
 
-def _scan_codex_token_events_unlocked(home: Path) -> tuple[list[dict], int, float | None]:
+def _scan_codex_token_events_unlocked(home: Path) -> tuple[list[dict], int, float | None, dict]:
     files = collect_codex_session_files(home)
     file_keys = [(path, str(path.resolve())) for path in files]
     cache = _CODEX_SESSION_SCAN_CACHE.setdefault(str(home.resolve()), {})
@@ -410,24 +420,33 @@ def _scan_codex_token_events_unlocked(home: Path) -> tuple[list[dict], int, floa
     usage_events = []
     seen_event_ids = set()
     latest_timestamp = None
+    complete_sessions, incomplete_sessions, source_files, legacy_event_ids = set(), set(), set(), set()
     for _, key in file_keys:
         state = cache.get(key)
         if state is None:
             continue
-        replay_boundary = state["replayBoundary"] if state["carriesHistory"] else None
+        source_file = Path(key).name
+        if state["invalidLines"] or not state["hasSessionMeta"]:
+            incomplete_sessions.add(state["sessionId"])
+            continue
+        source_files.add(source_file)
+        complete_sessions.add(state["sessionId"])
         for cached_event in state["events"]:
-            if replay_boundary is not None and cached_event["lineIndex"] < replay_boundary:
-                continue
-            event_id = f'{state["sessionId"]}:{cached_event["index"]}'
+            legacy_event_ids.add(f'{state["sessionId"]}:{cached_event["index"]}')
+            identity = [state["sessionId"], cached_event["checkedAt"], cached_event["cumulative"] or cached_event["tokens"]]
+            event_id = f'{state["sessionId"]}:{hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]}'
             if event_id in seen_event_ids:
                 continue
             seen_event_ids.add(event_id)
-            event = {"eventId": event_id, "sessionId": state["sessionId"], **{key: value for key, value in cached_event.items() if key not in {"index", "lineIndex"}}}
+            event = {"eventId": event_id, "sessionId": state["sessionId"], "sourceFile": source_file, **{key: value for key, value in cached_event.items() if key not in {"index", "lineIndex", "cumulative"}}}
             usage_events.append(event)
             latest_timestamp = max(latest_timestamp or 0, event.get("timestamp") or 0) or latest_timestamp
-    return usage_events, len(files), latest_timestamp
+    return usage_events, len(files), latest_timestamp, {
+        "completeSessionIds": sorted(complete_sessions - incomplete_sessions), "incompleteSessionIds": sorted(incomplete_sessions),
+        "sourceFiles": sorted(source_files), "legacyEventIds": sorted(legacy_event_ids),
+    }
 
-def _scan_codex_token_events(home: Path) -> tuple[list[dict], int, float | None]:
+def _scan_codex_token_events(home: Path) -> tuple[list[dict], int, float | None, dict]:
     with _CODEX_SESSION_SCAN_LOCK:
         return _scan_codex_token_events_unlocked(home)
 
@@ -455,7 +474,7 @@ def token_sessions_from_events(usage_events: list[dict]) -> list[dict]:
     return sorted(sessions.values(), key=lambda session: (parse_timestamp(session.get("updatedAt")) or 0, session["sessionId"]))
 
 def scan_codex_token_usage(home: Path) -> dict:
-    usage_events, files_scanned, latest_timestamp = _scan_codex_token_events(home)
+    usage_events, files_scanned, latest_timestamp, scan_status = _scan_codex_token_events(home)
     totals = _session_totals()
     by_model: dict[str, dict] = {}
     fast_by_model: dict[str, dict] = {}
@@ -475,6 +494,7 @@ def scan_codex_token_usage(home: Path) -> dict:
         "fastByModel": fast_by_model,
         "sessions": token_sessions_from_events(usage_events),
         "events": usage_events,
+        **scan_status,
         "errors": [],
     }
 

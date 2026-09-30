@@ -50,6 +50,7 @@ def main() -> int:
     migrate_installed_usage_data(
         Path(__file__).resolve().parent, args.data_home, args.quota_history, args.token_ledger, args.sample_log,
         runtime_state_path=args.state, dashboard_cache_path=args.dashboard_cache, usage_sync_cache_path=args.usage_sync_cache,
+        codex_home=args.codex_home,
     )
     args.account_root = args.data_home / "accounts"
     args.legacy_account_root = args.auth.parent / "usage-monitor-accounts"

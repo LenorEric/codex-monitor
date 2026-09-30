@@ -2,6 +2,7 @@
 
 import base64
 import bisect
+import copy
 import gzip
 import hashlib
 import hmac
@@ -29,7 +30,10 @@ from monitor_cloud import CloudError, CloudManager, control_password_is_compromi
 from monitor_cloud_queue import OperationSkipped
 from monitor_common import DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_device_auth import DeviceAuthManager
-from monitor_events import collect_with_bad_remote_usage_retry
+from monitor_events import (
+    allocate_model_delta_events, collect_with_bad_remote_usage_retry, compact_delta_event, hydrate_delta_state_from_events,
+    print_ratio_warnings, print_special_events, process_sample_delta_events, valid_delta_cost_rate,
+)
 from monitor_history import (
     append_capped_jsonl, append_quota_history_sample, collect_usage_sample, compact_quota_history, default_dashboard_cache_path,
     fetch_usage_with_percent_arbitration, load_quota_history, load_state, make_history_sample, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, rewrite_account_labels, write_state,
@@ -659,6 +663,24 @@ def dashboard_cost_usage(quota_points: list[dict], ledger: list[dict], slot_usag
         values.sort(key=lambda row: (row["timestamp"], row["usageAccountId"]))
     return result
 
+def dashboard_cost_usage_delta_events(cost_usage: dict[str, list[dict]]) -> list[dict]:
+    events = []
+    for collection, label in (("fiveHour", "5h"), ("sevenDay", "7d")):
+        for point in cost_usage.get(collection) or []:
+            delta_percent = coerce_float(point.get("deltaPercent")) or 0.0
+            delta_cost = coerce_float(point.get("totalCostUsd")) or 0.0
+            if not valid_delta_cost_rate(delta_percent, delta_cost):
+                continue
+            common = {
+                "checkedAt": point.get("checkedAt"), "window": label,
+                "accountSlotId": point.get("accountSlotId"), "accountLabel": point.get("accountLabel"),
+                "usageAccountId": point.get("usageAccountId"), "plan": point.get("plan"),
+                "planMultiplier": point.get("planMultiplier"),
+            }
+            model_events = allocate_model_delta_events(common, delta_percent, delta_cost, point.get("costByModelUsd") or {}, {})
+            events.extend(compact_delta_event(event) for event in model_events)
+    return events
+
 def _dashboard_display_data(quota_history: list[dict], token_ledger: list[dict], accounts: dict, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     slot_usage_accounts = {str(account.get("id")): str(account.get("usageAccountId")) for account in accounts.get("items", []) if account.get("id") and account.get("usageAccountId")}
@@ -820,6 +842,7 @@ class UsageDashboardState:
         )
         self.args.usage_sync_cache = self.usage_data.cache_path
         self.usage_data.normalize_local()
+        self.usage_data.v4_local_snapshot()
         if self.usage_data.needs_remote_rebuild:
             self.cloud.reset_usage_apply_cursors()
             self.usage_data.needs_remote_rebuild = False
@@ -859,6 +882,17 @@ class UsageDashboardState:
         self._series_build_lock = threading.Lock()
         self.dashboard_cache_event.set()
         self.runtime_state = reset_runtime_baselines(load_state(args.state))
+        self.console_event_state = {"windows": {"5h": {}, "7d": {}}}
+        local_quota, local_ledger = self.usage_data.datasets("local")
+        console_accounts = dashboard_accounts(self)
+        slot_usage_accounts = {str(account["id"]): str(account["usageAccountId"]) for account in console_accounts["items"]}
+        quota_points = dashboard_quota_points(local_quota, slot_usage_accounts)
+        historical_cost_usage = dashboard_cost_usage(quota_points, local_ledger, slot_usage_accounts)
+        hydrate_delta_state_from_events(self.console_event_state, dashboard_cost_usage_delta_events(historical_cost_usage))
+        previous_sample = self.runtime_state.get("lastSample")
+        if isinstance(previous_sample, dict) and previous_sample.get("checkedAt"):
+            process_sample_delta_events(self.console_event_state, copy.deepcopy(previous_sample), None)
+            self.console_event_state["_specialEvents"] = []
         account_status = self.accounts.status()
         self.account_statuses = {account["id"]: None for account in account_status["items"]}
         if not self.runtime_state.get("activeAccountSlotId"):
@@ -1107,6 +1141,11 @@ class UsageDashboardState:
         with self.lock:
             return load_quota_history(self.args.quota_history)
 
+    def _print_usage_console_events(self, sample: dict) -> None:
+        events = process_sample_delta_events(self.console_event_state, copy.deepcopy(sample), None)
+        print_special_events(self.console_event_state.get("_specialEvents") or [])
+        print_ratio_warnings(events)
+
     def poll_once(self) -> dict:
         account_status = self.accounts.status()
         if not self.args.local_only and account_status["awaitingLogin"]:
@@ -1144,10 +1183,15 @@ class UsageDashboardState:
                     sample["accountLabel"],
                     self.accounts.attribution_timeline(),
                     record_provenance=lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
+                    source_files=token_usage.get("sourceFiles"), legacy_event_ids=token_usage.get("legacyEventIds"), own_machine_id=self.cloud.machine_id,
                 )
                 sample["cost"], sample["costByModel"] = token_cost_snapshot(token_sessions)
                 token_usage.pop("sessions", None)
                 token_usage.pop("events", None)
+                token_usage.pop("completeSessionIds", None)
+                token_usage.pop("incompleteSessionIds", None)
+                token_usage.pop("sourceFiles", None)
+                token_usage.pop("legacyEventIds", None)
             self.runtime_state["activeAccountSlotId"] = account_status["activeAccountId"]
             if not api_account:
                 append_quota_history_sample(self.args.quota_history, sample)
@@ -1162,6 +1206,7 @@ class UsageDashboardState:
             self.last_sample = sample
             self._update_account_status_locked(account_status["activeAccountId"], sample)
             self.last_error = None
+            self._print_usage_console_events(sample)
             return sample
 
     def _poll_inactive_account(self, credential: dict) -> None:

@@ -836,10 +836,11 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
     clear_reset_recovery_state(window_state)
     return events
 
-def process_sample_delta_events(state: dict, sample: dict, existing_events: list[dict]) -> list[dict]:
+def process_sample_delta_events(state: dict, sample: dict, existing_events: list[dict] | None) -> list[dict]:
     state["_specialEvents"] = []
     state["_pendingCostIntervals"] = []
-    hydrate_delta_state_from_events(state, existing_events)
+    if existing_events is not None:
+        hydrate_delta_state_from_events(state, existing_events)
     rejection_reasons = remote_usage_rejection_reasons(state, sample)
     if rejection_reasons:
         sample.setdefault("errors", {})["remoteUsageRejected"] = "; ".join(rejection_reasons)

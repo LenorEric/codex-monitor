@@ -25,7 +25,7 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RUNTIME_FILE_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 AUTO_UPDATE_RESTART = 75
-DATA_CONTRACT_VERSION = 4
+DATA_CONTRACT_VERSION = 6
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 
@@ -290,7 +290,66 @@ def _migrate_history_to_v4(paths: dict[str, Path]) -> None:
             os.replace(source, target)
 
 
-DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4}
+def _migrate_history_to_v5(paths: dict[str, Path], codex_home: Path | None = None) -> None:
+    if codex_home is None:
+        raise AutoUpdateError("Codex session directory is required for token ledger migration")
+    from monitor_token_ledger import load_token_ledger, sync_token_ledger
+    from monitor_tokens import scan_codex_token_usage
+
+    scan = scan_codex_token_usage(codex_home)
+    if scan.get("errors"):
+        raise AutoUpdateError("Cannot reconcile token ledger while session scanning is incomplete")
+    complete_sessions = set(scan["completeSessionIds"])
+    if not complete_sessions:
+        return
+    ledger = load_token_ledger(paths["token_ledger"])
+    machine_path = paths["token_ledger"].parent / "machine.json"
+    machine_id = json.loads(machine_path.read_text(encoding="utf-8")).get("machineId") if machine_path.exists() else None
+    if machine_id is None:
+        origins = {(row.get("sync") or {}).get("originMachineId") for row in ledger if row.get("recordType") == "usage" and (row.get("sync") or {}).get("originMachineId")}
+        machine_id = next(iter(origins)) if len(origins) == 1 else None
+    timeline = []
+    account_manifest = paths["token_ledger"].parent / "accounts" / "accounts.json"
+    if account_manifest.exists():
+        manifest = json.loads(account_manifest.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict) or not isinstance(manifest.get("activationHistory", []), list):
+            raise AutoUpdateError("Cannot read account attribution history during token ledger migration")
+        timeline.extend(row for row in manifest.get("activationHistory", []) if isinstance(row, dict) and row.get("checkedAt") and row.get("accountSlotId"))
+    timeline.extend(
+        {"checkedAt": row["checkedAt"], "accountSlotId": row["accountSlotId"], "accountLabel": row.get("accountLabel")}
+        for row in _json_records_with_torn_tail(paths["quota_history"])
+        if row.get("checkedAt") and row.get("accountSlotId") and (not row.get("originMachineId") or row.get("originMachineId") == machine_id)
+    )
+    timeline.extend(
+        {"checkedAt": row["occurredAt"], "accountSlotId": row.get("accountSlotId"), "accountLabel": row.get("accountLabel")}
+        for row in ledger
+        if row.get("recordType") == "usage" and row.get("occurredAt") and row.get("accountSlotId")
+        and (not (row.get("sync") or {}).get("originMachineId") or (row.get("sync") or {}).get("originMachineId") == machine_id)
+    )
+    from monitor_common import parse_timestamp
+    timeline.sort(key=lambda row: parse_timestamp(row.get("checkedAt")) or 0)
+    fallback = timeline[-1] if timeline else {}
+    sync_token_ledger(
+        paths["token_ledger"], [], scan["events"], str(fallback.get("accountSlotId") or "unknown"), str(fallback.get("accountLabel") or "Unknown"),
+        timeline, source_files=scan["sourceFiles"], legacy_event_ids=scan["legacyEventIds"], own_machine_id=machine_id,
+    )
+    paths["dashboard_cache"].unlink(missing_ok=True)
+
+
+def _migrate_history_to_v6(paths: dict[str, Path]) -> None:
+    from monitor_usage_sync import initialize_v4_cache
+
+    cache = paths["usage_sync_cache"]
+    initialize_v4_cache(cache.with_name(f"{cache.stem}-v4.sqlite3"))
+    if paths["cloud_state"].exists():
+        state = json.loads(paths["cloud_state"].read_text(encoding="utf-8"))
+        if not isinstance(state, dict):
+            raise AutoUpdateError("Invalid cloud state during usage v4 migration")
+        state["usageV4"] = {"remote": {}, "localHeadEtag": None, "transferByMonth": {}}
+        _atomic_write(paths["cloud_state"], (json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+
+
+DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6}
 
 
 def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[str, Path]) -> None:
@@ -380,7 +439,11 @@ def _run_data_migration(migration, paths: dict[str, Path], version: int, state_p
     journal_path.unlink(missing_ok=True)
 
 
-def migrate_history_data(data_home: Path, history_path: Path, quota_history_path: Path, token_session_history_path: Path, token_ledger_path: Path, sample_log_path: Path, target_version: int | None = None, runtime_state_path: Path | None = None, dashboard_cache_path: Path | None = None, usage_sync_cache_path: Path | None = None, cloud_state_path: Path | None = None) -> list[int]:
+def migrate_history_data(
+    data_home: Path, history_path: Path, quota_history_path: Path, token_session_history_path: Path, token_ledger_path: Path, sample_log_path: Path,
+    target_version: int | None = None, runtime_state_path: Path | None = None, dashboard_cache_path: Path | None = None,
+    usage_sync_cache_path: Path | None = None, cloud_state_path: Path | None = None, codex_home: Path | None = None,
+) -> list[int]:
     """Migrate every configured history store to the latest data contract once."""
     data_home = Path(data_home)
     data_home.mkdir(parents=True, exist_ok=True)
@@ -418,6 +481,8 @@ def migrate_history_data(data_home: Path, history_path: Path, quota_history_path
         migration = DATA_MIGRATIONS.get(version)
         if migration is None:
             raise AutoUpdateError(f"Missing data migration for contract version {version}")
+        if version == 5:
+            migration = lambda migration_paths: _migrate_history_to_v5(migration_paths, codex_home)
         migration_paths = paths
         if version < 4:
             migration_paths = {name: path for name, path in paths.items() if not name.startswith("legacy_")}
@@ -429,7 +494,12 @@ def migrate_history_data(data_home: Path, history_path: Path, quota_history_path
     return completed
 
 
-def migrate_installed_usage_data(runtime_dir: Path, data_home: Path, quota_history_path: Path | None = None, token_ledger_path: Path | None = None, sample_log_path: Path | None = None, target_version: int | None = None, runtime_state_path: Path | None = None, dashboard_cache_path: Path | None = None, usage_sync_cache_path: Path | None = None, cloud_state_path: Path | None = None) -> list[int]:
+def migrate_installed_usage_data(
+    runtime_dir: Path, data_home: Path, quota_history_path: Path | None = None, token_ledger_path: Path | None = None,
+    sample_log_path: Path | None = None, target_version: int | None = None, runtime_state_path: Path | None = None,
+    dashboard_cache_path: Path | None = None, usage_sync_cache_path: Path | None = None, cloud_state_path: Path | None = None,
+    codex_home: Path | None = None,
+) -> list[int]:
     from monitor_history import default_history_path, default_quota_history_path, default_sample_log_path
     from monitor_token_ledger import default_token_ledger_path
 
@@ -437,7 +507,7 @@ def migrate_installed_usage_data(runtime_dir: Path, data_home: Path, quota_histo
     return migrate_history_data(
         data_home, history, quota_history_path or default_quota_history_path(history), Path(data_home) / "usage_monitor_token_sessions.jsonl",
         token_ledger_path or default_token_ledger_path(history), sample_log_path or default_sample_log_path(history),
-        installed_data_contract_version(runtime_dir) if target_version is None else target_version, runtime_state_path, dashboard_cache_path, usage_sync_cache_path, cloud_state_path,
+        installed_data_contract_version(runtime_dir) if target_version is None else target_version, runtime_state_path, dashboard_cache_path, usage_sync_cache_path, cloud_state_path, codex_home,
     )
 
 

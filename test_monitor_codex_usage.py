@@ -2597,7 +2597,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             session_dir = directory / "sessions" / "2030" / "01" / "01"
             session_dir.mkdir(parents=True)
             path = session_dir / "growing.jsonl"
-            path.write_text(json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "output_tokens": 2}}}}) + "\n", encoding="utf-8")
+            path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "growing"}}) + "\n" + json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "output_tokens": 2}}}}) + "\n", encoding="utf-8")
             appended = (json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 20, "output_tokens": 4}}}}) + "\n").encode()
             original_open, grew = Path.open, []
 
@@ -2638,7 +2638,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     "timestamp": f"2030-01-01T00:0{value // 10}:00Z", "type": "event_msg",
                     "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": value, "output_tokens": value // 5}}},
                 }) + "\n").encode()
-            path.write_bytes(token_line(10))
+            path.write_bytes(json.dumps({"type": "session_meta", "payload": {"id": "continuously-growing"}}).encode() + b"\n" + token_line(10))
             original_open, appended_values = Path.open, []
 
             class GrowingStream:
@@ -2692,7 +2692,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             session_dir = directory / "sessions" / "2030" / "01" / "01"
             session_dir.mkdir(parents=True)
             path = session_dir / "final.jsonl"
-            path.write_text(json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 11, "output_tokens": 2}}}}), encoding="utf-8")
+            path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "final"}}) + "\n" + json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 11, "output_tokens": 2}}}}), encoding="utf-8")
 
             usage = monitor_tokens.scan_codex_token_usage(directory)
 
@@ -2710,7 +2710,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             session_dir = directory / "sessions" / "2030" / "01" / "01"
             session_dir.mkdir(parents=True)
-            (session_dir / "keyword.jsonl").write_text(json.dumps({
+            (session_dir / "keyword.jsonl").write_text(json.dumps({"type": "session_meta", "payload": {"id": "keyword"}}) + "\n" + json.dumps({
                 "timestamp": "2030-01-01T00:01:00Z", "type": "event_msg",
                 "payload": {"type": "token_count", "note": "session_meta thread_settings_applied", "info": {"last_token_usage": {"input_tokens": 9, "output_tokens": 2}}},
             }) + "\n", encoding="utf-8")
@@ -6162,7 +6162,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
             cloud = CloudManager(directory / "private", skills, None)
 
-            usage = {"uploaded": 2, "deleted": 1, "fullSnapshot": False, "pushedAt": "now"}
+            usage = {"daysChanged": 2, "partsUploaded": 2, "pushedAt": "now"}
             with mock.patch.object(cloud, "upload_skills", return_value={"snapshotId": "skills", "changed": False}) as upload_skills, mock.patch.object(cloud, "_push_usage_data", return_value=usage) as push_usage:
                 result = cloud.push()
 
@@ -6621,7 +6621,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
                 def list(self, path):
                     return {
-                        "skills/packages": ["package.enc"], "skills/snapshots": ["snapshot.enc"], "accounts/states": ["account.enc"],
+                        "skills": ["current.enc"], "skills/packages": ["package.enc"], "skills/snapshots": ["snapshot.enc"], "accounts/states": ["account.enc"],
                         "accounts/revisions": ["account"], "accounts/revisions/account": ["revision.enc"],
                     }.get(path, [])
 
@@ -6769,14 +6769,14 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             cloud._state["skills"]["localSha256"] = {"alpha": "base-a", "beta": "base-b"}
             cloud._last_auto_fetch_at = 1000
 
-            with mock.patch.object(skills, "content_hashes", side_effect=({"alpha": "base-a", "beta": "base-b"}, {"alpha": "new-a", "beta": "base-b"}, {"alpha": "new-a", "beta": "new-b"}, {"alpha": "new-a", "beta": "new-b"}, {"alpha": "new-a", "beta": "new-b"})), mock.patch.object(cloud, "upload_skills", return_value={"changed": True}) as upload:
+            with mock.patch.object(skills, "content_hashes", side_effect=({"alpha": "base-a", "beta": "base-b"}, {"alpha": "new-a", "beta": "base-b"}, {"alpha": "new-a", "beta": "new-b"}, {"alpha": "new-a", "beta": "new-b"}, {"alpha": "new-a", "beta": "new-b"}, {"alpha": "new-a", "beta": "new-b"})), mock.patch.object(cloud, "upload_skills", return_value={"changed": True}) as upload:
                 cloud.maintenance_tick(now=0)
                 cloud.maintenance_tick(now=1)
-                cloud.maintenance_tick(now=61)
-                cloud.maintenance_tick(now=121)
+                cloud.maintenance_tick(now=3)
+                cloud.maintenance_tick(now=6)
 
             upload.assert_called_once_with({"alpha"})
-            self.assertEqual(cloud._pending_skill_pushes["beta"]["nextAttemptAt"], 61 + AUTO_PUSH_STABLE_SECONDS)
+            self.assertEqual(cloud._pending_skill_pushes["beta"]["nextAttemptAt"], 3 + AUTO_PUSH_STABLE_SECONDS)
 
     def test_skill_auto_push_respects_skills_auto_upload_setting(self):
         with self.account_directory() as directory:
@@ -7405,9 +7405,9 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.assertRaises(CloudError):
             CloudManager._parse_usage_pointer(box, "machine-a", json.dumps(pointer).encode())
 
-    def test_automatic_cloud_periods_are_one_hour(self):
+    def test_automatic_usage_period_is_thirty_minutes(self):
         self.assertEqual(AUTO_FETCH_INTERVAL_SECONDS, 60 * 60)
-        self.assertEqual(USAGE_SYNC_INTERVAL_SECONDS, 60 * 60)
+        self.assertEqual(USAGE_SYNC_INTERVAL_SECONDS, 30 * 60)
 
     def test_usage_auto_sync_waits_one_hour_after_failure(self):
         with self.account_directory() as directory:
@@ -7432,7 +7432,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             with mock.patch("monitor_cloud.time.time", return_value=now), mock.patch("monitor_cloud.time.monotonic", return_value=1000):
                 cloud.configure_usage_sync(object())
 
-            self.assertEqual(cloud._next_usage_sync_at, 1000 + 30 * 60)
+            self.assertEqual(cloud._next_usage_sync_at, 1000)
 
     def test_usage_sync_records_attempt_before_failure(self):
         with self.account_directory() as directory:
@@ -7461,6 +7461,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertEqual((intervals[0]["startedAt"], intervals[0]["startPercent"], intervals[0]["endPercent"]), ("2030-01-01T00:00:00Z", 0, 1))
         self.assertEqual((intervals[0]["modelCostsUsd"]["gpt-5.5"], intervals[0]["deltaCostUsd"]), (2, 2))
 
+    @unittest.skip("Legacy hash-pack integration is replaced by test_usage_v4")
     def test_usage_cloud_pack_manifest_fetches_each_missing_hash_and_updates_only_changed_buckets(self):
         class Client:
             def __init__(self):

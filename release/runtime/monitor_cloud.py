@@ -7,6 +7,7 @@ import functools
 import hashlib
 import hmac
 import json
+import re
 import secrets
 import threading
 import time
@@ -25,15 +26,15 @@ from monitor_accounts import api_identity_id, atomic_write_json, auth_identity, 
 from monitor_cloud_queue import CloudOperationQueue, OperationCancelled, OperationSkipped
 from monitor_common import SafeRedirectHandler
 from monitor_skills import SkillError
-from monitor_usage_sync import canonical_json, content_hash, validate_sync_operation
+from monitor_usage_sync import canonical_json, content_hash, v4_logical_hash, v4_period, validate_sync_operation
 
-AUTO_PUSH_STABLE_SECONDS = 120
+AUTO_PUSH_STABLE_SECONDS = 5
 AUTO_PUSH_RETRY_SECONDS = 30
 AUTO_PUSH_MAX_ATTEMPTS = 3
 WEBDAV_MKCOL_MAX_ATTEMPTS = 3
 WEBDAV_MKCOL_RETRY_SECONDS = 1
 AUTO_FETCH_INTERVAL_SECONDS = 60 * 60
-USAGE_SYNC_INTERVAL_SECONDS = 60 * 60
+USAGE_SYNC_INTERVAL_SECONDS = 30 * 60
 LEGACY_PASSPHRASE_SALT = b"codex-switch-passphrase-v1"
 USAGE_PACK_FORMAT_VERSION = 3
 USAGE_PACK_BUCKET_BITS = 6
@@ -286,6 +287,8 @@ class WebDavClient:
         token = base64.b64encode(f"{config.get('username', '')}:{config.get('password', '')}".encode()).decode()
         self.opener = urllib.request.build_opener(SafeRedirectHandler())
         self.authorization = f"Basic {token}"
+        self.transfers = []
+        self.transfer_category = "metadata"
 
     def _url(self, path: str = "") -> str:
         parts = [urllib.parse.quote(part, safe="") for part in f"{self.root}/{path}".strip("/").split("/") if part]
@@ -294,17 +297,23 @@ class WebDavClient:
     def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204)) -> tuple[bytes, str | None, int]:
         request = urllib.request.Request(self._url(path), data=data, method=method, headers=headers or {})
         request.add_unredirected_header("Authorization", self.authorization)
+        transfer = {"method": method, "path": path, "category": self.transfer_category, "attemptedUploadBytes": len(data) if method == "PUT" and data is not None else 0, "successfulUploadBytes": 0, "downloadBytes": 0}
+        self.transfers.append(transfer)
         try:
             with self.opener.open(request, timeout=30) as response:
                 body, etag, status = response.read(), response.headers.get("ETag"), response.status
         except urllib.error.HTTPError as exc:
             if exc.code in expected:
-                return exc.read(), exc.headers.get("ETag"), exc.code
+                body = exc.read()
+                transfer["downloadBytes"] = len(body)
+                return body, exc.headers.get("ETag"), exc.code
             raise CloudError(f"WebDAV {method} failed with HTTP {exc.code}", 409 if exc.code in {409, 412} else 502, http_status=exc.code, category="http") from exc
         except OSError as exc:
             raise CloudError(f"WebDAV connection failed: {exc}", 502, category="network") from exc
         if status not in expected:
             raise CloudError(f"WebDAV {method} returned HTTP {status}", 502, http_status=status, category="protocol")
+        transfer["downloadBytes"] = len(body)
+        transfer["successfulUploadBytes"] = transfer["attemptedUploadBytes"]
         return body, etag, status
 
     def ensure_directories(self, path: str) -> None:
@@ -398,6 +407,7 @@ class CloudManager:
         self._auto_push_failure_id = 0
         self._last_auto_fetch_at = time.monotonic() - min(_elapsed_since(self._state.get("lastAutoFetchAt"), AUTO_FETCH_INTERVAL_SECONDS), AUTO_FETCH_INTERVAL_SECONDS)
         self._usage_data = None
+        self._v4_month_cache = {}
         self._usage_account_ids = {}
         self._next_usage_sync_at = time.monotonic()
         if not self._config_error:
@@ -714,6 +724,9 @@ class CloudManager:
         self._state["remote"] = {"accounts": {}, "skills": {}}
         self._state["skills"]["indexEtag"] = None
         self._state["usage"]["remote"] = {}
+        self._state.setdefault("usageV4", {})["remote"] = {}
+        self._state["usageV4"]["localHeadEtag"] = None
+        self._v4_month_cache.clear()
         self._save_state()
         atomic_write_json(self.config_path, config)
 
@@ -1176,6 +1189,10 @@ class CloudManager:
         self._state["remote"] = {"accounts": {}, "skills": {}}
         self._state["skills"]["indexEtag"] = None
         self._state["usage"]["remote"] = {}
+        self._state.setdefault("usageV4", {})["remote"] = {}
+        self._state["usageV4"]["localHeadEtag"] = None
+        self._state["usageV4"].pop("lastGcDay", None)
+        self._v4_month_cache.clear()
         self._state["conditionalWritesVerified"] = False
         self._state["decryptFailure"] = None
         self._save_state()
@@ -1275,12 +1292,12 @@ class CloudManager:
         for key in sorted(name.strip("/") for name in self._optional_remote_list(client, "accounts/revisions") if name.strip("/") and "/" not in name.strip("/") and "\\" not in name):
             for revision in sorted(name[:-4] for name in self._optional_remote_list(client, f"accounts/revisions/{key}") if name.endswith(".enc") and "/" not in name and "\\" not in name):
                 inventory.append((f"accounts/revisions/{key}/{revision}.enc", f"account-revision:{key}:{revision}"))
-        for name in sorted(self._optional_remote_list(client, "usage/machines")):
+        for name in sorted(self._optional_remote_list(client, "usage/v4/heads")):
             if not name.endswith(".enc") or "/" in name or "\\" in name:
                 continue
             machine_id = name[:-4]
-            inventory.append((self._usage_pointer_path(machine_id), f"usage-pointer:{machine_id}"))
-            for kind in ("packs", "chunks", "checkpoints"):
+            inventory.append((self._v4_head_path(machine_id), f"usage-v4-head:{machine_id}"))
+            for kind in ("v4/months", "v4/days", "v4/data"):
                 for payload_id in sorted(item[:-4] for item in self._optional_remote_list(client, f"usage/{kind}/{machine_id}") if item.endswith(".enc") and "/" not in item and "\\" not in item):
                     inventory.append((self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"))
         return inventory
@@ -1346,56 +1363,9 @@ class CloudManager:
             raise CloudError("Finish the pending account operation before re-encrypting cloud data", 409)
         client, box = self._connection()
         refreshed = []
-        for package_id in sorted(self._encrypted_payloads(client, "skills/packages")):
-            path = f"skills/packages/{package_id}.enc"
-            self._reencrypt_object(client, box, path, f"skill-package:{package_id}")
+        for path, purpose in self._encrypted_inventory(client):
+            self._reencrypt_object(client, box, path, purpose)
             refreshed.append(path)
-        for snapshot_id in sorted(self._encrypted_payloads(client, "skills/snapshots")):
-            path = f"skills/snapshots/{snapshot_id}.enc"
-            self._reencrypt_object(client, box, path, f"skills-snapshot:{snapshot_id}")
-            refreshed.append(path)
-        try:
-            self._reencrypt_object(client, box, "skills/current.enc", "skills-pointer")
-            refreshed.append("skills/current.enc")
-        except CloudError as exc:
-            if "HTTP 404" not in str(exc):
-                raise
-        for key in sorted(self._encrypted_payloads(client, "accounts/states")):
-            path = f"accounts/states/{key}.enc"
-            self._reencrypt_object(client, box, path, f"account-state:{key}")
-            refreshed.append(path)
-        try:
-            account_keys = client.list("accounts/revisions")
-        except CloudError as exc:
-            if "HTTP 404" not in str(exc):
-                raise
-            account_keys = []
-        for key in sorted(name.strip("/") for name in account_keys if name.strip("/") and "/" not in name.strip("/") and "\\" not in name):
-            for revision in sorted(self._encrypted_payloads(client, f"accounts/revisions/{key}")):
-                path = f"accounts/revisions/{key}/{revision}.enc"
-                self._reencrypt_object(client, box, path, f"account-revision:{key}:{revision}")
-                refreshed.append(path)
-        try:
-            usage_machines = [name[:-4] for name in client.list("usage/machines") if name.endswith(".enc")]
-        except CloudError as exc:
-            if "HTTP 404" not in str(exc):
-                raise
-            usage_machines = []
-        for machine_id in sorted(usage_machines):
-            path = self._usage_pointer_path(machine_id)
-            self._reencrypt_object(client, box, path, f"usage-pointer:{machine_id}")
-            refreshed.append(path)
-            for kind in ("packs", "chunks", "checkpoints"):
-                try:
-                    payloads = self._encrypted_payloads(client, f"usage/{kind}/{machine_id}")
-                except CloudError as exc:
-                    if "HTTP 404" not in str(exc):
-                        raise
-                    payloads = set()
-                for payload_id in sorted(payloads):
-                    path = self._usage_payload_path(kind, machine_id, payload_id)
-                    self._reencrypt_object(client, box, path, f"usage-{kind}:{machine_id}:{payload_id}")
-                    refreshed.append(path)
         self._state["remote"] = {"accounts": {}, "skills": {}}
         self._state["skills"]["indexEtag"] = None
         self._save_state()
@@ -1406,7 +1376,7 @@ class CloudManager:
     def push(self, force_full: bool = False) -> dict:
         accounts = {"pushedAccounts": []}
         result = {"skills": self.upload_skills(force=True) if force_full else self.upload_skills(), "accounts": accounts, "usage": self._push_usage_data(True) if force_full else self._push_usage_data()}
-        result["changed"] = bool(result["skills"].get("changed") or result["usage"].get("uploaded") or result["usage"].get("deleted"))
+        result["changed"] = bool(result["skills"].get("changed") or result["usage"].get("daysChanged"))
         self._finish_successful_push(time.monotonic())
         self._state["decryptFailure"] = None
         self._save_state()
@@ -1631,15 +1601,107 @@ class CloudManager:
         return hashlib.sha256(compressed).hexdigest(), compressed
 
     @staticmethod
+    def _v4_head_path(machine_id: str) -> str:
+        return f"usage/v4/heads/{machine_id}.enc"
+
+    @staticmethod
+    def _v4_valid_hash(value) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
+
+    @staticmethod
+    def _v4_valid_day(value) -> bool:
+        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+            return False
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") == value
+        except ValueError:
+            return False
+
+    def _v4_head(self, client: WebDavClient, box: CryptoBox, machine_id: str) -> tuple[dict | None, str | None]:
+        client.transfer_category = "metadata"
+        try:
+            encrypted, etag = client.get(self._v4_head_path(machine_id))
+        except CloudError as exc:
+            if exc.http_status == 404:
+                return None, None
+            raise
+        try:
+            head = json.loads(box.decrypt(f"usage-v4-head:{machine_id}", encrypted, 1024 * 1024))
+        except (ValueError, TypeError) as exc:
+            raise CloudError("Invalid usage v4 head", 409) from exc
+        if not isinstance(head, dict) or head.get("version") != 4 or head.get("machineId") != machine_id or not isinstance(head.get("generation"), int) or isinstance(head["generation"], bool) or head["generation"] < 1 or not isinstance(head.get("months"), dict) or any(not isinstance(month, str) or not re.fullmatch(r"\d{4}-\d{2}", month) or not self._v4_valid_hash(digest) for month, digest in head["months"].items()):
+            raise CloudError("Invalid usage v4 head", 409)
+        active = head.get("activeDay")
+        if active is not None and (not isinstance(active, dict) or not self._v4_valid_day(active.get("day")) or not self._v4_valid_hash(active.get("manifestId")) or not self._v4_valid_hash(active.get("logicalHash")) or active.get("layout") != "parts"):
+            raise CloudError("Invalid usage v4 active day", 409)
+        return head, etag
+
+    def _v4_catalog(self, client: WebDavClient, box: CryptoBox, machine_id: str, head: dict | None) -> dict[str, dict]:
+        if head is None:
+            return {}
+        catalog = {}
+        for month, payload_id in sorted(head["months"].items()):
+            cache_key = (machine_id, payload_id)
+            if cache_key not in self._v4_month_cache:
+                client.transfer_category = "metadata"
+                value = self._download_usage_payload(client, box, "v4/months", machine_id, payload_id)
+                if value.get("machineId") != machine_id or value.get("month") != month or not isinstance(value.get("days"), dict):
+                    raise CloudError("Invalid usage v4 month index", 409)
+                for day, reference in value["days"].items():
+                    if not self._v4_valid_day(day) or day[:7] != month or not isinstance(reference, dict) or not self._v4_valid_hash(reference.get("manifestId")) or not self._v4_valid_hash(reference.get("logicalHash")) or reference.get("layout") != "bulk":
+                        raise CloudError("Invalid usage v4 day reference", 409)
+                self._v4_month_cache[cache_key] = value
+            catalog.update(self._v4_month_cache[cache_key]["days"])
+        if head.get("activeDay"):
+            day = head["activeDay"]["day"]
+            if day in catalog:
+                raise CloudError("Usage v4 day has duplicate references", 409)
+            catalog[day] = {key: head["activeDay"][key] for key in ("manifestId", "logicalHash", "layout")}
+        return catalog
+
+    def _v4_day_manifest(self, client: WebDavClient, box: CryptoBox, machine_id: str, day: str, reference: dict) -> dict:
+        client.transfer_category = "metadata"
+        value = self._download_usage_payload(client, box, "v4/days", machine_id, reference["manifestId"])
+        parts = value.get("parts")
+        if value.get("machineId") != machine_id or value.get("day") != day or value.get("logicalHash") != reference["logicalHash"] or value.get("layout") != reference["layout"] or not isinstance(parts, dict) or not parts or any(not isinstance(part, str) or not self._v4_valid_hash(digest) or part != "bulk" and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):(?:00|30)Z", part) or part[:10] != day) for part, digest in parts.items()) or (value["layout"] == "bulk") != (set(parts) == {"bulk"}):
+            raise CloudError("Invalid usage v4 day manifest", 409)
+        return value
+
+    def _v4_data(self, client: WebDavClient, box: CryptoBox, machine_id: str, day: str, part: str, payload_id: str, category: str = "payload") -> list[dict]:
+        client.transfer_category = category
+        value = self._download_usage_payload(client, box, "v4/data", machine_id, payload_id)
+        if value.get("machineId") != machine_id or value.get("day") != day or value.get("partId") != part or not isinstance(value.get("records"), list) or len(value["records"]) > 100000:
+            raise CloudError("Invalid usage v4 data part", 409)
+        return value["records"]
+
+    def _v4_write_head(self, client: WebDavClient, box: CryptoBox, head: dict, etag: str | None) -> str:
+        data = box.encrypt(f"usage-v4-head:{head['machineId']}", canonical_json(head))
+        return client.put(self._v4_head_path(head["machineId"]), data, etag=etag) if etag else client.put(self._v4_head_path(head["machineId"]), data, create=True)
+
+    @staticmethod
+    def _v4_sealed_day(day: str, content: dict, current_period: str, machine_id: str) -> dict | None:
+        parts = {period: entries for period, entries in content["parts"].items() if period < current_period}
+        if not parts:
+            return None
+        entries = [entry for records in parts.values() for entry in records]
+        layout = "parts" if day == current_period[:10] else "bulk"
+        payloads = ({period: {"version": 1, "machineId": machine_id, "day": day, "partId": period, "records": records} for period, records in parts.items()} if layout == "parts" else {"bulk": {"version": 1, "machineId": machine_id, "day": day, "partId": "bulk", "records": sorted(entries, key=lambda entry: entry["recordKey"])}})
+        return {"day": day, "layout": layout, "logicalHash": v4_logical_hash(entries), "payloads": payloads}
+
+    @staticmethod
     def _decode_usage_payload(box: CryptoBox, purpose: str, encrypted: bytes, expected_id: str) -> dict:
         compressed = box.decrypt(purpose, encrypted)
         if hashlib.sha256(compressed).hexdigest() != expected_id:
             raise CloudError("Usage payload identity check failed", 409)
         try:
-            value = json.loads(zlib.decompress(compressed))
-        except (json.JSONDecodeError, zlib.error) as exc:
+            decoder = zlib.decompressobj()
+            uncompressed = decoder.decompress(compressed, 600 * 1024 * 1024 + 1)
+            if len(uncompressed) > 600 * 1024 * 1024 or decoder.unconsumed_tail or not decoder.eof or decoder.unused_data:
+                raise ValueError("Usage payload exceeds the decoder safety bound")
+            value = json.loads(uncompressed)
+        except (ValueError, json.JSONDecodeError, zlib.error) as exc:
             raise CloudError("Invalid usage payload", 409) from exc
-        if value.get("version") != 1:
+        if not isinstance(value, dict) or value.get("version") != 1:
             raise CloudError("Unsupported usage payload", 409)
         return value
 
@@ -1819,6 +1881,153 @@ class CloudManager:
         encrypted, _ = client.get(self._usage_payload_path(kind, machine_id, payload_id))
         return self._decode_usage_payload(box, f"usage-{kind}:{machine_id}:{payload_id}", encrypted, payload_id)
 
+    def _v4_publish(self, client: WebDavClient, box: CryptoBox, force_full: bool = False) -> dict:
+        machine_id = self.machine_id
+        for path in ("usage/v4/heads", f"usage/v4/months/{machine_id}", f"usage/v4/days/{machine_id}", f"usage/v4/data/{machine_id}"):
+            client.ensure_directories(path)
+        head, etag = self._v4_head(client, box, machine_id)
+        old_catalog = self._v4_catalog(client, box, machine_id, head)
+        now_period = v4_period(time.time())
+        desired = {day: sealed for day, content in self._usage_data.v4_local_snapshot(time.time()).items() if (sealed := self._v4_sealed_day(day, content, now_period, machine_id)) is not None}
+        catalog = dict(old_catalog)
+        uploaded, changed_days, consolidated = 0, set(), False
+        for day, source in sorted(desired.items(), reverse=True):
+            previous = old_catalog.get(day)
+            if previous and previous["logicalHash"] == source["logicalHash"] and previous["layout"] == source["layout"]:
+                if force_full:
+                    manifest = self._v4_day_manifest(client, box, machine_id, day, previous)
+                    for part, payload_id in manifest["parts"].items():
+                        self._v4_data(client, box, machine_id, day, part, payload_id)
+                continue
+            old_manifest = self._v4_day_manifest(client, box, machine_id, day, previous) if previous else None
+            consolidated |= bool(previous and previous["layout"] == "parts" and source["layout"] == "bulk")
+            parts = {}
+            for part, value in source["payloads"].items():
+                payload_id = self._usage_payload_bytes(value)[0]
+                parts[part] = payload_id
+                if old_manifest is None or old_manifest["parts"].get(part) != payload_id:
+                    client.transfer_category = "consolidation" if source["layout"] == "bulk" and previous and previous["layout"] == "parts" else "backfill" if previous is None and day < now_period[:10] else "payload"
+                    self._put_usage_payload(client, box, "v4/data", machine_id, value)
+                    uploaded += 1
+            manifest = {"version": 1, "machineId": machine_id, "day": day, "layout": source["layout"], "logicalHash": source["logicalHash"], "parts": parts}
+            client.transfer_category = "metadata"
+            manifest_id, _ = self._put_usage_payload(client, box, "v4/days", machine_id, manifest)
+            catalog[day] = {"manifestId": manifest_id, "logicalHash": source["logicalHash"], "layout": source["layout"]}
+            changed_days.add(day)
+        for day in old_catalog.keys() - desired.keys():
+            catalog.pop(day)
+            changed_days.add(day)
+        months = {}
+        for day, reference in catalog.items():
+            if reference["layout"] == "bulk":
+                months.setdefault(day[:7], {})[day] = reference
+        month_ids = {}
+        for month, days in sorted(months.items()):
+            value = {"version": 1, "machineId": machine_id, "month": month, "days": days}
+            payload_id = self._usage_payload_bytes(value)[0]
+            if head is None or head["months"].get(month) != payload_id:
+                client.transfer_category = "metadata"
+                self._put_usage_payload(client, box, "v4/months", machine_id, value)
+            month_ids[month] = payload_id
+            self._v4_month_cache[(machine_id, payload_id)] = value
+        active_days = [(day, reference) for day, reference in catalog.items() if reference["layout"] == "parts"]
+        if len(active_days) > 1:
+            raise CloudError("Usage v4 has multiple active days", 409)
+        active = {"day": active_days[0][0], **active_days[0][1]} if active_days else None
+        changed = head is None or head["months"] != month_ids or head.get("activeDay") != active
+        if changed:
+            updated = {"version": 4, "machineId": machine_id, "generation": (head or {}).get("generation", 0) + 1, "months": month_ids, "activeDay": active}
+            client.transfer_category = "metadata"
+            new_etag = self._v4_write_head(client, box, updated, etag)
+            verified, verified_etag = self._v4_head(client, box, machine_id)
+            if verified != updated:
+                raise CloudError("Usage v4 head verification failed", 409)
+            self._state.setdefault("usageV4", {})["localHeadEtag"] = verified_etag or new_etag
+            self._save_state()
+        if consolidated or old_catalog.keys() - desired.keys() or self._state.setdefault("usageV4", {}).get("lastGcDay") != now_period[:10]:
+            try:
+                self._v4_gc(client, box, machine_id, updated if changed else head)
+            except Exception as exc:
+                raise CloudError(f"Usage v4 publication completed, but daily cleanup is pending: {exc}", 502) from exc
+            self._state["usageV4"]["lastGcDay"] = now_period[:10]
+            self._save_state()
+        return {"daysChanged": len(changed_days), "partsUploaded": uploaded, "dailyFiles": sum(ref["layout"] == "bulk" for ref in catalog.values()), "headChanged": changed}
+
+    def _v4_gc(self, client: WebDavClient, box: CryptoBox, machine_id: str, head: dict) -> None:
+        client.transfer_category = "metadata"
+        catalog = self._v4_catalog(client, box, machine_id, head)
+        referenced = {"v4/months": set(head["months"].values()), "v4/days": {reference["manifestId"] for reference in catalog.values()}, "v4/data": set()}
+        for day, reference in catalog.items():
+            referenced["v4/data"].update(self._v4_day_manifest(client, box, machine_id, day, reference)["parts"].values())
+        for kind, retained in referenced.items():
+            for name in self._optional_remote_list(client, f"usage/{kind}/{machine_id}"):
+                if name.endswith(".enc") and name[:-4] not in retained:
+                    client.delete(self._usage_payload_path(kind, machine_id, name[:-4]))
+
+    def _v4_fetch(self, client: WebDavClient, box: CryptoBox, force_full: bool = False) -> dict:
+        client.transfer_category = "metadata"
+        try:
+            items = client.list_details("usage/v4/heads")
+        except CloudError as exc:
+            if exc.http_status == 404:
+                return {"machinesChanged": 0, "payloadsDownloaded": 0}
+            raise
+        remote = self._state.setdefault("usageV4", {}).setdefault("remote", {})
+        changed, downloaded = 0, 0
+        for item in items:
+            if not item["name"].endswith(".enc"):
+                continue
+            machine_id = item["name"][:-4]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", machine_id):
+                continue
+            if machine_id == self.machine_id or not force_full and item.get("etag") and remote.get(machine_id) == item["etag"] and self._usage_data.v4_cached_days(machine_id):
+                continue
+            for attempt in range(2):
+                head, etag = self._v4_head(client, box, machine_id)
+                if head is None:
+                    break
+                try:
+                    catalog = self._v4_catalog(client, box, machine_id, head)
+                    cached = self._usage_data.v4_cached_days(machine_id)
+                    for day, reference in sorted(catalog.items()):
+                        if not force_full and cached.get(day, {}).get("logicalHash") == reference["logicalHash"]:
+                            continue
+                        manifest = self._v4_day_manifest(client, box, machine_id, day, reference)
+                        old_parts = cached.get(day, {}).get("layout", {})
+                        required = set(manifest["parts"]) if force_full or "bulk" in manifest["parts"] or "bulk" in old_parts else {part for part, payload_id in manifest["parts"].items() if old_parts.get(part) != payload_id}
+                        payloads = {part: self._v4_data(client, box, machine_id, day, part, manifest["parts"][part], "backfill" if day < _timestamp()[:10] and day not in cached else "payload") for part in sorted(required)}
+                        self._usage_data.v4_apply_day(machine_id, manifest, payloads, force_full)
+                        downloaded += len(payloads)
+                    self._usage_data.v4_remove_days(machine_id, set(cached) - set(catalog))
+                    remote[machine_id] = etag
+                    self._save_state()
+                    changed += 1
+                    break
+                except CloudError as exc:
+                    if attempt or exc.http_status != 404:
+                        raise
+                    self._v4_month_cache.clear()
+                    continue
+        return {"machinesChanged": changed, "payloadsDownloaded": downloaded}
+
+    def _v4_record_transfers(self, client: WebDavClient, start: int = 0) -> None:
+        monthly = self._state.setdefault("usageV4", {}).setdefault("transferByMonth", {}).setdefault(_timestamp()[:7], {})
+        for transfer in getattr(client, "transfers", [])[start:]:
+            totals = monthly.setdefault(transfer["category"], {"attemptedUploadBytes": 0, "successfulUploadBytes": 0, "downloadBytes": 0})
+            for field in totals:
+                totals[field] += transfer[field]
+        self._save_state()
+
+    def _v4_publish_retry(self, client: WebDavClient, box: CryptoBox, force_full: bool = False) -> dict:
+        for attempt in range(2):
+            try:
+                return self._v4_publish(client, box, force_full)
+            except CloudError as exc:
+                if attempt or exc.http_status not in {404, 409, 412}:
+                    raise
+                self._v4_month_cache.clear()
+        raise CloudError("Usage v4 publication retry was exhausted", 409)
+
     def _fetch_legacy_usage(self, client: WebDavClient, box: CryptoBox, machine_id: str, pointer: dict) -> tuple[list[dict], int]:
         checkpoint = self._download_usage_payload(client, box, "checkpoints", machine_id, pointer["checkpointId"])
         operations = [{"action": "upsert", **record} for record in checkpoint.get("records", [])]
@@ -1937,18 +2146,21 @@ class CloudManager:
     def _fetch_usage_data(self, client: WebDavClient, box: CryptoBox, force_full: bool = False) -> dict:
         if self._usage_data is None:
             return {"skipped": True}
-        client.ensure_directories("usage/machines")
-        return {**self._fetch_usage(client, box, force_full), "fetchedAt": _timestamp()}
+        first_transfer = len(getattr(client, "transfers", []))
+        try:
+            return {**self._v4_fetch(client, box, force_full), "fetchedAt": _timestamp()}
+        finally:
+            self._v4_record_transfers(client, first_transfer)
 
     def _push_usage_data(self, force_full: bool = False) -> dict:
         if self._usage_data is None:
             return {"skipped": True}
         self._require_conditional_writes()
         client, box = self._connection(True)
-        for path in ("usage/machines", f"usage/packs/{self.machine_id}"):
-            client.ensure_directories(path)
-        records, present_keys = self._usage_data.snapshot()
-        return {**self._publish_usage(client, box, records, present_keys, force_full), "pushedAt": _timestamp()}
+        try:
+            return {**self._v4_publish_retry(client, box, force_full), "pushedAt": _timestamp()}
+        finally:
+            self._v4_record_transfers(client)
 
     @_serialized_cloud_operation
     def sync_usage_data(self) -> dict:
@@ -1958,14 +2170,14 @@ class CloudManager:
         self._save_state()
         self._require_conditional_writes()
         client, box = self._connection(True)
-        for path in ("usage/machines", f"usage/packs/{self.machine_id}"):
-            client.ensure_directories(path)
-        records, present_keys = self._usage_data.snapshot()
-        published = self._publish_usage(client, box, records, present_keys)
-        fetched = self._fetch_usage(client, box)
-        self._state["usage"].update({"lastSuccessAt": _timestamp(), "failure": None})
-        self._save_state()
-        return {"published": published, "fetched": fetched, "syncedAt": self._state["usage"]["lastSuccessAt"]}
+        try:
+            published = self._v4_publish_retry(client, box)
+            fetched = self._v4_fetch(client, box)
+            self._state["usage"].update({"lastSuccessAt": _timestamp(), "failure": None})
+            self._save_state()
+            return {"published": published, "fetched": fetched, "syncedAt": self._state["usage"]["lastSuccessAt"]}
+        finally:
+            self._v4_record_transfers(client)
 
     def _schedule_skill_push(self, name: str, current_hash: str, now: float) -> None:
         self._pending_skill_pushes[name] = {"hash": current_hash, "since": now, "nextAttemptAt": now + AUTO_PUSH_STABLE_SECONDS, "attempts": 0}
@@ -2045,6 +2257,8 @@ class CloudManager:
             self._record_decrypt_failure(exc, "usage sync")
             attempt = int((usage.get("failure") or {}).get("attempt") or 0) + 1
             usage["failure"] = {"message": str(exc), "attempt": attempt, "failedAt": _timestamp()}
+            if isinstance(exc, CloudError) and exc.http_status in {403, 507}:
+                self._next_usage_sync_at = now + min(24 * 60 * 60, USAGE_SYNC_INTERVAL_SECONDS * 2 ** min(attempt, 6))
             self._save_state()
             return False
         return True

@@ -82,15 +82,15 @@ class CloudContractV3Tests(unittest.TestCase):
             self.assertFalse({"packBytes", "updatedAt"} & captured.keys())
             self.assertEqual(set(captured["verification"]), {"fullVerifiedAt"})
 
-    def test_force_verification_keeps_compacted_snapshot(self):
+    def test_force_verification_uses_v4_publication(self):
         with self.directory() as directory:
             cloud = self.manager(directory)
-            store = SimpleNamespace(snapshot=mock.Mock(return_value=({}, set())))
+            store = SimpleNamespace()
             cloud._usage_data = store
-            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(SimpleNamespace(ensure_directories=lambda _path: None), object())), mock.patch.object(cloud, "_publish_usage", return_value={}) as publish:
+            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(SimpleNamespace(transfers=[]), object())), mock.patch.object(cloud, "_v4_publish_retry", return_value={}) as publish:
                 cloud._push_usage_data(True)
 
-            store.snapshot.assert_called_once_with()
+            publish.assert_called_once()
             self.assertTrue(publish.call_args.args[-1])
 
     def test_complete_empty_machine_listing_clears_remote_cache(self):

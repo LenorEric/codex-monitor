@@ -139,9 +139,6 @@ def _source_highwaters(rows: list[dict]) -> dict[tuple[str, str, str], dict]:
             for model, tiers in source_totals.items():
                 for tier, totals in (tiers or {}).items():
                     result[(session_id, str(model), str(tier))] = normalize_saved_token_totals(totals)
-        elif row.get("recordType") == "usage":
-            key = (str(row.get("sessionId") or ""), str(row.get("rawModel") or ""), str(row.get("serviceTier") or "default"))
-            _add_tokens(result.setdefault(key, empty_token_totals()), row.get("tokens"))
     return result
 
 def _account_for_event(event: dict, account_slot_id: str, account_label: str, account_timeline: list[dict]) -> tuple[str, str]:
@@ -170,7 +167,7 @@ def _usage_records(events: list[dict], highwaters: dict, account_slot_id: str, a
             "schemaVersion": LEDGER_SCHEMA_VERSION, "recordType": "usage", "eventId": str(event.get("eventId") or ""), "occurredAt": event.get("checkedAt"), "sessionId": key[0],
             "rawModel": key[1], "billingModel": normalize_codex_model(key[1]), "serviceTier": key[2], "accountSlotId": slot_id, "accountLabel": label,
             "tokens": delta, "cost": cost,
-        })
+        } | ({"sourceFile": event["sourceFile"]} if event.get("sourceFile") else {}))
     return usages
 
 def _empty_session(row: dict) -> dict:
@@ -218,18 +215,50 @@ def token_cost_snapshot(sessions: list[dict]) -> tuple[dict, dict[str, dict]]:
             by_model[normalized] = sum_cost_totals(by_model.get(normalized), value.get("cost") if isinstance(value, dict) else None)
     return sum_cost_totals(*(session.get("cost") for session in sessions)), by_model
 
-def sync_token_ledger(path: Path, legacy_sessions: list[dict], events: list[dict], account_slot_id: str, account_label: str, account_timeline: list[dict] | None = None, record_provenance=None) -> list[dict]:
+def sync_token_ledger(
+    path: Path, legacy_sessions: list[dict], events: list[dict], account_slot_id: str, account_label: str,
+    account_timeline: list[dict] | None = None, record_provenance=None, source_files=None, legacy_event_ids=None, own_machine_id: str | None = None,
+) -> list[dict]:
     rows = load_token_ledger(path)
     additions = _legacy_baselines(legacy_sessions) if not any(row.get("recordType") in {"legacyBaseline", "usage"} for row in rows) else []
     combined = rows + additions
-    timeline = sorted(account_timeline or [], key=lambda row: parse_timestamp(row.get("checkedAt")) or 0)
-    usages = _usage_records(events, _source_highwaters(combined), account_slot_id, account_label, timeline)
     if record_provenance is not None:
         additions = [record_provenance(row) for row in additions]
-        usages = [record_provenance(row) for row in usages]
         combined = rows + additions
-    append_token_ledger(path, additions + usages)
-    sessions = token_sessions_from_ledger(combined + usages)
+    timeline = sorted(account_timeline or [], key=lambda row: parse_timestamp(row.get("checkedAt")) or 0)
+    usages = _usage_records(events, _source_highwaters(combined), account_slot_id, account_label, timeline)
+    source_files, legacy_event_ids = set(source_files or ()), set(legacy_event_ids or ())
+    canonical = {row["eventId"]: row for row in usages if row.get("eventId")}
+    retained, existing, legacy_by_occurrence = [], {}, {}
+    for row in combined:
+        if row.get("recordType") != "usage":
+            retained.append(row)
+            continue
+        event_id = str(row.get("eventId") or "")
+        local_origin = own_machine_id is None or not (row.get("sync") or {}).get("originMachineId") or (row.get("sync") or {}).get("originMachineId") == own_machine_id
+        if local_origin and (event_id in canonical or row.get("sourceFile") in source_files or not row.get("sourceFile") and event_id in legacy_event_ids):
+            if event_id in canonical:
+                existing[event_id] = row
+            elif not row.get("sourceFile"):
+                legacy_by_occurrence[(row.get("sessionId"), row.get("occurredAt"), row.get("rawModel"))] = row
+            continue
+        retained.append(row)
+    reconciled = []
+    for usage in usages:
+        if (previous := existing.get(usage["eventId"]) or legacy_by_occurrence.get((usage.get("sessionId"), usage.get("occurredAt"), usage.get("rawModel")))) is not None:
+            if previous.get("accountSlotId") not in {None, "", UNKNOWN_EVENT_ACCOUNT_ID}:
+                usage = usage | {"accountSlotId": previous["accountSlotId"], "accountLabel": previous.get("accountLabel") or usage["accountLabel"]}
+            if previous.get("sync") and previous.get("accountSlotId") not in {None, "", UNKNOWN_EVENT_ACCOUNT_ID}:
+                usage["sync"] = previous["sync"]
+            elif record_provenance is not None:
+                usage = record_provenance(usage)
+        elif record_provenance is not None:
+            usage = record_provenance(usage)
+        reconciled.append(usage)
+    updated = retained + reconciled
+    if updated != rows:
+        write_token_ledger(path, updated)
+    sessions = token_sessions_from_ledger(updated)
     labels = {str(row["accountSlotId"]): str(row["accountLabel"]) for row in timeline if row.get("accountSlotId") and row.get("accountLabel")} | {str(account_slot_id): str(account_label)}
     for session in sessions:
         if session.get("accountSlotId") in labels:

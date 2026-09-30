@@ -66,7 +66,7 @@ class AutoUpdateTests(unittest.TestCase):
             (data_home / "usage_monitor_sync_cache.json").write_text('{"version":2}', encoding="utf-8")
             (data_home / "cloud-state.json").write_text('{"usage":{"published":{"old":"pack"},"remote":{"machine":"cursor"},"lastSuccessAt":"old","lastAttemptAt":"old","lastFullVerificationAt":"old","failure":{"message":"old"}}}', encoding="utf-8")
 
-            self.assertEqual(migrate_history_data(data_home, history, quota, sessions, ledger, samples), [1, 2, 3, 4])
+            self.assertEqual(migrate_history_data(data_home, history, quota, sessions, ledger, samples, target_version=4), [1, 2, 3, 4])
             self.assertEqual(json.loads((data_home / DATA_MIGRATION_STATE_FILENAME).read_text(encoding="utf-8")), {"dataContractVersion": 4})
             self.assertEqual([json.loads(line) for line in samples.read_text(encoding="utf-8").splitlines()], [{"sample": 1}, {"sample": 2}])
             self.assertIn('"accountSlotId":"unknown"', quota.read_text(encoding="utf-8"))
@@ -79,7 +79,7 @@ class AutoUpdateTests(unittest.TestCase):
             cloud_usage = json.loads((data_home / "cloud-state.json").read_text(encoding="utf-8"))["usage"]
             self.assertEqual(cloud_usage, {"published": {"old": "pack"}, "remote": {}, "lastSuccessAt": None, "lastAttemptAt": None, "failure": None})
             snapshots = {path: path.read_bytes() for path in (quota, ledger, samples, data_home / "usage_monitor_state.json", data_home / "cloud-state.json")}
-            self.assertEqual(migrate_history_data(data_home, history, quota, sessions, ledger, samples), [])
+            self.assertEqual(migrate_history_data(data_home, history, quota, sessions, ledger, samples, target_version=4), [])
             self.assertEqual(snapshots, {path: path.read_bytes() for path in snapshots})
 
     def test_successful_update_defers_data_migration_until_new_runtime_startup(self):
@@ -319,17 +319,17 @@ class AutoUpdateTests(unittest.TestCase):
 
         commit.assert_not_called()
 
-    def test_current_release_is_complete_version_1_5_2_and_next_build_is_patch(self):
+    def test_current_release_is_complete_and_next_build_is_patch(self):
         package = json.loads((build_release.ROOT / "package.json").read_text(encoding="utf-8"))
         manifest = json.loads((build_release.RELEASE_DIR / "version.json").read_text(encoding="utf-8"))
         actual = {path.name: descriptor(path.read_bytes()) for path in build_release.RUNTIME_DIR.iterdir() if path.is_file()}
 
-        self.assertEqual(package["version"], "1.5.2")
+        self.assertEqual(package["version"], "1.5.5")
         self.assertEqual(package["dataContractVersion"], monitor_auto_update.DATA_CONTRACT_VERSION)
-        self.assertEqual(manifest, {"version": "1.5.2", "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
-        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": "1.5.2", "dataContractVersion": 4})
+        self.assertEqual(manifest, {"version": "1.5.5", "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
+        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": "1.5.5", "dataContractVersion": 6})
         self.assertTrue(all((build_release.ROOT / name).read_text(encoding="utf-8") == (build_release.RUNTIME_DIR / name).read_text(encoding="utf-8") for name in build_release.RUNTIME_FILES))
-        self.assertEqual(build_release.next_patch_version("1.5.2"), "1.5.3")
+        self.assertEqual(build_release.next_patch_version("1.5.5"), "1.5.6")
         ignore = (build_release.ROOT / ".vscodeignore").read_text(encoding="utf-8").splitlines()
         self.assertIn("release/**", ignore)
         self.assertIn("release_pack/**", ignore)
