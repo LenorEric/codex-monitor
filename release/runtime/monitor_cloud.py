@@ -10,6 +10,7 @@ import json
 import re
 import secrets
 import threading
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -21,6 +22,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.exceptions import InvalidTag
 
 from monitor_accounts import api_identity_id, atomic_write_json, auth_identity, parse_auth_bytes
 from monitor_cloud_queue import CloudOperationQueue, OperationCancelled, OperationSkipped
@@ -294,14 +296,31 @@ class WebDavClient:
         parts = [urllib.parse.quote(part, safe="") for part in f"{self.root}/{path}".strip("/").split("/") if part]
         return urllib.parse.urljoin(self.base, "/".join(parts))
 
-    def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204)) -> tuple[bytes, str | None, int]:
+    def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204), output=None) -> tuple[bytes, str | None, int]:
+        size = len(data) if isinstance(data, bytes) else 0
+        if data is not None and hasattr(data, "seek"):
+            data.seek(0, 2)
+            size = data.tell()
+            data.seek(0)
+            headers = dict(headers or {}) | {"Content-Length": str(size)}
         request = urllib.request.Request(self._url(path), data=data, method=method, headers=headers or {})
         request.add_unredirected_header("Authorization", self.authorization)
-        transfer = {"method": method, "path": path, "category": self.transfer_category, "attemptedUploadBytes": len(data) if method == "PUT" and data is not None else 0, "successfulUploadBytes": 0, "downloadBytes": 0}
+        transfer = {"method": method, "path": path, "category": self.transfer_category, "attemptedUploadBytes": size if method == "PUT" else 0, "successfulUploadBytes": 0, "downloadBytes": 0}
         self.transfers.append(transfer)
         try:
             with self.opener.open(request, timeout=30) as response:
-                body, etag, status = response.read(), response.headers.get("ETag"), response.status
+                etag, status = response.headers.get("ETag"), response.status
+                if output is None:
+                    body = response.read()
+                else:
+                    from monitor_streaming import CHUNK_BYTES, PAYLOAD_LIMIT
+                    for chunk in iter(lambda: response.read(CHUNK_BYTES), b""):
+                        transfer["downloadBytes"] += len(chunk)
+                        if transfer["downloadBytes"] > PAYLOAD_LIMIT * 2:
+                            raise CloudError("WebDAV payload is too large", 409)
+                        output.write(chunk)
+                    output.seek(0)
+                    body = b""
         except urllib.error.HTTPError as exc:
             if exc.code in expected:
                 body = exc.read()
@@ -312,7 +331,8 @@ class WebDavClient:
             raise CloudError(f"WebDAV connection failed: {exc}", 502, category="network") from exc
         if status not in expected:
             raise CloudError(f"WebDAV {method} returned HTTP {status}", 502, http_status=status, category="protocol")
-        transfer["downloadBytes"] = len(body)
+        if output is None:
+            transfer["downloadBytes"] = len(body)
         transfer["successfulUploadBytes"] = transfer["attemptedUploadBytes"]
         return body, etag, status
 
@@ -334,6 +354,26 @@ class WebDavClient:
         if not etag or etag.startswith("W/"):
             raise CloudError("WebDAV requires strong ETags", 409)
         return body, etag
+
+    def get_file(self, path, output):
+        _, etag, _ = self.request("GET", path, output=output)
+        if not etag or etag.startswith("W/"):
+            raise CloudError("WebDAV requires strong ETags", 409)
+        return etag
+
+    def put_file(self, path, source, create=False):
+        _, etag, _ = self.request("PUT", path, source, {"Content-Type": "application/octet-stream", **({"If-None-Match": "*"} if create else {})})
+        if not etag or etag.startswith("W/"):
+            with tempfile.TemporaryFile() as downloaded:
+                etag = self.get_file(path, downloaded)
+                source.seek(0)
+                while True:
+                    chunk = source.read(65536)
+                    if chunk != downloaded.read(65536):
+                        raise CloudError("WebDAV PUT read-back verification failed", 409)
+                    if not chunk:
+                        break
+        return etag
 
     def get_if_changed(self, path: str, etag: str | None) -> tuple[bytes | None, str]:
         body, current_etag, status = self.request("GET", path, headers={"If-None-Match": etag} if etag else None, expected=(200, 304))
@@ -1670,7 +1710,8 @@ class CloudManager:
     def _v4_data(self, client: WebDavClient, box: CryptoBox, machine_id: str, day: str, part: str, payload_id: str, category: str = "payload") -> list[dict]:
         client.transfer_category = category
         value = self._download_usage_payload(client, box, "v4/data", machine_id, payload_id)
-        if value.get("machineId") != machine_id or value.get("day") != day or value.get("partId") != part or not isinstance(value.get("records"), list) or len(value["records"]) > 100000:
+        from monitor_streaming import RecordSpool
+        if value.get("machineId") != machine_id or value.get("day") != day or value.get("partId") != part or not isinstance(value.get("records"), (list, RecordSpool)) or len(value["records"]) > 100000:
             raise CloudError("Invalid usage v4 data part", 409)
         return value["records"]
 
@@ -1683,10 +1724,12 @@ class CloudManager:
         parts = {period: entries for period, entries in content["parts"].items() if period < current_period}
         if not parts:
             return None
-        entries = [entry for records in parts.values() for entry in records]
+        from monitor_streaming import Records, sorted_records, logical_hash_sorted
+        streamed = any(isinstance(rows, Records) for rows in parts.values())
+        entries = sorted_records(parts) if streamed else [entry for records in parts.values() for entry in records]
         layout = "parts" if day == current_period[:10] else "bulk"
-        payloads = ({period: {"version": 1, "machineId": machine_id, "day": day, "partId": period, "records": records} for period, records in parts.items()} if layout == "parts" else {"bulk": {"version": 1, "machineId": machine_id, "day": day, "partId": "bulk", "records": sorted(entries, key=lambda entry: entry["recordKey"])}})
-        return {"day": day, "layout": layout, "logicalHash": v4_logical_hash(entries), "payloads": payloads}
+        payloads = ({period: {"version": 1, "machineId": machine_id, "day": day, "partId": period, "records": records} for period, records in parts.items()} if layout == "parts" else {"bulk": {"version": 1, "machineId": machine_id, "day": day, "partId": "bulk", "records": entries if streamed else sorted(entries, key=lambda entry: entry["recordKey"])}})
+        return {"day": day, "layout": layout, "logicalHash": logical_hash_sorted(entries) if streamed else v4_logical_hash(entries), "payloads": payloads}
 
     @staticmethod
     def _decode_usage_payload(box: CryptoBox, purpose: str, encrypted: bytes, expected_id: str) -> dict:
@@ -1706,6 +1749,27 @@ class CloudManager:
         return value
 
     def _put_usage_payload(self, client: WebDavClient, box: CryptoBox, kind: str, machine_id: str, value: dict, verify: bool = True) -> tuple[str, int]:
+        if kind == "v4/data" and isinstance(client, WebDavClient):
+            from monitor_streaming import compressed_payload, encrypt_file, decode_payload
+            with tempfile.TemporaryFile() as compressed, tempfile.TemporaryFile() as encrypted:
+                payload_id, size = compressed_payload(value, compressed)
+                path, purpose = self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"
+                encrypt_file(box, purpose, compressed, encrypted, size, payload_id)
+                try:
+                    client.put_file(path, encrypted, create=True)
+                except CloudError as exc:
+                    if exc.http_status != 412:
+                        raise
+                if verify:
+                    with tempfile.TemporaryFile() as downloaded:
+                        client.get_file(path, downloaded)
+                        checked = decode_payload(box, purpose, downloaded, payload_id)
+                        if hasattr(checked.get("records"), "close"):
+                            checked["records"].close()
+                return payload_id, size
+        from monitor_streaming import Records
+        if isinstance(value.get("records"), Records):
+            value = value | {"records": list(value["records"])}
         payload_id, compressed = self._usage_payload_bytes(value)
         path, purpose = self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"
         try:
@@ -1878,6 +1942,14 @@ class CloudManager:
         }
 
     def _download_usage_payload(self, client: WebDavClient, box: CryptoBox, kind: str, machine_id: str, payload_id: str) -> dict:
+        if kind == "v4/data" and isinstance(client, WebDavClient):
+            from monitor_streaming import decode_payload
+            try:
+                with tempfile.TemporaryFile() as downloaded:
+                    client.get_file(self._usage_payload_path(kind, machine_id, payload_id), downloaded)
+                    return decode_payload(box, f"usage-{kind}:{machine_id}:{payload_id}", downloaded, payload_id)
+            except (ValueError, zlib.error, InvalidTag) as exc:
+                raise CloudError("Usage payload authentication or validation failed", 409, decrypt_failed=True) from exc
         encrypted, _ = client.get(self._usage_payload_path(kind, machine_id, payload_id))
         return self._decode_usage_payload(box, f"usage-{kind}:{machine_id}:{payload_id}", encrypted, payload_id)
 
@@ -1888,7 +1960,9 @@ class CloudManager:
         head, etag = self._v4_head(client, box, machine_id)
         old_catalog = self._v4_catalog(client, box, machine_id, head)
         now_period = v4_period(time.time())
-        desired = {day: sealed for day, content in self._usage_data.v4_local_snapshot(time.time()).items() if (sealed := self._v4_sealed_day(day, content, now_period, machine_id)) is not None}
+        content, claims = self._usage_data.v4_publication_changes(time.time(), old_catalog, force_full)
+        desired = {day: sealed for day, rows in content.items() if rows is not None and (sealed := self._v4_sealed_day(day, rows, now_period, machine_id)) is not None}
+        removed = {day for day, rows in content.items() if rows is None}
         catalog = dict(old_catalog)
         uploaded, changed_days, consolidated = 0, set(), False
         for day, source in sorted(desired.items(), reverse=True):
@@ -1903,7 +1977,9 @@ class CloudManager:
             consolidated |= bool(previous and previous["layout"] == "parts" and source["layout"] == "bulk")
             parts = {}
             for part, value in source["payloads"].items():
-                payload_id = self._usage_payload_bytes(value)[0]
+                from monitor_streaming import compressed_payload
+                with tempfile.TemporaryFile() as spool:
+                    payload_id = compressed_payload(value, spool)[0]
                 parts[part] = payload_id
                 if old_manifest is None or old_manifest["parts"].get(part) != payload_id:
                     client.transfer_category = "consolidation" if source["layout"] == "bulk" and previous and previous["layout"] == "parts" else "backfill" if previous is None and day < now_period[:10] else "payload"
@@ -1914,7 +1990,7 @@ class CloudManager:
             manifest_id, _ = self._put_usage_payload(client, box, "v4/days", machine_id, manifest)
             catalog[day] = {"manifestId": manifest_id, "logicalHash": source["logicalHash"], "layout": source["layout"]}
             changed_days.add(day)
-        for day in old_catalog.keys() - desired.keys():
+        for day in old_catalog.keys() & removed:
             catalog.pop(day)
             changed_days.add(day)
         months = {}
@@ -1944,7 +2020,8 @@ class CloudManager:
                 raise CloudError("Usage v4 head verification failed", 409)
             self._state.setdefault("usageV4", {})["localHeadEtag"] = verified_etag or new_etag
             self._save_state()
-        if consolidated or old_catalog.keys() - desired.keys() or self._state.setdefault("usageV4", {}).get("lastGcDay") != now_period[:10]:
+        self._usage_data.acknowledge_publication({day: generation for day, generation in claims.items() if day in removed or day in desired}, now_period)
+        if consolidated or old_catalog.keys() & removed or self._state.setdefault("usageV4", {}).get("lastGcDay") != now_period[:10]:
             try:
                 self._v4_gc(client, box, machine_id, updated if changed else head)
             except Exception as exc:
@@ -1995,9 +2072,16 @@ class CloudManager:
                         manifest = self._v4_day_manifest(client, box, machine_id, day, reference)
                         old_parts = cached.get(day, {}).get("layout", {})
                         required = set(manifest["parts"]) if force_full or "bulk" in manifest["parts"] or "bulk" in old_parts else {part for part, payload_id in manifest["parts"].items() if old_parts.get(part) != payload_id}
-                        payloads = {part: self._v4_data(client, box, machine_id, day, part, manifest["parts"][part], "backfill" if day < _timestamp()[:10] and day not in cached else "payload") for part in sorted(required)}
-                        self._usage_data.v4_apply_day(machine_id, manifest, payloads, force_full)
-                        downloaded += len(payloads)
+                        payloads = {}
+                        try:
+                            for part in sorted(required):
+                                payloads[part] = self._v4_data(client, box, machine_id, day, part, manifest["parts"][part], "backfill" if day < _timestamp()[:10] and day not in cached else "payload")
+                            self._usage_data.v4_apply_day(machine_id, manifest, payloads, force_full)
+                            downloaded += len(payloads)
+                        finally:
+                            for entries in payloads.values():
+                                if hasattr(entries, "close"):
+                                    entries.close()
                     self._usage_data.v4_remove_days(machine_id, set(cached) - set(catalog))
                     remote[machine_id] = etag
                     self._save_state()

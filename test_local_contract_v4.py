@@ -2,7 +2,8 @@ import json
 import shutil
 import unittest
 import uuid
-from contextlib import contextmanager
+import sqlite3
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import monitor_auto_update
@@ -21,6 +22,64 @@ def workspace_directory():
 
 
 class LocalContractV4Tests(unittest.TestCase):
+    def test_v8_preserves_canonical_files_and_durable_v4_database(self):
+        from monitor_usage_sync import initialize_v4_cache
+        with workspace_directory() as root:
+            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state.write_text('{"dataContractVersion":7}\n', encoding="utf-8")
+            quota, ledger, cache = root / "quota.jsonl", root / "ledger.jsonl", root / "cache.json"
+            quota.write_bytes(b'{"raw":"quota"}\n')
+            ledger.write_bytes(b'{"raw":"ledger"}\n')
+            database = cache.with_name("cache-v4.sqlite3")
+            initialize_v4_cache(database)
+            with closing(sqlite3.connect(database)) as db, db:
+                db.execute("INSERT INTO local_records VALUES('key','2030-01-01T00:00Z','digest','{}')")
+            args = (root, root / "history.jsonl", quota, root / "sessions.jsonl", ledger, root / "samples.jsonl")
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [8])
+            with closing(sqlite3.connect(database)) as db, db:
+                self.assertEqual(db.execute("SELECT * FROM local_records").fetchall(), [('key', '2030-01-01T00:00Z', 'digest', '{}')])
+                self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_scan_sources'").fetchone())
+            self.assertEqual(quota.read_bytes(), b'{"raw":"quota"}\n')
+            self.assertEqual(ledger.read_bytes(), b'{"raw":"ledger"}\n')
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [])
+
+    def test_sqlite_migration_backup_and_rollback_include_wal(self):
+        with workspace_directory() as root:
+            path, state, journal = root / "cache.sqlite3", root / "state.json", root / "journal.json"
+            db = sqlite3.connect(path)
+            try:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("CREATE TABLE durable(value TEXT)")
+                db.execute("INSERT INTO durable VALUES('original')")
+                db.commit()
+                def fail(paths):
+                    db.execute("UPDATE durable SET value='modified'")
+                    db.commit()
+                    raise RuntimeError("interrupted")
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    monitor_auto_update._run_data_migration(fail, {"processing_index": path}, 8, state, journal)
+                self.assertEqual(db.execute("SELECT value FROM durable").fetchone()[0], "original")
+                self.assertFalse(state.exists())
+                self.assertFalse(journal.exists())
+            finally:
+                db.close()
+    def test_v7_rebuilds_derived_dashboard_without_changing_raw_history(self):
+        with workspace_directory() as root:
+            (root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":6}\n', encoding="utf-8")
+            history = monitor_history.default_history_path(root)
+            quota = monitor_history.default_quota_history_path(history)
+            ledger = monitor_token_ledger.default_token_ledger_path(history)
+            quota.write_text('{"raw":"quota"}\n', encoding="utf-8")
+            ledger.write_text('{"raw":"tokens"}\n', encoding="utf-8")
+            cache = root / "usage_monitor_dashboard_cache.json"
+            cache.write_text('{"version":3}\n', encoding="utf-8")
+            args = (root, history, quota, root / "usage_monitor_token_sessions.jsonl", ledger, monitor_history.default_sample_log_path(history))
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, target_version=7), [7])
+            self.assertFalse(cache.exists())
+            self.assertEqual(quota.read_text(encoding="utf-8"), '{"raw":"quota"}\n')
+            self.assertEqual(ledger.read_text(encoding="utf-8"), '{"raw":"tokens"}\n')
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, target_version=7), [])
+
     def test_default_recorders_are_named_for_their_data(self):
         with workspace_directory() as root:
             history = monitor_history.default_history_path(root)

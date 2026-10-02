@@ -7,6 +7,7 @@ import math
 import os
 import sqlite3
 import tempfile
+import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
@@ -458,6 +459,215 @@ class UsageDataStore:
         self._account_revision = None
         self._cache_repair_needed = False
         self._v4_source_stats = None
+        from monitor_processing import ProcessingIndex
+        initialize_v4_cache(self.v4_cache_path)
+        self.index = ProcessingIndex(self.v4_cache_path)
+        self._legacy_records = None
+
+    def normalize_new_quota(self, row):
+        from monitor_history import normalize_quota_history_row
+        row = normalize_quota_history_row(row)
+        return add_record_provenance("quota", row, self.machine_id, self.account_id_resolver(row.get("accountSlotId"))) if row is not None else None
+
+    def normalize_new_ledger(self, row):
+        if (row := canonical_ledger_row(row, preserve_legacy_highwater=True)) is None:
+            return None
+        source = row.get("session") or row
+        return add_record_provenance("tokenLedger", row, self.machine_id, self.account_id_resolver(source.get("accountSlotId")))
+
+    def ingest_local(self):
+        with self.lock:
+            return self._ingest_local()
+
+    def retain_quota(self, days):
+        if days is None or days <= 0:
+            return False
+        with self.lock:
+            self._ingest_local()
+            source, cutoff = str(self.quota_path.resolve()), time.time() - days * 86400
+            with self.index.transaction() as db:
+                if not db.execute("SELECT 1 FROM processing_facts WHERE source=? AND kind='quota' AND event_at<? LIMIT 1", (source, cutoff)).fetchone():
+                    return False
+                descriptor, name = tempfile.mkstemp(prefix=f".{self.quota_path.name}.", suffix=".retention", dir=self.quota_path.parent)
+                try:
+                    with os.fdopen(descriptor, "wb") as output:
+                        for (data,) in db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='quota' AND (event_at IS NULL OR event_at>=?) ORDER BY position", (source, cutoff)):
+                            output.write(data.encode() + b"\n")
+                        output.flush()
+                        os.fsync(output.fileno())
+                    os.replace(name, self.quota_path)
+                finally:
+                    Path(name).unlink(missing_ok=True)
+            self._ingest_local()
+            return True
+
+    def _ingest_local(self):
+        with self.index.transaction() as db:
+            normalized = self.index.get(db, "canonicalNormalized", False)
+        if not normalized:
+            self._normalize_local()
+            with self.index.transaction() as db:
+                self.index.put(db, "canonicalNormalized", True)
+        self.index.audit()
+        changed = self.index.refresh(self.quota_path, "quota", self.normalize_new_quota)
+        changed = self.index.refresh(self.token_ledger_path, "tokenLedger", self.normalize_new_ledger) or changed
+        if changed:
+            self._local_datasets_cache = self._merged_datasets_cache = None
+        return changed
+
+    def account_datasets(self, view, account):
+        self.ingest_local()
+        quota = self.index.rows(self.quota_path, "quota", account=account)
+        ledger = self.index.rows(self.token_ledger_path, "tokenLedger", account=account)
+        if view == "local":
+            return quota, ledger
+        with self.index.transaction() as db:
+            for kind, data in db.execute("SELECT kind,data FROM processing_facts WHERE source LIKE 'peer:%' AND account=? ORDER BY source,position", (account,)):
+                if kind == "quota":
+                    quota.append(json.loads(data))
+                elif kind == "tokenLedger":
+                    ledger.append(json.loads(data))
+        ledger, _ = merge_token_ledger_rows(ledger)
+        return merge_quota_rows(quota), ledger
+
+    def refresh_peer_partition(self, machine_id, day, force=False):
+        source = f"peer:{machine_id}:{day}"
+        with self.index.transaction() as db, self.index.defer_sessions(db):
+            manifest = db.execute("SELECT logical_hash FROM remote_days WHERE machine_id=? AND day=?", (machine_id, day)).fetchone()
+            revision = [manifest[0] if manifest else None, self.account_revision_resolver() if self.account_revision_resolver else None]
+            if not force and self.index.get(db, f"peerRevision:{source}", "uninitialized") == revision:
+                return
+            legacy = f"peer:{machine_id}:legacy"
+            for (account,) in list(db.execute("SELECT DISTINCT account FROM processing_facts WHERE source=?", (legacy,))):
+                self.index.dirty(db, account, "peer update", ("merged",))
+            legacy_keys = [row[0] for row in db.execute("SELECT record_key FROM processing_facts WHERE source=? AND kind='tokenLedger'", (legacy,))]
+            db.execute("DELETE FROM processing_facts WHERE source=?", (legacy,))
+            previous_revision = self.index.get(db, f"peerRevision:{source}")
+            remap = force or previous_revision is None or previous_revision[1] != revision[1]
+            def remove(position):
+                previous = db.execute("SELECT kind,record_key,account FROM processing_facts WHERE source=? AND position=?", (source, position)).fetchone()
+                if previous:
+                    db.execute("DELETE FROM processing_facts WHERE source=? AND position=?", (source, position))
+                    self.index.dirty(db, previous[2], "peer update", ("merged",))
+                    if previous[0] == "tokenLedger":
+                        self.index._effective(db, previous[1])
+            for key, position in list(db.execute("SELECT p.record_key,p.position FROM processing_peer_rows p WHERE p.source=? AND NOT EXISTS "
+                "(SELECT 1 FROM remote_records r WHERE r.machine_id=? AND r.day=? AND r.record_key=p.record_key)", (source, machine_id, day))):
+                remove(position)
+                db.execute("DELETE FROM processing_peer_rows WHERE source=? AND record_key=?", (source, key))
+            position = db.execute("SELECT COALESCE(MAX(position),-1)+1 FROM processing_peer_rows WHERE source=?", (source,)).fetchone()[0]
+            for key, digest, data in db.execute("SELECT r.record_key,r.content_hash,r.record_json FROM remote_records r LEFT JOIN processing_peer_rows p ON p.source=? AND p.record_key=r.record_key "
+                "WHERE r.machine_id=? AND r.day=? AND (? OR p.record_key IS NULL OR p.digest<>r.content_hash) ORDER BY r.record_key", (source, machine_id, day, remap)):
+                previous = db.execute("SELECT position FROM processing_peer_rows WHERE source=? AND record_key=?", (source, key)).fetchone()
+                target = previous[0] if previous else position
+                record = json.loads(data)["record"]
+                row = self._map_account(record["kind"], record["row"]) if record.get("kind") in {"quota", "tokenLedger"} else None
+                if previous:
+                    remove(target)
+                if row is not None:
+                    self.index.fact(db, source, target, record["kind"], row)
+                db.execute("INSERT OR REPLACE INTO processing_peer_rows VALUES(?,?,?,?)", (source, key, target, digest))
+                if not previous:
+                    position += 1
+            for key in legacy_keys:
+                self.index._effective(db, key)
+            db.execute("DELETE FROM processing_ledger_sessions WHERE source=?", (source,))
+            db.execute("DELETE FROM processing_ledger_sessions WHERE source=?", (legacy,))
+            self.index.put(db, f"peerRevision:{source}", revision)
+            self.index.put(db, "factRevision", self.index.get(db, "factRevision", 0) + 1)
+        self._merged_datasets_cache = None
+
+    def initialize_processing(self):
+        self.ingest_local()
+        with self.index.transaction() as db:
+            initialized = self.index.get(db, "peersInitialized", False)
+            peers = list(db.execute("SELECT machine_id,day FROM remote_days")) if not initialized else []
+        for machine_id, day in peers:
+            self.refresh_peer_partition(machine_id, day)
+        if not initialized:
+            # Preserve provisional legacy peers until their v4 origin becomes authoritative.
+            cache, _ = self._load_cache()
+            with self.index.transaction() as db:
+                origins = {row[0] for row in db.execute("SELECT machine_id FROM remote_origins")}
+                for position, entry in enumerate(cache.values()):
+                    record = entry["record"]
+                    if entry["sourceMachineId"] not in origins and entry["sourceMachineId"] != self.machine_id and record["kind"] in {"quota", "tokenLedger"}:
+                        if (row := self._map_account(record["kind"], record["row"])) is not None:
+                            self.index.fact(db, f'peer:{entry["sourceMachineId"]}:legacy', position, record["kind"], row)
+                self.index.put(db, "peersInitialized", True)
+
+    def initialize_v4_index(self, now=None):
+        self.ingest_local()
+        current = time.time() if now is None else now
+        with self.index.transaction() as db:
+            historical = db.execute("SELECT value FROM metadata WHERE name='localInitialized'").fetchone() is None
+            initialized = self.index.get(db, "localFactsInitialized", False)
+            if not initialized:
+                db.execute("INSERT OR IGNORE INTO processing_pending_records SELECT l.record_key,json_extract(l.record_json,'$.kind'),NULL "
+                    "FROM local_records l WHERE NOT EXISTS(SELECT 1 FROM processing_facts f WHERE f.record_key=l.record_key AND f.source NOT LIKE 'peer:%')")
+            generation = self.index.get(db, "publishGeneration", 0)
+            for key, kind, data in list(db.execute("SELECT record_key,kind,data FROM processing_pending_records")):
+                previous = db.execute("SELECT period,content_hash FROM local_records WHERE record_key=?", (key,)).fetchone()
+                if data is None:
+                    if previous:
+                        db.execute("DELETE FROM local_records WHERE record_key=?", (key,))
+                        generation += 1
+                        db.execute("INSERT OR REPLACE INTO processing_dirty_days VALUES(?,?)", (previous[0][:10], generation))
+                    continue
+                row = json.loads(data)
+                if not syncable_record(kind, row, self.machine_id):
+                    continue
+                record = self._transport_record(kind, row)
+                validate_sync_operation({"action": "upsert", "key": key, "record": record})
+                digest = content_hash(record)
+                if previous and previous[1] == digest:
+                    continue
+                event = row.get("checkedAt") or row.get("occurredAt") or (row.get("session") or {}).get("updatedAt") or (row.get("session") or {}).get("startedAt")
+                period = previous[0] if previous else v4_period((parse_timestamp(event) or current) if historical else current)
+                db.execute("INSERT INTO local_records VALUES(?,?,?,?) ON CONFLICT(record_key) DO UPDATE SET content_hash=excluded.content_hash,record_json=excluded.record_json",
+                    (key, period, digest, canonical_json(record).decode()))
+                generation += 1
+                db.execute("INSERT OR REPLACE INTO processing_dirty_days VALUES(?,?)", (period[:10], generation))
+            db.execute("DELETE FROM processing_pending_records")
+            db.execute("INSERT OR IGNORE INTO metadata VALUES('localInitialized','1')")
+            self.index.put(db, "localFactsInitialized", True)
+            self.index.put(db, "publishGeneration", generation)
+
+    def _v4_index_day(self, db, day):
+        from monitor_streaming import RecordSpool
+        parts = {}
+        for key, period, data in db.execute("SELECT record_key,period,record_json FROM local_records WHERE period>=? AND period<? ORDER BY period,record_key", (day, day + "~")):
+            if period not in parts:
+                parts[period] = RecordSpool()
+            parts[period].append(v4_record_envelope(self.machine_id, key, json.loads(data), period))
+        return {"parts": parts} if parts else None
+
+    def v4_publication_changes(self, now, catalog, force=False):
+        self.initialize_v4_index(now)
+        with self.index.transaction() as db:
+            claims = dict(db.execute("SELECT day,generation FROM processing_dirty_days"))
+            days = set(claims) | {day for day, row in catalog.items() if row["layout"] == "parts" and day < v4_period(now)[:10]}
+            if not force:
+                for day in list(days):
+                    previous = self.index.get(db, f"publicationBoundary:{day}")
+                    if day >= v4_period(now)[:10] and db.execute("SELECT 1 FROM local_records WHERE period>=? AND period<? LIMIT 1", (day, day + "~")).fetchone() and not db.execute(
+                        "SELECT 1 FROM local_records WHERE period>=? AND period<? LIMIT 1", (day, min(day + "~", v4_period(now)))).fetchone():
+                        self.index.put(db, f"publicationBoundary:{day}", [claims.get(day), v4_period(now)])
+                        days.remove(day)
+                    elif previous and previous[0] == claims.get(day) and day >= v4_period(now)[:10] and not db.execute(
+                        "SELECT 1 FROM local_records WHERE period>=? AND period<? AND substr(period,1,10)=? LIMIT 1", (previous[1], v4_period(now), day)).fetchone():
+                        days.remove(day)
+            if force:
+                days.update(row[0] for row in db.execute("SELECT DISTINCT substr(period,1,10) FROM local_records"))
+            return {day: self._v4_index_day(db, day) for day in days}, claims
+
+    def acknowledge_publication(self, claims, period=None):
+        with self.index.transaction() as db:
+            for day, generation in claims.items():
+                if period is not None and db.execute("SELECT 1 FROM local_records WHERE period>=? AND substr(period,1,10)=? LIMIT 1", (period, day)).fetchone():
+                    self.index.put(db, f"publicationBoundary:{day}", [generation, period])
+                else:
+                    db.execute("DELETE FROM processing_dirty_days WHERE day=? AND generation=?", (day, generation))
 
     @staticmethod
     def _v4_stat(path: Path) -> tuple[int, int, int] | None:
@@ -777,10 +987,16 @@ class UsageDataStore:
 
     def refresh_accounts(self) -> None:
         with self.lock:
-            if self._local_datasets_cache is None:
-                self._normalize_local()
-            else:
-                self._materialize_datasets(self._load(), self._load_cache()[0])
+            self._normalize_local()
+            with self.index.transaction() as db:
+                db.execute("DELETE FROM processing_files")
+                peers = list(db.execute("SELECT machine_id,day FROM remote_days"))
+                for source, position, kind, data in list(db.execute("SELECT source,position,kind,data FROM processing_facts WHERE source LIKE 'peer:%:legacy'")):
+                    if (row := self._map_account(kind, json.loads(data))) is not None:
+                        self.index.fact(db, source, position, kind, row)
+            self._ingest_local()
+            for machine_id, day in peers:
+                self.refresh_peer_partition(machine_id, day, force=True)
 
     def _datasets(self, view: str) -> tuple[list[dict], list[dict]]:
         if self._local_datasets_cache is None or self._merged_datasets_cache is None:
@@ -791,7 +1007,10 @@ class UsageDataStore:
 
     def datasets(self, view: str = "local") -> tuple[list[dict], list[dict]]:
         with self.lock:
-            return self._datasets("merged" if view == "merged" else "local")
+            self._ingest_local()
+            if self._local_datasets_cache is None or self._merged_datasets_cache is None:
+                self._materialize_datasets((self.index.rows(self.quota_path, "quota"), self.index.rows(self.token_ledger_path, "tokenLedger")), self._load_cache()[0])
+            return self._merged_datasets_cache if view == "merged" else self._local_datasets_cache
 
     def snapshot(self, necessary_only: bool = True) -> tuple[dict[str, dict], set[str]]:
         with self.lock:
@@ -949,14 +1168,15 @@ class UsageDataStore:
                             if entry["collectionPeriod"][:10] != day or part != "bulk" and entry["collectionPeriod"] != part or db.execute("SELECT 1 FROM remote_records WHERE machine_id=? AND record_key=?", (machine_id, entry["recordKey"])).fetchone():
                                 raise ValueError("Usage v4 record is stored outside its owning collection period")
                             db.execute("INSERT OR REPLACE INTO remote_records(machine_id, day, part_id, record_key, content_hash, record_json) VALUES(?,?,?,?,?,?)", (machine_id, day, part, entry["recordKey"], content_hash(entry["record"]), canonical_json(entry).decode()))
-                    rows = [json.loads(record_json) for (record_json,) in db.execute("SELECT record_json FROM remote_records WHERE machine_id=? AND day=?", (machine_id, day))]
-                    if v4_logical_hash(rows) != manifest["logicalHash"]:
+                    from monitor_streaming import logical_hash_sorted
+                    rows = (json.loads(record_json) for (record_json,) in db.execute("SELECT record_json FROM remote_records WHERE machine_id=? AND day=? ORDER BY record_key", (machine_id, day)))
+                    if logical_hash_sorted(rows) != manifest["logicalHash"]:
                         raise ValueError("Usage day logical digest does not match downloaded records")
                 elif downloaded:
                     raise ValueError("Unchanged usage day unexpectedly downloaded payloads")
                 db.execute("INSERT INTO remote_origins(machine_id) VALUES(?) ON CONFLICT DO NOTHING", (machine_id,))
                 db.execute("INSERT INTO remote_days(machine_id, day, logical_hash, layout_json) VALUES(?,?,?,?) ON CONFLICT(machine_id, day) DO UPDATE SET logical_hash=excluded.logical_hash, layout_json=excluded.layout_json", (machine_id, day, manifest["logicalHash"], canonical_json(parts).decode()))
-            self._materialize_datasets(self._normalize_local(), self._load_cache()[0])
+            self.refresh_peer_partition(machine_id, day)
 
     def v4_remove_days(self, machine_id: str, days: set[str]) -> None:
         with self.lock:
@@ -966,4 +1186,5 @@ class UsageDataStore:
                     db.execute("DELETE FROM remote_records WHERE machine_id=? AND day=?", (machine_id, day))
                     db.execute("DELETE FROM remote_days WHERE machine_id=? AND day=?", (machine_id, day))
                 db.execute("INSERT INTO remote_origins(machine_id) VALUES(?) ON CONFLICT DO NOTHING", (machine_id,))
-            self._materialize_datasets(self._normalize_local(), self._load_cache()[0])
+            for day in days:
+                self.refresh_peer_partition(machine_id, day)

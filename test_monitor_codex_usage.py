@@ -4165,7 +4165,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertLess(serve_source.index("instance_lock.acquire()"), serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'))
         self.assertIn("self.wake_event.wait(poll_sleep_seconds(self.last_acquire_started_at, self.args.interval))", source)
         self.assertIn("threading.Thread(target=state.run_cloud_maintenance, name=\"cloud-maintenance\", daemon=True)", source)
-        self.assertIn("threading.Thread(target=state.run_inactive_account_polling, daemon=True)", source)
+        self.assertIn("threading.Thread(target=managed_worker, args=(state.run_inactive_account_polling,), daemon=True)", source)
         self.assertIn("self.cloud_maintenance_event.wait(5)", source)
         self.assertIn('DASHBOARD_PORT = 8765', source)
         self.assertIn('if path == "/api/status":', source)
@@ -4484,6 +4484,36 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertEqual(continuous([98, 96, 96, 96]), [98, 96, 96, 96])
         self.assertEqual(continuous([98, 96, 97, 97]), [98, 96, 97, 97])
+
+    def test_usage_time_filter_rebases_same_account_on_subscription_change(self):
+        for label, output in (("5h", "fiveHour"), ("7d", "sevenDay")):
+            for values in ([80, 1, 2], [1, 80, 81]):
+                with self.subTest(label=label, values=values):
+                    rows = [{"checkedAt": f"2030-01-01T00:{index:02}:00Z", "accountSlotId": "a", "windows": {
+                        label: {"usedPercent": value, "resetAt": "2030-01-05T00:00:00Z", "plan": "pro" if index == 0 else "plus"},
+                    }} for index, value in enumerate(values)]
+                    self.assertEqual([point[output]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)], values)
+
+    def test_usage_time_filter_rebases_after_ten_consecutive_large_drops(self):
+        for label, output in (("5h", "fiveHour"), ("7d", "sevenDay")):
+            for lows in ([1] * 10, list(range(10, 0, -1))):
+                with self.subTest(label=label, lows=lows):
+                    values = [80] + lows + [2]
+                    rows = [{"checkedAt": f"2030-01-01T00:{index:02}:00Z", "accountSlotId": "a", "windows": {
+                        label: {"usedPercent": value, "resetAt": "2030-01-05T00:00:00Z", "plan": "plus"},
+                    }} for index, value in enumerate(values)]
+                    self.assertEqual([point[output]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows[:10])], [80] + [None] * 9)
+                    self.assertEqual([point[output]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)], values)
+
+    def test_usage_time_filter_interrupts_ten_drop_recovery(self):
+        for interruption in (80, 90, None, 101):
+            with self.subTest(interruption=interruption):
+                rows = [{"checkedAt": f"2030-01-01T00:{index:02}:00Z", "accountSlotId": "a", "windows": {
+                    "7d": {"usedPercent": value, "resetAt": "2030-01-05T00:00:00Z", "plan": "plus"},
+                }} for index, value in enumerate([80] + [1] * 9 + [interruption] + [1] * 9)]
+                points = monitor_dashboard.dashboard_quota_points(rows)
+                self.assertEqual([point["sevenDay"]["continuous"] for point in points[1:10]], [None] * 9)
+                self.assertEqual([point["sevenDay"]["continuous"] for point in points[-9:]], [None] * 9)
 
     def test_usage_time_filter_removes_consecutive_upward_spikes_using_historical_rate(self):
         rows = [

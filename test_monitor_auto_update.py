@@ -324,10 +324,9 @@ class AutoUpdateTests(unittest.TestCase):
         manifest = json.loads((build_release.RELEASE_DIR / "version.json").read_text(encoding="utf-8"))
         actual = {path.name: descriptor(path.read_bytes()) for path in build_release.RUNTIME_DIR.iterdir() if path.is_file()}
 
-        self.assertEqual(package["version"], "1.5.5")
         self.assertEqual(package["dataContractVersion"], monitor_auto_update.DATA_CONTRACT_VERSION)
-        self.assertEqual(manifest, {"version": "1.5.5", "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
-        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": "1.5.5", "dataContractVersion": 6})
+        self.assertEqual(manifest, {"version": package["version"], "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
+        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": package["version"], "dataContractVersion": monitor_auto_update.DATA_CONTRACT_VERSION})
         self.assertTrue(all((build_release.ROOT / name).read_text(encoding="utf-8") == (build_release.RUNTIME_DIR / name).read_text(encoding="utf-8") for name in build_release.RUNTIME_FILES))
         self.assertEqual(build_release.next_patch_version("1.5.5"), "1.5.6")
         ignore = (build_release.ROOT / ".vscodeignore").read_text(encoding="utf-8").splitlines()

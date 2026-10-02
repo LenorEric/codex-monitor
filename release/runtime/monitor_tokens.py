@@ -351,7 +351,7 @@ def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> Non
         "model": state["currentModel"], "serviceTier": state["currentServiceTier"], "tokens": delta,
     })
 
-def _update_codex_file_state(path: Path, state: dict | None, retry_race: bool = True) -> dict | None:
+def _update_codex_file_state(path: Path, state: dict | None, retry_race: bool = True, max_bytes: int | None = None) -> dict | None:
     try:
         stat = path.stat()
     except OSError:
@@ -367,7 +367,7 @@ def _update_codex_file_state(path: Path, state: dict | None, retry_race: bool = 
         try:
             with path.open("rb") as stream:
                 stream.seek(state["offset"])
-                appended = stream.read()
+                appended = stream.read(max_bytes) if max_bytes is not None else stream.read()
         except OSError:
             return None
         reads += 1
@@ -378,7 +378,7 @@ def _update_codex_file_state(path: Path, state: dict | None, retry_race: bool = 
             elif appended.startswith((b"\n", b"\r")):
                 appended = appended[1:]
             else:
-                return _update_codex_file_state(path, None, False)
+                return _update_codex_file_state(path, None, False, max_bytes)
             state["unterminatedComplete"] = False
         state["offset"] += bytes_read
         lines = (state["partial"] + appended).splitlines(keepends=True)
@@ -399,9 +399,9 @@ def _update_codex_file_state(path: Path, state: dict | None, retry_race: bool = 
         except OSError:
             return None
         if (final_stat.st_dev, final_stat.st_ino) != identity or final_stat.st_size < state["offset"]:
-            return _update_codex_file_state(path, None, False)
+            return _update_codex_file_state(path, None, False, max_bytes)
         if retry_race and final_stat.st_size == initial_size and final_stat.st_mtime_ns != initial_mtime_ns:
-            return _update_codex_file_state(path, None, False)
+            return _update_codex_file_state(path, None, False, max_bytes)
         if final_stat.st_size == state["offset"] or reads >= MAX_CODEX_APPEND_DRAIN_READS:
             break
     state["size"] = state["offset"]

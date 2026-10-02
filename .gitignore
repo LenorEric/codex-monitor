@@ -47,6 +47,7 @@ tmp/
 venv/
 env/
 node_modules/
+.npm-build-cache/
 
 .DS_Store
 Thumbs.db

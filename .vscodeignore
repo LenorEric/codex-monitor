@@ -32,6 +32,7 @@ usage-monitor-accounts/**
 .codex-monitor-update-*/**
 .tmp*/**
 node_modules/**
+.npm-build-cache/**
 .venv/**
 venv/**
 env/**

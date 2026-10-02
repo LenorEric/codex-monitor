@@ -19,7 +19,7 @@ from monitor_token_ledger import default_token_ledger_path
 from monitor_tokens import *
 
 
-def main() -> int:
+def _main(instance_lock) -> int:
     print(f"Codex Usage Monitor v{installed_version(Path(__file__).resolve().parent)}", flush=True)
     parser = argparse.ArgumentParser(description="Poll Codex ChatGPT-account usage/rate-limit data and local Codex session token usage.")
     parser.add_argument("--auth", type=Path, default=codex_home() / "auth.json")
@@ -35,8 +35,13 @@ def main() -> int:
     parser.add_argument("--compact-history-days", type=int, help="Rewrite quota history to keep only samples newer than this many days.")
     parser.add_argument("--local-only", action="store_true", help="Only scan local Codex session logs; do not call ChatGPT usage endpoints.")
     parser.add_argument("--no-token-scan", action="store_true", help="Disable local Codex session token usage scanning.")
+    parser.add_argument("--repair-processing", action="store_true", help="Rebuild derived processing checkpoints and dashboard rows; preserve canonical histories and v4 collection periods.")
     parser.add_argument("--retry-limit", type=int, default=DEFAULT_RETRY_LIMIT, help="Retries for HTTP and dashboard polling failures before raising; network errors retry indefinitely. Defaults to 3.")
     args = parser.parse_args()
+    if not instance_lock.acquire():
+        print("Cannot start dashboard: another monitor instance is already running.", file=sys.stderr, flush=True)
+        return 1
+    args.instance_lock = instance_lock
 
     args.data_home = codex_switch_home()
     migrate_default_monitor_data(Path(__file__).resolve().parent, args.data_home)
@@ -55,7 +60,16 @@ def main() -> int:
     args.account_root = args.data_home / "accounts"
     args.legacy_account_root = args.auth.parent / "usage-monitor-accounts"
     migrate_account_vault(args.legacy_account_root, args.account_root)
-    backfill_quota_history(args.sample_log, args.quota_history)
+    from monitor_processing import ProcessingIndex
+    index = ProcessingIndex(args.usage_sync_cache.with_name(f"{args.usage_sync_cache.stem}-v4.sqlite3"))
+    if args.repair_processing:
+        index.repair()
+    with index.transaction() as db:
+        backfilled = index.get(db, "diagnosticBackfillComplete", False)
+    if not backfilled:
+        backfill_quota_history(args.sample_log, args.quota_history)
+        with index.transaction() as db:
+            index.put(db, "diagnosticBackfillComplete", True)
     if args.reencrypt_cloud:
         result = CloudManager(args.data_home, SkillManager(args.codex_home, args.data_home), None).reencrypt_remote_data()
         print(f"Re-encrypted and verified {result['reencrypted']} cloud payloads.")
@@ -70,6 +84,14 @@ def main() -> int:
         restart_process(entry)
         return 0
     return result
+
+
+def main() -> int:
+    instance_lock = DashboardInstanceLock()
+    try:
+        return _main(instance_lock)
+    finally:
+        instance_lock.release()
 
 
 if __name__ == "__main__":

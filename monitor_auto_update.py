@@ -25,7 +25,7 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RUNTIME_FILE_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 AUTO_UPDATE_RESTART = 75
-DATA_CONTRACT_VERSION = 6
+DATA_CONTRACT_VERSION = 8
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 
@@ -349,7 +349,30 @@ def _migrate_history_to_v6(paths: dict[str, Path]) -> None:
         _atomic_write(paths["cloud_state"], (json.dumps(state, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
 
 
-DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6}
+def _migrate_history_to_v7(paths: dict[str, Path]) -> None:
+    # Derived quota baselines are rebuilt from the retained raw readings on startup.
+    paths["dashboard_cache"].unlink(missing_ok=True)
+
+
+def _migrate_history_to_v8(paths: dict[str, Path]) -> None:
+    from monitor_processing import initialize_processing_index
+    initialize_processing_index(paths["processing_index"])
+    # Raw facts and v4 periods/peer records are preserved; derived state is rebuilt on first use.
+    paths["dashboard_cache"].unlink(missing_ok=True)
+
+
+DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8}
+
+
+def _restore_data_backup(backup: Path, path: Path) -> None:
+    if path.suffix == ".sqlite3":
+        import sqlite3
+        from contextlib import closing
+        with closing(sqlite3.connect(backup)) as source, closing(sqlite3.connect(path)) as target:
+            source.backup(target)
+            target.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    else:
+        os.replace(backup, path)
 
 
 def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[str, Path]) -> None:
@@ -362,6 +385,8 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
     if not isinstance(journal, dict) or not isinstance(journal.get("version"), int) or isinstance(journal.get("version"), bool) or not isinstance(journal.get("targets"), dict) or not isinstance(journal.get("backups"), dict) or not isinstance(journal.get("existing"), list):
         raise AutoUpdateError("Cannot recover data migration: invalid journal")
     expected_targets = {name: str(path.resolve()) for name, path in paths.items()}
+    if journal["version"] < 8 and "processing_index" not in journal["targets"]:
+        expected_targets.pop("processing_index", None)
     base_targets = {name: target for name, target in expected_targets.items() if not name.startswith("legacy_")}
     legacy_targets = {"quota_history": "legacy_quota_history", "token_ledger": "legacy_token_ledger", "sample_log": "legacy_sample_log"}
     valid_base_targets = set(journal["targets"]) == set(base_targets) and all(
@@ -386,7 +411,7 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
             backup = Path(journal["backups"][name]) if name in journal["backups"] else None
             if name in journal["existing"]:
                 if backup is not None and backup.exists():
-                    os.replace(backup, path)
+                    _restore_data_backup(backup, path)
                 elif not path.exists():
                     raise AutoUpdateError(f"Cannot recover migrated data file: {path}")
             else:
@@ -404,10 +429,16 @@ def _run_data_migration(migration, paths: dict[str, Path], version: int, state_p
             descriptor, backup = tempfile.mkstemp(prefix=f".{paths[name].name}.", suffix=".migration-backup", dir=paths[name].parent)
             os.close(descriptor)
             try:
-                with paths[name].open("rb") as source, Path(backup).open("wb") as target:
-                    shutil.copyfileobj(source, target)
-                    target.flush()
-                    os.fsync(target.fileno())
+                if paths[name].suffix == ".sqlite3":
+                    import sqlite3
+                    from contextlib import closing
+                    with closing(sqlite3.connect(paths[name])) as source, closing(sqlite3.connect(backup)) as target:
+                        source.backup(target)
+                else:
+                    with paths[name].open("rb") as source, Path(backup).open("wb") as target:
+                        shutil.copyfileobj(source, target)
+                        target.flush()
+                        os.fsync(target.fileno())
             except Exception:
                 Path(backup).unlink(missing_ok=True)
                 raise
@@ -423,7 +454,7 @@ def _run_data_migration(migration, paths: dict[str, Path], version: int, state_p
         for name, path in paths.items():
             try:
                 if name in backups:
-                    os.replace(backups[name], path)
+                    _restore_data_backup(backups[name], path)
                 elif name not in existing:
                     path.unlink(missing_ok=True)
             except OSError as rollback_exc:
@@ -466,6 +497,7 @@ def migrate_history_data(
     ):
         if paths[current_name].resolve() == (data_home / current_filename).resolve():
             paths[name] = data_home / legacy_filename
+    paths["processing_index"] = paths["usage_sync_cache"].with_name(f"{paths['usage_sync_cache'].stem}-v4.sqlite3")
     _recover_data_migration(journal_path, state_path, paths)
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -484,8 +516,10 @@ def migrate_history_data(
         if version == 5:
             migration = lambda migration_paths: _migrate_history_to_v5(migration_paths, codex_home)
         migration_paths = paths
+        if version < 8:
+            migration_paths = {name: path for name, path in paths.items() if name != "processing_index"}
         if version < 4:
-            migration_paths = {name: path for name, path in paths.items() if not name.startswith("legacy_")}
+            migration_paths = {name: path for name, path in migration_paths.items() if not name.startswith("legacy_")}
             for legacy_name, current_name in (("legacy_quota_history", "quota_history"), ("legacy_token_ledger", "token_ledger"), ("legacy_sample_log", "sample_log")):
                 if legacy_name in paths and paths[legacy_name].exists():
                     migration_paths[current_name] = paths[legacy_name]

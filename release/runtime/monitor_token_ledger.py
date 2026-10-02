@@ -146,8 +146,8 @@ def _account_for_event(event: dict, account_slot_id: str, account_label: str, ac
     attributed = next((row for row in reversed(account_timeline) if timestamp is not None and (parse_timestamp(row.get("checkedAt")) or float("inf")) <= timestamp), None)
     return str((attributed or {}).get("accountSlotId") or account_slot_id or UNKNOWN_EVENT_ACCOUNT_ID), str((attributed or {}).get("accountLabel") or account_label or UNKNOWN_EVENT_ACCOUNT_LABEL)
 
-def _usage_records(events: list[dict], highwaters: dict, account_slot_id: str, account_label: str, account_timeline: list[dict]) -> list[dict]:
-    cumulative, usages = {}, []
+def _usage_records(events: list[dict], highwaters: dict, account_slot_id: str, account_label: str, account_timeline: list[dict], cumulative: dict | None = None) -> list[dict]:
+    cumulative, usages = cumulative if cumulative is not None else {}, []
     for event in events:
         key = (str(event.get("sessionId") or ""), str(event.get("model") or "unknown"), "fast" if event.get("serviceTier") == "fast" else "default")
         before = cumulative.setdefault(key, empty_token_totals()).copy()

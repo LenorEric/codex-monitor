@@ -20,6 +20,7 @@ import urllib.parse
 import urllib.request
 import webbrowser
 from collections import deque
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -35,7 +36,7 @@ from monitor_events import (
     print_ratio_warnings, print_special_events, process_sample_delta_events, valid_delta_cost_rate,
 )
 from monitor_history import (
-    append_capped_jsonl, append_quota_history_sample, collect_usage_sample, compact_quota_history, default_dashboard_cache_path,
+    append_capped_jsonl, append_quota_history_sample, collect_usage_sample, compact_quota_history, default_dashboard_cache_path, normalize_plan_type,
     fetch_usage_with_percent_arbitration, load_quota_history, load_state, make_history_sample, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, rewrite_account_labels, write_state,
 )
 from monitor_skills import SkillError, SkillManager
@@ -65,7 +66,7 @@ QUOTA_HISTORY_DISPLAY_FULL_SECONDS = 3 * 24 * 60 * 60
 QUOTA_HISTORY_DISPLAY_X4_SECONDS = 7 * 24 * 60 * 60
 QUOTA_HISTORY_DISPLAY_X8_SECONDS = 30 * 24 * 60 * 60
 HOUR_MULTIPLIER = 60 * 60
-DASHBOARD_DISPLAY_CACHE_VERSION = 3
+DASHBOARD_DISPLAY_CACHE_VERSION = 4
 DASHBOARD_DISPLAY_CACHE_GAP_SECONDS = 4 * 60 * 60
 DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS = 60
 DASHBOARD_SERIES_PROTOCOL_VERSION = 3
@@ -176,6 +177,9 @@ class ControlAuth:
         return 0 <= current - issued_at <= CONTROL_COOKIE_MAX_AGE_SECONDS and hmac.compare_digest(signature, hmac.new(self.cookie_secret, payload, hashlib.sha256).hexdigest())
 
 def dashboard_safe_json(value):
+    from monitor_streaming import Records
+    if isinstance(value, Records):
+        return Records(lambda: (dashboard_safe_json(item) for item in value))
     if isinstance(value, dict):
         return {key: dashboard_safe_json(item) for key, item in value.items() if key not in SENSITIVE_DASHBOARD_FIELDS or key in {"password", "encryptionPassphrase"} and isinstance(item, bool)}
     if isinstance(value, list):
@@ -312,7 +316,7 @@ def _usage_time_rate_limit(records: list[dict], label: str) -> float:
     rates = sorted(
         max(0.0, current["raw"] - previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE) / ((current["timestamp"] - previous["timestamp"]) / 60)
         for previous, current in zip(records, records[1:])
-        if current["timestamp"] > previous["timestamp"] and current["raw"] > previous["raw"]
+        if current["raw"] is not None and previous["raw"] is not None and current["timestamp"] > previous["timestamp"] and current["raw"] > previous["raw"]
     )
     floor = USAGE_TIME_RATE_FLOORS[label]
     if len(rates) < 10:
@@ -329,6 +333,8 @@ def _usage_time_new_reset_is_supported(records: list[dict], index: int, previous
     for candidate in records[index:index + 64]:
         if candidate["timestamp"] - current["timestamp"] > 2 * 60 * 60:
             break
+        if candidate["raw"] is None:
+            continue
         if previous["resetAt"] is not None and candidate["raw"] >= previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE and candidate["resetAt"] is not None and abs(candidate["resetAt"] - previous["resetAt"]) <= USAGE_TIME_RESET_JITTER_SECONDS:
             return False
         if (
@@ -346,19 +352,22 @@ def _usage_time_reset_is_credible(records: list[dict], index: int, previous: dic
         return True
     return _usage_time_new_reset_is_supported(records, index, previous, duration)
 
-def _usage_time_continuous_values(records: list[dict], label: str) -> None:
+def _usage_time_continuous_values(records: list[dict], label: str, rate_limit: float | None = None) -> dict:
     if not records:
-        return
-    rate_limit = _usage_time_rate_limit(records, label)
-    previous, lower_anchor, lower_run = None, None, []
+        return {"safe": True}
+    rate_limit = _usage_time_rate_limit(records, label) if rate_limit is None else rate_limit
+    previous, lower_anchor, lower_run, rejected_run = None, None, [], []
     for index, current in enumerate(records):
-        if not 0 <= current["raw"] <= 100:
+        if current["raw"] is None or not 0 <= current["raw"] <= 100:
             current["window"]["continuous"] = None
-            lower_anchor, lower_run = None, []
+            lower_anchor, lower_run, rejected_run = None, [], []
             continue
-        if previous is None:
+        if previous is None or normalize_plan_type(current["window"].get("plan")) != normalize_plan_type(previous["window"].get("plan")):
             previous = current
+            lower_anchor, lower_run, rejected_run = None, [], []
             continue
+        if current["raw"] >= previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE:
+            rejected_run = []
         if lower_anchor is not None:
             if current["raw"] >= lower_anchor["raw"]:
                 for candidate in lower_run:
@@ -379,17 +388,25 @@ def _usage_time_continuous_values(records: list[dict], label: str) -> None:
         if current["raw"] < previous["raw"]:
             if _usage_time_reset_is_credible(records, index, previous, USAGE_TIME_WINDOWS[label]):
                 previous = current
+                rejected_run = []
             elif current["raw"] >= previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE:
                 current["window"]["continuous"] = previous["raw"]
                 lower_anchor, lower_run = previous, [current]
             else:
                 current["window"]["continuous"] = None
+                rejected_run.append(current)
+                if len(rejected_run) >= 10:
+                    for candidate in rejected_run:
+                        candidate["window"]["continuous"] = candidate["raw"]
+                    previous = current
+                    rejected_run = []
             continue
         elapsed_minutes = (current["timestamp"] - previous["timestamp"]) / 60
         if elapsed_minutes < 0 or current["raw"] - previous["raw"] > USAGE_TIME_ROUNDING_ALLOWANCE + rate_limit * elapsed_minutes:
             current["window"]["continuous"] = None
             continue
         previous = current
+    return {"safe": lower_anchor is None and not rejected_run and previous is records[-1], "rate": rate_limit}
 
 def dashboard_quota_points(rows: list[dict], slot_usage_accounts: dict[str, str] | None = None) -> list[dict]:
     merged = {}
@@ -409,7 +426,7 @@ def dashboard_quota_points(rows: list[dict], slot_usage_accounts: dict[str, str]
         groups = {}
         for point in points:
             window = point[label]
-            if point["timestamp"] is None or window["raw"] is None:
+            if point["timestamp"] is None:
                 window["continuous"] = None
                 continue
             groups.setdefault(point["usageAccountId"], []).append({
@@ -841,8 +858,11 @@ class UsageDashboardState:
             getattr(self.args, "usage_sync_cache", None), self.cloud.usage_account_revision,
         )
         self.args.usage_sync_cache = self.usage_data.cache_path
-        self.usage_data.normalize_local()
-        self.usage_data.v4_local_snapshot()
+        self.args.processing_index = self.usage_data.index
+        self.usage_data.initialize_processing()
+        self.usage_data.initialize_v4_index()
+        from monitor_projection import DashboardProjector
+        self.projector = DashboardProjector(self.usage_data)
         if self.usage_data.needs_remote_rebuild:
             self.cloud.reset_usage_apply_cursors()
             self.usage_data.needs_remote_rebuild = False
@@ -863,6 +883,9 @@ class UsageDashboardState:
         self.cloud_maintenance_event = threading.Event()
         self.config_monitor_event = threading.Event()
         self.dashboard_cache_event = threading.Event()
+        self.token_capture_event = threading.Event()
+        self.stop_event = threading.Event()
+        self.last_retention_at = 0
         self.cloud_maintenance_connection_failed = False
         self.running = True
         self.last_sample = None
@@ -882,13 +905,16 @@ class UsageDashboardState:
         self._series_build_lock = threading.Lock()
         self.dashboard_cache_event.set()
         self.runtime_state = reset_runtime_baselines(load_state(args.state))
-        self.console_event_state = {"windows": {"5h": {}, "7d": {}}}
-        local_quota, local_ledger = self.usage_data.datasets("local")
-        console_accounts = dashboard_accounts(self)
-        slot_usage_accounts = {str(account["id"]): str(account["usageAccountId"]) for account in console_accounts["items"]}
-        quota_points = dashboard_quota_points(local_quota, slot_usage_accounts)
-        historical_cost_usage = dashboard_cost_usage(quota_points, local_ledger, slot_usage_accounts)
-        hydrate_delta_state_from_events(self.console_event_state, dashboard_cost_usage_delta_events(historical_cost_usage))
+        with self.usage_data.index.transaction() as db:
+            self.console_event_state = self.usage_data.index.get(db, "consoleState")
+        if self.console_event_state is None:
+            self.console_event_state = {"windows": {"5h": {}, "7d": {}}}
+            local_quota, local_ledger = self.usage_data.datasets("local")
+            console_accounts = dashboard_accounts(self)
+            slot_usage_accounts = {str(account["id"]): str(account["usageAccountId"]) for account in console_accounts["items"]}
+            quota_points = dashboard_quota_points(local_quota, slot_usage_accounts)
+            historical_cost_usage = dashboard_cost_usage(quota_points, local_ledger, slot_usage_accounts)
+            hydrate_delta_state_from_events(self.console_event_state, dashboard_cost_usage_delta_events(historical_cost_usage))
         previous_sample = self.runtime_state.get("lastSample")
         if isinstance(previous_sample, dict) and previous_sample.get("checkedAt"):
             process_sample_delta_events(self.console_event_state, copy.deepcopy(previous_sample), None)
@@ -988,6 +1014,13 @@ class UsageDashboardState:
         self._series_initialized = self._series_views is not None
         self._merged_revision = _dashboard_revision({"streamId": self._series_stream_id, "merged": (self._series_views or {}).get("merged")})
         self._dashboard_cache_reasons = set()
+        if hasattr(self, "projector"):
+            from monitor_projection import IndexedViews
+            self._series_views = IndexedViews(self.projector)
+            with self.usage_data.index.transaction() as db:
+                revision = self.usage_data.index.get(db, "displayRevision", 0)
+            self._series_initialized = bool(revision)
+            self._merged_revision = _dashboard_revision({"streamId": self._series_stream_id, "generation": revision})
 
     def _append_series_batch_locked(self, local_changes: dict, merged_changes: dict, now: float) -> None:
         self._series_index += 1
@@ -1006,7 +1039,7 @@ class UsageDashboardState:
         ):
             self._series_journal_bytes -= self._series_journal.popleft()["bytes"]
 
-    def _series_snapshot_locked(self, status: dict | None = None) -> dict:
+    def _series_snapshot_locked(self, status: dict | None = None, streamed=False) -> dict:
         status = status or self.status_payload()
         return {
             "protocolVersion": DASHBOARD_SERIES_PROTOCOL_VERSION,
@@ -1016,7 +1049,7 @@ class UsageDashboardState:
             "mergedRevision": self._merged_revision,
             "status": status,
             "statusEtag": f'W/"status-{status["revision"]}"',
-            "views": self._series_views or {"local": dashboard_transfer_view(None), "merged": dashboard_transfer_view(None)},
+            "views": {name: self.projector.snapshot(name, True) if streamed and hasattr(self, "projector") else self._series_views[name] for name in ("local", "merged")} if self._series_views else {"local": dashboard_transfer_view(None), "merged": dashboard_transfer_view(None)},
         }
 
     def status_payload(self) -> dict:
@@ -1027,30 +1060,34 @@ class UsageDashboardState:
             if not accounts["awaitingLogin"] and self.last_error and self.last_error.startswith("Waiting for Codex login"):
                 self.wake_event.set()
             last_sample = self._active_account_status_locked(accounts)
+            if last_sample is not None and getattr(self.args, "background_token_capture", False):
+                last_sample = last_sample | {"tokenUsage": getattr(self.args, "token_capture_snapshot", None), "cost": self.runtime_state.get("cost"), "costByModel": self.runtime_state.get("costByModel")}
             sample = dashboard_sample(last_sample)
             control_password_configured = control_password_is_configured(self.cloud.config()["control"]) if hasattr(self, "cloud") else True
             stream = {"streamId": self._series_stream_id, "newestIndex": self._series_index, "mergedRevision": self._merged_revision}
+            processing = {"ingestion": dict(self.usage_data.index.metrics), "projection": dict(self.projector.metrics)} if hasattr(self, "projector") else None
             return {
-                "revision": _dashboard_revision({"sample": sample, "accounts": accounts, "error": self.last_error, "controlPasswordConfigured": control_password_configured, "stream": stream}),
+                "revision": _dashboard_revision({"sample": sample, "accounts": accounts, "error": self.last_error, "controlPasswordConfigured": control_password_configured, "stream": stream, **({"processing": processing} if processing else {})}),
                 **stream,
                 "controlPasswordConfigured": control_password_configured,
                 "lastSample": sample,
                 "display": dashboard_display(last_sample),
                 "accounts": accounts,
+                **({"processing": processing} if processing else {}),
             }
 
-    def series_response(self, stream_id: str | None = None, included_index: int | None = None, merged_revision: str | None = None) -> dict:
+    def series_response(self, stream_id: str | None = None, included_index: int | None = None, merged_revision: str | None = None, *, streamed=False) -> dict:
         self.refresh_dashboard_cache()
         status = self.status_payload()
-        with self.lock:
+        with getattr(self, "_series_build_lock", nullcontext()), self.lock:
             self._ensure_series_stream_state_locked()
             if stream_id is None and included_index is None and merged_revision is None:
-                return self._series_snapshot_locked(status)
+                return self._series_snapshot_locked(status, streamed)
             if stream_id != self._series_stream_id or included_index is None or included_index < 0 or included_index > self._series_index:
-                return self._series_snapshot_locked(status)
+                return self._series_snapshot_locked(status, streamed)
             batches = [batch for batch in self._series_journal if batch["index"] > included_index]
             if included_index < self._series_index and (not batches or batches[0]["index"] != included_index + 1 or batches[-1]["index"] != self._series_index):
-                return self._series_snapshot_locked(status)
+                return self._series_snapshot_locked(status, streamed)
             replace_merged = merged_revision != self._merged_revision
             return {
                 "protocolVersion": DASHBOARD_SERIES_PROTOCOL_VERSION,
@@ -1060,10 +1097,12 @@ class UsageDashboardState:
                 "includedIndex": self._series_index,
                 "mergedRevision": self._merged_revision,
                 "batches": [{"index": batch["index"], "local": batch["local"], **({} if replace_merged else {"merged": batch["merged"]})} for batch in batches],
-                **({"mergedSnapshot": self._series_views["merged"]} if replace_merged else {}),
+                **({"mergedSnapshot": self.projector.snapshot("merged", True) if streamed and hasattr(self, "projector") else self._series_views["merged"]} if replace_merged else {}),
             }
 
     def refresh_dashboard_cache(self, force: bool = False, now: float | None = None) -> bool:
+        if hasattr(self, "projector"):
+            return self._refresh_indexed_dashboard_cache(force, now)
         cache = getattr(self, "dashboard_cache", None)
         if cache is None:
             return False
@@ -1109,6 +1148,41 @@ class UsageDashboardState:
                         self._append_series_batch_locked(local_changes, merged_changes, now)
                 return True
 
+    def _refresh_indexed_dashboard_cache(self, force=False, now=None):
+        now = time.time() if now is None else now
+        with self._series_build_lock:
+            with self.lock:
+                self._ensure_series_stream_state_locked()
+                accounts = self._dashboard_accounts_locked()
+                reasons = set(self._dashboard_cache_reasons)
+                source_revision = self._series_source_revision_locked(accounts)
+            result = self.projector.refresh(accounts, now, force)
+            if result is None:
+                with self.usage_data.index.transaction() as db:
+                    deadlines = [json.loads(row[0]).get("nextMaintenanceAt") for row in db.execute("SELECT data FROM processing_projections")]
+                    result = {"revision": self.usage_data.index.get(db, "displayRevision", 0), "changes": {"local": {}, "merged": {}},
+                        "nextMaintenanceAt": min((value for value in deadlines if value is not None), default=None)}
+                with self.lock:
+                    if self.dashboard_cache.entry("local", source_revision, now) is not None:
+                        self._dashboard_cache_reasons.difference_update(reasons)
+                        return False
+            with self.lock:
+                payload = {"version": DASHBOARD_DISPLAY_CACHE_VERSION, "indexed": True, "sourceRevision": source_revision,
+                    "builtAt": now, "nextMaintenanceAt": result["nextMaintenanceAt"], "displayRevision": str(result["revision"]),
+                    "views": {name: dashboard_transfer_view(None) for name in ("local", "merged")}}
+                self.dashboard_cache.replace(payload)
+                self._dashboard_cache_reasons.difference_update(reasons)
+                local, merged = result["changes"]["local"], result["changes"]["merged"]
+                if not self._series_initialized:
+                    self._series_initialized = True
+                elif "cloud" in reasons and merged:
+                    self._merged_revision = _dashboard_revision({"streamId": self._series_stream_id, "generation": result["revision"]})
+                    if local:
+                        self._append_series_batch_locked(local, merged, now)
+                elif local or merged:
+                    self._append_series_batch_locked(local, merged, now)
+                return True
+
     def dashboard_cache_wait_seconds(self, now: float | None = None) -> float:
         now = time.time() if now is None else now
         with self.lock:
@@ -1121,6 +1195,8 @@ class UsageDashboardState:
             self.dashboard_cache_event.wait(self.dashboard_cache_wait_seconds())
             self.dashboard_cache_event.clear()
             try:
+                with self.lock:
+                    self._maintain_quota_retention()
                 self.refresh_dashboard_cache()
             except Exception as exc:
                 print(f"Dashboard display cache maintenance failed: {exc}", file=sys.stderr, flush=True)
@@ -1145,6 +1221,36 @@ class UsageDashboardState:
         events = process_sample_delta_events(self.console_event_state, copy.deepcopy(sample), None)
         print_special_events(self.console_event_state.get("_specialEvents") or [])
         print_ratio_warnings(events)
+        if hasattr(self, "usage_data") and hasattr(self.usage_data, "index"):
+            with self.usage_data.index.transaction() as db:
+                self.usage_data.index.put(db, "consoleState", self.console_event_state)
+
+    def run_token_capture(self) -> None:
+        while self.running:
+            try:
+                token_usage = self.usage_data.index.scan(self.args.codex_home)
+                status = self.accounts.status()
+                label = next((row["label"] for row in status["items"] if row["id"] == status["activeAccountId"]), "Unknown")
+                cost, by_model = self.usage_data.index.sync_ledger(self.args.token_ledger, status["activeAccountId"], label, self.accounts.attribution_timeline(),
+                    lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
+                    self.usage_data.normalize_new_ledger, self.cloud.machine_id)
+                with self.lock:
+                    self.args.token_capture_snapshot = token_usage
+                    self.runtime_state.update({"tokenUsage": token_usage, "cost": cost, "costByModel": by_model})
+                    self.usage_data.ingest_local()
+                    self._signal_dashboard_cache()
+            except Exception as exc:
+                print(f"Token capture failed: {exc}", file=sys.stderr, flush=True)
+            self.token_capture_event.wait(min(max(self.args.interval, 1), 5))
+            self.token_capture_event.clear()
+
+    def _maintain_quota_retention(self) -> None:
+        if time.monotonic() - getattr(self, "last_retention_at", 0) >= 24 * 60 * 60:
+            if hasattr(getattr(self, "usage_data", None), "retain_quota"):
+                self.usage_data.retain_quota(self.args.compact_history_days)
+            else:
+                compact_quota_history(self.args.quota_history, self.args.compact_history_days)
+            self.last_retention_at = time.monotonic()
 
     def poll_once(self) -> dict:
         account_status = self.accounts.status()
@@ -1158,6 +1264,8 @@ class UsageDashboardState:
         with self.lock:
             self.last_acquire_started_at = time.monotonic()
             previous_token_usage = self.runtime_state.get("tokenUsage")
+            if getattr(self.args, "background_token_capture", False):
+                previous_token_usage = (self.runtime_state.get("lastSample") or {}).get("tokenUsage") or previous_token_usage
         sample = collect_with_bad_remote_usage_retry(
             lambda: collect_usage_sample(self.args, self.opener, previous_token_usage, None, self.runtime_state),
             self.runtime_state,
@@ -1174,7 +1282,15 @@ class UsageDashboardState:
         api_account = is_api_auth(json.loads(self.args.auth.read_text(encoding="utf-8")))
         with self.lock:
             token_usage = sample.get("tokenUsage") or {}
-            if token_usage:
+            if token_usage.get("incremental") and getattr(self.args, "background_token_capture", False):
+                sample["cost"], sample["costByModel"] = self.runtime_state.get("cost") or empty_cost_totals(), self.runtime_state.get("costByModel") or {}
+            elif token_usage.get("incremental"):
+                sample["cost"], sample["costByModel"] = self.usage_data.index.sync_ledger(
+                    self.args.token_ledger, account_status["activeAccountId"], sample["accountLabel"], self.accounts.attribution_timeline(),
+                    lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
+                    self.usage_data.normalize_new_ledger, self.cloud.machine_id,
+                )
+            elif token_usage:
                 token_sessions = sync_token_ledger(
                     self.args.token_ledger,
                     [],
@@ -1200,8 +1316,8 @@ class UsageDashboardState:
             self.runtime_state.update({"tokenUsage": token_usage or None, "cost": sample.get("cost") or empty_cost_totals(), "costByModel": sample.get("costByModel") or {}, "lastSample": sample, "updatedAt": sample.get("checkedAt")})
             append_capped_jsonl(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample}, self.args.sample_log_max_bytes)
             write_state(self.args.state, self.runtime_state)
-            compact_quota_history(self.args.quota_history, self.args.compact_history_days)
-            self.usage_data.normalize_local()
+            self._maintain_quota_retention()
+            self.usage_data.ingest_local()
             self._signal_dashboard_cache()
             self.last_sample = sample
             self._update_account_status_locked(account_status["activeAccountId"], sample)
@@ -1271,8 +1387,8 @@ class UsageDashboardState:
                 print(f"Inactive account usage polling failed for {credential['label']!r}: {exc}", file=sys.stderr, flush=True)
         if polled:
             with self.lock:
-                compact_quota_history(self.args.quota_history, self.args.compact_history_days)
-                self.usage_data.normalize_local()
+                self._maintain_quota_retention()
+                self.usage_data.ingest_local()
                 self._signal_dashboard_cache()
         return polled
 
@@ -1817,9 +1933,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         print(f"Cannot start dashboard: {exc}.", file=sys.stderr, flush=True)
         return 1
     server_host = server_config["host"]
-    instance_lock = DashboardInstanceLock()
+    instance_lock = getattr(args, "instance_lock", None) or DashboardInstanceLock()
     try:
-        instance_acquired = instance_lock.acquire()
+        instance_acquired = bool(getattr(args, "instance_lock", None)) or instance_lock.acquire()
     except OSError as exc:
         print(f"Cannot start dashboard instance lock: {exc}.", file=sys.stderr, flush=True)
         return 1
@@ -1864,6 +1980,34 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
             self.wfile.write(body)
 
         def send_json(self, status: int, payload: dict, headers: dict | None = None, *, sanitize: bool = True, cache_key: str | None = None):
+            from monitor_streaming import Records, json_chunks
+            def streamed(value):
+                return isinstance(value, Records) or isinstance(value, dict) and any(streamed(item) for item in value.values())
+            if streamed(payload):
+                from monitor_streaming import close_records
+                with tempfile.TemporaryFile() as spool:
+                    compress = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+                    output = gzip.GzipFile(fileobj=spool, mode="wb") if compress else spool
+                    try:
+                        for chunk in json_chunks(dashboard_safe_json(payload) if sanitize else payload, sort_keys=False):
+                            output.write(chunk)
+                    finally:
+                        close_records(payload)
+                    if compress:
+                        output.close()
+                    length = spool.tell()
+                    spool.seek(0)
+                    self.send_response(status)
+                    self.send_header("Content-Type", "application/json; charset=utf-8")
+                    for key, value in ({"Cache-Control": "no-store", "Vary": "Accept-Encoding"} | (headers or {})).items():
+                        self.send_header(key, value)
+                    if compress:
+                        self.send_header("Content-Encoding", "gzip")
+                    self.send_header("Content-Length", str(length))
+                    self.end_headers()
+                    for chunk in iter(lambda: spool.read(65536), b""):
+                        self.wfile.write(chunk)
+                return
             body = None
             if cache_key:
                 with response_body_cache_lock:
@@ -1936,9 +2080,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 try:
                     if not query:
-                        payload = state.series_response()
+                        payload = state.series_response(streamed=True)
                     elif set(query) == {"streamId", "includedIndex", "mergedRevision"} and all(len(query[key]) == 1 for key in query):
-                        payload = state.series_response(query["streamId"][0], int(query["includedIndex"][0]), query["mergedRevision"][0])
+                        payload = state.series_response(query["streamId"][0], int(query["includedIndex"][0]), query["mergedRevision"][0], streamed=True)
                     else:
                         raise ValueError
                 except ValueError:
@@ -2091,11 +2235,27 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         instance_lock.release()
         raise
     control_auth = ControlAuth(state.cloud.config()["control"])
-    thread = threading.Thread(target=state.run, daemon=True)
+    def managed_worker(operation):
+        from monitor_common import REQUEST_STOP
+        REQUEST_STOP.event = getattr(state, "stop_event", None)
+        operation()
+    token_thread = None
+    source_watcher = None
+    if hasattr(state, "projector") and not getattr(args, "no_token_scan", True):
+        from monitor_processing import SourceWatcher
+        try:
+            source_watcher = SourceWatcher(args.codex_home)
+            state.usage_data.index.source_watcher = source_watcher
+        except (ImportError, OSError) as exc:
+            print(f"Session notifications unavailable; bounded polling and audits remain active: {exc}", file=sys.stderr, flush=True)
+        args.background_token_capture = True
+        token_thread = threading.Thread(target=managed_worker, args=(state.run_token_capture,), name="token-capture", daemon=True)
+        token_thread.start()
+    thread = threading.Thread(target=managed_worker, args=(state.run,), daemon=True)
     thread.start()
-    inactive_account_thread = threading.Thread(target=state.run_inactive_account_polling, daemon=True)
+    inactive_account_thread = threading.Thread(target=managed_worker, args=(state.run_inactive_account_polling,), daemon=True)
     inactive_account_thread.start()
-    session_refresh_thread = threading.Thread(target=state.run_session_refreshing, daemon=True)
+    session_refresh_thread = threading.Thread(target=managed_worker, args=(state.run_session_refreshing,), daemon=True)
     session_refresh_thread.start()
     dashboard_cache_thread = threading.Thread(target=state.run_dashboard_cache_maintenance, daemon=True)
     dashboard_cache_thread.start()
@@ -2129,6 +2289,8 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         except Exception as exc:
             print(f"Final auth.json reconciliation failed: {exc}", file=sys.stderr, flush=True)
         state.running = False
+        if hasattr(state, "stop_event"):
+            state.stop_event.set()
         state.device_auth.stop()
         state.wake_event.set()
         state.inactive_account_poll_event.set()
@@ -2136,8 +2298,16 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         state.dashboard_cache_event.set()
         state.cloud_maintenance_event.set()
         state.config_monitor_event.set()
+        if hasattr(state, "token_capture_event"):
+            state.token_capture_event.set()
         state.cloud.operation_queue.close()
         cloud_thread.join()
+        if token_thread is not None:
+            token_thread.join()
+        if source_watcher is not None:
+            source_watcher.stop()
+        for worker in (thread, inactive_account_thread, session_refresh_thread, dashboard_cache_thread, config_thread):
+            worker.join()
         server.server_close()
         instance_lock.release()
     return AUTO_UPDATE_RESTART if auto_updater is not None and auto_updater.restart_requested else 0

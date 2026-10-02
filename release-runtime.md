@@ -22,4 +22,8 @@ Change the host to `127.0.0.1` in the management page and restart when LAN acces
 
 Runtime state and sensitive account data are stored under `~/.codex-switch` and must be protected separately. They are deliberately not part of this release.
 
+Token capture runs independently of remote quota acquisition. Persistent checkpoints resume after restart, and ordinary appends update only new facts and affected dashboard rows. Watchdog supplies OS file notifications; if it is unavailable, bounded polling and scheduled audits remain active. Install the updated `requirements.txt` after upgrading to enable notifications.
+
+The local data contract is version 8. Ordered startup migration preserves canonical JSONL histories and existing v4 collection periods and peer records. Bootstrap, repair, scheduled audits/retention, and retrospective quota corrections can still read their complete affected scope. Run `python codex_monitor_daemon.py --repair-processing` to rebuild derived checkpoints and dashboard rows while preserving canonical histories and cloud ownership metadata. An older runtime cannot write a newer local contract; restore a verified backup to roll back.
+
 This runtime is distributed under the GNU General Public License version 3. See `LICENSE` in this directory.

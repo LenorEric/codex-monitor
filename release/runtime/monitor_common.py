@@ -6,12 +6,15 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
+
+REQUEST_STOP = threading.local()
 
 try:
     import winreg
@@ -234,6 +237,9 @@ def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, h
             request.add_unredirected_header(key, value)
     attempt = 0
     while True:
+        stop = getattr(REQUEST_STOP, "event", None)
+        if stop is not None and stop.is_set():
+            raise UsageError("HTTP acquisition cancelled during shutdown")
         try:
             with opener.open(request, timeout=timeout) as response:
                 return response.status, json.loads(response.read().decode("utf-8"))
@@ -245,10 +251,10 @@ def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, h
             if not retry_network_errors_forever and attempt >= retries:
                 raise UsageError(f"{method} {url} -> network error: {exc}") from exc
             if retry_network_errors_forever:
-                time.sleep(1)
+                stop.wait(1) if stop is not None else time.sleep(1)
                 continue
         attempt += 1
-        time.sleep(1)
+        stop.wait(1) if stop is not None else time.sleep(1)
 
 def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_refresh: bool = True, force_refresh: bool = False) -> str:
     tokens = auth.get("tokens") or {}

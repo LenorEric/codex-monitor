@@ -883,6 +883,7 @@ def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, pre
             getattr(args, "auth_lock", None), getattr(args, "auth_refreshed_callback", None), False,
         ))
     if not args.no_token_scan:
-        output["tokenUsage"] = scan_codex_token_usage(args.codex_home)
+        output["tokenUsage"] = getattr(args, "token_capture_snapshot", None) if getattr(args, "background_token_capture", False) else (
+            args.processing_index.scan(args.codex_home) if getattr(args, "processing_index", None) is not None else scan_codex_token_usage(args.codex_home))
     output["checkedAt"] = now_iso()
     return make_history_sample(output, previous_token_usage, previous_cost, previous_cost_by_model=(runtime_state or {}).get("costByModel"))
