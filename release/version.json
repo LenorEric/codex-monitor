@@ -1,5 +1,5 @@
 {
-  "version": "1.5.7",
+  "version": "1.5.8",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 4850,
@@ -91,7 +91,7 @@
     },
     "version.json": {
       "size": 53,
-      "sha256": "2dbaa4be26dc7fb1c834722b8d63520b8ef7d2f19dbe88aa7b831376c0e7c033"
+      "sha256": "ff16980d9132bd451f2f6f5583bfab8611857f11aa563c0bc3df5207f00f7c14"
     }
   }
 }
