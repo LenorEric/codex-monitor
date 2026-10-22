@@ -16,7 +16,7 @@ python codex_monitor_daemon.py
 
 Use `python codex_monitor_daemon.py --dashboard` to open the dashboard automatically. The default server host is `0.0.0.0` on port 8765. Use `http://127.0.0.1:8765` locally or the machine's LAN/public IP remotely. The former `python monitor_codex_usage.py` command remains compatible.
 
-Automatic updates are disabled by default. Enable them on the management Config page to check the published runtime in the background after startup and every hour. Verified updates replace this directory's packaged files and restart the same command with the same arguments; dependencies from `requirements.txt` are not installed automatically.
+Automatic updates are disabled by default. Enable them on the management Config page to check the published runtime before data migrations and dashboard startup, then every hour in the background. Startup waits for the initial check; a failed check is reported and startup continues. The console shows check results and download/verification progress. Verified updates replace this directory's packaged files and restart the same command with the same arguments; dependencies from `requirements.txt` are not installed automatically.
 Password-protected control requests are accepted through public addresses and reverse proxies without an origin restriction. Direct public-IP access uses unencrypted HTTP, so prefer a trusted VPN or an HTTPS reverse proxy.
 Change the host to `127.0.0.1` in the management page and restart when LAN access is unnecessary. Install the matching VSIX from the parent release directory to connect VS Code to it.
 

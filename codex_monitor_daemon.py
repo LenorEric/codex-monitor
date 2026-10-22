@@ -7,7 +7,7 @@ if sys.version_info < (3, 12):
     raise SystemExit("Codex Usage Monitor requires Python 3.12 or newer.")
 
 from monitor_accounts import migrate_account_vault
-from monitor_auto_update import AUTO_UPDATE_RESTART, installed_version, migrate_installed_usage_data, restart_process
+from monitor_auto_update import AUTO_UPDATE_RESTART, check_startup_update, installed_version, migrate_installed_usage_data, restart_process
 from monitor_cloud import CloudManager
 from monitor_common import *
 from monitor_dashboard import *
@@ -44,6 +44,11 @@ def _main(instance_lock) -> int:
     args.instance_lock = instance_lock
 
     args.data_home = codex_switch_home()
+    if check_startup_update(Path(__file__).resolve().parent, args.data_home, lambda: opener_for(args.auth.parent), args.timeout):
+        instance_lock.release()
+        restart_process(Path(sys.argv[0]).resolve())
+        return 0
+    args.startup_update_checked = True
     migrate_default_monitor_data(Path(__file__).resolve().parent, args.data_home)
     legacy_history = default_history_path(args.data_home)
     args.quota_history = args.quota_history or default_quota_history_path(legacy_history)

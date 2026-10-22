@@ -185,7 +185,7 @@ The five-second observer hashes incrementally and performs a bounded full verifi
 
 ## Automatic runtime updates
 
-Enable **Automatically update Codex Monitor** on the management Config page to check the published `release/runtime` manifest after startup and every hour. Checks run in the background. A newer verified runtime replaces only files named by the release manifest and then restarts the same entry command with the same arguments; failed checks leave the running installation unchanged. Python dependencies are not installed automatically.
+Enable **Automatically update Codex Monitor** on the management Config page to check the published `release/runtime` manifest before data migrations and dashboard startup, then every hour in the background. The initial check finishes before normal startup continues; a failed check is reported and startup continues. Console messages show the check result and download/verification progress. A newer verified runtime replaces only files named by the release manifest and then restarts the same entry command with the same arguments; failed checks leave the running installation unchanged. Python dependencies are not installed automatically.
 
 ## WebDAV and encrypted synchronization
 

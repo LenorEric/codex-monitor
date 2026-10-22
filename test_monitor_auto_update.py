@@ -49,6 +49,49 @@ def temporary_directory():
 
 
 class AutoUpdateTests(unittest.TestCase):
+    def test_startup_check_respects_setting_and_does_not_initialize_data(self):
+        with temporary_directory() as root, mock.patch.object(monitor_auto_update.AutoUpdater, "check_for_update", return_value=True) as check:
+            self.assertFalse(monitor_auto_update.check_startup_update(root, root, lambda: None))
+            self.assertEqual(list(root.iterdir()), [])
+            check.assert_not_called()
+            (root / "config.json").write_text('{"autoUpdate":{"enabled":true}}', encoding="utf-8")
+            self.assertTrue(monitor_auto_update.check_startup_update(root, root, lambda: None))
+            check.assert_called_once_with()
+
+    def test_startup_check_failure_allows_startup_to_continue(self):
+        with temporary_directory() as root:
+            (root / "config.json").write_text('{"autoUpdate":{"enabled":true}}', encoding="utf-8")
+            with mock.patch.object(monitor_auto_update.AutoUpdater, "check_for_update", side_effect=OSError("offline")):
+                self.assertFalse(monitor_auto_update.check_startup_update(root, root, lambda: None))
+
+    def test_startup_checks_before_migration_failure_and_restarts_before_migration(self):
+        import codex_monitor_daemon as daemon
+
+        with mock.patch.object(daemon.sys, "argv", [str(Path(daemon.__file__))]), mock.patch.object(daemon, "check_startup_update", return_value=False) as check, mock.patch.object(daemon, "migrate_default_monitor_data", side_effect=RuntimeError("migration failed")) as migrate:
+            with self.assertRaisesRegex(RuntimeError, "migration failed"):
+                daemon._main(mock.Mock())
+            check.assert_called_once()
+            migrate.assert_called_once()
+            check.reset_mock()
+            migrate.reset_mock()
+            check.return_value = True
+            with mock.patch.object(daemon, "restart_process") as restart:
+                self.assertEqual(daemon._main(mock.Mock()), 0)
+            restart.assert_called_once()
+            migrate.assert_not_called()
+
+    def test_periodic_worker_can_defer_duplicate_startup_check(self):
+        with temporary_directory() as root:
+            updater = AutoUpdater(root, lambda: True, lambda: None)
+            updater.check_for_update = mock.Mock(return_value=False)
+            updater._wake.wait = mock.Mock(side_effect=lambda _seconds: updater._stop.set())
+            try:
+                updater.start(lambda: None, immediate=False)
+                updater._thread.join(1)
+                updater.check_for_update.assert_not_called()
+            finally:
+                updater.stop()
+
     def test_history_data_migration_rewrites_every_store_and_only_runs_once(self):
         with temporary_directory() as data_home:
             history = data_home / "custom.jsonl"

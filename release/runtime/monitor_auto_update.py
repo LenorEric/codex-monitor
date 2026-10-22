@@ -560,6 +560,22 @@ def migrate_installed_usage_data(
     )
 
 
+def check_startup_update(runtime_dir: Path, data_home: Path, opener_factory, timeout: int = 10) -> bool:
+    """Check before normal startup; a failed check leaves startup available."""
+    try:
+        try:
+            config = json.loads((data_home / "config.json").read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            config = {}
+        if config.get("autoUpdate", {}).get("enabled") is not True:
+            print("Startup update check skipped: automatic updates are disabled.", flush=True)
+            return False
+        return AutoUpdater(runtime_dir, lambda: True, opener_factory, timeout).check_for_update()
+    except Exception as exc:
+        print(f"Startup update check failed; continuing startup: {exc}", file=sys.stderr, flush=True)
+        return False
+
+
 class AutoUpdater:
     def __init__(self, runtime_dir: Path, enabled, opener_factory, timeout: int = 10, interval: int = UPDATE_INTERVAL_SECONDS, clock=time.monotonic):
         self.runtime_dir, self.enabled, self.opener_factory = Path(runtime_dir).resolve(), enabled, opener_factory
@@ -571,10 +587,11 @@ class AutoUpdater:
         self._thread = None
         self._on_update = None
 
-    def start(self, on_update) -> None:
+    def start(self, on_update, immediate: bool = True) -> None:
         if self._thread is not None:
             return
         self._on_update = on_update
+        self._immediate = immediate
         self._thread = threading.Thread(target=self._run, name="codex-monitor-auto-update", daemon=True)
         self._thread.start()
 
@@ -588,7 +605,7 @@ class AutoUpdater:
             self._thread.join(self.timeout + 1)
 
     def _run(self) -> None:
-        was_enabled, next_check = False, 0.0
+        was_enabled, next_check = not self._immediate, 0.0 if self._immediate else self.clock() + self.interval
         while not self._stop.is_set():
             try:
                 enabled = self.enabled() is True
@@ -629,11 +646,14 @@ class AutoUpdater:
 
     def check_for_update_details(self) -> dict:
         with self._check_lock:
+            print("Checking for Codex Monitor updates...", flush=True)
             opener = self.opener_factory()
             version, files = self._manifest(opener)
             current_version = installed_version(self.runtime_dir)
             if parse_version(version) <= parse_version(current_version):
+                print(f"Update check complete: installed v{current_version}, published v{version}; no newer update.", flush=True)
                 return {"currentVersion": current_version, "latestVersion": version, "updated": False}
+            print(f"Update available: v{current_version} -> v{version}.", flush=True)
             self._install(opener, version, files)
             print(f"Codex Monitor updated to v{version}; restarting.", flush=True)
             return {"currentVersion": current_version, "latestVersion": version, "updated": True}
@@ -651,7 +671,8 @@ class AutoUpdater:
         backup.mkdir()
         replaced = []
         try:
-            for name, descriptor in files.items():
+            for number, (name, descriptor) in enumerate(files.items(), 1):
+                print(f"Downloading and verifying update file {number}/{len(files)}: {name}", flush=True)
                 data = self._read(opener, RUNTIME_FILE_URL.format(name=urllib.parse.quote(name)), descriptor["size"])
                 if len(data) != descriptor["size"] or hashlib.sha256(data).hexdigest() != descriptor["sha256"]:
                     raise AutoUpdateError(f"Runtime file verification failed: {name}")

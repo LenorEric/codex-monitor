@@ -2353,7 +2353,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
     if args.dashboard:
         webbrowser.open(url)
     if auto_updater is not None:
-        auto_updater.start(server.shutdown)
+        auto_updater.start(server.shutdown, immediate=not getattr(args, "startup_update_checked", False))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
