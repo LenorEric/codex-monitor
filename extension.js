@@ -10,6 +10,7 @@ const DASHBOARD_URL = new URL("http://127.0.0.1:8765/");
 const MANAGEMENT_URL = new URL("http://127.0.0.1:8765/manage");
 const STATUS_API_URL = new URL("http://127.0.0.1:8765/api/status");
 const SERIES_API_URL = new URL("http://127.0.0.1:8765/api/series");
+const DASHBOARD_API_URL = new URL("http://127.0.0.1:8765/api/dashboard");
 const ACCOUNT_CREATE_URL = new URL("http://127.0.0.1:8765/api/accounts");
 const ACCOUNT_SWITCH_URL = new URL("http://127.0.0.1:8765/api/accounts/switch");
 const ACCOUNT_RENAME_URL = new URL("http://127.0.0.1:8765/api/accounts/rename");
@@ -63,6 +64,7 @@ class PythonMonitor {
         this.statusBar = statusBar;
         this.pendingStatusRequest = null;
         this.pendingSeriesRequest = null;
+        this.pendingDashboardRequests = new Map();
         this.cachedStatus = null;
         this.statusEtag = null;
         this.pollTimer = null;
@@ -111,6 +113,18 @@ class PythonMonitor {
             this.pendingSeriesRequest = null;
         });
         return this.pendingSeriesRequest;
+    }
+
+    async getDashboard(scope, etag) {
+        if (!scope || typeof scope !== "object") throw new Error("Invalid dashboard scope");
+        const url = new URL(scope.chunkId ? `${DASHBOARD_API_URL}/chunk` : DASHBOARD_API_URL);
+        if (scope.chunkId) url.searchParams.set("id", scope.chunkId);
+        else for (const name of ["view", "range", "start", "end"]) if (scope[name] !== undefined) url.searchParams.set(name, scope[name]);
+        const key = `${url}|${etag || ""}`;
+        if (!this.pendingDashboardRequests.has(key)) {
+            this.pendingDashboardRequests.set(key, requestJson(url, { etag, responseMetadata: true, timeoutMs: 30000 }).finally(() => this.pendingDashboardRequests.delete(key)));
+        }
+        return this.pendingDashboardRequests.get(key);
     }
 
     async update() {
@@ -203,6 +217,7 @@ function requestJson(url, options = {}) {
                     error.statusCode = response.statusCode;
                     error.details = payload.details;
                     error.decryptFailed = payload.decryptFailed;
+                    error.preparing = payload.preparing;
                     reject(error);
                 }
                 else resolve(options.responseMetadata ? { payload, etag, notModified: false } : payload);
@@ -264,10 +279,7 @@ function activate(context) {
         statusBar,
         vscode.commands.registerCommand("codexUsageMonitor.showDetails", async () => {
             if (panel) {
-                const target = panel;
-                target.reveal();
-                const html = await detailsHtml(context, target.webview, currentPage);
-                if (panel === target) target.webview.html = html;
+                panel.reveal();
                 return;
             }
             panel = vscode.window.createWebviewPanel("codexUsageDetails", "Codex Usage Details", vscode.ViewColumn.One, {
@@ -277,6 +289,14 @@ function activate(context) {
             panel.webview.onDidReceiveMessage(async message => {
                 const target = panel;
                 if (!target) return;
+                if (message.type === "getCodexDashboard") {
+                    try {
+                        target.webview.postMessage({ type: "codexDashboardResponse", requestId: message.requestId, response: await monitor.getDashboard(message.scope, message.etag) });
+                    } catch (error) {
+                        target.webview.postMessage({ type: "codexDashboardResponse", requestId: message.requestId, error: error.message || String(error), preparing: error.preparing });
+                    }
+                    return;
+                }
                 if (message.type === "codexUsageNavigate") {
                     if (!PAGE_ALLOWLIST[message.page]) return;
                     currentPage = message.page;

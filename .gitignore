@@ -42,6 +42,9 @@ cloud-state.json
 *.swp
 ~$*
 tmp/
+.test-delivery-*/
+.test-console-state-*/
+.dashboard-benchmark-*/
 
 .venv/
 venv/

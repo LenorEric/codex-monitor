@@ -22,6 +22,16 @@ test_monitor_codex_usage.py
 test_monitor_auto_update.py
 test_cloud_queue.py
 test_management_queue.js
+test_dashboard_loading.js
+test_delivery.py
+test_console_state.py
+benchmark_dashboard.py
+startup-optimization-plan.md
+dashboard-delivery.md
+.test-delivery-*/**
+.test-console-state-*/**
+.dashboard-benchmark-*/**
+tmp/**
 .test-cloud-queue-*/**
 usage_monitor_*.json
 usage_monitor_*.jsonl

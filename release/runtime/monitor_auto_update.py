@@ -25,7 +25,7 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RUNTIME_FILE_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 AUTO_UPDATE_RESTART = 75
-DATA_CONTRACT_VERSION = 8
+DATA_CONTRACT_VERSION = 9
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 
@@ -361,7 +361,22 @@ def _migrate_history_to_v8(paths: dict[str, Path]) -> None:
     paths["dashboard_cache"].unlink(missing_ok=True)
 
 
-DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8}
+def _migrate_history_to_v9(paths: dict[str, Path]) -> None:
+    import sqlite3
+    from contextlib import closing
+    from monitor_processing import initialize_processing_index
+    from monitor_common import parse_timestamp
+    initialize_processing_index(paths["processing_index"])
+    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
+        for view, key, data in db.execute("SELECT view,record_key,data FROM processing_display WHERE kind='tokenSessions' AND event_at IS NULL").fetchall():
+            row = json.loads(data)
+            db.execute("UPDATE processing_display SET event_at=? WHERE view=? AND kind='tokenSessions' AND record_key=?",
+                (parse_timestamp(row.get("updatedAt") or row.get("startedAt")), view, key))
+    # Existing exact quota points and sessions rebuild delivery artifacts automatically in the maintenance worker.
+    # Canonical files, v4 peer ownership, collection periods and parser checkpoints are preserved.
+
+
+DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8, 9: _migrate_history_to_v9}
 
 
 def _restore_data_backup(backup: Path, path: Path) -> None:

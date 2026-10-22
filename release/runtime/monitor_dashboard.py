@@ -33,7 +33,7 @@ from monitor_common import DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JIT
 from monitor_device_auth import DeviceAuthManager
 from monitor_events import (
     allocate_model_delta_events, collect_with_bad_remote_usage_retry, compact_delta_event, hydrate_delta_state_from_events,
-    print_ratio_warnings, print_special_events, process_sample_delta_events, valid_delta_cost_rate,
+    print_ratio_warnings, print_special_events, process_sample_delta_events, valid_delta_cost_rate, delta_state_needs_hydration,
 )
 from monitor_history import (
     append_capped_jsonl, append_quota_history_sample, collect_usage_sample, compact_quota_history, default_dashboard_cache_path, normalize_plan_type,
@@ -863,6 +863,8 @@ class UsageDashboardState:
         self.usage_data.initialize_v4_index()
         from monitor_projection import DashboardProjector
         self.projector = DashboardProjector(self.usage_data)
+        from monitor_delivery import DashboardDelivery
+        self.delivery = DashboardDelivery(self.usage_data.index)
         if self.usage_data.needs_remote_rebuild:
             self.cloud.reset_usage_apply_cursors()
             self.usage_data.needs_remote_rebuild = False
@@ -874,7 +876,9 @@ class UsageDashboardState:
             self.accounts.error = f"Cloud account recovery requires attention: {exc}"
         self.projection_errors = self.skills.reconcile()
         self.skills.status()
-        self.skills.scan(refresh=True)
+        self.skill_scan_snapshot = []
+        self.skill_scan_requested = True
+        self.skill_scan_at = 0
         self.args.auth_lock = self.accounts.lock
         self.args.auth_refreshed_callback = self.sync_active_account_from_live
         self.args.account_attribution_callback = self.accounts.attribution_for_auth
@@ -905,20 +909,7 @@ class UsageDashboardState:
         self._series_build_lock = threading.Lock()
         self.dashboard_cache_event.set()
         self.runtime_state = reset_runtime_baselines(load_state(args.state))
-        with self.usage_data.index.transaction() as db:
-            self.console_event_state = self.usage_data.index.get(db, "consoleState")
-        if self.console_event_state is None:
-            self.console_event_state = {"windows": {"5h": {}, "7d": {}}}
-            local_quota, local_ledger = self.usage_data.datasets("local")
-            console_accounts = dashboard_accounts(self)
-            slot_usage_accounts = {str(account["id"]): str(account["usageAccountId"]) for account in console_accounts["items"]}
-            quota_points = dashboard_quota_points(local_quota, slot_usage_accounts)
-            historical_cost_usage = dashboard_cost_usage(quota_points, local_ledger, slot_usage_accounts)
-            hydrate_delta_state_from_events(self.console_event_state, dashboard_cost_usage_delta_events(historical_cost_usage))
-        previous_sample = self.runtime_state.get("lastSample")
-        if isinstance(previous_sample, dict) and previous_sample.get("checkedAt"):
-            process_sample_delta_events(self.console_event_state, copy.deepcopy(previous_sample), None)
-            self.console_event_state["_specialEvents"] = []
+        self.restore_console_event_state()
         account_status = self.accounts.status()
         self.account_statuses = {account["id"]: None for account in account_status["items"]}
         if not self.runtime_state.get("activeAccountSlotId"):
@@ -929,6 +920,29 @@ class UsageDashboardState:
             write_state(args.state, self.runtime_state)
         self.sync_active_account_from_live()
         self.sync_device_auth()
+
+    def restore_console_event_state(self) -> None:
+        with self.usage_data.index.transaction() as db:
+            self.console_event_state = self.usage_data.index.get(db, "consoleState")
+        if not isinstance(self.console_event_state, dict):
+            self.console_event_state = {"windows": {"5h": {}, "7d": {}}}
+        if delta_state_needs_hydration(self.console_event_state):
+            windows = self.console_event_state.get("windows") or {}
+            self.console_event_state["windows"] = {label: windows.get(label) if isinstance(windows, dict) and isinstance(windows.get(label), dict) else {} for label in ("5h", "7d")}
+            local_quota, local_ledger = self.usage_data.datasets("local")
+            console_accounts = dashboard_accounts(self)
+            slot_usage_accounts = {str(account["id"]): str(account["usageAccountId"]) for account in console_accounts["items"]}
+            quota_points = dashboard_quota_points(local_quota, slot_usage_accounts)
+            historical_cost_usage = dashboard_cost_usage(quota_points, local_ledger, slot_usage_accounts)
+            hydrate_delta_state_from_events(self.console_event_state, dashboard_cost_usage_delta_events(historical_cost_usage))
+        # Seeding lastSample establishes a baseline; it must not count the previous run's final delta twice.
+        reset_runtime_baselines(self.console_event_state)
+        previous_sample = self.runtime_state.get("lastSample")
+        if isinstance(previous_sample, dict) and previous_sample.get("checkedAt"):
+            process_sample_delta_events(self.console_event_state, copy.deepcopy(previous_sample), None)
+        self.console_event_state["_specialEvents"] = []
+        with self.usage_data.index.transaction() as db:
+            self.usage_data.index.put(db, "consoleState", self.console_event_state)
 
     def sync_device_auth(self, status: dict | None = None) -> None:
         if not hasattr(self, "device_auth"):
@@ -1076,8 +1090,9 @@ class UsageDashboardState:
                 **({"processing": processing} if processing else {}),
             }
 
-    def series_response(self, stream_id: str | None = None, included_index: int | None = None, merged_revision: str | None = None, *, streamed=False) -> dict:
-        self.refresh_dashboard_cache()
+    def series_response(self, stream_id: str | None = None, included_index: int | None = None, merged_revision: str | None = None, *, streamed=False, refresh=True) -> dict:
+        if refresh:
+            self.refresh_dashboard_cache()
         status = self.status_payload()
         with getattr(self, "_series_build_lock", nullcontext()), self.lock:
             self._ensure_series_stream_state_locked()
@@ -1198,6 +1213,8 @@ class UsageDashboardState:
                 with self.lock:
                     self._maintain_quota_retention()
                 self.refresh_dashboard_cache()
+                if hasattr(self, "delivery"):
+                    self.delivery.prepare()
             except Exception as exc:
                 print(f"Dashboard display cache maintenance failed: {exc}", file=sys.stderr, flush=True)
 
@@ -1662,6 +1679,13 @@ class UsageDashboardState:
                 self.accounts.sync_config_from_disk()
             except AccountError as exc:
                 self.accounts.error = f"config.toml update could not be recorded: {exc}"
+            if getattr(self, "skill_scan_requested", False) or time.monotonic() - getattr(self, "skill_scan_at", 0) >= 60:
+                self.skill_scan_requested = False
+                try:
+                    self.skill_scan_snapshot = self.skills.scan(refresh=True)
+                    self.skill_scan_at = time.monotonic()
+                except Exception as exc:
+                    print(f"Background skill scan failed: {exc}", file=sys.stderr, flush=True)
             self.config_monitor_event.wait(5)
             self.config_monitor_event.clear()
 
@@ -1877,6 +1901,9 @@ def enqueue_management_action(state, control_auth, path, body):
 
 
 def management_payload(state: UsageDashboardState, include_remote: bool = False, refresh_scan: bool = False) -> dict:
+    if refresh_scan and hasattr(state, "skill_scan_snapshot") and time.monotonic() - state.skill_scan_at >= 30:
+        state.skill_scan_requested = True
+        state.config_monitor_event.set()
     remote_accounts = state.cloud.cached_remote_accounts()
     api_identity_ids = state.accounts.api_identity_ids() if hasattr(state.accounts, "api_identity_ids") else {}
     accounts = dashboard_accounts(state)
@@ -1891,7 +1918,7 @@ def management_payload(state: UsageDashboardState, include_remote: bool = False,
         "server": state.cloud.config()["server"],
         "editableConfig": state.cloud.editable_config(),
         "skills": dashboard_skill_status(state.skills.status()),
-        "scan": [{**{key: item.get(key) for key in ("name", "sources", "authoritativeSource", "defaultAssignments")}, **({"error": "Skill scan error"} if item.get("error") else {})} for item in state.skills.scan(refresh_scan)],
+        "scan": [{**{key: item.get(key) for key in ("name", "sources", "authoritativeSource", "defaultAssignments")}, **({"error": "Skill scan error"} if item.get("error") else {})} for item in (state.skill_scan_snapshot if hasattr(state, "skill_scan_snapshot") else state.skills.scan(refresh_scan))],
         "cloud": dashboard_cloud_status(state.cloud.redacted_status()),
         "accounts": accounts,
         "deviceAuth": state.device_auth.status() if hasattr(state, "device_auth") else None,
@@ -1980,7 +2007,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
             self.wfile.write(body)
 
         def send_json(self, status: int, payload: dict, headers: dict | None = None, *, sanitize: bool = True, cache_key: str | None = None):
-            from monitor_streaming import Records, json_chunks
+            from monitor_streaming import Records, dashboard_json_chunks
             def streamed(value):
                 return isinstance(value, Records) or isinstance(value, dict) and any(streamed(item) for item in value.values())
             if streamed(payload):
@@ -1989,7 +2016,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                     compress = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
                     output = gzip.GzipFile(fileobj=spool, mode="wb") if compress else spool
                     try:
-                        for chunk in json_chunks(dashboard_safe_json(payload) if sanitize else payload, sort_keys=False):
+                        for chunk in dashboard_json_chunks(dashboard_safe_json(payload) if sanitize else payload):
                             output.write(chunk)
                     finally:
                         close_records(payload)
@@ -2080,9 +2107,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                 query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
                 try:
                     if not query:
-                        payload = state.series_response(streamed=True)
+                        payload = state.series_response(streamed=True, refresh=False)
                     elif set(query) == {"streamId", "includedIndex", "mergedRevision"} and all(len(query[key]) == 1 for key in query):
-                        payload = state.series_response(query["streamId"][0], int(query["includedIndex"][0]), query["mergedRevision"][0], streamed=True)
+                        payload = state.series_response(query["streamId"][0], int(query["includedIndex"][0]), query["mergedRevision"][0], streamed=True, refresh=False)
                     else:
                         raise ValueError
                 except ValueError:
@@ -2090,6 +2117,57 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                     return
                 etag = f'W/"series-{payload["streamId"]}-{payload.get("fromIndex", "snapshot")}-{payload["includedIndex"]}-{payload["mergedRevision"]}-{payload["mode"]}"'
                 self.send_json(200, payload, {"Cache-Control": "no-cache", "ETag": etag}, cache_key=etag)
+                return
+            if path == "/api/dashboard":
+                started = time.perf_counter()
+                try:
+                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    if set(query) - {"view", "range", "start", "end"} or any(len(values) != 1 for values in query.values()):
+                        raise ValueError("Invalid dashboard scope")
+                    manifest = state.delivery.manifest(query.get("view", ["merged"])[0], query.get("range", ["All"])[0],
+                        float(query["start"][0]) if "start" in query else None, float(query["end"][0]) if "end" in query else None)
+                except (ValueError, OverflowError) as exc:
+                    self.send_json(400, {"error": str(exc)})
+                    return
+                if manifest is None:
+                    state.dashboard_cache_event.set()
+                    self.send_json(503, {"error": "History is being prepared", "preparing": True}, {"Retry-After": "1"})
+                    return
+                etag = f'"dashboard-{manifest["generation"]}"'
+                if self.headers.get("If-None-Match") == etag:
+                    self.send_not_modified(etag)
+                else:
+                    self.send_json(200, manifest, {"ETag": etag, "Cache-Control": "no-cache", "Server-Timing": f"scope;dur={(time.perf_counter() - started) * 1000:.2f}"}, cache_key=etag)
+                return
+            if path == "/api/dashboard/chunk":
+                try:
+                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+                    if set(query) != {"id"} or len(query["id"]) != 1:
+                        raise ValueError("Expected one chunk identity")
+                    digest = query["id"][0]
+                    etag = f'"chunk-{digest}"'
+                    compressed = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
+                    body = state.delivery.blob(digest, compressed)
+                except ValueError as exc:
+                    self.send_json(400, {"error": str(exc)})
+                    return
+                if body is None:
+                    state.dashboard_cache_event.set()
+                    self.send_json(404, {"error": "Dashboard chunk expired; reload the active scope"})
+                    return
+                if self.headers.get("If-None-Match") == etag:
+                    self.send_not_modified(etag)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Cache-Control", "private, max-age=86400, immutable")
+                self.send_header("ETag", etag)
+                self.send_header("Vary", "Accept-Encoding")
+                if compressed:
+                    self.send_header("Content-Encoding", "gzip")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
                 return
             if path == "/api/status":
                 payload = dashboard_status_payload(state)

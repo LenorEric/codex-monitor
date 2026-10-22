@@ -578,6 +578,19 @@ def hydrate_delta_state_from_events(state: dict, rows: list[dict]) -> None:
                     "cumulativeCostUsd": model_event["modelCumulativeCostUsd"],
                 }
 
+
+def delta_state_needs_hydration(state: dict) -> bool:
+    windows = state.get("windows")
+    if not isinstance(windows, dict):
+        return True
+    for label in ("5h", "7d"):
+        window = windows.get(label)
+        if not isinstance(window, dict) or any(coerce_float(window.get(key)) is None for key in ("cumulativePercent", "cumulativeCostUsd")) or not isinstance(window.get("models"), dict):
+            return True
+        if any(not isinstance(model, dict) or any(coerce_float(model.get(key)) is None for key in ("cumulativePercent", "cumulativeCostUsd")) for model in window["models"].values()):
+            return True
+    return False
+
 def allocate_model_delta_events(common: dict, delta_percent: float, delta_cost: float, total_cost_by_model: dict[str, float], window_state: dict) -> list[dict]:
     baseline = window_state.get("baselineCostByModelUsd") or {}
     costs = {model: max(0.0, cost - baseline.get(model, 0.0)) for model, cost in total_cost_by_model.items()}
@@ -639,8 +652,8 @@ def cost_interval_from_sample(sample: dict, label: str, normalized: float, delta
 def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list[dict]:
     window = (sample.get("windows") or {}).get(label) or {}
     if window.get("unavailable"):
-        state["windows"].pop(label, None)
-        state["windows"][label] = {}
+        # Forget the live baseline, retaining historical totals for the incremental (history=None) path.
+        state["windows"][label] = {key: value for key, value in state["windows"][label].items() if key in {"cumulativePercent", "cumulativeCostUsd", "models"}}
         return []
     raw = coerce_float(window.get("usedPercent"))
     if raw is None:
@@ -841,6 +854,12 @@ def process_sample_delta_events(state: dict, sample: dict, existing_events: list
     state["_pendingCostIntervals"] = []
     if existing_events is not None:
         hydrate_delta_state_from_events(state, existing_events)
+    else:
+        for label in ("5h", "7d"):
+            window = state.setdefault("windows", {}).setdefault(label, {})
+            window.setdefault("cumulativePercent", 0.0)
+            window.setdefault("cumulativeCostUsd", 0.0)
+            window.setdefault("models", {})
     rejection_reasons = remote_usage_rejection_reasons(state, sample)
     if rejection_reasons:
         sample.setdefault("errors", {})["remoteUsageRejected"] = "; ".join(rejection_reasons)

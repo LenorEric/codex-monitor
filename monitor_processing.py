@@ -161,6 +161,8 @@ def initialize_processing_index(path: Path) -> None:
             db.execute("INSERT INTO processing_meta VALUES('countsInitialized','true')")
         if db.execute("SELECT value FROM processing_meta WHERE name='schemaVersion'").fetchone()[0] != str(PROCESSING_SCHEMA_VERSION):
             raise ValueError("Unsupported processing index schema")
+        from monitor_delivery import initialize_delivery
+        initialize_delivery(db)
 
 
 class ProcessingIndex:

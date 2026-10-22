@@ -3928,8 +3928,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertIn('<button data-data-view="local">Local</button><button data-data-view="merged">Merged</button>', html)
         self.assertIn('dataView="merged"', html)
-        self.assertIn('fetch(`/api/series${query}`', html)
-        self.assertIn('vscode.postMessage({type:"getCodexUsageSeries",cursor})', html)
+        self.assertIn('`/api/dashboard?${new URLSearchParams(scope)}`', html)
+        self.assertIn('vscode.postMessage({type:"getCodexDashboard",requestId,scope,etag})', html)
         self.assertIn('button.classList.toggle("active",button.dataset.dataView===dataView)', html)
         self.assertIn('async getSeries(cursor = {})', extension)
         self.assertIn('["streamId", "includedIndex", "mergedRevision"]', extension)
@@ -3956,8 +3956,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("PAGE_ALLOWLIST", extension)
         self.assertIn('asset: "dashboard.html"', extension)
         self.assertIn('asset: "management.html"', extension)
-        self.assertEqual(extension.count("const html = await detailsHtml(context, target.webview, currentPage)"), 2)
-        self.assertEqual(extension.count("if (panel === target) target.webview.html = html"), 2)
+        self.assertEqual(extension.count("const html = await detailsHtml(context, target.webview, currentPage)"), 1)
+        self.assertEqual(extension.count("if (panel === target) target.webview.html = html"), 1)
+        self.assertIn("panel.reveal();", extension)
         self.assertIn('message.type === "codexUsageAccountAction"', extension)
         self.assertIn('ACCOUNT_SWITCH_URL', extension)
         self.assertIn('ACCOUNT_RENAME_URL', extension)
@@ -3969,10 +3970,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("if (error.statusCode === 404) return this.getSeries()", extension)
         self.assertIn('message.type === "getCodexUsageStatus"', extension)
         self.assertIn('fetch("/api/status",{cache:"no-store",headers:statusEtag?', html)
-        self.assertIn('status.newestIndex>includedIndex||status.mergedRevision!==mergedRevision', html)
+        self.assertIn('if(historyGeneration===manifest.generation)return', html)
         self.assertIn("setInterval(pollStatus,5000)", html)
-        self.assertIn('addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}})', html)
-        self.assertNotIn("setInterval(load,5000)", html)
+        self.assertIn('addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true);load(true)}})', html)
+        self.assertIn("setInterval(load,5000)", html)
 
         self.assertNotIn("RELATIVE_TIME_UPDATE_INTERVAL_MS", extension)
         self.assertNotIn("lastTooltipRevision", extension)
@@ -4095,12 +4096,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('{name:"Account payloads",status:"skipped"', html)
         self.assertNotIn('Accounts updated:', html)
 
-    def test_management_page_scans_skills_silently_on_entry_and_every_five_seconds(self):
+    def test_management_page_refreshes_cached_data_and_requests_background_scans(self):
         html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
 
         self.assertNotIn('data-action="scan"', html)
         self.assertNotIn('showMessage("Skills scanned"', html)
-        self.assertIn('load(true);load(false,true);setInterval(load,1000);setInterval(()=>load(false,true),5000)', html)
+        self.assertIn('load(true);setInterval(load,1000);setInterval(()=>load(false,true),60000)', html)
         self.assertIn('await load(true);load(false,true)', html)
         self.assertIn('if(loading){if(refreshScan)scanPending=true;return}', html)
 
@@ -4682,7 +4683,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('button.setAttribute("aria-pressed",String(getValue()))', html)
         self.assertIn('normalize.setAttribute("aria-pressed",String(normalizedUsage))', html)
         self.assertIn('normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)', html)
-        self.assertIn('setupAccountControls();setupUsageFoldControls();load(true)', html)
+        self.assertIn('setupAccountControls();setupUsageFoldControls();pollStatus(true);load(true)', html)
         self.assertIn('function quotaTimeDomain(points)', html)
         self.assertIn('function quotaPointsInRange(points,domain)', html)
         self.assertIn('compactedBoundary:true', html)
@@ -4772,7 +4773,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}%', html)
         self.assertIn('drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)', html)
         self.assertIn('drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)', html)
-        self.assertIn('const previousSeries=previous?.series||[]', html)
+        self.assertIn('const previousSeries=animate?previous?.series||[]:[]', html)
         self.assertIn('const oldPoints=previousByAccount.get(series.accountId)?.points||[], oldOwners=new Map', html)
         self.assertIn('hasOverlap=series.points.some(point=>oldOwners.has(point.key))', html)
         self.assertIn('Math.abs(candidate.timestamp-point.timestamp)<Math.abs(nearest.timestamp-point.timestamp)', html)
@@ -6355,7 +6356,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertIn('api(`/api/manage/status${refreshScan?', html)
         self.assertIn('if(serialized!==serializedData)', html)
         self.assertNotIn('data-action="scan"', html)
-        self.assertIn('setInterval(()=>load(false,true),5000)', html)
+        self.assertIn('setInterval(()=>load(false,true),60000)', html)
         self.assertIn('run("/api/manage/cloud/fetch")', html)
         self.assertIn('run("/api/manage/cloud/fetch-all")', html)
         self.assertIn('run("/api/manage/cloud/push")', html)
@@ -7783,7 +7784,8 @@ class RawCostUsageTests(unittest.TestCase):
 
     def test_dashboard_uses_weighted_model_attribution_and_average_dense_points(self):
         html = dashboard_html()
-        self.assertIn("const attributedUsage=(Number(point.deltaPercent)||0)*selectedCost/allCost", html)
+        self.assertIn("(Number(point.deltaPercent)||0)*selectedCost/allCost", html)
+        self.assertIn("point.usageByModel", html)
         self.assertIn("usd(cost/percent*100)", html)
         self.assertIn("group.reduce((sum,p)=>sum+eventTimestamp(p),0)/group.length", html)
         self.assertIn("group.reduce((sum,p)=>sum+p.costPer100PercentUsd,0)/group.length", html)

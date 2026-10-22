@@ -50,6 +50,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 .legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
 .filter-bar{display:grid;gap:8px;padding:0 18px 10px}.model-filter,.account-filter{width:100%;padding:0;align-items:flex-start}.model-label,.account-label{width:58px;padding-top:4px;color:var(--muted);font-size:12px}.model-buttons,.account-buttons{flex:1}.model-buttons button,.account-buttons button{height:26px}
 .status{padding:0 18px 14px;color:var(--muted)}
+#historyStatus:empty{display:none}
 .message-stack{position:fixed;left:16px;bottom:16px;z-index:80;display:flex;flex-direction:column;gap:10px;width:min(360px,calc(100vw - 32px));max-height:calc(100vh - 32px);pointer-events:none}
 .pop-message{position:relative;flex:none;padding:12px 38px 12px 14px;border:1px solid #3c4656;border-left:4px solid var(--blue);background:#1b2029;border-radius:9px;box-shadow:0 12px 34px rgba(0,0,0,.45);cursor:default;pointer-events:auto;animation:message-in .18s ease-out}
 .pop-message.success{border-left-color:var(--green)}.pop-message.error{border-left-color:var(--red)}.pop-message.warning{border-left-color:var(--orange)}
@@ -78,6 +79,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <div class="control-group"><span class="control-label">Chart display</span><div class="fold-buttons" aria-label="Usage chart display options"><button id="collapseUsageGaps" type="button">Collapse gaps</button><button id="collapseUsageFlat" type="button">Collapse flat</button><button id="normalizeUsage" type="button" title="Show Plus-equivalent usage: Pro Lite ×5 and Pro ×20">Normalized usage</button></div></div>
 </div>
 <div class="account-banner" id="accountBanner" role="status"></div>
+<div class="status" id="historyStatus" role="status" aria-live="polite">Loading history…</div>
 <div class="filter-bar">
 <div class="model-filter"><span class="model-label">Models</span><div class="model-buttons" id="models"></div></div>
 <div class="account-filter"><span class="account-label">Accounts</span><div class="account-buttons" id="eventAccounts"></div></div>
@@ -165,8 +167,12 @@ const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null;
 const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
 const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections";
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
-let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}}, viewPayloads={local:null,merged:null};
-let pendingStatusRequest=null, pendingSeriesRequest=null, streamId=null, includedIndex=-1, mergedRevision=null, statusEtag=null, currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
+let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}};
+let pendingStatusRequest=null, statusEtag=null, currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
+let historyScope=null,historyGeneration=null,drawGeneration=0,chunkCacheBytes=0;
+let curveColors=new Map();
+const chunkCache=new Map(),scopeCache=new Map(),historyRequests=new Map(),deferredCharts=new Map();
+const historyMetrics={};
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
 const DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50, DATE_PICKER_VIRTUAL_WIDTH=280, DATE_PICKER_VIRTUAL_HEIGHT=360, DATE_PICKER_VIRTUAL_PADDING=8;
@@ -309,7 +315,7 @@ function updateDateLeavePointer(event){
 function shiftSelectedDate(days){
   const bounds=selectedDateBounds(), date=bounds?new Date(bounds.startMs):new Date();
   date.setDate(date.getDate()+days);
-  selectedDate=localDateValue(date);if(selectedDate>latestSelectableDate())selectedDate=latestSelectableDate();selected="Date";saveSelections();setupControls();drawAll(true);
+  selectedDate=localDateValue(date);if(selectedDate>latestSelectableDate())selectedDate=latestSelectableDate();selected="Date";saveSelections();setupControls();load(true);
 }
 function syncControls(){
   document.querySelectorAll("[data-range]").forEach(b=>b.classList.toggle("active",b.dataset.range===selected));
@@ -323,7 +329,7 @@ function syncControls(){
 function activateDateInput(){
   if(!selectedDate)selectedDate=localDateValue(new Date());
   if(selected==="Date"){syncControls();return}
-  selected="Date";saveSelections();syncControls();drawAll(true);
+  selected="Date";saveSelections();syncControls();load(true);
 }
 function filteredEvents(list){
   if(selected==="All"||!list.length)return list;
@@ -335,7 +341,7 @@ function filteredEvents(list){
   }
   const timed=allEvents().map(eventTimestamp).filter(value=>value!=null);
   if(!timed.length)return list;
-  const max=Math.max(...timed), secs=Object.fromEntries(ranges)[selected];
+  const max=payload.maxima?.costMax??Math.max(...timed), secs=Object.fromEntries(ranges)[selected];
   return list.filter(p=>p.synthetic||eventTimestamp(p)==null||eventTimestamp(p)>=max-secs);
 }
 function modelDisplayName(model){
@@ -364,7 +370,7 @@ function modelFilteredEvents(list){
     if(!selectedModels.size)return [{...point,deltaCostUsd:allCost,costPer100PercentUsd:point.deltaPercent>0?allCost/point.deltaPercent*100:null}];
     const selectedCost=Object.entries(point.costByModelUsd||{}).reduce((sum,[model,cost])=>sum+(selectedModels.has(model)?Number(cost)||0:0),0);
     if(allCost<=0||selectedCost<=0)return [];
-    const attributedUsage=(Number(point.deltaPercent)||0)*selectedCost/allCost;
+    const attributedUsage=point.usageByModel?Object.entries(point.usageByModel).reduce((sum,[model,usage])=>sum+(selectedModels.has(model)?Number(usage)||0:0),0):(Number(point.deltaPercent)||0)*selectedCost/allCost;
     return attributedUsage>0?[{...point,deltaPercent:attributedUsage,deltaCostUsd:selectedCost,costPer100PercentUsd:selectedCost/attributedUsage*100}]:[];
   });
 }
@@ -396,6 +402,7 @@ function accountFilteredQuotaPoints(list){
   return selectedAccounts.size?list.filter(point=>selectedAccounts.has(usageAccountId(point))):list;
 }
 function filteredTokenSessions(list){
+  if(payload.scopedHistory)return list;
   if(selected==="All"||!list.length)return list;
   if(selected==="Date"){
     const bounds=selectedDateBounds();
@@ -435,16 +442,17 @@ function updateTokenSummary(sessions){
   document.getElementById("tokenCacheHit").textContent=cacheable?`${(totals.cachedInputTokens/cacheable*100).toFixed(1)}%`:"0%";
   document.getElementById("tokenCost").textContent=usd(totals.cost);
   const timeSpan=document.getElementById("tokenTimeSpan");timeSpan.textContent=tokenDateSpan(included);timeSpan.hidden=selected!=="All"||!timeSpan.textContent;
-  document.getElementById("tokenSessionCount").textContent=`${included.length} session${included.length===1?"":"s"}`;
+  const count=included.reduce((sum,session)=>sum+(session.sessionCount??1),0);
+  document.getElementById("tokenSessionCount").textContent=`${count} session${count===1?"":"s"}`;
 }
 function setupControls(){
   document.getElementById("ranges").replaceChildren(...ranges.map(([range])=>{const button=document.createElement("button");button.dataset.range=range;button.classList.toggle("active",range===selected);button.textContent=range;return button}));
-  document.querySelectorAll("[data-range]").forEach(b=>b.onclick=()=>{selected=b.dataset.range;previousRange=selected;saveSelections();cancelDateLeaveTracking();setupControls();drawAll(true)});
+  document.querySelectorAll("[data-range]").forEach(b=>b.onclick=()=>{selected=b.dataset.range;previousRange=selected;saveSelections();cancelDateLeaveTracking();setupControls();load(true)});
   const date=document.getElementById("rangeDate");
   syncControls();
   date.onclick=activateDateInput;
   date.onfocus=activateDateInput;
-  date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}saveSelections();setupControls();drawAll(true)};
+  date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}saveSelections();setupControls();load(true)};
   const selector=document.getElementById("dateSelector");selector.onpointerenter=cancelDateLeaveTracking;selector.onpointerleave=startDateLeaveTracking;
   document.getElementById("prevDate").onclick=()=>shiftSelectedDate(-1);
   document.getElementById("nextDate").onclick=()=>shiftSelectedDate(1);
@@ -458,22 +466,6 @@ function setupUsageFoldControls(){
   sync();normalize.onclick=()=>{normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)};
 }
 addEventListener("pointermove",updateDateLeavePointer,{passive:true});
-function requestSeries(cursor=null){
-  if(pendingSeriesRequest)return pendingSeriesRequest;
-  const query=cursor?`?${new URLSearchParams(cursor)}`:"";
-  const request=!vscode?fetch(`/api/series${query}`,{cache:"no-store"}).then(response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}):new Promise((resolve,reject)=>{
-    const receive=event=>{
-      if(event.data?.type!=="codexUsageSeries")return;
-      removeEventListener("message",receive);clearTimeout(timeout);
-      event.data.error?reject(new Error(event.data.error)):resolve(event.data.payload);
-    };
-    const timeout=setTimeout(()=>{removeEventListener("message",receive);reject(new Error("Python monitor did not respond"))},10000);
-    addEventListener("message",receive);
-    vscode.postMessage({type:"getCodexUsageSeries",cursor});
-  });
-  pendingSeriesRequest=request.finally(()=>pendingSeriesRequest=null);
-  return pendingSeriesRequest;
-}
 function requestStatus(){
   if(pendingStatusRequest)return pendingStatusRequest;
   const request=!vscode?fetch("/api/status",{cache:"no-store",headers:statusEtag?{"If-None-Match":statusEtag}:{}}).then(async response=>{if(response.status===304)return {payload:currentStatus,etag:statusEtag,notModified:true};if(!response.ok)throw new Error(`HTTP ${response.status}`);return {payload:await response.json(),etag:response.headers.get("ETag"),notModified:false}}):new Promise((resolve,reject)=>{
@@ -613,84 +605,89 @@ function showRefreshError(error){
   lastUpdateTimestamp=null;const detail=error.message||String(error);document.getElementById("status").textContent=`Dashboard refresh failed; retrying automatically. ${detail}`;
   if(!refreshErrorShown){showMessage("Dashboard Refresh Failed",`Usage data could not be refreshed; retrying automatically: ${detail}`,messageDetailReport("Dashboard refresh","Failed",[{name:"Status or series request",status:"failed",detail},{name:"Automatic retry",status:"in progress",detail:"Polling remains active and will retry without user action."}]),"error");refreshErrorShown=true}
 }
-function cloneValue(value){return JSON.parse(JSON.stringify(value))}
 function validateView(view){
   if(!view||!Array.isArray(view.quotaPoints)||!Array.isArray(view.tokenSessions)||!Array.isArray(view.costUsage?.fiveHour)||!Array.isArray(view.costUsage?.sevenDay))throw new Error("Invalid dashboard snapshot");
   for(const row of [...view.quotaPoints,...view.tokenSessions,...view.costUsage.fiveHour,...view.costUsage.sevenDay])if(typeof row?._key!=="string"||!row._key)throw new Error("Dashboard row is missing its key");
   return view;
 }
-function sortCollection(name,rows){
-  const timestamp=row=>eventTimestamp(row)??(Date.parse(row.updatedAt||row.startedAt||"")/1000||0), account=row=>row.usageAccountId||row.accountSlotId||"";
-  return rows.sort((a,b)=>name==="tokenSessions"?(Date.parse(a.updatedAt||a.startedAt||"")-Date.parse(b.updatedAt||b.startedAt||"")||a._key.localeCompare(b._key)):(Number(Boolean(b.synthetic))-Number(Boolean(a.synthetic))||timestamp(a)-timestamp(b)||account(a).localeCompare(account(b))||a._key.localeCompare(b._key)));
-}
-function applyCollection(name,rows,changes){
-  if(!changes)return rows;
-  if(!Array.isArray(changes.upsert)||!Array.isArray(changes.delete))throw new Error(`Invalid ${name} update`);
-  const values=new Map(rows.map(row=>[row._key,row]));
-  for(const key of changes.delete){if(typeof key!=="string")throw new Error(`Invalid ${name} deletion`);values.delete(key)}
-  for(const row of changes.upsert){if(typeof row?._key!=="string"||!row._key)throw new Error(`Invalid ${name} upsert`);values.set(row._key,row)}
-  return sortCollection(name,[...values.values()]);
-}
-function applyViewChanges(view,changes={}){
-  const next=cloneValue(view);
-  next.quotaPoints=applyCollection("quotaPoints",next.quotaPoints,changes.quotaPoints);
-  next.tokenSessions=applyCollection("tokenSessions",next.tokenSessions,changes.tokenSessions);
-  next.costUsage.fiveHour=applyCollection("costUsage.fiveHour",next.costUsage.fiveHour,changes.costUsage?.fiveHour);
-  next.costUsage.sevenDay=applyCollection("costUsage.sevenDay",next.costUsage.sevenDay,changes.costUsage?.sevenDay);
-  if(Object.prototype.hasOwnProperty.call(changes,"historyStats"))next.historyStats=changes.historyStats;
-  return validateView(next);
-}
-function activateDataView(){
-  const view=viewPayloads[dataView];if(!view)return;
-  payload={...view,points:currentStatus?.lastSample?[pointFromSample(currentStatus.lastSample)]:[],lastSample:currentStatus?.lastSample,display:currentStatus?.display,accounts:currentStatus?.accounts};
-}
-function applySeriesResponse(response){
-  if(response?.protocolVersion!==3||!response.streamId||!Number.isInteger(response.includedIndex))throw new Error("Invalid indexed dashboard response");
-  if(response.mode==="snapshot"){
-    viewPayloads={local:validateView(cloneValue(response.views?.local)),merged:validateView(cloneValue(response.views?.merged))};
-    streamId=response.streamId;includedIndex=response.includedIndex;mergedRevision=response.mergedRevision;currentStatus=response.status;statusEtag=response.statusEtag||null;activateDataView();return;
-  }
-  if(response.mode!=="update"||response.streamId!==streamId||response.fromIndex!==includedIndex||!Array.isArray(response.batches))throw new Error("Dashboard update does not continue the current stream");
-  const next={local:cloneValue(viewPayloads.local),merged:cloneValue(viewPayloads.merged)};let expected=includedIndex+1;
-  for(const batch of response.batches){if(batch.index!==expected++)throw new Error("Dashboard update indexes are not consecutive");next.local=applyViewChanges(next.local,batch.local);if(!response.mergedSnapshot)next.merged=applyViewChanges(next.merged,batch.merged)}
-  if(expected-1!==response.includedIndex)throw new Error("Dashboard update did not reach its included index");
-  if(response.mergedSnapshot)next.merged=validateView(cloneValue(response.mergedSnapshot));
-  viewPayloads=next;includedIndex=response.includedIndex;mergedRevision=response.mergedRevision;activateDataView();
-}
 async function load(force=false){
   if(document.hidden&&!force)return;
-  const sequence=++seriesLoadSequence;
+  const scope={view:dataView,range:selected}, bounds=selected==="Date"?selectedDateBounds():null;
+  if(bounds){scope.start=String(bounds.startMs/1000);scope.end=String(bounds.endMs/1000)}
+  const key=new URLSearchParams(scope).toString(), sequence=++seriesLoadSequence, cached=scopeCache.get(key), started=performance.now();
+  if(historyScope!==key){
+    historyScope=key;historyGeneration=null;
+    if(cached)showScope(key,cached);
+    else{
+      drawGeneration++;deferredCharts.clear();
+      payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]},accounts:currentStatus?.accounts,scopedHistory:true};
+      for(const id of ["usageTime5h","usageTime7d","scatter5h","scatter7d"]){const canvas=document.getElementById(id);if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);if(usageTimeChartStates[id]?.frame)cancelAnimationFrame(usageTimeChartStates[id].frame);delete chartStates[id];delete usageTimeChartStates[id];canvas.getContext("2d").clearRect(0,0,canvas.width,canvas.height);canvas.onmousemove=null;document.getElementById(`${id}Legend`).replaceChildren()}
+      for(const id of ["tokenInput","tokenCachedInput","tokenOutput","tokenCacheWrite","tokenCacheHit","tokenCost","tokenSessionCount"])document.getElementById(id).textContent="—";
+      document.getElementById("tokenTimeSpan").hidden=true;
+      document.getElementById("historyStatus").textContent="Loading selected history…";
+    }
+  }
   try{
-    const response=await requestSeries();
+    const response=await requestDashboard(scope,cached?.etag), manifest=response.notModified?cached?.manifest:response.payload;
     if(sequence!==seriesLoadSequence)return;
-    applySeriesResponse(response);
-    refreshErrorShown=false;
-    await ensureControlPassword(currentStatus);renderCurrentStatus(currentStatus);drawAll();
-  }catch(error){showRefreshError(error)}
+    if(!manifest||manifest.protocolVersion!==4||manifest.view!==scope.view||manifest.range!==scope.range||!Array.isArray(manifest.chunks))throw new Error("Incompatible dashboard scope response");
+    if(historyGeneration===manifest.generation)return;
+    payload={...payload,tokenSessions:manifest.tokenSessions||[],rateRows:manifest.rateRows,maxima:manifest.maxima,accounts:currentStatus?.accounts,scopedHistory:true};
+    updateTokenSummary(accountFilteredEvents(payload.tokenSessions));
+    if(payload.rateRows){updateRate("rate5h",modelFilteredEvents(accountFilteredEvents(payload.rateRows.fiveHour)));updateRate("rate7d",modelFilteredEvents(accountFilteredEvents(payload.rateRows.sevenDay)))}
+    document.getElementById("historyStatus").textContent="Loading selected charts…";
+    const frames=new Array(manifest.chunks.length);let next=0;
+    await Promise.all(Array.from({length:Math.min(4,frames.length)},async()=>{
+      while(next<frames.length){const index=next++, id=manifest.chunks[index];let entry=chunkCache.get(id);
+        if(!entry){const result=await requestDashboard({chunkId:id});entry=chunkCache.get(id);if(!entry){entry={value:validateView(result.payload),bytes:JSON.stringify(result.payload).length*2};chunkCache.set(id,entry);chunkCacheBytes+=entry.bytes}
+          while(chunkCacheBytes>24*1024*1024&&chunkCache.size>1){const oldest=chunkCache.keys().next().value;chunkCacheBytes-=chunkCache.get(oldest).bytes;chunkCache.delete(oldest)}}
+        frames[index]=entry.value;
+        if(sequence!==seriesLoadSequence)return;
+      }
+    }));
+    if(sequence!==seriesLoadSequence)return;
+    const value={quotaPoints:[],tokenSessions:manifest.tokenSessions||[],costUsage:{fiveHour:[],sevenDay:[]},historyStats:{},maxima:manifest.maxima,rateRows:manifest.rateRows,scopedHistory:true};
+    for(const frame of frames){for(const row of frame.quotaPoints)value.quotaPoints.push(row);for(const name of ["fiveHour","sevenDay"])for(const row of frame.costUsage[name])value.costUsage[name].push(row)}
+    const entry={manifest,value,etag:response.etag||cached?.etag,bytes:JSON.stringify(value).length*2};
+    scopeCache.delete(key);scopeCache.set(key,entry);
+    while(scopeCache.size>8||[...scopeCache.values()].reduce((sum,item)=>sum+item.bytes,0)>24*1024*1024&&scopeCache.size>1)scopeCache.delete(scopeCache.keys().next().value);
+    showScope(key,entry);historyMetrics[key]={loadMs:performance.now()-started,chunks:frames.length,points:value.quotaPoints.length,generation:manifest.generation};
+  }catch(error){if(sequence===seriesLoadSequence){document.getElementById("historyStatus").textContent=error.preparing?"Preparing history in the background…":"History refresh failed; retrying automatically. "+error.message}}
 }
-async function refreshSeries(force=false){
-  if(document.hidden&&!force||!streamId)return;
-  const sequence=++seriesLoadSequence;
-  try{const response=await requestSeries({streamId,includedIndex:String(includedIndex),mergedRevision:mergedRevision??""});if(sequence!==seriesLoadSequence)return;applySeriesResponse(response);refreshErrorShown=false;renderCurrentStatus(currentStatus);drawAll()}
-  catch(error){if(sequence===seriesLoadSequence)await load(true)}
+function requestDashboard(scope,etag){
+  const key=JSON.stringify([scope,etag]);if(historyRequests.has(key))return historyRequests.get(key);
+  const request=!vscode?fetch(scope.chunkId?`/api/dashboard/chunk?id=${encodeURIComponent(scope.chunkId)}`:`/api/dashboard?${new URLSearchParams(scope)}`,{cache:scope.chunkId?"force-cache":"no-cache",headers:etag?{"If-None-Match":etag}:{}}).then(async response=>{
+    if(response.status===304)return {notModified:true,etag};
+    const payload=await response.json();if(!response.ok){const error=new Error(payload.error||`HTTP ${response.status}`);error.preparing=payload.preparing;throw error}return {payload,etag:response.headers.get("ETag")};
+  }):new Promise((resolve,reject)=>{
+    const requestId=`history-${++actionSequence}`,receive=event=>{if(event.data?.type!=="codexDashboardResponse"||event.data.requestId!==requestId)return;removeEventListener("message",receive);clearTimeout(timeout);if(event.data.error){const error=new Error(event.data.error);error.preparing=event.data.preparing;reject(error)}else resolve(event.data.response)};
+    const timeout=setTimeout(()=>{removeEventListener("message",receive);reject(new Error("History request timed out"))},30000);addEventListener("message",receive);vscode.postMessage({type:"getCodexDashboard",requestId,scope,etag});
+  });
+  const pending=request.finally(()=>historyRequests.delete(key));historyRequests.set(key,pending);return pending;
 }
+function showScope(key,entry){
+  if(historyScope!==key)return;
+  payload={...entry.value,accounts:currentStatus?.accounts,lastSample:currentStatus?.lastSample,display:currentStatus?.display};historyGeneration=entry.manifest.generation;
+  document.getElementById("historyStatus").textContent="";
+  drawAll();
+}
+async function refreshSeries(force=false){return load(force)}
 function setupDataView(){
-  document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();activateDataView();setupDataView();if(currentStatus)renderCurrentStatus(currentStatus);drawAll(true)}});
+  document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();setupDataView();load(true)}});
 }
 async function pollStatus(force=false){
   if(document.hidden&&!force)return;
   try{
     const response=await requestStatus(), status=response.payload;
     if(!status)throw new Error("Status response was empty");
-    currentStatus=status;statusEtag=response.etag||statusEtag;activateDataView();await ensureControlPassword(status);
+    currentStatus=status;statusEtag=response.etag||statusEtag;payload={...payload,accounts:status.accounts,lastSample:status.lastSample,display:status.display};
     refreshErrorShown=false;renderCurrentStatus(status);
-    if(status.streamId!==streamId||status.newestIndex<includedIndex)await load(true);
-    else if(status.newestIndex>includedIndex||status.mergedRevision!==mergedRevision)await refreshSeries(true);
+    ensureControlPassword(status);
   }catch(error){showRefreshError(error)}
 }
 function extent(values){
   const nums=values.filter(Number.isFinite);
-  return nums.length?[Math.min(...nums),Math.max(...nums)]:[0,1];
+  return nums.length?nums.reduce(([low,high],value)=>[Math.min(low,value),Math.max(high,value)],[Infinity,-Infinity]):[0,1];
 }
 function denseMergeMetrics(id,list){
   const rect=document.getElementById(id).getBoundingClientRect(), times=list.map(eventTimestamp).filter(Number.isFinite), values=list.map(p=>p.costPer100PercentUsd).filter(Number.isFinite), [minTime,maxTime]=extent(times), [minValue,maxValue]=extent(values);
@@ -868,7 +865,7 @@ function quotaTimeDomain(points){
   }
   const timestamps=points.map(eventTimestamp).filter(Number.isFinite);
   if(!timestamps.length)return null;
-  const max=Math.max(...timestamps);
+  const max=payload.maxima?.quotaMax??Math.max(...timestamps);
   if(selected==="All"){
     const min=Math.min(...timestamps);
     return min===max?[min-1800,max+1800]:[min,max];
@@ -919,7 +916,7 @@ function drawXAxisTickLabels(ctx,labels,start,pixels,y){
 }
 function plusEquivalentUsage(point,label,valueOf){return valueOf(point)*({plus:1,pro_lite:5,pro:20}[point[label]?.plan]||1)}
 function compactedUsageRanges(points){
-  return points.map(point=>({start:point.compactedFrom,end:eventTimestamp(point)})).filter(range=>Number.isFinite(range.start)&&Number.isFinite(range.end)&&range.start<range.end).sort((a,b)=>a.start-b.start||a.end-b.end).reduce((merged,range)=>{
+  return points.map(point=>({start:point.overviewBucket?.start??point.compactedFrom,end:point.overviewBucket?.end??eventTimestamp(point)})).filter(range=>Number.isFinite(range.start)&&Number.isFinite(range.end)&&range.start<range.end).sort((a,b)=>a.start-b.start||a.end-b.end).reduce((merged,range)=>{
     const previous=merged.at(-1);
     if(previous&&range.start<=previous.end)previous.end=Math.max(previous.end,range.end);
     else merged.push(range);
@@ -1047,8 +1044,7 @@ function drawUsageTimeFolds(ctx,folds,top,bottom,part="all"){
   ctx.globalAlpha=1;ctx.restore();
 }
 function accountCurveColor(accountId){
-  const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], points=payload.quotaPoints||[], accountIds=[...new Set(points.map(usageAccountId))].sort((a,b)=>accountDisplayName(a,points.find(point=>usageAccountId(point)===a)?.accountLabel).localeCompare(accountDisplayName(b,points.find(point=>usageAccountId(point)===b)?.accountLabel),undefined,{numeric:true})||a.localeCompare(b));
-  return palette[Math.max(0,accountIds.indexOf(accountId))%palette.length];
+  return curveColors.get(accountId)||"#4f8cff";
 }
 function usageTimeAccountTotal(points,valueOf){
   const values=points.filter(point=>Number.isFinite(valueOf(point))).sort((a,b)=>eventTimestamp(a)-eventTimestamp(b)).map(valueOf);
@@ -1062,7 +1058,7 @@ function renderUsageLegend(id,groups){
 function drawUsageTimeChart(id,label,points,animate=false){
   const c=document.getElementById(id), ctx=c.getContext("2d"), previous=usageTimeChartStates[id];
   if(previous?.frame)cancelAnimationFrame(previous.frame);
-  const previousSeries=previous?.series||[], previousFolds=previous?.folds||[], previousLabelLayer=previous?.labelLayer;
+  const previousSeries=animate?previous?.series||[]:[], previousFolds=animate?previous?.folds||[]:[], previousLabelLayer=previous?.labelLayer;
   const dpr=devicePixelRatio||1, rect=c.getBoundingClientRect(), m=CHART_MARGINS;
   if(!rect.width||!rect.height){delete usageTimeChartStates[id];return}
   c.width=rect.width*dpr;c.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,rect.width,rect.height);
@@ -1165,20 +1161,28 @@ function drawUsageTimeChart(id,label,points,animate=false){
   step(started);
 }
 function drawAll(animate=false){
+  if(payload.scopedHistory&&!historyGeneration)return;
+  const generation=++drawGeneration;deferredCharts.clear();
   const e=payload.costUsage||{}, fiveInRange=filteredEvents(e.fiveHour||[]), sevenInRange=filteredEvents(e.sevenDay||[]), quotaPoints=payload.quotaPoints||[], quotaInRange=quotaPointsInRange(quotaPoints,quotaTimeDomain(quotaPoints)), tokenSessions=filteredTokenSessions(payload.tokenSessions||[]);
+  const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], labels=new Map([...quotaPoints,...fiveInRange,...sevenInRange].map(row=>[usageAccountId(row),row.accountLabel]));
+  curveColors=new Map([...labels.keys()].sort((a,b)=>accountDisplayName(a,labels.get(a)).localeCompare(accountDisplayName(b,labels.get(b)),undefined,{numeric:true})||a.localeCompare(b)).map((id,index)=>[id,palette[index%palette.length]]));
   visibleTokenSessions=tokenSessions;
   updateModelControls([...fiveInRange,...sevenInRange]);
   updateAccountControls([...fiveInRange,...sevenInRange,...quotaInRange]);
   const five=modelFilteredEvents(accountFilteredEvents(fiveInRange)), seven=modelFilteredEvents(accountFilteredEvents(sevenInRange)), quota=accountFilteredQuotaPoints(quotaInRange);
   const selectedTokenSessions=accountFilteredEvents(tokenSessions);
   updateTokenSummary(selectedTokenSessions);
-  updateRate("rate5h",five);updateRate("rate7d",seven);
-  drawDeltaChart("scatter5h","5h cost vs usage",css("--blue"),five,animate);
-  drawDeltaChart("scatter7d","7d cost vs usage",css("--green"),seven,animate);
-  drawUsageTimeChart("usageTime5h","fiveHour",quota,animate);
-  drawUsageTimeChart("usageTime7d","sevenDay",quota,animate);
+  updateRate("rate5h",payload.rateRows?modelFilteredEvents(accountFilteredEvents(payload.rateRows.fiveHour)):five);
+  updateRate("rate7d",payload.rateRows?modelFilteredEvents(accountFilteredEvents(payload.rateRows.sevenDay)):seven);
+  const jobs=[["usageTime5h",()=>drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)],["usageTime7d",()=>drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)],
+    ["scatter5h",()=>drawDeltaChart("scatter5h","5h cost vs usage",css("--blue"),five,animate)],["scatter7d",()=>drawDeltaChart("scatter7d","7d cost vs usage",css("--green"),seven,animate)]];
+  const drawNext=()=>{if(generation!==drawGeneration||!jobs.length)return;const [id,draw]=jobs.shift(),canvas=document.getElementById(id),rect=canvas.getBoundingClientRect();
+    if(chartObserver&&(rect.top>=innerHeight||rect.bottom<=0)){deferredCharts.set(id,{generation,draw});chartObserver.observe(canvas)}else draw();
+    requestAnimationFrame(()=>setTimeout(drawNext,0));
+  };requestAnimationFrame(()=>setTimeout(drawNext,0));
 }
-restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();load(true);setInterval(pollStatus,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true)}});addEventListener("resize",drawAll);
+const chartObserver=typeof IntersectionObserver==="undefined"?null:new IntersectionObserver(entries=>{for(const entry of entries){if(!entry.isIntersecting)continue;const task=deferredCharts.get(entry.target.id);if(task&&task.generation===drawGeneration){deferredCharts.delete(entry.target.id);chartObserver.unobserve(entry.target);requestAnimationFrame(()=>setTimeout(()=>{if(task.generation===drawGeneration)task.draw()},0))}}});
+restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();pollStatus(true);load(true);setInterval(pollStatus,5000);setInterval(load,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true);load(true)}});addEventListener("resize",()=>{cancelAnimationFrame(drawAll.resizeFrame);drawAll.resizeFrame=requestAnimationFrame(()=>drawAll())});
 </script>
 </body>
 </html>

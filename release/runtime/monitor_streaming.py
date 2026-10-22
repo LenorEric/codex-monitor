@@ -87,6 +87,36 @@ def close_records(value):
             close_records(item)
 
 
+def dashboard_json_chunks(value):
+    """Encode complete sanitized dashboard records, buffering writes; canonical wire encoding is unchanged."""
+    def chunks(item):
+        if isinstance(item, Records):
+            yield b"["
+            for position, row in enumerate(item):
+                if position:
+                    yield b","
+                yield json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            yield b"]"
+        elif isinstance(item, dict):
+            yield b"{"
+            for position, (key, row) in enumerate(item.items()):
+                if position:
+                    yield b","
+                yield json.dumps(key, ensure_ascii=False).encode("utf-8") + b":"
+                yield from chunks(row)
+            yield b"}"
+        else:
+            yield json.dumps(item, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    buffer = bytearray()
+    for chunk in chunks(value):
+        buffer.extend(chunk)
+        if len(buffer) >= CHUNK_BYTES:
+            yield bytes(buffer)
+            buffer.clear()
+    if buffer:
+        yield bytes(buffer)
+
+
 def compressed_payload(value, target):
     compressor, digest, size = zlib.compressobj(9), hashlib.sha256(), 0
     for chunk in json_chunks(value):

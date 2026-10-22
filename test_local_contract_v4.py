@@ -22,6 +22,25 @@ def workspace_directory():
 
 
 class LocalContractV4Tests(unittest.TestCase):
+    def test_v9_preserves_history_and_bootstraps_retryable_delivery_indexes(self):
+        from monitor_processing import ProcessingIndex
+        with workspace_directory() as root:
+            (root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":8}\n', encoding="utf-8")
+            quota, ledger, cache = root / "quota.jsonl", root / "ledger.jsonl", root / "cache.json"
+            quota.write_bytes(b'{"original":"quota"}\n')
+            ledger.write_bytes(b'{"original":"ledger"}\n')
+            index = ProcessingIndex(root / "cache-v4.sqlite3")
+            with index.transaction() as db:
+                db.execute("INSERT INTO processing_display VALUES('local','a','tokenSessions','s',NULL,?)", (json.dumps({"startedAt": "2030-01-01T00:00:00Z"}),))
+            args = (root, root / "history.jsonl", quota, root / "sessions.jsonl", ledger, root / "samples.jsonl")
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [9])
+            with index.transaction() as db:
+                self.assertEqual(db.execute("SELECT event_at FROM processing_display").fetchone()[0], 1893456000)
+                self.assertTrue(db.execute("SELECT dirty FROM dashboard_days WHERE day=?", (1893456000 // 86400,)).fetchone()[0])
+            self.assertEqual(quota.read_bytes(), b'{"original":"quota"}\n')
+            self.assertEqual(ledger.read_bytes(), b'{"original":"ledger"}\n')
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [])
+
     def test_v8_preserves_canonical_files_and_durable_v4_database(self):
         from monitor_usage_sync import initialize_v4_cache
         with workspace_directory() as root:
@@ -35,7 +54,7 @@ class LocalContractV4Tests(unittest.TestCase):
             with closing(sqlite3.connect(database)) as db, db:
                 db.execute("INSERT INTO local_records VALUES('key','2030-01-01T00:00Z','digest','{}')")
             args = (root, root / "history.jsonl", quota, root / "sessions.jsonl", ledger, root / "samples.jsonl")
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [8])
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [8, 9])
             with closing(sqlite3.connect(database)) as db, db:
                 self.assertEqual(db.execute("SELECT * FROM local_records").fetchall(), [('key', '2030-01-01T00:00Z', 'digest', '{}')])
                 self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_scan_sources'").fetchone())

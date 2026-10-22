@@ -118,7 +118,7 @@ class DashboardProjector:
         previous = db.execute("SELECT data FROM processing_display WHERE view=? AND kind=? AND record_key=?", (view, kind, key)).fetchone()
         if previous and previous[0] == data:
             return
-        stamp = parse_timestamp(row.get("updatedAt")) if kind == "tokenSessions" else row.get("timestamp")
+        stamp = parse_timestamp(row.get("updatedAt") or row.get("startedAt")) if kind == "tokenSessions" else row.get("timestamp")
         db.execute("INSERT OR REPLACE INTO processing_display VALUES(?,?,?,?,?,?)", (view, account, kind, key, stamp, data))
         if kind.startswith("costUsage:"):
             db.execute("INSERT OR REPLACE INTO processing_cost_ranges VALUES(?,?,?,?,?,?)", (view, account, kind, key, parse_timestamp(row["startedAt"]), parse_timestamp(row["endedAt"])))
