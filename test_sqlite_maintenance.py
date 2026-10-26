@@ -120,7 +120,7 @@ class SQLiteMaintenanceTests(unittest.TestCase):
             source.backup(target)
         def migrate():
             return monitor_auto_update.migrate_history_data(self.root, self.root / "history", self.root / "quota", self.root / "sessions",
-                self.root / "ledger", self.root / "samples", usage_sync_cache_path=self.root / "sync.json")
+                self.root / "ledger", self.root / "samples", usage_sync_cache_path=self.root / "sync.json", target_version=13)
         original = monitor_auto_update.DATA_MIGRATIONS[13]
         def interrupted(paths):
             original(paths)

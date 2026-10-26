@@ -12,6 +12,7 @@ from contextlib import closing, contextmanager
 from pathlib import Path
 
 from monitor_common import empty_token_totals, parse_timestamp
+import monitor_sample_store as samples
 
 PROCESSING_SCHEMA_VERSION = 1
 SOURCE_READ_BYTES = 1024 * 1024
@@ -83,21 +84,13 @@ def encode(value) -> str:
 
 def initialize_processing_index(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as db, db:
+    with closing(samples.connect(path)) as db, db:
         db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         db.execute("PRAGMA journal_mode=WAL")
+        normalized = samples.prepare(db)
         db.executescript("""
             CREATE TABLE IF NOT EXISTS processing_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS processing_files (path TEXT PRIMARY KEY, signature TEXT NOT NULL, offset INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS processing_facts (
-                source TEXT NOT NULL, position INTEGER NOT NULL, kind TEXT NOT NULL, record_key TEXT NOT NULL,
-                account TEXT NOT NULL, session TEXT NOT NULL, event_id TEXT NOT NULL, event_at REAL, data TEXT NOT NULL,
-                PRIMARY KEY(source, position)
-            );
-            CREATE INDEX IF NOT EXISTS processing_facts_key ON processing_facts(kind, record_key);
-            CREATE INDEX IF NOT EXISTS processing_facts_account ON processing_facts(kind, account, event_at, position);
-            CREATE INDEX IF NOT EXISTS processing_facts_session ON processing_facts(kind, session, event_at);
-            CREATE INDEX IF NOT EXISTS processing_facts_event ON processing_facts(kind, event_id);
             CREATE TABLE IF NOT EXISTS processing_scan_sources (path TEXT PRIMARY KEY, home TEXT NOT NULL, state TEXT NOT NULL, valid INTEGER NOT NULL);
             CREATE INDEX IF NOT EXISTS processing_scan_home ON processing_scan_sources(home);
             CREATE TABLE IF NOT EXISTS processing_scan_events (
@@ -114,10 +107,6 @@ def initialize_processing_index(path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS processing_occurrence_event ON processing_occurrences(event_id, source);
             CREATE INDEX IF NOT EXISTS processing_occurrence_order ON processing_occurrences(source,event_index);
-            CREATE INDEX IF NOT EXISTS processing_fact_source_event ON processing_facts(source,event_id);
-            CREATE INDEX IF NOT EXISTS processing_fact_source_time ON processing_facts(source,kind,event_at);
-            CREATE INDEX IF NOT EXISTS processing_fact_source_key ON processing_facts(source,kind,record_key);
-            CREATE INDEX IF NOT EXISTS processing_fact_account_key ON processing_facts(account,kind,record_key,source);
             CREATE TABLE IF NOT EXISTS processing_staged_occurrences (source TEXT NOT NULL, event_id TEXT NOT NULL, event_index INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(source,event_id));
             CREATE TABLE IF NOT EXISTS processing_totals (home TEXT NOT NULL, model TEXT NOT NULL, tier TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(home, model, tier));
             CREATE TABLE IF NOT EXISTS processing_dirty (view TEXT NOT NULL, account TEXT NOT NULL, reason TEXT NOT NULL, PRIMARY KEY(view, account));
@@ -136,7 +125,6 @@ def initialize_processing_index(path: Path) -> None:
             CREATE INDEX IF NOT EXISTS processing_display_session ON processing_display(view,account,kind,json_extract(data,'$.sessionId'));
             CREATE TABLE IF NOT EXISTS processing_cost_ranges (view TEXT NOT NULL, account TEXT NOT NULL, kind TEXT NOT NULL, record_key TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL, PRIMARY KEY(view,kind,record_key));
             CREATE INDEX IF NOT EXISTS processing_cost_range_end ON processing_cost_ranges(view,account,end,start);
-            CREATE INDEX IF NOT EXISTS processing_baselines ON processing_facts(source,session) WHERE json_extract(data,'$.recordType')='legacyBaseline';
             CREATE TABLE IF NOT EXISTS processing_quota_points (view TEXT NOT NULL, account TEXT NOT NULL, event_at REAL NOT NULL, record_key TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(view,account,record_key));
             CREATE INDEX IF NOT EXISTS processing_quota_order ON processing_quota_points(view,account,event_at,record_key);
             CREATE TABLE IF NOT EXISTS processing_rank_nodes (scope TEXT NOT NULL, value REAL NOT NULL, priority INTEGER NOT NULL, frequency INTEGER NOT NULL, size INTEGER NOT NULL, left_value REAL, right_value REAL, PRIMARY KEY(scope,value));
@@ -153,11 +141,15 @@ def initialize_processing_index(path: Path) -> None:
         for table, scope, account, kind in (("facts", "NEW.source", "NEW.account", "NEW.kind"), ("effective", "'effective'", "NEW.account", "'tokenLedger'"),
             ("display", "'display:'||NEW.view", "NEW.account", "NEW.kind"), ("quota_points", "'quota:'||NEW.view", "NEW.account", "'quota'"),
             ("scan_sources", "'sources'", "NEW.home", "'files'")):
+            physical = "fact_refs" if table == "facts" and normalized else table
+            if table == "facts" and normalized:
+                scope = "(SELECT value FROM sample_sources WHERE id=NEW.source_id)"
+                account = "(SELECT value FROM sample_accounts WHERE id=NEW.account_id)"
             db.executescript(f"""
-                CREATE TRIGGER IF NOT EXISTS processing_count_{table}_insert AFTER INSERT ON processing_{table} BEGIN
+                CREATE TRIGGER IF NOT EXISTS processing_count_{table}_insert AFTER INSERT ON processing_{physical} BEGIN
                     INSERT INTO processing_counts VALUES({scope},{account},{kind},1) ON CONFLICT(scope,account,kind) DO UPDATE SET count=count+1;
                 END;
-                CREATE TRIGGER IF NOT EXISTS processing_count_{table}_delete AFTER DELETE ON processing_{table} BEGIN
+                CREATE TRIGGER IF NOT EXISTS processing_count_{table}_delete AFTER DELETE ON processing_{physical} BEGIN
                     UPDATE processing_counts SET count=count-1 WHERE scope={scope.replace('NEW.', 'OLD.')} AND account={account.replace('NEW.', 'OLD.')} AND kind={kind.replace('NEW.', 'OLD.')};
                 END;
             """)
@@ -184,7 +176,7 @@ class ProcessingIndex:
     @contextmanager
     def transaction(self):
         with self.lock:
-            db = sqlite3.connect(self.path, timeout=10)
+            db = samples.connect(self.path, timeout=10)
             db.execute("PRAGMA recursive_triggers=ON")
             try:
                 with db:
@@ -199,7 +191,7 @@ class ProcessingIndex:
             return 0
         try:
             self._vacuum_check_at = now + VACUUM_CHECK_SECONDS
-            with closing(sqlite3.connect(self.path, timeout=0, isolation_level=None)) as db:
+            with closing(samples.connect(self.path, timeout=0, isolation_level=None)) as db:
                 if db.execute("PRAGMA auto_vacuum").fetchone()[0] != 2:
                     return 0  # Existing NONE databases convert only during startup migration.
                 page_size = db.execute("PRAGMA page_size").fetchone()[0]
@@ -275,7 +267,7 @@ class ProcessingIndex:
             self.dirty(db, previous[0], "record correction", views=("merged",) if source.startswith("peer:") else ("local", "merged"))
         account = record_account_key(row)
         duplicate = db.execute("SELECT 1 FROM processing_facts WHERE source=? AND kind=? AND record_key=? LIMIT 1", (source, kind, record_key(kind, row))).fetchone()
-        db.execute("INSERT OR REPLACE INTO processing_facts VALUES(?,?,?,?,?,?,?,?,?)", (
+        samples.put_fact(db, (
             source, position, kind, record_key(kind, row), account, str(session.get("sessionId") or ""), str(row.get("eventId") or ""),
             parse_timestamp(row.get("checkedAt") or row.get("occurredAt") or session.get("updatedAt")), data,
         ))
@@ -772,7 +764,7 @@ class ProcessingIndex:
                 return self.sync_ledger(path, slot, label, timeline, provenance, normalize, machine_id)
             with self.transaction() as db:
                 baselines = [json.loads(row[0]) for session in sessions for row in db.execute("SELECT data FROM processing_facts WHERE source=? AND session=? "
-                    "AND json_extract(data,'$.recordType')='legacyBaseline'", (str(Path(path).resolve()), session))]
+                    "AND subtype='legacyBaseline'", (str(Path(path).resolve()), session))]
                 additions, replacements = [], {}
                 for event_id, data, source, index in pending:
                     event = json.loads(data)

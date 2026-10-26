@@ -1,0 +1,179 @@
+{
+  "source": ".sample-benchmark-before.sqlite3",
+  "counts": {
+    "processing_facts": 104154,
+    "local_records": 77707,
+    "remote_records": 26271
+  },
+  "sharedSamples": 104154,
+  "migrationSeconds": 171.70940890000202,
+  "before": {
+    "allocation": {
+      "tablesBytes": 214667264,
+      "indexesBytes": 120758272,
+      "objects": {
+        "local_records": 79794176,
+        "local_records_period": 2007040,
+        "processing_baselines": 114688,
+        "processing_fact_account_key": 27164672,
+        "processing_fact_source_event": 10174464,
+        "processing_fact_source_key": 19488768,
+        "processing_fact_source_time": 8773632,
+        "processing_facts": 107458560,
+        "processing_facts_account": 10035200,
+        "processing_facts_event": 4366336,
+        "processing_facts_key": 12709888,
+        "processing_facts_session": 3895296,
+        "remote_records": 27414528,
+        "remote_records_day": 1486848,
+        "sqlite_autoindex_local_records_1": 9719808,
+        "sqlite_autoindex_processing_facts_1": 7790592,
+        "sqlite_autoindex_remote_records_1": 3031040
+      }
+    },
+    "queries": {
+      "sourcePosition": {
+        "medianMs": 0.022400054149329662,
+        "rows": 1,
+        "plan": [
+          "SEARCH processing_facts USING INDEX sqlite_autoindex_processing_facts_1 (source=? AND position=?)"
+        ]
+      },
+      "accountRecent100": {
+        "medianMs": 0.14720007311552763,
+        "rows": 100,
+        "plan": [
+          "SEARCH processing_facts USING INDEX processing_facts_account (kind=? AND account=?)"
+        ]
+      },
+      "session100": {
+        "medianMs": 201.88840001355857,
+        "rows": 1,
+        "plan": [
+          "SEARCH processing_facts USING INDEX processing_fact_source_key (source=? AND kind=?)"
+        ]
+      },
+      "remotePartition100": {
+        "medianMs": 0.15239999629557133,
+        "rows": 100,
+        "plan": [
+          "SEARCH remote_records USING INDEX remote_records_day (machine_id=? AND day=?)"
+        ]
+      }
+    },
+    "fingerprints": {
+      "processing_facts": "f298aa2ef920224e5278f052155254461dd1f504c86ebbecc4a52fe94b801322",
+      "local_records": "0d73928f0c8d84298cb360a9084f897e23e9857cb08e53dbc65f17b41e4938ca",
+      "remote_records": "62d7d092c0ec4cab8bc47a248c0af7873e9f6a5619740d151d22c8e768655c2e"
+    }
+  },
+  "after": {
+    "allocation": {
+      "tablesBytes": 83791872,
+      "indexesBytes": 101355520,
+      "objects": {
+        "baseline_models": 24576,
+        "baseline_sessions": 348160,
+        "baseline_tiers": 4096,
+        "baseline_totals": 249856,
+        "local_record_refs": 17063936,
+        "local_record_refs_sample": 999424,
+        "local_records_period": 2228224,
+        "processing_baselines": 20480,
+        "processing_fact_account_key": 14536704,
+        "processing_fact_refs": 26329088,
+        "processing_fact_refs_sample": 1363968,
+        "processing_fact_source_event": 4030464,
+        "processing_fact_source_key": 14430208,
+        "processing_fact_source_session": 2945024,
+        "processing_fact_source_time": 2686976,
+        "processing_facts_account": 3166208,
+        "processing_facts_event": 4812800,
+        "processing_facts_key": 13967360,
+        "processing_facts_session": 2711552,
+        "quota_samples": 929792,
+        "quota_windows": 4509696,
+        "remote_record_refs": 6385664,
+        "remote_record_refs_sample": 335872,
+        "remote_records_day": 761856,
+        "sample_account_event_time": 1695744,
+        "sample_account_time": 1597440,
+        "sample_accounts": 4096,
+        "sample_devices": 4096,
+        "sample_event": 3817472,
+        "sample_event_time": 1908736,
+        "sample_models": 4096,
+        "sample_plans": 4096,
+        "sample_records": 18419712,
+        "sample_releases": 4096,
+        "sample_session": 1703936,
+        "sample_sessions": 106496,
+        "sample_sources": 131072,
+        "sample_sync": 6246400,
+        "sample_tiers": 4096,
+        "sqlite_autoindex_baseline_models_1": 20480,
+        "sqlite_autoindex_baseline_tiers_1": 4096,
+        "sqlite_autoindex_baseline_totals_1": 90112,
+        "sqlite_autoindex_local_record_refs_1": 10702848,
+        "sqlite_autoindex_processing_fact_refs_1": 1646592,
+        "sqlite_autoindex_quota_windows_1": 1695744,
+        "sqlite_autoindex_remote_record_refs_1": 2445312,
+        "sqlite_autoindex_sample_accounts_1": 4096,
+        "sqlite_autoindex_sample_devices_1": 4096,
+        "sqlite_autoindex_sample_models_1": 4096,
+        "sqlite_autoindex_sample_plans_1": 4096,
+        "sqlite_autoindex_sample_records_1": 4751360,
+        "sqlite_autoindex_sample_sessions_1": 118784,
+        "sqlite_autoindex_sample_sources_1": 139264,
+        "sqlite_autoindex_sample_tiers_1": 4096,
+        "token_samples": 3018752
+      }
+    },
+    "queries": {
+      "sourcePosition": {
+        "medianMs": 0.15680002979934216,
+        "rows": 1,
+        "plan": [
+          "SEARCH s USING COVERING INDEX sqlite_autoindex_sample_sources_1 (value=?)",
+          "SEARCH f USING INDEX sqlite_autoindex_processing_fact_refs_1 (source_id=? AND position=?)",
+          "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)",
+          "SEARCH x USING INTEGER PRIMARY KEY (rowid=?)"
+        ]
+      },
+      "accountRecent100": {
+        "medianMs": 5.598800024017692,
+        "rows": 100,
+        "plan": [
+          "SEARCH a USING COVERING INDEX sqlite_autoindex_sample_accounts_1 (value=?)",
+          "SEARCH f USING INDEX processing_facts_account (kind=? AND account_id=?)",
+          "SEARCH s USING INTEGER PRIMARY KEY (rowid=?)",
+          "SEARCH x USING INTEGER PRIMARY KEY (rowid=?)"
+        ]
+      },
+      "session100": {
+        "medianMs": 0.14800007920712233,
+        "rows": 1,
+        "plan": [
+          "SEARCH s USING COVERING INDEX sqlite_autoindex_sample_sources_1 (value=?)",
+          "SEARCH x USING COVERING INDEX sqlite_autoindex_sample_sessions_1 (value=?)",
+          "SEARCH f USING INDEX processing_fact_source_session (source_id=? AND session_id=? AND kind=?)",
+          "SEARCH a USING INTEGER PRIMARY KEY (rowid=?)"
+        ]
+      },
+      "remotePartition100": {
+        "medianMs": 7.159100030548871,
+        "rows": 100,
+        "plan": [
+          "SEARCH d USING COVERING INDEX sqlite_autoindex_sample_devices_1 (value=?)",
+          "SEARCH r USING INDEX remote_records_day (device_id=? AND day=?)"
+        ]
+      }
+    },
+    "fingerprints": {
+      "processing_facts": "f298aa2ef920224e5278f052155254461dd1f504c86ebbecc4a52fe94b801322",
+      "local_records": "0d73928f0c8d84298cb360a9084f897e23e9857cb08e53dbc65f17b41e4938ca",
+      "remote_records": "62d7d092c0ec4cab8bc47a248c0af7873e9f6a5619740d151d22c8e768655c2e"
+    }
+  },
+  "snapshotNote": "Consistent backup of usage_monitor_sync_cache-v4.sqlite3; live database unchanged; temporary database copies removed after verification."
+}

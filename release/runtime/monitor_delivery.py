@@ -4,7 +4,7 @@ import gzip
 import hashlib
 import json
 import math
-import sqlite3
+import monitor_sample_store as samples
 import threading
 import time
 from collections import OrderedDict, defaultdict
@@ -199,7 +199,7 @@ class DashboardDelivery:
 
     @contextmanager
     def reader(self):
-        db = sqlite3.connect(self.index.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
+        db = samples.connect(self.index.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
         try:
             db.execute("BEGIN")
             yield db

@@ -16,6 +16,8 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+import monitor_sample_store as samples
+
 
 UPDATE_INTERVAL_SECONDS = 60 * 60
 RELEASE_VERSION_URL = "https://raw.githubusercontent.com/LenorEric/codex-monitor/refs/heads/master/release/version.json"
@@ -25,7 +27,7 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RUNTIME_FILE_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 AUTO_UPDATE_RESTART = 75
-DATA_CONTRACT_VERSION = 13
+DATA_CONTRACT_VERSION = 14
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 
@@ -367,7 +369,7 @@ def _migrate_history_to_v9(paths: dict[str, Path]) -> None:
     from monitor_processing import initialize_processing_index
     from monitor_common import parse_timestamp
     initialize_processing_index(paths["processing_index"])
-    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
+    with closing(samples.connect(paths["processing_index"])) as db, db:
         for view, key, data in db.execute("SELECT view,record_key,data FROM processing_display WHERE kind='tokenSessions' AND event_at IS NULL").fetchall():
             row = json.loads(data)
             db.execute("UPDATE processing_display SET event_at=? WHERE view=? AND kind='tokenSessions' AND record_key=?",
@@ -381,7 +383,7 @@ def _migrate_history_to_v10(paths: dict[str, Path]) -> None:
     from contextlib import closing
     from monitor_processing import initialize_processing_index
     initialize_processing_index(paths["processing_index"])
-    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
+    with closing(samples.connect(paths["processing_index"])) as db, db:
         for table in ("display", "projections", "quota_points", "rank_nodes", "cost_ranges"):
             db.execute(f"DELETE FROM processing_{table}")
         for table in ("days", "parts", "day_meta", "blobs", "manifests", "rollups"):
@@ -398,7 +400,7 @@ def _migrate_history_to_v11(paths: dict[str, Path]) -> None:
     from contextlib import closing
     from monitor_processing import initialize_processing_index
     initialize_processing_index(paths["processing_index"])
-    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
+    with closing(samples.connect(paths["processing_index"])) as db, db:
         for table in ("parts", "day_meta", "blobs", "manifests", "rollups"):
             db.execute(f"DELETE FROM dashboard_{table}")
         db.execute("UPDATE dashboard_days SET dirty=1,revision=revision+1")
@@ -428,7 +430,16 @@ def _migrate_history_to_v13(paths: dict[str, Path]) -> None:
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
 
 
-DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8, 9: _migrate_history_to_v9, 10: _migrate_history_to_v10, 11: _migrate_history_to_v11, 12: _migrate_history_to_v12, 13: _migrate_history_to_v13}
+def _migrate_history_to_v14(paths: dict[str, Path]) -> None:
+    # Cloud contract 2 still provisions sync-lock.json lazily under file ownership.
+    # Local sampled storage shares typed payloads; JSONL and derived caches survive.
+    from monitor_sample_store import migrate
+    from monitor_processing import initialize_processing_index
+    migrate(paths["processing_index"])
+    initialize_processing_index(paths["processing_index"])
+
+
+DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8, 9: _migrate_history_to_v9, 10: _migrate_history_to_v10, 11: _migrate_history_to_v11, 12: _migrate_history_to_v12, 13: _migrate_history_to_v13, 14: _migrate_history_to_v14}
 
 
 def _restore_data_backup(backup: Path, path: Path) -> None:

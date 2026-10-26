@@ -377,8 +377,8 @@ class DashboardProjector:
             order = "COALESCE(event_at,0),json_extract(data,'$.sessionId'),account,record_key" if kind == "tokenSessions" else "event_at IS NULL,event_at,account,record_key"
             return (json.loads(row[0]) for row in db.execute(f"SELECT data FROM processing_display WHERE view=? AND kind=? ORDER BY {order}", (view, kind)))
         if streamed:
-            import sqlite3
-            db = sqlite3.connect(self.index.path)
+            from monitor_sample_store import connect
+            db = connect(self.index.path)
             db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
             stats = self.stats(db, view)

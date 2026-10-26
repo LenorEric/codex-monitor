@@ -32,7 +32,6 @@ from monitor_usage_sync import canonical_json, content_hash, v4_logical_hash, v4
 
 AUTO_PUSH_STABLE_SECONDS = 5
 AUTO_PUSH_RETRY_SECONDS = 30
-AUTO_PUSH_MAX_ATTEMPTS = 3
 WEBDAV_MKCOL_MAX_ATTEMPTS = 3
 WEBDAV_MKCOL_RETRY_SECONDS = 1
 AUTO_FETCH_INTERVAL_SECONDS = 60 * 60
@@ -44,8 +43,10 @@ USAGE_PACK_MAX_BYTES = 16 * 1024
 USAGE_REGULAR_VERIFY_PACKS = 2
 USAGE_FULL_VERIFY_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 USAGE_ACCOUNT_ID_DOMAIN = "codex-monitor-usage-account-v3"
-CLOUD_DATA_CONTRACT_VERSION = 1
+CLOUD_DATA_CONTRACT_VERSION = 2
 CLOUD_DATA_CONTRACT_PATH = "data-contract.json"
+CLOUD_LOCK_PATH = "sync-lock.json"
+CLOUD_LOCK_INIT_PATH = ".sync-lock-init"
 
 
 def _migrate_cloud_to_v1(client):
@@ -54,7 +55,13 @@ def _migrate_cloud_to_v1(client):
     pass
 
 
-CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1}
+def _migrate_cloud_to_v2(client):
+    # The coordination file is provisioned and exclusively owned before migration.
+    # Payload formats and all retained sources remain unchanged.
+    pass
+
+
+CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2}
 
 
 def _read_cloud_contract(client):
@@ -328,67 +335,149 @@ class WebDavClient:
         self.authorization = f"Basic {token}"
         self.transfers = []
         self.transfer_category = "metadata"
-        self._root_lock_token = None
-        self._root_lock_deadline = 0
-        self._root_lock_refresh = 0
+        self._file_lock_token = None
+        self._file_lock_deadline = 0
+        self._file_lock_refresh = 0
+        self._lock_writing = False
+        self._lock_status_failed = False
+        self._lock_owner = uuid.uuid4().hex
+        self._lock_etag = None
+        self._lock_claimed = False
 
-    def _accept_root_lock(self, body, started):
+    def _accept_file_lock(self, body, started):
         import xml.etree.ElementTree as ET
         try:
             active = ET.fromstring(body).find(".//{DAV:}activelock")
             token = active.findtext("{DAV:}locktoken/{DAV:}href")
             timeout = active.findtext("{DAV:}timeout")
-            if active.find("{DAV:}lockscope/{DAV:}exclusive") is None or active.findtext("{DAV:}depth") != "infinity" or not token or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s<>]+", token):
+            if active.find("{DAV:}lockscope/{DAV:}exclusive") is None or active.findtext("{DAV:}depth") not in {"0", "infinity"} or not token or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s<>]+", token):
                 raise ValueError()
-            if not isinstance(timeout, str) or not re.fullmatch(r"Second-[0-9]+", timeout):
+            if not isinstance(timeout, str) or timeout != "Infinite" and not re.fullmatch(r"Second-[0-9]+", timeout):
                 raise ValueError()
-            seconds = int(timeout.removeprefix("Second-"))
-            if seconds <= 60 or self._root_lock_token is not None and token != self._root_lock_token:
+            seconds = float("inf") if timeout == "Infinite" else int(timeout.removeprefix("Second-"))
+            if seconds <= 60 or self._file_lock_token is not None and token != self._file_lock_token:
                 raise ValueError()
         except (ET.ParseError, AttributeError, TypeError, ValueError) as exc:
-            raise CloudError("WebDAV must provide an exclusive depth-infinity lock with a finite timeout exceeding 60 seconds", 409) from exc
-        self._root_lock_token = token
-        self._root_lock_deadline = started + seconds
-        self._root_lock_refresh = started + seconds / 2
+            raise CloudError("WebDAV must provide an exclusive file lock with an infinite timeout or a finite timeout exceeding 60 seconds", 409) from exc
+        self._file_lock_token = token
+        self._file_lock_deadline = started + seconds
+        self._file_lock_refresh = started + seconds / 2
 
-    def acquire_root_lock(self):
-        self.ensure_directories("")
-        started = time.monotonic()
-        body, _, _ = self.request("LOCK", "", b'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>',
-            {"Content-Type": "application/xml", "Depth": "infinity", "Timeout": "Second-300"}, expected=(200,))
+    @staticmethod
+    def _check_idle_lock_state(data):
         try:
-            self._accept_root_lock(body, started)
+            state = json.loads(data)
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise CloudError("Invalid cloud lock status; preserve sync-lock.json and repair it before retrying", 409) from exc
+        if isinstance(state, dict) and state.get("owner"):
+            raise CloudError("Cloud synchronization is busy or an interrupted operation needs recovery; sync-lock.json is owned by another operation", 409, http_status=423, category="lock")
+        if not isinstance(state, dict) or type(state.get("writing")) is not int or state != {"writing": 0}:
+            raise CloudError("Cloud lock file records an interrupted write or invalid status; inspect and recover cloud data before resetting sync-lock.json to writing=0", 409)
+
+    def _ensure_lock_file(self):
+        try:
+            return self.get(CLOUD_LOCK_PATH)
+        except CloudError as exc:
+            if exc.http_status != 404:
+                raise
+        self.ensure_directories("")
+        # Jianguoyun ignores If-None-Match on PUT. Atomic MKCOL is used only for
+        # first-time provisioning, never as the operation lock or a stale-lock lease.
+        try:
+            self.request("MKCOL", CLOUD_LOCK_INIT_PATH, expected=(201,))
+        except CloudError as exc:
+            if exc.http_status in {405, 409}:
+                raise CloudError("Cloud lock file initialization is busy or needs recovery; retry after .sync-lock-init is released", 409, http_status=423, category="lock") from exc
+            raise
+        try:
+            try:
+                return self.get(CLOUD_LOCK_PATH)
+            except CloudError as exc:
+                if exc.http_status != 404:
+                    raise
+            self.put(CLOUD_LOCK_PATH, b'{"writing":0}')
+            return self.get(CLOUD_LOCK_PATH)
+        finally:
+            self.delete(CLOUD_LOCK_INIT_PATH)
+
+    def acquire_file_lock(self):
+        self._check_idle_lock_state(self._ensure_lock_file()[0])
+        started = time.monotonic()
+        try:
+            body, _, _ = self.request("LOCK", CLOUD_LOCK_PATH,
+                b'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>',
+                {"Content-Type": "application/xml", "Depth": "0", "Timeout": "Second-300"}, expected=(200,))
+        except CloudError as exc:
+            if exc.http_status == 423:
+                exc.category = "lock"
+            raise
+        try:
+            self._accept_file_lock(body, started)
         except CloudError:
             # A rejected lock response may still have installed a server-side lock.
             import xml.etree.ElementTree as ET
             try:
                 token = ET.fromstring(body).findtext(".//{DAV:}locktoken/{DAV:}href")
                 if token and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s<>]+", token):
-                    self.request("UNLOCK", "", headers={"Lock-Token": f"<{token}>"}, expected=(204, 404, 409))
+                    self.request("UNLOCK", CLOUD_LOCK_PATH, headers={"Lock-Token": f"<{token}>"}, expected=(204, 404, 409))
             except (ET.ParseError, CloudError):
                 pass
             raise
+        try:
+            state, self._lock_etag = self.get(CLOUD_LOCK_PATH)
+            self._check_idle_lock_state(state)
+            # Some providers grant multiple native locks to the same account. The
+            # conditional owner claim is the mutex, even for a read-only operation.
+            self._write_lock_state(0)
+            self._lock_claimed = True
+        except Exception as exc:
+            self.release_file_lock()
+            if isinstance(exc, CloudError) and exc.http_status == 412:
+                raise CloudError("Cloud lock ownership changed during acquisition; retry the operation", 409, http_status=412, category="lock") from exc
+            raise
 
-    def release_root_lock(self):
-        if self._root_lock_token:
+    def _write_lock_state(self, writing, release=False):
+        state = {"writing": writing} if release else {"writing": writing, "owner": self._lock_owner}
+        self._lock_etag = self.put(CLOUD_LOCK_PATH, canonical_json(state), etag=self._lock_etag)
+
+    def release_file_lock(self):
+        if self._file_lock_token:
             try:
-                self.request("UNLOCK", "", headers={"Lock-Token": f"<{self._root_lock_token}>"}, expected=(204, 404, 409))
+                if self._lock_claimed:
+                    self._write_lock_state(0, release=True)
             finally:
-                self._root_lock_token = None
+                try:
+                    self.request("UNLOCK", CLOUD_LOCK_PATH, headers={"Lock-Token": f"<{self._file_lock_token}>"}, expected=(204, 404, 409))
+                finally:
+                    self._file_lock_token = None
+                    self._lock_writing = False
+                    self._lock_status_failed = False
+                    self._lock_claimed = False
+                    self._lock_etag = None
 
     def _url(self, path: str = "") -> str:
         parts = [urllib.parse.quote(part, safe="") for part in f"{self.root}/{path}".strip("/").split("/") if part]
         return urllib.parse.urljoin(self.base, "/".join(parts))
 
     def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204), output=None) -> tuple[bytes, str | None, int]:
-        if self._root_lock_token and method != "UNLOCK":
-            if time.monotonic() >= self._root_lock_deadline:
+        if self._file_lock_token and method != "UNLOCK":
+            if self._lock_status_failed and path != CLOUD_LOCK_PATH:
+                raise CloudError("Cloud lock status update failed; operation stopped before further data access", 409)
+            if time.monotonic() >= self._file_lock_deadline:
                 raise CloudError("WebDAV cloud contract lock expired; operation stopped before further data access", 409)
-            if method != "LOCK" and time.monotonic() >= self._root_lock_refresh:
+            if method != "LOCK" and time.monotonic() >= min(self._file_lock_refresh, self._file_lock_deadline - 60):
                 started = time.monotonic()
-                body, _, _ = self.request("LOCK", "", headers={"Timeout": "Second-300"}, expected=(200,))
-                self._accept_root_lock(body, started)
-            headers = dict(headers or {}) | {"If": f"<{self._url('')}> (<{self._root_lock_token}>)"}
+                body, _, _ = self.request("LOCK", CLOUD_LOCK_PATH, headers={"Timeout": "Second-300"}, expected=(200,))
+                self._accept_file_lock(body, started)
+            if path != CLOUD_LOCK_PATH and method in {"PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH"} and not self._lock_writing:
+                # Arm cleanup before sending: a lost response may still mean PUT succeeded.
+                self._lock_writing = True
+                try:
+                    self._write_lock_state(1)
+                except Exception:
+                    self._lock_status_failed = True
+                    raise
+            headers = dict(headers or {}) | {"If": f"<{self._url(CLOUD_LOCK_PATH)}> (<{self._file_lock_token}>)"}
         size = len(data) if isinstance(data, bytes) else 0
         if data is not None and hasattr(data, "seek"):
             data.seek(0, 2)
@@ -425,7 +514,7 @@ class WebDavClient:
             raise CloudError(f"WebDAV connection failed: {exc}", 502, category="network") from exc
         if status not in expected:
             raise CloudError(f"WebDAV {method} returned HTTP {status}", 502, http_status=status, category="protocol")
-        if self._root_lock_token and method not in {"LOCK", "UNLOCK"} and time.monotonic() >= self._root_lock_deadline:
+        if self._file_lock_token and method not in {"LOCK", "UNLOCK"} and time.monotonic() >= self._file_lock_deadline:
             raise CloudError("WebDAV cloud contract lock expired during transfer; operation stopped", 409)
         if output is None:
             transfer["downloadBytes"] = len(body)
@@ -602,17 +691,26 @@ class CloudManager:
         def execute():
             with self._operation_lock:
                 self._contract_clients = {}
+                failure = None
                 try:
                     result = getattr(self, method_name)(*args, **kwargs)
                     if on_success:
                         result = on_success(result)
                     return result
+                except Exception as exc:
+                    failure = exc
+                    raise
                 finally:
-                    try:
-                        for client in self._contract_clients.values():
-                            client.release_root_lock()
-                    finally:
-                        self._contract_clients = None
+                    cleanup_errors = []
+                    for client in self._contract_clients.values():
+                        try:
+                            client.release_file_lock()
+                        except Exception as exc:
+                            cleanup_errors.append(exc)
+                    self._contract_clients = None
+                    if cleanup_errors:
+                        detail = f"Cloud operation failed: {failure}. " if failure else "Cloud operation may have partially or fully completed. "
+                        raise CloudError(detail + "Lock cleanup failed; inspect cloud status before retrying: " + "; ".join(map(str, cleanup_errors)), 409) from (failure or cleanup_errors[0])
 
         # Only identical adjacent synchronization requests share execution.
         combine_key = (method_name, json.dumps([args, kwargs], sort_keys=True), generation, source) if method_name in {"push", "fetch", "sync_usage_data"} else None
@@ -1298,7 +1396,7 @@ class CloudManager:
         client = WebDavClient(webdav)
         # Check newer versions before even attempting root creation or locking.
         _read_cloud_contract(client)
-        client.acquire_root_lock()
+        client.acquire_file_lock()
         self._contract_clients[identity] = client
         _ensure_cloud_contract(client)
         return client
@@ -1337,9 +1435,9 @@ class CloudManager:
         if not webdav.get("enabled"):
             raise CloudError("WebDAV is disabled", 409)
         client = self._contract_client(webdav)
-        # Keep the collection and contract marker: deleting the root destroys its lock.
+        # Coordination metadata must survive overwrite, including the locked file itself.
         for name in client.list(""):
-            if name != CLOUD_DATA_CONTRACT_PATH:
+            if name not in {CLOUD_DATA_CONTRACT_PATH, CLOUD_LOCK_PATH, CLOUD_LOCK_INIT_PATH}:
                 if not name or name in {".", ".."} or any(char in name for char in "/\\"):
                     raise CloudError("Unsafe WebDAV root inventory", 409)
                 client.delete(name)
@@ -2420,7 +2518,7 @@ class CloudManager:
         baseline = self._state.get("skills", {}).get("localSha256", {})
         baseline = baseline if isinstance(baseline, dict) else {}
         for name, current_hash in current_hashes.items():
-            if current_hash != baseline.get(name) and name not in self._auto_push_failures:
+            if current_hash != baseline.get(name):
                 self._schedule_skill_push(name, current_hash, now)
             elif current_hash == baseline.get(name):
                 self._pending_skill_pushes.pop(name, None)
@@ -2435,6 +2533,9 @@ class CloudManager:
             self.fetch(include_usage=False)
         except Exception as exc:
             self._record_decrypt_failure(exc, "fetch")
+            if isinstance(exc, CloudError) and exc.category == "lock":
+                self._last_auto_fetch_at = now - AUTO_FETCH_INTERVAL_SECONDS + AUTO_PUSH_RETRY_SECONDS
+                return False
             if getattr(exc, "decrypt_failed", False):
                 return False
             raise
@@ -2451,7 +2552,9 @@ class CloudManager:
             self._record_decrypt_failure(exc, "usage sync")
             attempt = int((usage.get("failure") or {}).get("attempt") or 0) + 1
             usage["failure"] = {"message": str(exc), "attempt": attempt, "failedAt": _timestamp()}
-            if isinstance(exc, CloudError) and exc.http_status in {403, 507}:
+            if isinstance(exc, CloudError) and exc.category == "lock":
+                self._next_usage_sync_at = now + AUTO_PUSH_RETRY_SECONDS
+            elif isinstance(exc, CloudError) and exc.http_status in {403, 507}:
                 self._next_usage_sync_at = now + min(24 * 60 * 60, USAGE_SYNC_INTERVAL_SECONDS * 2 ** min(attempt, 6))
             self._save_state()
             return False
@@ -2484,7 +2587,7 @@ class CloudManager:
         with self._operation_lock:
             if config["webdav"].get("skillsAutoUpload", True):
                 self._observe_skill_content(now)
-            due = {name for name, pending in self._pending_skill_pushes.items() if config["webdav"].get("skillsAutoUpload", True) and name not in self._auto_push_failures and now >= pending["nextAttemptAt"]}
+            due = {name for name, pending in self._pending_skill_pushes.items() if config["webdav"].get("skillsAutoUpload", True) and now >= pending["nextAttemptAt"]}
             before_hashes = dict(self._observed_skill_hashes or {})
         errors = {}
         if due:
@@ -2497,7 +2600,7 @@ class CloudManager:
         pushed = False
         for name in sorted(due):
             pending = self._pending_skill_pushes.get(name)
-            if not pending or not config["webdav"].get("skillsAutoUpload", True) or name in self._auto_push_failures or now < pending["nextAttemptAt"]:
+            if not pending or not config["webdav"].get("skillsAutoUpload", True) or now < pending["nextAttemptAt"]:
                 continue
             before_hash = before_hashes.get(name)
             try:
@@ -2511,11 +2614,9 @@ class CloudManager:
                 if not pending or (self._observed_skill_hashes or {}).get(name) != before_hash:
                     continue
                 pending["attempts"] += 1
-                if pending["attempts"] >= AUTO_PUSH_MAX_ATTEMPTS:
-                    self._auto_push_failure_id += 1
-                    self._auto_push_failures[name] = {"id": self._auto_push_failure_id, "skill": name, "message": str(exc)}
-                else:
-                    pending["nextAttemptAt"] = now + AUTO_PUSH_RETRY_SECONDS
+                pending["nextAttemptAt"] = now + AUTO_PUSH_RETRY_SECONDS
+                self._auto_push_failure_id += 1
+                self._auto_push_failures[name] = {"id": self._auto_push_failure_id, "skill": name, "message": str(exc)}
                 continue
             current_hashes = self.skills.content_hashes({name})
             self._observed_skill_hashes = dict(self._observed_skill_hashes or {})

@@ -31,6 +31,7 @@ RUNTIME_FILES = (
     "monitor_history.py",
     "monitor_quota.py",
     "monitor_processing.py",
+    "monitor_sample_store.py",
     "monitor_projection.py",
     "monitor_streaming.py",
     "monitor_skills.py",

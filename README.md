@@ -181,7 +181,7 @@ Newly managed skills are local-only by default. Existing managed skills retain t
 - **Unshare / Unmanage:** publishes a durable tombstone so stale machines remove the shared skill instead of uploading it again. Unsharing keeps the managed source on the initiating machine; unmanaging keeps independent assigned copies.
 - **Restore:** exact API restore creates a local safety ZIP before replacing the shared managed set; local-only managed skills remain untouched.
 
-Changed shared skills and pending share-deletion tombstones receive independent two-minute stability windows. Stable content is uploaded automatically up to three times, with 30 seconds between failures.
+Changed shared skills and pending share-deletion tombstones receive independent two-minute stability windows. Stable content is uploaded automatically with unlimited retries, with 30 seconds between failures.
 The five-second observer hashes incrementally and performs a bounded full verification; disabling `skillsAutoUpload` disables this observation.
 
 ## Automatic runtime updates
@@ -205,7 +205,7 @@ Open **Manage skills & accounts → Config file**. Configure the remote without 
 
 Use **Test WebDAV** before Push. Jianguoyun/Nutstore users can use `https://dav.jianguoyun.com/dav/` with an application password.
 
-The sync root has one global cloud data contract in `data-contract.json`. Every operation checks it under an exclusive recursive WebDAV lock: older cloud contracts migrate automatically, equal versions permit access, and newer versions block access until the local script is updated. The server must support finite-lease `LOCK`/`UNLOCK`; optimistic writes cannot bypass this protection. Update all participating clients. See [cloud contract and recovery details](cloud-data-contract.md).
+The sync root has one global cloud data contract in `data-contract.json`. Every operation claims the root’s `sync-lock.json` using a native file lock and an atomic ETag-based owner claim. Its `writing` flag becomes 1 before writes and returns to 0 before unlock; readers claim the same file for consistency. Folder locking is unnecessary, and infinite file locks are supported. Older cloud contracts migrate automatically; newer versions block access until the local script is updated. Optimistic writes cannot bypass coordination; interrupted ownership requires explicit recovery. Update all participating clients. See [cloud contract and recovery details](cloud-data-contract.md).
 
 Manual and automatic WebDAV operations share a server-side queue and run one at a time. The management page shows a spinner and the running-plus-waiting count in the bottom-right corner. Click it to inspect operations or remove waiting work.
 Share/Unshare Skill and Unmanage apply their local changes when execution starts, so removing waiting work prevents those changes too. Each operation has one queued/start notification and one outcome notification, including skipped, cancelled, and partially completed work.

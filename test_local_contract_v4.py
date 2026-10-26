@@ -89,8 +89,9 @@ class LocalContractV4Tests(unittest.TestCase):
             quota.write_bytes(b'{"raw":"quota"}\n')
             ledger.write_bytes(b'{"raw":"ledger"}\n')
             database = cache.with_name("cache-v4.sqlite3")
-            initialize_v4_cache(database)
+            # This fixture represents released contract 7, before shared samples.
             with closing(sqlite3.connect(database)) as db, db:
+                db.execute("CREATE TABLE local_records(record_key TEXT PRIMARY KEY,period TEXT,content_hash TEXT,record_json TEXT)")
                 db.execute("INSERT INTO local_records VALUES('key','2030-01-01T00:00Z','digest','{}')")
             args = (root, root / "history.jsonl", quota, root / "sessions.jsonl", ledger, root / "samples.jsonl")
             self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [8, 9])

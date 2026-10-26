@@ -33,7 +33,7 @@ import monitor_tokens
 import monitor_usage_sync
 from monitor_accounts import AccountError, AccountManager, api_identity_id, atomic_write_json, auth_fingerprint, auth_identity, normalize_session_refresh, normalize_session_refresh_windows, parse_auth_bytes
 from monitor_cloud import (
-    AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_MAX_ATTEMPTS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_FULL_VERIFY_INTERVAL_SECONDS, USAGE_PACK_BUCKET_BITS, USAGE_PACK_MAX_BYTES,
+    AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_FULL_VERIFY_INTERVAL_SECONDS, USAGE_PACK_BUCKET_BITS, USAGE_PACK_MAX_BYTES,
     USAGE_REGULAR_VERIFY_PACKS, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
     WEBDAV_MKCOL_RETRY_SECONDS, control_password_matches, hash_control_password, load_server_config, new_control_password_salt, normalized_webdav_identity, passphrase_hash, valid_passphrase_hash, webdav_passphrase_salt,
 )
@@ -6913,7 +6913,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             push.assert_not_called()
             self.assertEqual(cloud._pending_skill_pushes, {})
 
-    def test_skill_auto_push_retries_three_times_then_exposes_failure(self):
+    def test_skill_auto_push_retries_without_limit_then_clears_failure_on_success(self):
         with self.account_directory() as directory:
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
             cloud = CloudManager(directory / "private", skills, SimpleNamespace(lock=threading.RLock(), manifest={"cloudBindingEnabled": True, "accounts": []}))
@@ -6923,12 +6923,22 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             cloud._last_auto_fetch_at = 1000
 
             with mock.patch.object(skills, "content_hashes", return_value={"alpha": "modified"}), mock.patch.object(cloud, "upload_skills", side_effect=CloudError("offline")) as push:
-                for now in (AUTO_PUSH_STABLE_SECONDS, AUTO_PUSH_STABLE_SECONDS + AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS + AUTO_PUSH_RETRY_SECONDS * 2):
-                    cloud.maintenance_tick(now=now)
-                cloud.maintenance_tick(now=AUTO_PUSH_STABLE_SECONDS + AUTO_PUSH_RETRY_SECONDS * 3)
+                for attempt in range(6):
+                    cloud.maintenance_tick(now=AUTO_PUSH_STABLE_SECONDS + AUTO_PUSH_RETRY_SECONDS * attempt)
+                    cloud.maintenance_tick(now=AUTO_PUSH_STABLE_SECONDS + AUTO_PUSH_RETRY_SECONDS * (attempt + 1) - 1)
 
-            self.assertEqual(push.call_count, AUTO_PUSH_MAX_ATTEMPTS)
+            self.assertEqual(push.call_count, 6)
+            self.assertEqual(cloud._pending_skill_pushes["alpha"]["attempts"], 6)
             self.assertEqual(cloud.redacted_status()["autoSync"]["failure"]["message"], "offline")
+            def recovered(names):
+                cloud._state["skills"]["localSha256"]["alpha"] = "modified"
+                return {"changed": True}
+            with mock.patch.object(skills, "content_hashes", return_value={"alpha": "modified"}), mock.patch.object(cloud, "upload_skills", side_effect=recovered) as push:
+                cloud.maintenance_tick(now=AUTO_PUSH_STABLE_SECONDS + AUTO_PUSH_RETRY_SECONDS * 6)
+                cloud.maintenance_tick(now=AUTO_PUSH_STABLE_SECONDS + AUTO_PUSH_RETRY_SECONDS * 7)
+            push.assert_called_once_with({"alpha"})
+            self.assertNotIn("alpha", cloud._pending_skill_pushes)
+            self.assertIsNone(cloud.redacted_status()["autoSync"]["failure"])
 
     def test_skill_edit_during_failed_upload_restarts_stability_window(self):
         with self.account_directory() as directory:

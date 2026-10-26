@@ -5,7 +5,7 @@ import heapq
 import json
 import math
 import os
-import sqlite3
+import monitor_sample_store as samples
 import tempfile
 import time
 from contextlib import closing
@@ -404,13 +404,16 @@ def initialize_v4_cache(path: Path) -> None:
     """Create the local v4 index without altering the original history or legacy cache."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with closing(sqlite3.connect(path)) as db, db:
+    with closing(samples.connect(path)) as db, db:
         db.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        db.execute("CREATE TABLE IF NOT EXISTS local_records (record_key TEXT PRIMARY KEY, period TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL)")
-        db.execute("CREATE INDEX IF NOT EXISTS local_records_period ON local_records(period)")
+        normalized = samples.prepare(db)
+        if not normalized:
+            db.execute("CREATE TABLE IF NOT EXISTS local_records (record_key TEXT PRIMARY KEY, period TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL)")
+            db.execute("CREATE INDEX IF NOT EXISTS local_records_period ON local_records(period)")
         db.execute("CREATE TABLE IF NOT EXISTS remote_days (machine_id TEXT NOT NULL, day TEXT NOT NULL, logical_hash TEXT NOT NULL, layout_json TEXT NOT NULL, PRIMARY KEY(machine_id, day))")
-        db.execute("CREATE TABLE IF NOT EXISTS remote_records (machine_id TEXT NOT NULL, day TEXT NOT NULL, part_id TEXT NOT NULL, record_key TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY(machine_id, record_key))")
-        db.execute("CREATE INDEX IF NOT EXISTS remote_records_day ON remote_records(machine_id, day, part_id)")
+        if not normalized:
+            db.execute("CREATE TABLE IF NOT EXISTS remote_records (machine_id TEXT NOT NULL, day TEXT NOT NULL, part_id TEXT NOT NULL, record_key TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY(machine_id, record_key))")
+            db.execute("CREATE INDEX IF NOT EXISTS remote_records_day ON remote_records(machine_id, day, part_id)")
         db.execute("CREATE TABLE IF NOT EXISTS remote_origins (machine_id TEXT PRIMARY KEY)")
         db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
@@ -589,8 +592,9 @@ class UsageDataStore:
             historical = db.execute("SELECT value FROM metadata WHERE name='localInitialized'").fetchone() is None
             initialized = self.index.get(db, "localFactsInitialized", False)
             if not initialized:
-                db.execute("INSERT OR IGNORE INTO processing_pending_records SELECT l.record_key,json_extract(l.record_json,'$.kind'),NULL "
-                    "FROM local_records l WHERE NOT EXISTS(SELECT 1 FROM processing_facts f WHERE f.record_key=l.record_key AND f.source NOT LIKE 'peer:%')")
+                db.execute("INSERT OR IGNORE INTO processing_pending_records SELECT l.record_key,s.kind,NULL "
+                    "FROM local_record_refs l JOIN sample_records s ON s.id=l.sample_id "
+                    "WHERE NOT EXISTS(SELECT 1 FROM processing_facts f WHERE f.record_key=l.record_key AND f.source NOT LIKE 'peer:%')")
             generation = self.index.get(db, "publishGeneration", 0)
             for key, kind, data in list(db.execute("SELECT record_key,kind,data FROM processing_pending_records")):
                 previous = db.execute("SELECT period,content_hash FROM local_records WHERE record_key=?", (key,)).fetchone()
@@ -610,8 +614,7 @@ class UsageDataStore:
                     continue
                 event = row.get("checkedAt") or row.get("occurredAt") or (row.get("session") or {}).get("updatedAt") or (row.get("session") or {}).get("startedAt")
                 period = previous[0] if previous else v4_period((parse_timestamp(event) or current) if historical else current)
-                db.execute("INSERT INTO local_records VALUES(?,?,?,?) ON CONFLICT(record_key) DO UPDATE SET content_hash=excluded.content_hash,record_json=excluded.record_json",
-                    (key, period, digest, canonical_json(record).decode()))
+                samples.put_local(db, key, period, digest, record)
                 generation += 1
                 db.execute("INSERT OR REPLACE INTO processing_dirty_days VALUES(?,?)", (period[:10], generation))
             db.execute("DELETE FROM processing_pending_records")
@@ -1084,7 +1087,7 @@ class UsageDataStore:
 
     def _v4_remote_cache(self) -> tuple[list[dict], set[str]]:
         initialize_v4_cache(self.v4_cache_path)
-        with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+        with closing(samples.connect(self.v4_cache_path)) as db, db:
             origins = {row[0] for row in db.execute("SELECT machine_id FROM remote_origins")}
             return [{"sourceMachineId": machine_id, "key": key, "record": json.loads(record_json)["record"]} for machine_id, key, record_json in db.execute("SELECT machine_id, record_key, record_json FROM remote_records")], origins
 
@@ -1095,7 +1098,7 @@ class UsageDataStore:
             quota, ledger = self._v4_local_sources()
             records = active_records(quota, ledger, self.machine_id, self.account_id_resolver, False)
             initialize_v4_cache(self.v4_cache_path)
-            with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+            with closing(samples.connect(self.v4_cache_path)) as db, db:
                 existing = {key: (period, digest) for key, period, digest in db.execute("SELECT record_key, period, content_hash FROM local_records")}
                 historical = db.execute("SELECT value FROM metadata WHERE name='localInitialized'").fetchone() is None
                 for key, record in records.items():
@@ -1108,7 +1111,7 @@ class UsageDataStore:
                         period = v4_period((parse_timestamp(event_at) or current) if historical else current)
                     digest = content_hash(record)
                     if existing.get(key) != (period, digest):
-                        db.execute("INSERT INTO local_records(record_key, period, content_hash, record_json) VALUES(?,?,?,?) ON CONFLICT(record_key) DO UPDATE SET content_hash=excluded.content_hash, record_json=excluded.record_json", (key, period, digest, canonical_json(record).decode()))
+                        samples.put_local(db, key, period, digest, record)
                 for key in existing.keys() - records.keys():
                     db.execute("DELETE FROM local_records WHERE record_key=?", (key,))
                 db.execute("INSERT OR IGNORE INTO metadata(name, value) VALUES('localInitialized', '1')")
@@ -1123,14 +1126,14 @@ class UsageDataStore:
     def v4_cached_days(self, machine_id: str) -> dict[str, dict]:
         with self.lock:
             initialize_v4_cache(self.v4_cache_path)
-            with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+            with closing(samples.connect(self.v4_cache_path)) as db, db:
                 return {day: {"logicalHash": digest, "layout": json.loads(layout)} for day, digest, layout in db.execute("SELECT day, logical_hash, layout_json FROM remote_days WHERE machine_id=?", (machine_id,))}
 
     def v4_apply_day(self, machine_id: str, manifest: dict, downloaded: dict[str, list[dict]], force: bool = False) -> None:
         with self.lock:
             day, parts = manifest["day"], manifest["parts"]
             initialize_v4_cache(self.v4_cache_path)
-            with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+            with closing(samples.connect(self.v4_cache_path)) as db, db:
                 previous = db.execute("SELECT logical_hash, layout_json FROM remote_days WHERE machine_id=? AND day=?", (machine_id, day)).fetchone()
                 old_parts = json.loads(previous[1]) if previous else {}
                 if force or previous is None or previous[0] != manifest["logicalHash"]:
@@ -1144,7 +1147,7 @@ class UsageDataStore:
                             validate_v4_envelope(entry, machine_id)
                             if entry["collectionPeriod"][:10] != day or part != "bulk" and entry["collectionPeriod"] != part or db.execute("SELECT 1 FROM remote_records WHERE machine_id=? AND record_key=?", (machine_id, entry["recordKey"])).fetchone():
                                 raise ValueError("Usage v4 record is stored outside its owning collection period")
-                            db.execute("INSERT OR REPLACE INTO remote_records(machine_id, day, part_id, record_key, content_hash, record_json) VALUES(?,?,?,?,?,?)", (machine_id, day, part, entry["recordKey"], content_hash(entry["record"]), canonical_json(entry).decode()))
+                            samples.put_remote(db, machine_id, day, part, entry["recordKey"], content_hash(entry["record"]), entry)
                     from monitor_streaming import logical_hash_sorted
                     rows = (json.loads(record_json) for (record_json,) in db.execute("SELECT record_json FROM remote_records WHERE machine_id=? AND day=? ORDER BY record_key", (machine_id, day)))
                     if logical_hash_sorted(rows) != manifest["logicalHash"]:
@@ -1158,7 +1161,7 @@ class UsageDataStore:
     def v4_remove_days(self, machine_id: str, days: set[str]) -> None:
         with self.lock:
             initialize_v4_cache(self.v4_cache_path)
-            with closing(sqlite3.connect(self.v4_cache_path)) as db, db:
+            with closing(samples.connect(self.v4_cache_path)) as db, db:
                 for day in days:
                     db.execute("DELETE FROM remote_records WHERE machine_id=? AND day=?", (machine_id, day))
                     db.execute("DELETE FROM remote_days WHERE machine_id=? AND day=?", (machine_id, day))
