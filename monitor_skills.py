@@ -6,15 +6,15 @@ import os
 import re
 import shutil
 import struct
-import tempfile
 import time
 import uuid
 import zipfile
-from datetime import datetime, timezone
+from datetime import datetime
 from io import BytesIO
 from pathlib import Path, PurePosixPath
 
 from monitor_accounts import atomic_write_json
+from monitor_common import now_iso as _timestamp
 
 MAX_SKILL_FILES = 10000
 MAX_SKILL_BYTES = 512 * 1024 * 1024
@@ -29,10 +29,6 @@ class SkillError(RuntimeError):
     def __init__(self, message: str, status: int = 400):
         super().__init__(message)
         self.status = status
-
-
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _safe_name(name: str) -> str:

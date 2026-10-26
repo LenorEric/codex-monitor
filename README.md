@@ -4,7 +4,7 @@
 
 **A local-first Codex quota, token, cost, account, skill, and encrypted-sync dashboard for VS Code.**
 
-[![Version](https://img.shields.io/badge/version-1.5.0-4f8cff)](#quick-start)
+[![Version](https://img.shields.io/badge/version-1.5.13-4f8cff)](#quick-start)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#requirements)
@@ -43,7 +43,7 @@ flowchart LR
     M <--> W[Optional encrypted WebDAV]
 ```
 
-The monitor is authoritative. The dashboard receives complete, independent local and merged datasets from `/api/series` on its first connection, then polls `/api/status` every five seconds with an ETag. Local semantic changes are transferred as consecutive indexed patches for both views. Cloud supplemental-data changes replace the complete merged view because a cloud merge may revise historical points. A restart or missing retained index automatically recovers with another complete snapshot.
+The monitor is authoritative. The dashboard loads scoped `/api/dashboard` manifests and immutable chunks for the selected view and time range, then polls `/api/status` every five seconds with an ETag. Unchanged manifests reuse downloaded chunks; local and synchronized changes prepare updated views in the backend. The legacy `/api/series` snapshot/patch API remains available for compatibility.
 
 ## Requirements
 
@@ -77,7 +77,7 @@ python codex_monitor_daemon.py
 
 ### 2. Install the VS Code extension
 
-Install `release/codex-usage-monitor-1.3.0.vsix` from VS Code:
+Install `release/codex-usage-monitor-1.5.13.vsix` from VS Code:
 
 1. Open **Extensions**.
 2. Select **Views and More Actions (…) → Install from VSIX…**.
@@ -86,7 +86,7 @@ Install `release/codex-usage-monitor-1.3.0.vsix` from VS Code:
 The command line is also supported:
 
 ```console
-code --install-extension release/codex-usage-monitor-1.3.0.vsix
+code --install-extension release/codex-usage-monitor-1.5.13.vsix
 ```
 
 ### 3. Complete first-run setup
@@ -108,6 +108,7 @@ The top cards show the latest 5-hour and 7-day usage, reset times, plan, and act
 - **Local** and **Merged** quota, token, and cost datasets.
 - Separate colored quota curves per selected account.
 - Fresh input, cached input, output, cache write, cache-hit rate, and estimated cost.
+- A full-width Cost vs Time chart with adaptive whole-minute/hour/day spending bars, a cumulative-cost toggle, 5h/7d usage overlays, and exact event-based account/model filters. Joint idle folding preserves intervals containing spending or usage changes. Older session-only cost baselines are excluded from this chart.
 
 **Local** shows only quota, token, and cost data recorded by this machine. **Merged** extends each local account with synchronized records carrying the same private account identity.
 Synchronized records that do not yet match a local account remain in the sync cache but are temporarily excluded; they are included automatically when the corresponding account is created or bound locally.
@@ -203,6 +204,8 @@ Open **Manage skills & accounts → Config file**. Configure the remote without 
 | Allow optimistic writes | Permits servers that ignore conditional writes; account exclusivity then becomes best-effort. |
 
 Use **Test WebDAV** before Push. Jianguoyun/Nutstore users can use `https://dav.jianguoyun.com/dav/` with an application password.
+
+The sync root has one global cloud data contract in `data-contract.json`. Every operation checks it under an exclusive recursive WebDAV lock: older cloud contracts migrate automatically, equal versions permit access, and newer versions block access until the local script is updated. The server must support finite-lease `LOCK`/`UNLOCK`; optimistic writes cannot bypass this protection. Update all participating clients. See [cloud contract and recovery details](cloud-data-contract.md).
 
 Manual and automatic WebDAV operations share a server-side queue and run one at a time. The management page shows a spinner and the running-plus-waiting count in the bottom-right corner. Click it to inspect operations or remove waiting work.
 Share/Unshare Skill and Unmanage apply their local changes when execution starts, so removing waiting work prevents those changes too. Each operation has one queued/start notification and one outcome notification, including skipped, cancelled, and partially completed work.

@@ -9,9 +9,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 import urllib.request
 
+from monitor_common import atomic_write_bytes as _write_atomic_bytes
 from monitor_common import (
     DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, TARGET_WINDOWS, UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
-    empty_token_totals, first_value, load_json, now_iso, parse_timestamp,
+    first_value, load_json, now_iso, parse_timestamp,
 )
 from monitor_accounts import is_api_auth
 from monitor_quota import fetch_usage
@@ -225,7 +226,7 @@ def consecutive_percent_stable(newer: dict, older: dict) -> bool:
             return False
     return True
 
-def fetch_usage_with_percent_arbitration(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, debug: dict, retries: int, state: dict | None = None, auth_lock=None, refreshed_callback=None, allow_token_refresh: bool = True) -> dict:
+def fetch_usage_with_percent_arbitration(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path | None, timeout: int, debug: dict, retries: int, state: dict | None = None, auth_lock=None, refreshed_callback=None, allow_token_refresh: bool = True) -> dict:
     output = fetch_usage(auth, opener, auth_path, timeout, debug, retries, auth_lock, refreshed_callback, allow_token_refresh)
     output["remoteUsage"] = debug
     weird = weird_percent_response(output, state)
@@ -644,20 +645,7 @@ def parse_json_sequence(text: str) -> list:
     return values
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(data)
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_name, path)
-    except Exception:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+    _write_atomic_bytes(path, data)
 
 def rewrite_account_labels(paths, account_id: str, label: str):
     originals = {}
@@ -706,11 +694,6 @@ def format_history_row(row: dict) -> str:
         "}",
     ])
     return "\n".join(lines)
-
-def state_path_for(history_path: Path) -> Path:
-    if history_path.name == "usage_monitor_history.jsonl":
-        return history_path.with_name("usage_monitor_state.json")
-    return history_path.with_suffix(".state.json")
 
 def load_state(path: Path) -> dict:
     try:

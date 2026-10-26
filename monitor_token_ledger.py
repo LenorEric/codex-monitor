@@ -217,7 +217,7 @@ def token_cost_snapshot(sessions: list[dict]) -> tuple[dict, dict[str, dict]]:
 
 def sync_token_ledger(
     path: Path, legacy_sessions: list[dict], events: list[dict], account_slot_id: str, account_label: str,
-    account_timeline: list[dict] | None = None, record_provenance=None, source_files=None, legacy_event_ids=None, own_machine_id: str | None = None,
+    account_timeline: list[dict] | None = None, record_provenance=None, source_files=None, legacy_event_ids=None, own_machine_id: str | None = None, on_new_cost=None,
 ) -> list[dict]:
     rows = load_token_ledger(path)
     additions = _legacy_baselines(legacy_sessions) if not any(row.get("recordType") in {"legacyBaseline", "usage"} for row in rows) else []
@@ -243,7 +243,7 @@ def sync_token_ledger(
                 legacy_by_occurrence[(row.get("sessionId"), row.get("occurredAt"), row.get("rawModel"))] = row
             continue
         retained.append(row)
-    reconciled = []
+    reconciled, new_costs = [], []
     for usage in usages:
         if (previous := existing.get(usage["eventId"]) or legacy_by_occurrence.get((usage.get("sessionId"), usage.get("occurredAt"), usage.get("rawModel")))) is not None:
             if previous.get("accountSlotId") not in {None, "", UNKNOWN_EVENT_ACCOUNT_ID}:
@@ -252,12 +252,17 @@ def sync_token_ledger(
                 usage["sync"] = previous["sync"]
             elif record_provenance is not None:
                 usage = record_provenance(usage)
-        elif record_provenance is not None:
-            usage = record_provenance(usage)
+        else:
+            if record_provenance is not None:
+                usage = record_provenance(usage)
+            new_costs.append(usage)
         reconciled.append(usage)
     updated = retained + reconciled
     if updated != rows:
         write_token_ledger(path, updated)
+    if on_new_cost is not None:
+        for row in new_costs:
+            on_new_cost(row)
     sessions = token_sessions_from_ledger(updated)
     labels = {str(row["accountSlotId"]): str(row["accountLabel"]) for row in timeline if row.get("accountSlotId") and row.get("accountLabel")} | {str(account_slot_id): str(account_label)}
     for session in sessions:

@@ -2,13 +2,10 @@
 
 from collections import deque
 from copy import deepcopy
-from datetime import datetime, timezone
 import threading
 import uuid
 
-
-def timestamp():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+from monitor_common import now_iso as timestamp
 
 
 class OperationSkipped(RuntimeError):

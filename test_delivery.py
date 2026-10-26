@@ -48,6 +48,91 @@ class DeliveryTests(unittest.TestCase):
     def materialize(self, manifest):
         return [json.loads(self.delivery.blob(digest, False)) for digest in manifest["chunks"]]
 
+    def test_compact_account_records_rebuild_after_v12(self):
+        from monitor_auto_update import _migrate_history_to_v12
+        self.quota(self.start)
+        self.token(self.start)
+        self.delivery.prepare(self.start + 100)
+        paths = {"processing_index": self.index.path, "dashboard_cache": self.directory / "display.json"}
+        for _ in range(2):
+            _migrate_history_to_v12(paths)
+            with self.index.transaction() as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT count(*) FROM dashboard_blobs").fetchone()[0], 0)
+        self.quota(self.start)
+        self.token(self.start)
+        self.delivery.prepare(self.start + 100)
+        for manifest in (self.delivery.manifest("local", "All"), self.delivery.manifest("local", "Date", self.start, self.start + DAY)):
+            self.assertEqual(manifest["tokenSessions"][0]["usageAccountId"], "a")
+            self.assertNotIn("accountSlotId", manifest["tokenSessions"][0])
+            for frame in self.materialize(manifest):
+                for point in frame["quotaPoints"]:
+                    self.assertEqual(point["timestamp"], self.start)
+                    self.assertEqual(point["usageAccountId"], "a")
+                    self.assertFalse({"checkedAt", "accountSlotId", "accountLabel"} & point.keys())
+
+    def test_contract_12_failure_and_crash_roll_back_and_retry_automatically(self):
+        import sqlite3
+        from contextlib import closing
+        import monitor_auto_update
+        self.quota(self.start)
+        self.delivery.prepare(self.start + 100)
+        database = self.directory / "cache-v4.sqlite3"
+        with closing(sqlite3.connect(self.index.path)) as source, closing(sqlite3.connect(database)) as target:
+            source.backup(target)
+        state = self.directory / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+        state.write_text('{"dataContractVersion":11}', encoding="utf-8")
+        history = self.directory / "quota.jsonl"
+        history.write_text('{"original":"preserved"}\n', encoding="utf-8")
+        account_manifest = self.directory / "accounts" / "accounts.json"
+        account_manifest.parent.mkdir()
+        account_manifest.write_text(json.dumps({"version": 3, "accounts": [{"id": "a"}, {"id": "b"}]}), encoding="utf-8")
+        legacy_manifest = self.directory / "codex" / "usage-monitor-accounts" / "accounts.json"
+        legacy_manifest.parent.mkdir(parents=True)
+        legacy_manifest.write_text(json.dumps({"version": 3, "accounts": [{"id": "x"}, {"id": "y"}], "slotOrder": ["y", "x"]}), encoding="utf-8")
+        original_manifest = account_manifest.read_bytes()
+        original_legacy = legacy_manifest.read_bytes()
+        def migrate():
+            return monitor_auto_update.migrate_history_data(self.directory, self.directory / "history", history, self.directory / "sessions", self.directory / "ledger",
+                self.directory / "samples", target_version=12, usage_sync_cache_path=self.directory / "cache.json", codex_home=self.directory / "codex")
+        def interrupted(paths):
+            monitor_auto_update._migrate_history_to_v12(paths)
+            raise RuntimeError("interrupted migration")
+        with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {12: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted migration"):
+            migrate()
+        self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
+        self.assertEqual(account_manifest.read_bytes(), original_manifest)
+        self.assertEqual(legacy_manifest.read_bytes(), original_legacy)
+        with closing(sqlite3.connect(database)) as db:
+            self.assertGreater(db.execute("SELECT count(*) FROM dashboard_blobs").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 1)
+        def crashed(paths):
+            monitor_auto_update._migrate_history_to_v12(paths)
+            raise KeyboardInterrupt("simulated process interruption")
+        with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {12: crashed}), self.assertRaises(KeyboardInterrupt):
+            migrate()
+        self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
+        self.assertTrue((self.directory / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).exists())
+        # Recovery must restore both manifests before the next migration attempt.
+        def verify_recovery(paths):
+            self.assertEqual(account_manifest.read_bytes(), original_manifest)
+            self.assertEqual(legacy_manifest.read_bytes(), original_legacy)
+            with closing(sqlite3.connect(database)) as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 1)
+            monitor_auto_update._migrate_history_to_v12(paths)
+        with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {12: verify_recovery}):
+            self.assertEqual(migrate(), [12])
+        self.assertEqual(migrate(), [])
+        self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 12)
+        self.assertEqual(json.loads(account_manifest.read_text())["slotOrder"], ["a", "b"])
+        self.assertEqual(json.loads(legacy_manifest.read_text())["slotOrder"], ["y", "x"])
+        self.assertFalse((self.directory / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).exists())
+        with closing(sqlite3.connect(database)) as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT count(*) FROM dashboard_blobs").fetchone()[0], 0)
+            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='processing_slot_cost_activity'").fetchone())
+        self.assertEqual(history.read_text(), '{"original":"preserved"}\n')
+
     def test_warm_manifest_and_idle_preparation_do_not_reload_or_encode_history(self):
         self.quota(self.start)
         self.token(self.start)
@@ -144,18 +229,59 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(grouped["usageByModel"], {"m": 20, "n": 10})
         self.assertEqual(cost_groups([grouped])[0], grouped)
 
-    def test_reduction_preserves_extrema_and_reset_boundaries(self):
+    def test_quota_buckets_average_instead_of_retaining_extrema(self):
         rows = [self.quota(self.start + i, value=value) | {"_key": str(i)} for i, value in enumerate([10, 11, 99, 12, 13, 14])]
+        for i, row in enumerate(rows):
+            for label in ("fiveHour", "sevenDay"):
+                row[label]["continuous"] = 10 + i
         reduced = reduce_quota(rows, 300)
-        self.assertIn(99, [row["fiveHour"]["raw"] for row in reduced])
-        self.assertEqual(reduced[0]["timestamp"], self.start)
-        self.assertEqual(reduced[-1]["timestamp"], self.start + 5)
-        rows[3]["fiveHour"]["resetAt"] = "2030-02-02T00:00:00Z"
-        self.assertTrue({"2", "3"}.issubset({row["_key"] for row in reduce_quota(rows, 300)}))
-        costs = [{"usageAccountId": "a", "plan": "plus", "timestamp": self.start + i, "startedAt": str(i), "endedAt": str(i + 1),
+        self.assertEqual(len(reduced), 1)
+        self.assertEqual(reduced[0]["fiveHour"]["raw"], 26.5)
+        self.assertEqual(reduced[0]["fiveHour"]["continuous"], 12.5)
+        self.assertEqual(reduced[0]["overviewBucket"]["count"], 6)
+        self.assertEqual(reduce_quota(rows, 0), rows)
+        self.assertEqual(rows[2]["fiveHour"]["raw"], 99)
+        for row in rows[3:]:
+            row["fiveHour"]["resetAt"] = "2030-02-02T00:00:00Z"
+        reduced = reduce_quota(rows, 300)
+        self.assertEqual(len(reduced), 2)
+        self.assertEqual([row["fiveHour"]["raw"] for row in reduced], [40, 13])
+
+    def test_quota_rollups_weight_original_observations_and_keep_accounts_separate(self):
+        rows = [self.quota(self.start + offset, value=value) | {"_key": str(i)}
+            for i, (offset, value) in enumerate([(0, 10), (1, 20), (2, 30), (301, 40)])]
+        self.assertEqual(len(reduce_quota(rows, 300)), 2)
+        self.assertEqual(reduce_quota(reduce_quota(rows, 300), 3600)[0]["fiveHour"]["raw"], 25)
+        self.assertEqual(reduce_quota(reduce_quota(rows, 300), 3600)[0]["overviewBucket"]["count"], 4)
+        other = rows[0] | {"usageAccountId": "b", "_key": "other"}
+        reduced = reduce_quota(rows + [other], 3600)
+        self.assertEqual(len(reduced), 2)
+        self.assertEqual([row["fiveHour"]["raw"] for row in reduced], [25, 10])
+        for row in rows:
+            row["sevenDay"]["raw"] = None
+            row["sevenDay"]["continuous"] = None
+        self.assertIsNone(reduce_quota(rows, 3600)[0]["sevenDay"]["raw"])
+
+    def test_prepared_overview_averages_while_selected_day_retains_observations(self):
+        for minute, value in enumerate([10, 11, 12, 13]):
+            self.quota(self.start + minute * 60, value=value)
+        self.delivery.prepare(self.start + 4 * DAY)
+        overview = [row for part in self.materialize(self.delivery.manifest("local", "All")) for row in part["quotaPoints"]]
+        self.assertEqual(len(overview), 1)
+        self.assertEqual(overview[0]["fiveHour"]["raw"], 11.5)
+        detail = [row for part in self.materialize(self.delivery.manifest("local", "Date", self.start, self.start + DAY)) for row in part["quotaPoints"]]
+        self.assertEqual([row["fiveHour"]["raw"] for row in detail], [10, 11, 12, 13])
+
+    def test_cost_buckets_sum_even_noncontiguous_intervals_and_preserve_rates(self):
+        costs = [{"usageAccountId": "a", "plan": "plus", "timestamp": self.start + i, "startedAt": str(i * 2), "endedAt": str(i * 2 + 1),
             "deltaPercent": i + 1, "totalCostUsd": 2 * (i + 1), "costByModelUsd": {"m": 2 * (i + 1)}} for i in range(3)]
-        self.assertEqual(reduce_cost(costs, 300)[0]["costPer100PercentUsd"], 200)
-        costs[2]["startedAt"] = "reset"
+        reduced = reduce_cost(costs, 300)
+        self.assertEqual(len(reduced), 1)
+        self.assertEqual(reduced[0]["totalCostUsd"], 12)
+        self.assertEqual(reduced[0]["deltaPercent"], 6)
+        self.assertEqual(reduced[0]["costByModelUsd"], {"m": 12})
+        self.assertEqual(reduced[0]["costPer100PercentUsd"], 200)
+        costs[2]["plan"] = "pro"
         self.assertEqual(len(reduce_cost(costs, 300)), 2)
 
     def test_http_scope_conditional_requests_and_precompressed_chunks_do_not_refresh_history(self):

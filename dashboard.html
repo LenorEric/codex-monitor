@@ -37,6 +37,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 .rate{color:var(--text);font-size:12px;font-variant-numeric:tabular-nums;white-space:nowrap}
 .meta{display:flex;gap:14px;flex-wrap:wrap;color:var(--muted);font-size:12px;margin-bottom:8px}
 .chart{width:100%;height:280px;display:block}
+#costTimeCard .card-title{flex-wrap:wrap}
 .window-progress{display:grid;grid-template-columns:max-content minmax(120px,1fr) max-content;gap:8px 12px;align-items:center;margin-top:10px;padding-top:10px;border-top:1px solid var(--border);font-variant-numeric:tabular-nums}
 .progress-label{min-width:88px;font-weight:650}.progress-track{height:10px;overflow:hidden;background:var(--panel2);border-radius:999px}
 .progress-fill{width:0;height:100%;background:var(--blue);border-radius:inherit;transition:width .3s ease}.progress-value{text-align:right}
@@ -48,6 +49,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 .tooltip{position:fixed;display:none;pointer-events:none;background:#101318;border:1px solid var(--border);border-radius:7px;padding:9px;box-shadow:0 12px 32px rgba(0,0,0,.35)}
 .tooltip{max-width:360px;z-index:20;color:var(--text)}
 .legend{display:flex;gap:12px;flex-wrap:wrap;color:var(--muted);font-size:12px}.dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px}
+.legend-line{display:inline-block;width:16px;border-top:2px solid;margin-right:5px;vertical-align:middle}.legend-line.dashed{border-top-style:dashed}
 .filter-bar{display:grid;gap:8px;padding:0 18px 10px}.model-filter,.account-filter{width:100%;padding:0;align-items:flex-start}.model-label,.account-label{width:58px;padding-top:4px;color:var(--muted);font-size:12px}.model-buttons,.account-buttons{flex:1}.model-buttons button,.account-buttons button{height:26px}
 .status{padding:0 18px 14px;color:var(--muted)}
 #historyStatus:empty{display:none}
@@ -138,6 +140,14 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <canvas class="chart" id="scatter7d"></canvas>
 <div class="legend" id="scatter7dLegend"></div>
 </section>
+<section class="card wide" id="costTimeCard">
+<div class="card-title"><h2>Cost vs Time</h2><div class="controls"><span class="rate" id="costTimeTotal">Total: —</span>
+<div class="fold-buttons" aria-label="Cost chart display"><button id="costTimeSpending" type="button" class="active" aria-pressed="true">Spending</button><button id="costTimeCumulative" type="button" aria-pressed="false">Cumulative</button></div></div></div>
+<div class="meta"><span>Time on X axis</span><span>USD on left axis · Usage % on right axis</span><span id="costTimeInterval"></span><span>Usage: account totals</span></div>
+<canvas class="chart" id="costTime" role="img" aria-label="Estimated cost over time"></canvas>
+<div class="legend" id="costTimeLegend"></div>
+<div class="meta">Event-recorded cost. Older session-only cost records are excluded because event timestamps are unavailable.</div>
+</section>
 </main>
 <div class="tooltip" id="tip"></div>
 <div class="message-stack" id="messageStack" aria-live="polite" aria-relevant="additions"></div>
@@ -171,8 +181,9 @@ let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()
 let pendingStatusRequest=null, statusEtag=null, currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
 let historyScope=null,historyGeneration=null,drawGeneration=0,chunkCacheBytes=0;
 let curveColors=new Map();
+let availableScopeAccounts=new Map();
+let costTimeMode="spending", costTimeFrame=null;
 const chunkCache=new Map(),scopeCache=new Map(),historyRequests=new Map(),deferredCharts=new Map();
-const historyMetrics={};
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
 const DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50, DATE_PICKER_VIRTUAL_WIDTH=280, DATE_PICKER_VIRTUAL_HEIGHT=360, DATE_PICKER_VIRTUAL_PADDING=8;
@@ -375,7 +386,7 @@ function modelFilteredEvents(list){
   });
 }
 function accountDisplayName(accountId,fallback){
-  return ((payload.accounts||{}).usageGroups||[]).find(account=>account.id===accountId)?.label||((payload.accounts||{}).items||[]).find(account=>account.id===accountId)?.displayLabel||fallback||"Unknown";
+  return ((payload.accounts||{}).usageGroups||[]).find(account=>account.id===accountId)?.label||payload.accountLabels?.[accountId]||((payload.accounts||{}).items||[]).find(account=>account.id===accountId)?.displayLabel||fallback||"Unknown";
 }
 function usageAccountId(value){
   return value.usageAccountId||((payload.accounts||{}).items||[]).find(account=>account.id===value.accountSlotId)?.usageAccountId||value.accountSlotId||"unknown";
@@ -384,6 +395,7 @@ function updateAccountControls(events){
   events=[...events,...visibleTokenSessions];
   const available=new Map();
   events.filter(p=>!p.synthetic).forEach(p=>available.set(usageAccountId(p),accountDisplayName(usageAccountId(p),p.accountLabel)));
+  availableScopeAccounts=available;
   selectedAccounts=new Set([...selectedAccounts].map(accountId=>((payload.accounts||{}).items||[]).find(account=>account.id===accountId)?.usageAccountId||accountId));
   selectedAccounts=new Set([...selectedAccounts].filter(accountId=>available.has(accountId)));
   const container=document.getElementById("eventAccounts");container.replaceChildren();
@@ -559,7 +571,7 @@ async function performAccountAction(action,body){
   try{const result=await authenticatedAccountAction(action,body);payload.accounts=result.accounts||payload.accounts;if(currentStatus)currentStatus={...currentStatus,accounts:payload.accounts};succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(`${actionName} Completed`,{switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(action,"Completed",steps),"success")}
   catch(error){payload.accounts={...(payload.accounts||{}),error:error.message||String(error)}}
   finally{workingMessage.dismiss();actionBusy=false;renderAccounts(payload.accounts)}
-  if(succeeded)refreshSeries(true);
+  if(succeeded)load(true);
 }
 function setupAccountControls(){
   const modal=document.getElementById("renameAccountModal"), input=document.getElementById("renameAccountLabel"), deleteModal=document.getElementById("deleteAccountModal");
@@ -608,20 +620,23 @@ function showRefreshError(error){
 function validateView(view){
   if(!view||!Array.isArray(view.quotaPoints)||!Array.isArray(view.tokenSessions)||!Array.isArray(view.costUsage?.fiveHour)||!Array.isArray(view.costUsage?.sevenDay))throw new Error("Invalid dashboard snapshot");
   for(const row of [...view.quotaPoints,...view.tokenSessions,...view.costUsage.fiveHour,...view.costUsage.sevenDay])if(typeof row?._key!=="string"||!row._key)throw new Error("Dashboard row is missing its key");
+  if(view.costTime!==undefined&&(!Array.isArray(view.costTime)||view.costTime.some(row=>typeof row?._key!=="string"||!row._key)))throw new Error("Invalid cost time collection");
   return view;
 }
 async function load(force=false){
   if(document.hidden&&!force)return;
   const scope={view:dataView,range:selected}, bounds=selected==="Date"?selectedDateBounds():null;
   if(bounds){scope.start=String(bounds.startMs/1000);scope.end=String(bounds.endMs/1000)}
-  const key=new URLSearchParams(scope).toString(), sequence=++seriesLoadSequence, cached=scopeCache.get(key), started=performance.now();
+  const key=new URLSearchParams(scope).toString(), sequence=++seriesLoadSequence, cached=scopeCache.get(key);
   if(historyScope!==key){
     historyScope=key;historyGeneration=null;
     if(cached)showScope(key,cached);
     else{
       drawGeneration++;deferredCharts.clear();
       payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]},accounts:currentStatus?.accounts,scopedHistory:true};
-      for(const id of ["usageTime5h","usageTime7d","scatter5h","scatter7d"]){const canvas=document.getElementById(id);if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);if(usageTimeChartStates[id]?.frame)cancelAnimationFrame(usageTimeChartStates[id].frame);delete chartStates[id];delete usageTimeChartStates[id];canvas.getContext("2d").clearRect(0,0,canvas.width,canvas.height);canvas.onmousemove=null;document.getElementById(`${id}Legend`).replaceChildren()}
+      if(costTimeFrame!==null)cancelAnimationFrame(costTimeFrame);costTimeFrame=null;hideTip();
+      for(const id of ["usageTime5h","usageTime7d","scatter5h","scatter7d","costTime"]){const canvas=document.getElementById(id);if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);if(usageTimeChartStates[id]?.frame)cancelAnimationFrame(usageTimeChartStates[id].frame);delete chartStates[id];delete usageTimeChartStates[id];canvas.getContext("2d").clearRect(0,0,canvas.width,canvas.height);canvas.onmousemove=null;document.getElementById(`${id}Legend`).replaceChildren()}
+      document.getElementById("costTimeTotal").textContent="Total: —";document.getElementById("costTimeInterval").textContent="Loading…";
       for(const id of ["tokenInput","tokenCachedInput","tokenOutput","tokenCacheWrite","tokenCacheHit","tokenCost","tokenSessionCount"])document.getElementById(id).textContent="—";
       document.getElementById("tokenTimeSpan").hidden=true;
       document.getElementById("historyStatus").textContent="Loading selected history…";
@@ -632,7 +647,7 @@ async function load(force=false){
     if(sequence!==seriesLoadSequence)return;
     if(!manifest||manifest.protocolVersion!==4||manifest.view!==scope.view||manifest.range!==scope.range||!Array.isArray(manifest.chunks))throw new Error("Incompatible dashboard scope response");
     if(historyGeneration===manifest.generation)return;
-    payload={...payload,tokenSessions:manifest.tokenSessions||[],rateRows:manifest.rateRows,maxima:manifest.maxima,accounts:currentStatus?.accounts,scopedHistory:true};
+    payload={...payload,tokenSessions:manifest.tokenSessions||[],rateRows:manifest.rateRows,accountLabels:manifest.accountLabels,maxima:manifest.maxima,accounts:currentStatus?.accounts,scopedHistory:true};
     updateTokenSummary(accountFilteredEvents(payload.tokenSessions));
     if(payload.rateRows){updateRate("rate5h",modelFilteredEvents(accountFilteredEvents(payload.rateRows.fiveHour)));updateRate("rate7d",modelFilteredEvents(accountFilteredEvents(payload.rateRows.sevenDay)))}
     document.getElementById("historyStatus").textContent="Loading selected charts…";
@@ -646,12 +661,13 @@ async function load(force=false){
       }
     }));
     if(sequence!==seriesLoadSequence)return;
-    const value={quotaPoints:[],tokenSessions:manifest.tokenSessions||[],costUsage:{fiveHour:[],sevenDay:[]},historyStats:{},maxima:manifest.maxima,rateRows:manifest.rateRows,scopedHistory:true};
-    for(const frame of frames){for(const row of frame.quotaPoints)value.quotaPoints.push(row);for(const name of ["fiveHour","sevenDay"])for(const row of frame.costUsage[name])value.costUsage[name].push(row)}
+    const value={quotaPoints:[],costTime:[],costTimeBounds:manifest.costTimeBounds,costTimeTotals:manifest.costTimeTotals,costTimeResolution:manifest.costTimeResolution,
+      tokenSessions:manifest.tokenSessions||[],costUsage:{fiveHour:[],sevenDay:[]},historyStats:{},maxima:manifest.maxima,rateRows:manifest.rateRows,accountLabels:manifest.accountLabels,scopedHistory:true};
+    for(const frame of frames){for(const row of frame.quotaPoints)value.quotaPoints.push(row);value.costTime.push(...(frame.costTime||[]));for(const name of ["fiveHour","sevenDay"])for(const row of frame.costUsage[name])value.costUsage[name].push(row)}
     const entry={manifest,value,etag:response.etag||cached?.etag,bytes:JSON.stringify(value).length*2};
     scopeCache.delete(key);scopeCache.set(key,entry);
     while(scopeCache.size>8||[...scopeCache.values()].reduce((sum,item)=>sum+item.bytes,0)>24*1024*1024&&scopeCache.size>1)scopeCache.delete(scopeCache.keys().next().value);
-    showScope(key,entry);historyMetrics[key]={loadMs:performance.now()-started,chunks:frames.length,points:value.quotaPoints.length,generation:manifest.generation};
+    showScope(key,entry);
   }catch(error){if(sequence===seriesLoadSequence){document.getElementById("historyStatus").textContent=error.preparing?"Preparing history in the background…":"History refresh failed; retrying automatically. "+error.message}}
 }
 function requestDashboard(scope,etag){
@@ -671,7 +687,6 @@ function showScope(key,entry){
   document.getElementById("historyStatus").textContent="";
   drawAll();
 }
-async function refreshSeries(force=false){return load(force)}
 function setupDataView(){
   document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();setupDataView();load(true)}});
 }
@@ -680,8 +695,9 @@ async function pollStatus(force=false){
   try{
     const response=await requestStatus(), status=response.payload;
     if(!status)throw new Error("Status response was empty");
+    const namesChanged=JSON.stringify(currentStatus?.accounts?.usageGroups)!==JSON.stringify(status.accounts?.usageGroups);
     currentStatus=status;statusEtag=response.etag||statusEtag;payload={...payload,accounts:status.accounts,lastSample:status.lastSample,display:status.display};
-    refreshErrorShown=false;renderCurrentStatus(status);
+    refreshErrorShown=false;renderCurrentStatus(status);if(namesChanged&&historyGeneration)drawAll();
     ensureControlPassword(status);
   }catch(error){showRefreshError(error)}
 }
@@ -702,7 +718,7 @@ function mergeDenseDeltaEvents(list,metrics){
   const flush=()=>{
     if(!group.length)return;
     const timestamp=group.reduce((sum,p)=>sum+eventTimestamp(p),0)/group.length, ratio=group.reduce((sum,p)=>sum+p.costPer100PercentUsd,0)/group.length;
-    result.push({...group[group.length-1],checkedAt:new Date(timestamp*1000).toISOString(),timestamp,costPer100PercentUsd:ratio,deltaPercent:group.reduce((sum,p)=>sum+(p.deltaPercent||0),0),deltaCostUsd:group.reduce((sum,p)=>sum+(p.deltaCostUsd||0),0),mergedCount:group.length,mergedFrom:group[0].checkedAt,mergedTo:group[group.length-1].checkedAt,rawKeys:group.map(p=>p._key||p.checkedAt)});group=[];
+    result.push({...group[group.length-1],checkedAt:new Date(timestamp*1000).toISOString(),timestamp,costPer100PercentUsd:ratio,deltaPercent:group.reduce((sum,p)=>sum+(p.deltaPercent||0),0),deltaCostUsd:group.reduce((sum,p)=>sum+(p.deltaCostUsd||0),0),mergedCount:group.length,mergedFrom:new Date(eventTimestamp(group[0])*1000).toISOString(),mergedTo:new Date(eventTimestamp(group[group.length-1])*1000).toISOString(),rawKeys:group.map(p=>p._key||String(eventTimestamp(p)))});group=[];
   };
   for(const point of list.sort((a,b)=>eventTimestamp(a)-eventTimestamp(b))){
     if(group.length&&denseDeltaDistance(group[group.length-1],point,metrics)>metrics.minDistance)flush();
@@ -726,10 +742,10 @@ function chart(id, series, opts={}){
   const previous=chartStates[id], previousSeries=previous?.series||[];
   const eventTime=p=>Number.isFinite(p.ref.timestamp)?p.ref.timestamp:Date.parse(p.ref.checkedAt||"")/1000;
   const parsedTime=s=>Number.isFinite(Date.parse(s||"")/1000)?Date.parse(s)/1000:null;
-  const pointKey=p=>p.ref.synthetic?"baseline":p.ref.mergedCount>1?`${p.ref.mergedFrom}|${p.ref.mergedTo}`:p.ref.checkedAt;
+  const pointKey=p=>p.ref.synthetic?"baseline":p.ref.mergedCount>1?`${p.ref.mergedFrom}|${p.ref.mergedTo}`:p.ref._key||String(eventTimestamp(p.ref));
   const preparePoint=p=>{
     const time=eventTime(p), from=parsedTime(p.ref.mergedFrom)??time, to=parsedTime(p.ref.mergedTo)??time;
-    return {...p,tx:X(p.x),ty:Y(p.y),x:X(p.x),y:Y(p.y),r:NODE_RADIUS,key:pointKey(p),time,from,to,rawKeys:p.ref.rawKeys||[p.ref.checkedAt||"baseline"],merged:(p.ref.mergedCount||1)>1};
+    return {...p,tx:X(p.x),ty:Y(p.y),x:X(p.x),y:Y(p.y),r:NODE_RADIUS,key:pointKey(p),time,from,to,rawKeys:p.ref.rawKeys||[p.ref._key||String(eventTimestamp(p.ref))],merged:(p.ref.mergedCount||1)>1};
   };
   const currentSeries=series.map(s=>({name:s.name,color:s.color,points:s.points.filter(p=>Number.isFinite(p.x)&&Number.isFinite(p.y)).map(preparePoint)}));
   const makeLineLayer=drawSeries=>{
@@ -820,12 +836,12 @@ function showTip(e,hit){
   for(const p of hit){const d=Math.hypot(e.offsetX-p.x,e.offsetY-p.y); if(d<bd){bd=d;best=p}}
   if(!best||bd>18)return hideTip();
   const p=best.ref, tip=document.getElementById("tip"), rows=[
-    {text:new Date(p.checkedAt).toLocaleString(),strong:true},
+    {text:new Date(eventTimestamp(p)*1000).toLocaleString(),strong:true},
     best.s.name,
     `Usage ${pct(p.deltaPercent)} / Cost ${usd(p.deltaCostUsd)}`,
     `Cost / 100% ${usd(p.costPer100PercentUsd)}`,
   ];
-  if(p.accountSlotId)rows.push(`Account ${accountDisplayName(usageAccountId(p),p.accountLabel)}`);
+  if(p.usageAccountId)rows.push(`Account ${accountDisplayName(usageAccountId(p),p.accountLabel)}`);
   if(p.startedAt&&p.endedAt)rows.push(`Period ${new Date(p.startedAt).toLocaleString()} to ${new Date(p.endedAt).toLocaleString()}`);
   if(p.plan&&p.plan!=="unknown")rows.push(`Plan ${p.plan} (${p.planMultiplier||1}x)`);
   if(p.mergedCount>1)rows.push(`Merged ${p.mergedCount} points from ${new Date(p.mergedFrom).toLocaleString()} to ${new Date(p.mergedTo).toLocaleString()}`);
@@ -1083,7 +1099,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
     drawXAxisTickLabels(labelContext,xTicks.labels,m.l,w-m.l-m.r,h-10);
     currentSeries=groups.map(([accountId,accountPoints])=>{
       const compactedRanges=compactedUsageRanges(accountPoints);
-      return {accountId,color:accountCurveColor(accountId),points:accountPoints.map((point,index)=>({point,value:renderedValueOf(point),key:point.checkedAt,timestamp:eventTimestamp(point),x:X(eventTimestamp(point)),y:Y(renderedValueOf(point)),breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,renderedValueOf,compactedRanges)}))};
+      return {accountId,color:accountCurveColor(accountId),points:accountPoints.map((point,index)=>({point,value:renderedValueOf(point),key:point._key||String(eventTimestamp(point)),timestamp:eventTimestamp(point),x:X(eventTimestamp(point)),y:Y(renderedValueOf(point)),breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,renderedValueOf,compactedRanges)}))};
     });
     const hit=currentSeries.flatMap(series=>series.points);
     mousemove=event=>{
@@ -1091,7 +1107,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
       if(!nearest||Math.abs(event.offsetX-nearest.x)>24||Math.abs(event.offsetY-nearest.y)>36)return hideTip();
       const point=nearest.point, tip=document.getElementById("tip"), window=point[label]||{};
       renderTip(tip,[
-        {text:new Date(point.checkedAt).toLocaleString(),strong:true},`${label==="fiveHour"?"5h":"7d"} ${normalizedUsage?"normalized ":""}usage ${Number(nearest.value).toFixed(1)}%`,
+        {text:new Date(eventTimestamp(point)*1000).toLocaleString(),strong:true},`${label==="fiveHour"?"5h":"7d"} ${normalizedUsage?"normalized ":""}usage ${Number(nearest.value).toFixed(1)}%`,
         normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}% · ${window.plan==="pro_lite"?"Pro Lite":window.plan==="pro"?"Pro":"Plus"} ×${{pro_lite:5,pro:20}[window.plan]||1}`:null,
         `Account ${accountDisplayName(usageAccountId(point),point.accountLabel)}`,window.resetAt?`Reset ${new Date(window.resetAt).toLocaleString()}`:null,
       ]);
@@ -1160,6 +1176,182 @@ function drawUsageTimeChart(id,label,points,animate=false){
   const step=now=>{const progress=chartEaseInOut(Math.min(1,(now-started)/duration));drawFrame(progress,true);if(progress<1)state.frame=requestAnimationFrame(step);else finish()};
   step(started);
 }
+const costUsd=value=>`$${new Intl.NumberFormat(undefined,{maximumFractionDigits:Math.abs(value)>0&&Math.abs(value)<.01?6:2}).format(value)}`;
+function costTimeAmount(row){
+  if(selectedAccounts.size&&!selectedAccounts.has(usageAccountId(row)))return null;
+  const values=Object.entries(row.costByModelUsd||{}).filter(([model])=>!selectedModels.size||selectedModels.has(model));
+  return values.length?values.reduce((sum,[,amount])=>sum+Math.round((Number(amount)||0)*1e8),0)/1e8:null;
+}
+function costTimeSeries(plotWidth=734,activeSpan=null){
+  const bounds=payload.costTimeBounds?.every(Number.isFinite)?payload.costTimeBounds:quotaTimeDomain(accountFilteredQuotaPoints(payload.quotaPoints||[]));
+  if(!Array.isArray(bounds)||bounds.length!==2||!bounds.every(Number.isFinite))return {buckets:[],total:0};
+  const [start,end]=bounds, target=(activeSpan??end-start)/Math.max(1,plotWidth/30);
+  const unit=Math.max(payload.costTimeResolution||60,target>=86400?86400:target>=3600?3600:60), seconds=Math.max(1,Math.round(target/unit))*unit;
+  const amounts=new Map();let count=0;
+  for(const row of payload.costTime||[]){
+    if(row.timestamp<start||row.timestamp>end||selected==="Date"&&row.timestamp===end)continue;
+    const amount=costTimeAmount(row);if(amount===null)continue;count++;
+    const bucket=Math.floor((row.timestamp===end&&end>start&&selected!=="Date"?end-1e-6:row.timestamp)/seconds)*seconds;
+    amounts.set(bucket,(amounts.get(bucket)||0)+Math.round(amount*1e8));
+  }
+  const buckets=[];let cumulative=0;
+  if(count)for(let stamp=Math.floor(start/seconds)*seconds;stamp<end||start===end&&stamp<=end;stamp+=seconds){
+    const amount=(amounts.get(stamp)||0)/1e8;cumulative=Math.round((cumulative+amount)*1e8)/1e8;
+    buckets.push({start:Math.max(start,stamp),end:start===end?start+seconds:Math.min(end,stamp+seconds),bucketStart:stamp,amount,cumulative});
+  }
+  const total=Array.isArray(payload.costTimeTotals)?payload.costTimeTotals.reduce((sum,row)=>sum+Math.round((costTimeAmount(row)||0)*1e8),0)/1e8:cumulative;
+  return {buckets,total,seconds,start,end};
+}
+function costTimeUsageIndex(points,time,after=false){
+  let low=0,high=points.length;
+  while(low<high){const middle=(low+high)>>>1,timestamp=eventTimestamp(points[middle]);if(after?timestamp<=time:timestamp<time)low=middle+1;else high=middle}
+  return low;
+}
+function costTimeUsageSeries(start,end){
+  const accounts=[...availableScopeAccounts.keys()].filter(accountId=>!selectedAccounts.size||selectedAccounts.has(accountId)), grouped=new Map(accounts.map(accountId=>[accountId,[]]));
+  for(const point of accountFilteredQuotaPoints(payload.quotaPoints||[])){const points=grouped.get(usageAccountId(point));if(points&&Number.isFinite(eventTimestamp(point)))points.push(point)}
+  for(const points of grouped.values())points.sort((a,b)=>eventTimestamp(a)-eventTimestamp(b));
+  return accounts.flatMap(accountId=>{
+    const ordered=grouped.get(accountId), invalidStart=Number.isNaN(Number(start)), invalidEnd=Number.isNaN(Number(end)), startIndex=costTimeUsageIndex(ordered,start), endIndex=costTimeUsageIndex(ordered,end,true);
+    const before=invalidStart?undefined:ordered[startIndex-1], after=invalidEnd?undefined:ordered[endIndex], points=invalidStart||invalidEnd?[]:[...(before?[before]:[]),...ordered.slice(startIndex,endIndex),...(after?[after]:[])], compactedRanges=compactedUsageRanges(points);
+    return ["fiveHour","sevenDay"].map(label=>{
+      const valueOf=point=>Number.isFinite(point[label]?.continuous)?normalizedUsage?plusEquivalentUsage(point,label,row=>row[label].continuous):point[label].continuous:null;
+      return {accountId,label,valueOf,color:accountCurveColor(accountId),dash:label==="fiveHour"?[6,4]:[],compactedRanges,
+        name:`${label==="fiveHour"?"5h":"7d"}${normalizedUsage?" normalized":""} · ${accountDisplayName(accountId,ordered[0]?.accountLabel)}`,
+        points};
+    });
+  });
+}
+function costTimeFoldCandidates(series,usage){
+  if(!usage.length||!Number.isFinite(series.start)||!Number.isFinite(series.end))return [];
+  const ranges=[series.buckets.length?series.buckets.filter(bucket=>bucket.amount===0).map(bucket=>({start:bucket.start,end:bucket.end,kind:"flat"})):[{start:series.start,end:series.end,kind:"flat"}]];
+  for(const item of usage){
+    const flat=[], compacted=item.compactedRanges||compactedUsageRanges(item.points);
+    for(let index=1;index<item.points.length;index++){
+      const previous=item.points[index-1], current=item.points[index];
+      if(!Number.isFinite(item.valueOf(previous))||item.valueOf(previous)!==item.valueOf(current))continue;
+      flat.push({start:Math.max(series.start,eventTimestamp(previous)),end:Math.min(series.end,eventTimestamp(current)),
+        kind:breakUsageCurve(previous,current,item.label,item.valueOf,compacted)?"gap":"flat"});
+    }
+    ranges.push(flat.filter(range=>range.start<range.end));
+  }
+  const boundaries=[...new Set([series.start,series.end,...ranges.flatMap(items=>items.flatMap(range=>[range.start,range.end]))])].sort((a,b)=>a-b), indexes=ranges.map(()=>0), candidates=[];
+  for(let index=1;index<boundaries.length;index++){
+    const start=boundaries[index-1], end=boundaries[index], states=ranges.map((items,group)=>{
+      while(indexes[group]<items.length&&items[indexes[group]].end<=start)indexes[group]++;
+      const range=items[indexes[group]];return range&&range.start<=start&&range.end>=end?range.kind:null;
+    });
+    if(!states.every((kind,group)=>group===0?kind==="flat":kind==="gap"?collapseUsageGaps:kind==="flat"&&collapseUsageFlat))continue;
+    const kind=states.includes("gap")?"gap":"unchanged", previous=candidates.at(-1);
+    if(previous&&previous.end===start&&previous.kind===kind){previous.end=end;previous.duration=end-previous.start}
+    else candidates.push({start,end,duration:end-start,kind});
+  }
+  return candidates;
+}
+function costTimeFolds(series,usage,left,right,charWidth){
+  const folds=[], candidates=usageTimeFoldMetrics(costTimeFoldCandidates(series,usage).map(range=>usageTimeEdgeFoldRange(range,series.start,series.end,left,right)).filter(Boolean),series.start,series.end,left,right,charWidth);
+  while(true){
+    const scale=usageTimeScale(series.start,series.end,folds,left,right);
+    const additions=candidates.filter(range=>!folds.includes(range)&&scale.x(range.end)-scale.x(range.start)>range.width*(range.kind==="gap"?2:4));
+    if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,series.start,series.end,left,right);
+    folds.push(...additions);folds.sort((a,b)=>a.start-b.start);
+  }
+}
+function costTimeUsageAt(item,time){
+  const right=costTimeUsageIndex(item.points,time);
+  if(right>=item.points.length)return null;
+  const current=item.points[right];
+  if(eventTimestamp(current)===time)return Number.isFinite(item.valueOf(current))?item.valueOf(current):null;
+  const previous=item.points[right-1];
+  if(!previous||!Number.isFinite(item.valueOf(previous))||!Number.isFinite(item.valueOf(current))||breakUsageCurve(previous,current,item.label,item.valueOf,item.compactedRanges||compactedUsageRanges(item.points)))return null;
+  return item.valueOf(previous)+(item.valueOf(current)-item.valueOf(previous))*(time-eventTimestamp(previous))/(eventTimestamp(current)-eventTimestamp(previous));
+}
+function setupCostTimeControls(){
+  for(const mode of ["spending","cumulative"])document.getElementById(mode==="spending"?"costTimeSpending":"costTimeCumulative").onclick=()=>{
+    costTimeMode=mode;
+    for(const value of ["spending","cumulative"]){const button=document.getElementById(value==="spending"?"costTimeSpending":"costTimeCumulative");button.classList.toggle("active",value===mode);button.setAttribute("aria-pressed",String(value===mode))}
+    drawAll(true);
+  };
+}
+function drawCostTimeChart(animate=false){
+  if(costTimeFrame!==null)cancelAnimationFrame(costTimeFrame);costTimeFrame=null;
+  const canvas=document.getElementById("costTime"), ctx=canvas.getContext("2d"), rect=canvas.getBoundingClientRect(), dpr=devicePixelRatio||1;
+  if(!rect.width||!rect.height)return;
+  canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);
+  let series=costTimeSeries(Math.max(1,rect.width-CHART_MARGINS.l-CHART_MARGINS.r));
+  const usage=costTimeUsageSeries(series.start,series.end), visibleUsage=usage.filter(item=>item.points.some(point=>Number.isFinite(item.valueOf(point))));
+  const legends=[...(series.buckets.length?[{name:costTimeMode==="spending"?"Spending":"Cumulative cost",color:css("--orange")}]:[]),...visibleUsage];
+  const legend=document.getElementById("costTimeLegend");legend.replaceChildren(...legends.map(item=>{
+    const entry=document.createElement("span"), dot=document.createElement("span");
+    dot.className=item.label?`legend-line${item.dash.length?" dashed":""}`:"dot";dot.style.background=item.color;dot.style.borderColor=item.color;entry.append(dot,item.name);return entry;
+  }));
+  canvas.onmousemove=null;canvas.onmouseleave=hideTip;hideTip();
+  canvas.setAttribute("aria-label",`${legends.map(item=>item.name).join(", ")||"No data"} over time. Total ${costUsd(series.total)}.`);
+  document.getElementById("costTimeTotal").textContent=`Total: ${costUsd(series.total)}`;
+  if(!series.buckets.length&&!visibleUsage.length){
+    document.getElementById("costTimeInterval").textContent="";ctx.clearRect(0,0,rect.width,rect.height);ctx.fillStyle=css("--muted");ctx.textAlign="center";
+    ctx.fillText("No timestamped cost events for the selected scope",rect.width/2,rect.height/2);return;
+  }
+  const cumulative=costTimeMode==="cumulative", m={...CHART_MARGINS,r:visibleUsage.length?58:CHART_MARGINS.r};
+  ctx.font="11px system-ui";
+  m.l=Math.max(m.l,ctx.measureText(costUsd(series.total*1.1)).width+12);
+  const width=rect.width-m.l-m.r, height=rect.height-m.t-m.b;
+  let folds=[];
+  for(let pass=0;pass<3;pass++){
+    folds=costTimeFolds(series,usage,m.l,rect.width-m.r,ctx.measureText("0").width);
+    if(!folds.length)break;
+    const next=costTimeSeries(Math.max(1,width-folds.reduce((sum,fold)=>sum+fold.width,0)),series.end-series.start-folds.reduce((sum,fold)=>sum+fold.duration,0));
+    if(next.seconds===series.seconds)break;
+    series=next;
+  }
+  folds=costTimeFolds(series,usage,m.l,rect.width-m.r,ctx.measureText("0").width);
+  const first=series.start, last=series.buckets.at(-1)?.end??series.end;
+  const timeScale=usageTimeScale(first,last,folds,m.l,rect.width-m.r), X=timeScale.x;
+  const maximum=Math.max(...series.buckets.map(bucket=>cumulative?bucket.cumulative:bucket.amount),0), yMax=maximum>0?maximum*1.1:1, Y=value=>m.t+height-value/yMax*height;
+  const percentMax=Math.max(100,...visibleUsage.flatMap(item=>item.points.map(item.valueOf).filter(Number.isFinite))), P=value=>m.t+height-value/percentMax*height;
+  document.getElementById("costTimeInterval").textContent=series.seconds?`${series.seconds%86400===0?series.seconds/86400:series.seconds%3600===0?series.seconds/3600:series.seconds/60}-${series.seconds%86400===0?"day":series.seconds%3600===0?"hour":"minute"} intervals`:"";
+  const draw=progress=>{
+    ctx.clearRect(0,0,rect.width,rect.height);ctx.font="11px system-ui";ctx.lineWidth=1;
+    for(let i=0;i<=4;i++){const value=yMax*i/4,y=Y(value);ctx.strokeStyle=css("--border");ctx.beginPath();ctx.moveTo(m.l,y);ctx.lineTo(rect.width-m.r,y);ctx.stroke();ctx.fillStyle=css("--muted");ctx.textAlign="right";ctx.fillText(costUsd(value),m.l-8,y+4)}
+    if(visibleUsage.length)for(let i=0;i<=4;i++){ctx.textAlign="left";ctx.fillText(pct(percentMax*i/4),rect.width-m.r+8,P(percentMax*i/4)+4)}
+    const ticks=Math.max(2,Math.min(5,Math.floor(width/140)));
+    for(let i=0;i<ticks;i++){const x=m.l+width*i/(ticks-1), value=timeScale.timestampAt(x), date=new Date(value*1000);ctx.textAlign=i===0?"left":i===ticks-1?"right":"center";
+      ctx.fillText(series.seconds<86400?date.toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):date.toLocaleDateString(),x,rect.height-10)}
+    if(timeScale.folds.length)drawUsageTimeFolds(ctx,timeScale.folds,m.t,m.t+height);
+    ctx.fillStyle=css("--orange");ctx.strokeStyle=css("--orange");ctx.lineWidth=2;
+    if(cumulative){ctx.beginPath();ctx.moveTo(X(series.start),Y(0));for(const bucket of series.buckets){ctx.lineTo(X(bucket.start),Y((bucket.cumulative-bucket.amount)*progress));ctx.lineTo(X(bucket.end),Y(bucket.cumulative*progress))}ctx.stroke()}
+    else for(const bucket of series.buckets){const x=X(bucket.start), barWidth=X(bucket.end)-x;ctx.fillRect(x+barWidth*.08,Y(bucket.amount*progress),barWidth*.84,height*bucket.amount/yMax*progress)}
+    if(visibleUsage.length){
+      ctx.save();ctx.beginPath();ctx.rect(m.l,m.t,width,height);ctx.clip();
+      for(const item of visibleUsage){
+        const compacted=item.compactedRanges||compactedUsageRanges(item.points);ctx.strokeStyle=item.color;ctx.lineWidth=2;ctx.setLineDash(item.dash);ctx.beginPath();
+        item.points.forEach((point,index)=>{
+          const value=item.valueOf(point);if(!Number.isFinite(value))return;
+          const previous=item.points[index-1], x=X(eventTimestamp(point)), y=P(value*progress);
+          if(!previous||!Number.isFinite(item.valueOf(previous))||breakUsageCurve(previous,point,item.label,item.valueOf,compacted))ctx.moveTo(x,y);else ctx.lineTo(x,y);
+        });
+        ctx.stroke();
+      }
+      ctx.restore();ctx.setLineDash([]);
+    }
+  };
+  const mode=costTimeMode, generation=drawGeneration;
+  const finish=()=>{
+    costTimeFrame=null;draw(1);
+    canvas.onmousemove=event=>{
+      if(event.offsetX<m.l||event.offsetX>rect.width-m.r||event.offsetY<m.t||event.offsetY>rect.height-m.b)return hideTip();
+      const time=timeScale.timestampAt(event.offsetX), bucket=series.buckets.find((value,index)=>time>=value.start&&(time<value.end||index===series.buckets.length-1&&time===value.end));
+      if(!bucket&&!visibleUsage.length)return hideTip();
+      const tip=document.getElementById("tip");
+      renderTip(tip,[{text:bucket?`${new Date(bucket.start*1000).toLocaleString()} to ${new Date(bucket.end*1000).toLocaleString()}`:new Date(time*1000).toLocaleString(),strong:true},
+        `Spending: ${costUsd(bucket?.amount||0)}`,`Cumulative: ${costUsd(bucket?.cumulative||0)}`,...visibleUsage.map(item=>{const value=costTimeUsageAt(item,time);return `${item.name}: ${value===null?"N/A":`${value.toFixed(1)}%`}`})]);
+      tip.style.display="block";positionTip(event,tip);
+    };
+  };
+  if(!animate){finish();return}
+  const started=performance.now(), step=now=>{if(generation!==drawGeneration||mode!==costTimeMode){costTimeFrame=null;return}const progress=Math.min(1,(now-started)/400);draw(chartEaseInOut(progress));if(progress<1)costTimeFrame=requestAnimationFrame(step);else finish()};
+  costTimeFrame=requestAnimationFrame(step);
+}
 function drawAll(animate=false){
   if(payload.scopedHistory&&!historyGeneration)return;
   const generation=++drawGeneration;deferredCharts.clear();
@@ -1167,22 +1359,24 @@ function drawAll(animate=false){
   const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], labels=new Map([...quotaPoints,...fiveInRange,...sevenInRange].map(row=>[usageAccountId(row),row.accountLabel]));
   curveColors=new Map([...labels.keys()].sort((a,b)=>accountDisplayName(a,labels.get(a)).localeCompare(accountDisplayName(b,labels.get(b)),undefined,{numeric:true})||a.localeCompare(b)).map((id,index)=>[id,palette[index%palette.length]]));
   visibleTokenSessions=tokenSessions;
-  updateModelControls([...fiveInRange,...sevenInRange]);
-  updateAccountControls([...fiveInRange,...sevenInRange,...quotaInRange]);
+  const costRows=(payload.costTimeTotals||payload.costTime||[]);
+  updateModelControls([...fiveInRange,...sevenInRange,...costRows]);
+  updateAccountControls([...fiveInRange,...sevenInRange,...quotaInRange,...costRows]);
   const five=modelFilteredEvents(accountFilteredEvents(fiveInRange)), seven=modelFilteredEvents(accountFilteredEvents(sevenInRange)), quota=accountFilteredQuotaPoints(quotaInRange);
   const selectedTokenSessions=accountFilteredEvents(tokenSessions);
   updateTokenSummary(selectedTokenSessions);
   updateRate("rate5h",payload.rateRows?modelFilteredEvents(accountFilteredEvents(payload.rateRows.fiveHour)):five);
   updateRate("rate7d",payload.rateRows?modelFilteredEvents(accountFilteredEvents(payload.rateRows.sevenDay)):seven);
   const jobs=[["usageTime5h",()=>drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)],["usageTime7d",()=>drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)],
-    ["scatter5h",()=>drawDeltaChart("scatter5h","5h cost vs usage",css("--blue"),five,animate)],["scatter7d",()=>drawDeltaChart("scatter7d","7d cost vs usage",css("--green"),seven,animate)]];
+    ["scatter5h",()=>drawDeltaChart("scatter5h","5h cost vs usage",css("--blue"),five,animate)],["scatter7d",()=>drawDeltaChart("scatter7d","7d cost vs usage",css("--green"),seven,animate)],
+    ["costTime",()=>drawCostTimeChart(animate)]];
   const drawNext=()=>{if(generation!==drawGeneration||!jobs.length)return;const [id,draw]=jobs.shift(),canvas=document.getElementById(id),rect=canvas.getBoundingClientRect();
     if(chartObserver&&(rect.top>=innerHeight||rect.bottom<=0)){deferredCharts.set(id,{generation,draw});chartObserver.observe(canvas)}else draw();
     requestAnimationFrame(()=>setTimeout(drawNext,0));
   };requestAnimationFrame(()=>setTimeout(drawNext,0));
 }
 const chartObserver=typeof IntersectionObserver==="undefined"?null:new IntersectionObserver(entries=>{for(const entry of entries){if(!entry.isIntersecting)continue;const task=deferredCharts.get(entry.target.id);if(task&&task.generation===drawGeneration){deferredCharts.delete(entry.target.id);chartObserver.unobserve(entry.target);requestAnimationFrame(()=>setTimeout(()=>{if(task.generation===drawGeneration)task.draw()},0))}}});
-restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();pollStatus(true);load(true);setInterval(pollStatus,5000);setInterval(load,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true);load(true)}});addEventListener("resize",()=>{cancelAnimationFrame(drawAll.resizeFrame);drawAll.resizeFrame=requestAnimationFrame(()=>drawAll())});
+restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();setupCostTimeControls();pollStatus(true);load(true);setInterval(pollStatus,5000);setInterval(load,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true);load(true)}});addEventListener("resize",()=>{cancelAnimationFrame(drawAll.resizeFrame);drawAll.resizeFrame=requestAnimationFrame(()=>drawAll())});
 </script>
 </body>
 </html>

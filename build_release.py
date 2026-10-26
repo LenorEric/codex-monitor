@@ -83,7 +83,8 @@ def rebuild_runtime(version: str) -> None:
     for name in RUNTIME_FILES:
         write_text_lf(RUNTIME_DIR / name, (ROOT / name).read_text(encoding="utf-8"))
     write_text_lf(RUNTIME_DIR / "README.md", (ROOT / "release-runtime.md").read_text(encoding="utf-8"))
-    write_text_lf(RUNTIME_DIR / "version.json", json.dumps({"version": version, "dataContractVersion": json.loads((ROOT / "package.json").read_text(encoding="utf-8"))["dataContractVersion"]}, indent=2) + "\n")
+    metadata = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+    write_text_lf(RUNTIME_DIR / "version.json", json.dumps({"version": version, "dataContractVersion": metadata["dataContractVersion"], "cloudDataContractVersion": metadata["cloudDataContractVersion"]}, indent=2) + "\n")
     write_text_lf(RELEASE_DIR / "README.md", (ROOT / "release-package.md").read_text(encoding="utf-8").replace("{{VERSION}}", version))
 
 

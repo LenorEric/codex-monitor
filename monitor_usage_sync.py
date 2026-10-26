@@ -12,6 +12,7 @@ from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
+from monitor_common import atomic_write_bytes as _write_atomic_bytes
 from monitor_common import MIN_DELTA_COST_PER_PERCENT_USD, RESET_TIME_JITTER_SECONDS, coerce_float, empty_cost_totals, empty_token_totals, parse_timestamp
 from monitor_history import compact_quota_history_rows
 from monitor_tokens import normalize_codex_model
@@ -462,7 +463,6 @@ class UsageDataStore:
         from monitor_processing import ProcessingIndex
         initialize_v4_cache(self.v4_cache_path)
         self.index = ProcessingIndex(self.v4_cache_path)
-        self._legacy_records = None
 
     def normalize_new_quota(self, row):
         from monitor_history import normalize_quota_history_row
@@ -514,21 +514,6 @@ class UsageDataStore:
         if changed:
             self._local_datasets_cache = self._merged_datasets_cache = None
         return changed
-
-    def account_datasets(self, view, account):
-        self.ingest_local()
-        quota = self.index.rows(self.quota_path, "quota", account=account)
-        ledger = self.index.rows(self.token_ledger_path, "tokenLedger", account=account)
-        if view == "local":
-            return quota, ledger
-        with self.index.transaction() as db:
-            for kind, data in db.execute("SELECT kind,data FROM processing_facts WHERE source LIKE 'peer:%' AND account=? ORDER BY source,position", (account,)):
-                if kind == "quota":
-                    quota.append(json.loads(data))
-                elif kind == "tokenLedger":
-                    ledger.append(json.loads(data))
-        ledger, _ = merge_token_ledger_rows(ledger)
-        return merge_quota_rows(quota), ledger
 
     def refresh_peer_partition(self, machine_id, day, force=False):
         source = f"peer:{machine_id}:{day}"
@@ -774,16 +759,7 @@ class UsageDataStore:
 
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(data)
-                stream.flush()
-                os.fsync(stream.fileno())
-            os.replace(temporary, path)
-        finally:
-            Path(temporary).unlink(missing_ok=True)
+        _write_atomic_bytes(path, data)
 
     def _load_sharded_cache(self, payload: dict) -> tuple[dict[tuple[str, str], dict], dict[str, dict[str, str]]]:
         origins = payload.get("origins")

@@ -13,12 +13,12 @@ import re
 import tomllib
 from collections.abc import Mapping
 from contextlib import closing
-from datetime import datetime, timezone
 from pathlib import Path
 
 import tomlkit
 
-from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, auth_account_id, jwt_payload, parse_timestamp
+from monitor_common import atomic_write_bytes as _write_atomic_bytes
+from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, auth_account_id, jwt_payload, now_iso as timestamp, parse_timestamp
 
 
 LATEST_SESSION_PROVIDER_UPDATE_LIMIT = 200
@@ -101,36 +101,8 @@ class AccountError(RuntimeError):
         self.status = status
 
 
-def timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
 def atomic_write_bytes(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "wb") as stream:
-            stream.write(data)
-            stream.flush()
-            os.fsync(stream.fileno())
-        try:
-            os.chmod(temp_name, 0o600)
-        except OSError:
-            pass
-        for attempt in range(5):
-            try:
-                os.replace(temp_name, path)
-                break
-            except PermissionError:
-                if attempt == 4 or os.name != "nt":
-                    raise
-                time.sleep(0.02 * (attempt + 1))
-    except Exception:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
+    _write_atomic_bytes(path, data, private=True, replace_attempts=5)
 
 
 def atomic_write_json(path: Path, data: dict) -> None:
@@ -235,6 +207,11 @@ def migrate_account_vault(legacy_root: Path, root: Path) -> bool:
         raise
 
 
+def normalized_slot_order(manifest: dict) -> list[str]:
+    slots = [account["id"] for account in manifest.get("accounts", [])]
+    return list(dict.fromkeys([slot for slot in manifest.get("slotOrder", []) if slot in slots] + slots))
+
+
 class AccountManager:
     def __init__(self, auth_path: Path, root: Path | None = None, legacy_root: Path | None = None):
         self.auth_path = Path(auth_path)
@@ -244,7 +221,6 @@ class AccountManager:
         self.lock = threading.RLock()
         self._config_fingerprint = None
         self._ignored_config_fingerprint = None
-        self._config_snapshot = self.config_path.read_text(encoding="utf-8") if self.config_path.exists() else ""
         self.error = None
         self.message = None
         self.cloud = None
@@ -324,6 +300,9 @@ class AccountManager:
             if "commonAccountHeaderToml" not in manifest:
                 manifest["commonAccountHeaderToml"] = ""
                 changed = True
+            if manifest.get("slotOrder") != normalized_slot_order(manifest):
+                manifest["slotOrder"] = normalized_slot_order(manifest)
+                changed = True
             if changed:
                 atomic_write_json(self.manifest_path, manifest)
             return manifest
@@ -342,6 +321,7 @@ class AccountManager:
             "accounts": [self._new_record("ppl-pro", "Current account", ready, live if ready else None)] if live is not None else [],
             "activationHistory": [{"checkedAt": timestamp(), "accountSlotId": "ppl-pro", "accountLabel": "Current account"}] if live is not None else [],
         }
+        manifest["slotOrder"] = normalized_slot_order(manifest)
         atomic_write_json(self.manifest_path, manifest)
         return manifest
 
@@ -607,7 +587,32 @@ class AccountManager:
             return {"provider": migration["provider"], "sessionsScanned": migration["scanned"], "sessionFilesUpdated": len(migration["files"]), "stateRowsUpdated": len(migration["state"])}
 
     def _save_manifest(self) -> None:
+        self.manifest["slotOrder"] = normalized_slot_order(self.manifest)
         atomic_write_json(self.manifest_path, self.manifest)
+
+    def promote_active_slot_on_cost(self, row: dict) -> bool:
+        with self.lock:
+            active = self.manifest.get("activeAccountId")
+            if not active or row.get("recordType") != "usage" or row.get("accountSlotId") != active:
+                return False
+            if not isinstance((row.get("cost") or {}).get("totalCostUsd"), (int, float)) or row["cost"]["totalCostUsd"] < 0:
+                return False
+            order = normalized_slot_order(self.manifest)
+            account_id = self.cloud.usage_account_id(active) if self.cloud is not None else active
+            first = next(slot for slot in order if (self.cloud.usage_account_id(slot) if self.cloud is not None else slot) == account_id)
+            if first == active:
+                return False
+            previous = self.manifest.get("slotOrder")
+            self.manifest["slotOrder"] = [active] + [slot for slot in order if slot != active]
+            try:
+                self._save_manifest()
+            except Exception:
+                if previous is None:
+                    self.manifest.pop("slotOrder", None)
+                else:
+                    self.manifest["slotOrder"] = previous
+                raise
+            return True
 
     def _normalized_activation_history(self, manifest: dict) -> list[dict]:
         labels = {str(account.get("id")): str(account.get("label") or "Unknown") for account in manifest.get("accounts", []) if account.get("id")}
@@ -616,7 +621,8 @@ class AccountManager:
             if not isinstance(row, dict) or parse_timestamp(row.get("checkedAt")) is None or not row.get("accountSlotId"):
                 continue
             account_id = str(row["accountSlotId"])
-            rows.append({"checkedAt": row["checkedAt"], "accountSlotId": account_id, "accountLabel": labels.get(account_id, str(row.get("accountLabel") or "Unknown"))})
+            rows.append({"checkedAt": row["checkedAt"], "accountSlotId": account_id, "accountLabel": labels.get(account_id, str(row.get("accountLabel") or "Unknown")),
+                **({"usageAccountId": row["usageAccountId"]} if row.get("usageAccountId") else {})})
         if not rows and manifest.get("activeAccountId"):
             account_id = str(manifest["activeAccountId"])
             rows.append({"checkedAt": timestamp(), "accountSlotId": account_id, "accountLabel": labels.get(account_id, "Unknown")})
@@ -624,6 +630,8 @@ class AccountManager:
         for row in sorted(rows, key=lambda item: parse_timestamp(item["checkedAt"]) or 0):
             if normalized and normalized[-1]["accountSlotId"] == row["accountSlotId"]:
                 normalized[-1]["accountLabel"] = row["accountLabel"]
+                if row.get("usageAccountId"):
+                    normalized[-1]["usageAccountId"] = row["usageAccountId"]
             else:
                 normalized.append(row)
         return normalized
@@ -633,9 +641,13 @@ class AccountManager:
         if account is None:
             return
         row = {"checkedAt": checked_at or timestamp(), "accountSlotId": account["id"], "accountLabel": account["label"]}
+        if self.cloud is not None:
+            row["usageAccountId"] = self.cloud.usage_account_id(account["id"])
         history = self.manifest.setdefault("activationHistory", [])
         if history and history[-1].get("accountSlotId") == account["id"]:
             history[-1]["accountLabel"] = account["label"]
+            if row.get("usageAccountId"):
+                history[-1]["usageAccountId"] = row["usageAccountId"]
         else:
             history.append(row)
 
@@ -651,7 +663,6 @@ class AccountManager:
 
     def _write_config(self, text: str) -> None:
         atomic_write_bytes(self.config_path, text.encode("utf-8"))
-        self._config_snapshot = text
         self._ignored_config_fingerprint = self._config_file_fingerprint()
 
     def sync_config_from_disk(self) -> bool:
@@ -662,11 +673,9 @@ class AccountManager:
             self._config_fingerprint = fingerprint
             if fingerprint == self._ignored_config_fingerprint:
                 self._ignored_config_fingerprint = None
-                self._config_snapshot = self.config_path.read_text(encoding="utf-8")
                 return False
             active = self._find(self.manifest.get("activeAccountId"))
             if active is None:
-                self._config_snapshot = self.config_path.read_text(encoding="utf-8")
                 return False
             text = self.config_path.read_text(encoding="utf-8")
             try:
@@ -676,7 +685,6 @@ class AccountManager:
             is_api = active.get("accountType") == "api"
             hint = self._header_for(active)
             _, header_toml = self._config_editor_parts(hint)
-            self._config_snapshot = text
             normalized = header_toml.strip() + "\n" if header_toml.strip() else ""
             current_header = active.get("configHeaderToml", "") if is_api else self.manifest.get("commonAccountHeaderToml", "")
             if normalized == current_header:
@@ -755,32 +763,6 @@ class AccountManager:
             return
         if not live_identity.get("accountId") or not saved_identity.get("accountId"):
             raise AccountError(f"Account change refused: cannot verify {account['label']} because account_id is missing from current or saved auth.json", 409)
-
-    def _snapshot_live_into(self, account: dict, strict_identity: bool = True, require_saved_match: bool = False) -> bool:
-        data = self.auth_path.read_bytes() if self.auth_path.exists() else b"{}"
-        if not data.strip():
-            data = b"{}"
-        auth = parse_auth_bytes(data)
-        tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
-        if require_saved_match:
-            self._validate_live_matches_saved(account, auth)
-        identity = auth_identity(auth)
-        stored_identity = account.get("identity") if isinstance(account.get("identity"), dict) else {}
-        if strict_identity and account.get("ready") and (stored_identity.get("accountId") or stored_identity.get("idTokenHash")) and (identity.get("accountId") or identity.get("idTokenHash")) and not same_auth_identity(stored_identity, identity):
-            raise AccountError("Live auth.json belongs to a different account; use New account before replacing the current login", 409)
-        if account.get("ready") and not is_api_auth(auth) and tokens and (not isinstance(tokens.get("refresh_token"), str) or not tokens["refresh_token"].strip()):
-            return False
-        if duplicate := self._find_disallowed_duplicate(identity, account["id"]):
-            raise AccountError(f"Account change refused: this login is already managed as {duplicate['label']}", 409)
-        fingerprint = auth_fingerprint(data)
-        if account.get("ready") and account.get("fingerprint") == fingerprint and self._account_path(account["id"]).exists():
-            return False
-        atomic_write_bytes(self._account_path(account["id"]), data)
-        account.update({"ready": True, "updatedAt": timestamp(), "fingerprint": fingerprint})
-        if identity.get("accountId") or identity.get("idTokenHash"):
-            account.update({"identity": identity, "accountType": identity.get("accountType", "account")})
-        self._save_manifest()
-        return True
 
     def reconcile_active_from_live(self) -> tuple[bool, dict | None]:
         with self.lock:
@@ -1047,6 +1029,11 @@ class AccountManager:
             credential_path = self._account_path(target["id"])
             old_credential = credential_path.read_bytes() if credential_path.exists() else None
             try:
+                # Preserve identity and order before credentials/slot metadata disappear.
+                if self.cloud is not None:
+                    for row in self.manifest.get("activationHistory", []):
+                        if row.get("accountSlotId") == target["id"]:
+                            row["usageAccountId"] = self.cloud.usage_account_id(target["id"])
                 self.manifest["accounts"] = [account for account in self.manifest["accounts"] if account["id"] != target["id"]]
                 remove_directory(credential_path.parent)
                 self._save_manifest()
@@ -1245,6 +1232,7 @@ class AccountManager:
             active = self._find(active_id)
             return {
                 "activeAccountId": active_id,
+                "slotOrder": normalized_slot_order(self.manifest),
                 "awaitingLogin": not bool(active and active.get("ready")),
                 "error": self.error,
                 "message": self.message,

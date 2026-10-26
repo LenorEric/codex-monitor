@@ -18,15 +18,15 @@ import urllib.request
 import uuid
 import zlib
 from copy import deepcopy
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from cryptography.exceptions import InvalidTag
 
 from monitor_accounts import api_identity_id, atomic_write_json, auth_identity, parse_auth_bytes
-from monitor_cloud_queue import CloudOperationQueue, OperationCancelled, OperationSkipped
-from monitor_common import SafeRedirectHandler
+from monitor_cloud_queue import CloudOperationQueue, OperationSkipped
+from monitor_common import SafeRedirectHandler, now_iso as _timestamp
 from monitor_skills import SkillError
 from monitor_usage_sync import canonical_json, content_hash, v4_logical_hash, v4_period, validate_sync_operation
 
@@ -44,6 +44,47 @@ USAGE_PACK_MAX_BYTES = 16 * 1024
 USAGE_REGULAR_VERIFY_PACKS = 2
 USAGE_FULL_VERIFY_INTERVAL_SECONDS = 30 * 24 * 60 * 60
 USAGE_ACCOUNT_ID_DOMAIN = "codex-monitor-usage-account-v3"
+CLOUD_DATA_CONTRACT_VERSION = 1
+CLOUD_DATA_CONTRACT_PATH = "data-contract.json"
+
+
+def _migrate_cloud_to_v1(client):
+    # Adopt existing account, skills and usage formats without changing any payload.
+    # Future steps must preserve originals and be idempotent: the marker commits last.
+    pass
+
+
+CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1}
+
+
+def _read_cloud_contract(client):
+    try:
+        data, etag = client.get(CLOUD_DATA_CONTRACT_PATH)
+    except CloudError as exc:
+        if exc.http_status == 404:
+            return 0, None
+        raise
+    try:
+        value = json.loads(data)
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise CloudError("Invalid cloud data contract metadata; cloud access is blocked", 409) from exc
+    version = value.get("dataContractVersion") if isinstance(value, dict) else None
+    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
+        raise CloudError("Invalid cloud data contract version; cloud access is blocked", 409)
+    if version > CLOUD_DATA_CONTRACT_VERSION:
+        raise CloudError(f"Cloud data contract {version} is newer than this app's target {CLOUD_DATA_CONTRACT_VERSION}; cloud access is blocked until the local script is updated", 409, category="update_required")
+    return version, etag
+
+
+def _ensure_cloud_contract(client):
+    current, etag = _read_cloud_contract(client)
+    for version in range(current + 1, CLOUD_DATA_CONTRACT_VERSION + 1):
+        if version not in CLOUD_DATA_MIGRATIONS:
+            raise CloudError(f"Missing cloud data migration {version}; cloud access is blocked", 409)
+        CLOUD_DATA_MIGRATIONS[version](client)
+        etag = client.put(CLOUD_DATA_CONTRACT_PATH, canonical_json({"dataContractVersion": version}), etag=etag, create=etag is None)
+        if _read_cloud_contract(client)[0] != version:
+            raise CloudError("Cloud migration commit verification failed", 409)
 
 
 def _serialized_cloud_operation(method):
@@ -83,10 +124,6 @@ def load_server_config(config_path: Path) -> dict:
     if not isinstance(server, dict):
         raise CloudError("Unsupported dashboard config", 500)
     return {"host": validate_server_host(server.get("host"))}
-
-
-def _timestamp() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _elapsed_since(timestamp: str | None, default: float) -> float:
@@ -291,12 +328,67 @@ class WebDavClient:
         self.authorization = f"Basic {token}"
         self.transfers = []
         self.transfer_category = "metadata"
+        self._root_lock_token = None
+        self._root_lock_deadline = 0
+        self._root_lock_refresh = 0
+
+    def _accept_root_lock(self, body, started):
+        import xml.etree.ElementTree as ET
+        try:
+            active = ET.fromstring(body).find(".//{DAV:}activelock")
+            token = active.findtext("{DAV:}locktoken/{DAV:}href")
+            timeout = active.findtext("{DAV:}timeout")
+            if active.find("{DAV:}lockscope/{DAV:}exclusive") is None or active.findtext("{DAV:}depth") != "infinity" or not token or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s<>]+", token):
+                raise ValueError()
+            if not isinstance(timeout, str) or not re.fullmatch(r"Second-[0-9]+", timeout):
+                raise ValueError()
+            seconds = int(timeout.removeprefix("Second-"))
+            if seconds <= 60 or self._root_lock_token is not None and token != self._root_lock_token:
+                raise ValueError()
+        except (ET.ParseError, AttributeError, TypeError, ValueError) as exc:
+            raise CloudError("WebDAV must provide an exclusive depth-infinity lock with a finite timeout exceeding 60 seconds", 409) from exc
+        self._root_lock_token = token
+        self._root_lock_deadline = started + seconds
+        self._root_lock_refresh = started + seconds / 2
+
+    def acquire_root_lock(self):
+        self.ensure_directories("")
+        started = time.monotonic()
+        body, _, _ = self.request("LOCK", "", b'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>',
+            {"Content-Type": "application/xml", "Depth": "infinity", "Timeout": "Second-300"}, expected=(200,))
+        try:
+            self._accept_root_lock(body, started)
+        except CloudError:
+            # A rejected lock response may still have installed a server-side lock.
+            import xml.etree.ElementTree as ET
+            try:
+                token = ET.fromstring(body).findtext(".//{DAV:}locktoken/{DAV:}href")
+                if token and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s<>]+", token):
+                    self.request("UNLOCK", "", headers={"Lock-Token": f"<{token}>"}, expected=(204, 404, 409))
+            except (ET.ParseError, CloudError):
+                pass
+            raise
+
+    def release_root_lock(self):
+        if self._root_lock_token:
+            try:
+                self.request("UNLOCK", "", headers={"Lock-Token": f"<{self._root_lock_token}>"}, expected=(204, 404, 409))
+            finally:
+                self._root_lock_token = None
 
     def _url(self, path: str = "") -> str:
         parts = [urllib.parse.quote(part, safe="") for part in f"{self.root}/{path}".strip("/").split("/") if part]
         return urllib.parse.urljoin(self.base, "/".join(parts))
 
     def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204), output=None) -> tuple[bytes, str | None, int]:
+        if self._root_lock_token and method != "UNLOCK":
+            if time.monotonic() >= self._root_lock_deadline:
+                raise CloudError("WebDAV cloud contract lock expired; operation stopped before further data access", 409)
+            if method != "LOCK" and time.monotonic() >= self._root_lock_refresh:
+                started = time.monotonic()
+                body, _, _ = self.request("LOCK", "", headers={"Timeout": "Second-300"}, expected=(200,))
+                self._accept_root_lock(body, started)
+            headers = dict(headers or {}) | {"If": f"<{self._url('')}> (<{self._root_lock_token}>)"}
         size = len(data) if isinstance(data, bytes) else 0
         if data is not None and hasattr(data, "seek"):
             data.seek(0, 2)
@@ -323,14 +415,18 @@ class WebDavClient:
                     body = b""
         except urllib.error.HTTPError as exc:
             if exc.code in expected:
-                body = exc.read()
-                transfer["downloadBytes"] = len(body)
-                return body, exc.headers.get("ETag"), exc.code
+                with exc:
+                    body = exc.read()
+                    transfer["downloadBytes"] = len(body)
+                    return body, exc.headers.get("ETag"), exc.code
+            exc.close()
             raise CloudError(f"WebDAV {method} failed with HTTP {exc.code}", 409 if exc.code in {409, 412} else 502, http_status=exc.code, category="http") from exc
         except OSError as exc:
             raise CloudError(f"WebDAV connection failed: {exc}", 502, category="network") from exc
         if status not in expected:
             raise CloudError(f"WebDAV {method} returned HTTP {status}", 502, http_status=status, category="protocol")
+        if self._root_lock_token and method not in {"LOCK", "UNLOCK"} and time.monotonic() >= self._root_lock_deadline:
+            raise CloudError("WebDAV cloud contract lock expired during transfer; operation stopped", 409)
         if output is None:
             transfer["downloadBytes"] = len(body)
         transfer["successfulUploadBytes"] = transfer["attemptedUploadBytes"]
@@ -438,7 +534,6 @@ class CloudManager:
             self._config, self._config_error = {"version": 1, "webdav": {}}, str(exc)
         self._machine = json.loads(self.machine_path.read_text(encoding="utf-8"))
         self._state = json.loads(self.state_path.read_text(encoding="utf-8"))
-        self._observed_skill_revision = None
         self._operation_lock = threading.RLock()
         self._queue = CloudOperationQueue()
         self._observed_skill_hashes = None
@@ -506,10 +601,18 @@ class CloudManager:
 
         def execute():
             with self._operation_lock:
-                result = getattr(self, method_name)(*args, **kwargs)
-                if on_success:
-                    result = on_success(result)
-                return result
+                self._contract_clients = {}
+                try:
+                    result = getattr(self, method_name)(*args, **kwargs)
+                    if on_success:
+                        result = on_success(result)
+                    return result
+                finally:
+                    try:
+                        for client in self._contract_clients.values():
+                            client.release_root_lock()
+                    finally:
+                        self._contract_clients = None
 
         # Only identical adjacent synchronization requests share execution.
         combine_key = (method_name, json.dumps([args, kwargs], sort_keys=True), generation, source) if method_name in {"push", "fetch", "sync_usage_data"} else None
@@ -910,9 +1013,8 @@ class CloudManager:
             with self.accounts.lock:
                 matches = [account for account in self.accounts.manifest.get("accounts", []) if usage_account_id in self.usage_account_aliases(account.get("id"))]
                 if matches:
-                    match_ids = {account["id"] for account in matches}
-                    primary_id = next((row.get("accountSlotId") for row in reversed(self.accounts.manifest.get("activationHistory") or []) if row.get("accountSlotId") in match_ids), self.accounts.manifest.get("activeAccountId") if self.accounts.manifest.get("activeAccountId") in match_ids else matches[0]["id"])
-                    primary = next(account for account in matches if account["id"] == primary_id)
+                    priority = {slot: index for index, slot in enumerate(self.accounts.manifest.get("slotOrder", []))}
+                    primary = min(matches, key=lambda account: priority.get(account["id"], len(priority)))
                     return primary["id"], primary.get("label") or fallback_label or "Unknown"
         return None
 
@@ -1187,13 +1289,26 @@ class CloudManager:
         self.clear_account_transition()
         return pending["operation"]
 
+    def _contract_client(self, webdav):
+        if getattr(self, "_contract_clients", None) is None or not self.operation_queue.in_worker():
+            raise CloudError("Cloud access requires a queued operation", 409)
+        identity = normalized_webdav_identity(webdav["baseUrl"], webdav.get("username", "")) + "\n" + webdav.get("remoteRoot", "codex-switch-sync")
+        if identity in self._contract_clients:
+            return self._contract_clients[identity]
+        client = WebDavClient(webdav)
+        # Check newer versions before even attempting root creation or locking.
+        _read_cloud_contract(client)
+        client.acquire_root_lock()
+        self._contract_clients[identity] = client
+        _ensure_cloud_contract(client)
+        return client
+
     def _connection(self, initialize: bool = False) -> tuple[WebDavClient, CryptoBox]:
         config = self.config()
         if not config["webdav"].get("enabled"):
             raise CloudError("WebDAV is disabled", 409)
         webdav = config["webdav"]
-        client = WebDavClient(webdav)
-        client.ensure_directories("")
+        client = self._contract_client(webdav)
         try:
             descriptor, _ = client.get("crypto.json")
             parsed = json.loads(descriptor)
@@ -1221,9 +1336,13 @@ class CloudManager:
         webdav = self.config()["webdav"]
         if not webdav.get("enabled"):
             raise CloudError("WebDAV is disabled", 409)
-        client = WebDavClient(webdav)
-        client.delete("")
-        client.ensure_directories("")
+        client = self._contract_client(webdav)
+        # Keep the collection and contract marker: deleting the root destroys its lock.
+        for name in client.list(""):
+            if name != CLOUD_DATA_CONTRACT_PATH:
+                if not name or name in {".", ".."} or any(char in name for char in "/\\"):
+                    raise CloudError("Unsafe WebDAV root inventory", 409)
+                client.delete(name)
         if self._usage_data is not None:
             self._usage_data.remove_origins_not_in(set())
         self._state["remote"] = {"accounts": {}, "skills": {}}
@@ -1345,8 +1464,7 @@ class CloudManager:
     def _rotate_remote_passphrase(self, webdav: dict, new_passphrase_hash: str, commit) -> dict:
         if self._state.get("pendingAccountOperation"):
             raise CloudError("Finish the pending account operation before updating the encryption passphrase", 409)
-        client = WebDavClient(webdav)
-        client.ensure_directories("")
+        client = self._contract_client(webdav)
         descriptor_bytes, descriptor_etag = client.get("crypto.json")
         try:
             descriptor = json.loads(descriptor_bytes)
@@ -1478,7 +1596,6 @@ class CloudManager:
             index_id = remote_index.get("indexId") or hashlib.sha256(json.dumps(packages, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
             self._state["skills"] = {"indexEtag": current_pointer_etag, "indexId": index_id, "localSha256": baseline, "updatedAt": remote_index.get("updatedAt")}
             self._state["remote"]["skills"] = remote_index
-            self._observed_skill_revision = self.skills.content_revision
             self._save_state()
             return {**self._state["skills"], "snapshotId": index_id, "changed": False, "added": [], "updated": [], "deleted": []}
         updated_at = _timestamp()
@@ -1494,7 +1611,6 @@ class CloudManager:
         baseline.update(local_hashes)
         state["skills"] = {"indexEtag": pointer_etag, "indexId": index_id, "localSha256": baseline, "updatedAt": updated_at}
         state["remote"]["skills"] = {"version": 2, "indexEtag": pointer_etag, "indexId": index_id, "packages": packages, "updatedAt": updated_at}
-        self._observed_skill_revision = self.skills.content_revision
         self._save_state()
         return {**state["skills"], "snapshotId": index_id, "changed": changed, "added": added, "updated": updated, "deleted": deleted}
 
@@ -1546,7 +1662,6 @@ class CloudManager:
             raise CloudError("The remote skill snapshot changed before restore", 409)
         result = self.skills.restore(snapshot)
         self._state["skills"] = {"indexEtag": pointer_etag, "indexId": snapshot_id, "localSha256": self.skills.content_hashes(), "restoredAt": _timestamp()}
-        self._observed_skill_revision = self.skills.content_revision
         self._save_state()
         return result
 
@@ -1579,11 +1694,6 @@ class CloudManager:
     def delete_local_account(self, account_id: str) -> dict:
         self.ensure_no_pending_account_operation()
         return self.accounts.delete(account_id)
-
-    @_serialized_cloud_operation
-    def rename_local_account(self, account_id: str, label: str) -> dict:
-        self.ensure_no_pending_account_operation()
-        return self.accounts.rename(account_id, label)
 
     def delete_account_payloads(self, key: str, expected_etag: str | None = None) -> dict:
         self._require_conditional_writes()
@@ -2434,9 +2544,6 @@ class CloudManager:
 
     def new_account_key(self) -> str:
         return self._connection()[1].placeholder_account_key()
-
-    def new_placeholder_account_key(self) -> str:
-        return self.new_account_key()
 
     def _require_conditional_writes(self) -> None:
         if not self._state.get("conditionalWritesVerified") and not self.config()["webdav"].get("allowOptimisticWrites", True):

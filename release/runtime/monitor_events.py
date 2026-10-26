@@ -984,10 +984,6 @@ def format_special_event(event: dict) -> str:
 def format_percent(value: float | None) -> str:
     return "-" if value is None else f"{value:.4g}%"
 
-def print_valid_delta_events(events: list[dict], sample: dict | None = None) -> None:
-    for event in events:
-        print(format_valid_delta_event(event, sample), flush=True)
-
 def print_ratio_warnings(events: list[dict]) -> None:
     for event in events:
         if event.get("ratioDeviationWarning"):

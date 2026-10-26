@@ -368,8 +368,12 @@ class AutoUpdateTests(unittest.TestCase):
         actual = {path.name: descriptor(path.read_bytes()) for path in build_release.RUNTIME_DIR.iterdir() if path.is_file()}
 
         self.assertEqual(package["dataContractVersion"], monitor_auto_update.DATA_CONTRACT_VERSION)
+        self.assertEqual(sorted(monitor_auto_update.DATA_MIGRATIONS), list(range(1, monitor_auto_update.DATA_CONTRACT_VERSION + 1)))
         self.assertEqual(manifest, {"version": package["version"], "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
-        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": package["version"], "dataContractVersion": monitor_auto_update.DATA_CONTRACT_VERSION})
+        from monitor_cloud import CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_MIGRATIONS
+        self.assertEqual(package["cloudDataContractVersion"], CLOUD_DATA_CONTRACT_VERSION)
+        self.assertEqual(sorted(CLOUD_DATA_MIGRATIONS), list(range(1, CLOUD_DATA_CONTRACT_VERSION + 1)))
+        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": package["version"], "dataContractVersion": monitor_auto_update.DATA_CONTRACT_VERSION, "cloudDataContractVersion": CLOUD_DATA_CONTRACT_VERSION})
         self.assertTrue(all((build_release.ROOT / name).read_text(encoding="utf-8") == (build_release.RUNTIME_DIR / name).read_text(encoding="utf-8") for name in build_release.RUNTIME_FILES))
         self.assertEqual(build_release.next_patch_version("1.5.5"), "1.5.6")
         ignore = (build_release.ROOT / ".vscodeignore").read_text(encoding="utf-8").splitlines()

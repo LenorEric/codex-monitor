@@ -1,6 +1,7 @@
 import json
 import shutil
 import unittest
+from unittest import mock
 import uuid
 import sqlite3
 from contextlib import closing, contextmanager
@@ -33,13 +34,51 @@ class LocalContractV4Tests(unittest.TestCase):
             with index.transaction() as db:
                 db.execute("INSERT INTO processing_display VALUES('local','a','tokenSessions','s',NULL,?)", (json.dumps({"startedAt": "2030-01-01T00:00:00Z"}),))
             args = (root, root / "history.jsonl", quota, root / "sessions.jsonl", ledger, root / "samples.jsonl")
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [9])
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [9])
             with index.transaction() as db:
                 self.assertEqual(db.execute("SELECT event_at FROM processing_display").fetchone()[0], 1893456000)
                 self.assertTrue(db.execute("SELECT dirty FROM dashboard_days WHERE day=?", (1893456000 // 86400,)).fetchone()[0])
             self.assertEqual(quota.read_bytes(), b'{"original":"quota"}\n')
             self.assertEqual(ledger.read_bytes(), b'{"original":"ledger"}\n')
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [])
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [])
+
+    def test_v12_rebuilds_projections_preserves_canonical_data_and_rolls_back_for_retry(self):
+        from monitor_processing import ProcessingIndex
+        from monitor_delivery import DashboardDelivery
+        with workspace_directory() as root:
+            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state.write_text('{"dataContractVersion":11}', encoding="utf-8")
+            cache = root / "cache.json"
+            index = ProcessingIndex(root / "cache-v4.sqlite3")
+            delivery = DashboardDelivery(index)
+            point = {"timestamp": 1893456000, "checkedAt": "2030-01-01T00:00:00Z", "usageAccountId": "a",
+                "fiveHour": {"raw": 10, "continuous": 10}, "sevenDay": {"raw": 20, "continuous": 20}}
+            with index.transaction() as db:
+                db.execute("INSERT INTO processing_quota_points VALUES('local','a',?,'point',?)", (point["timestamp"], json.dumps(point)))
+            delivery.prepare(point["timestamp"])
+            old = delivery.manifest("local", "All")
+            quota, ledger = root / "quota.jsonl", root / "ledger.jsonl"
+            quota.write_bytes(b'{"original":"quota"}\n')
+            ledger.write_bytes(b'{"original":"ledger"}\n')
+            args = (root, root / "history", quota, root / "sessions", ledger, root / "samples")
+            migration = monitor_auto_update.DATA_MIGRATIONS[12]
+            def fail(paths):
+                migration(paths)
+                raise RuntimeError("interrupted")
+            with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {12: fail}), self.assertRaisesRegex(RuntimeError, "interrupted"):
+                monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12)
+            self.assertEqual(delivery.manifest("local", "All"), old)
+            self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12), [12])
+            with index.transaction() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_quota_points").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM dashboard_blobs").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM dashboard_days").fetchone()[0], 0)
+            delivery.prepare(point["timestamp"] + 10 * 86400)
+            self.assertIsNotNone(delivery.manifest("local", "All"))
+            self.assertEqual(quota.read_bytes(), b'{"original":"quota"}\n')
+            self.assertEqual(ledger.read_bytes(), b'{"original":"ledger"}\n')
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12), [])
 
     def test_v8_preserves_canonical_files_and_durable_v4_database(self):
         from monitor_usage_sync import initialize_v4_cache
@@ -54,13 +93,13 @@ class LocalContractV4Tests(unittest.TestCase):
             with closing(sqlite3.connect(database)) as db, db:
                 db.execute("INSERT INTO local_records VALUES('key','2030-01-01T00:00Z','digest','{}')")
             args = (root, root / "history.jsonl", quota, root / "sessions.jsonl", ledger, root / "samples.jsonl")
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [8, 9])
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [8, 9])
             with closing(sqlite3.connect(database)) as db, db:
                 self.assertEqual(db.execute("SELECT * FROM local_records").fetchall(), [('key', '2030-01-01T00:00Z', 'digest', '{}')])
                 self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_scan_sources'").fetchone())
             self.assertEqual(quota.read_bytes(), b'{"raw":"quota"}\n')
             self.assertEqual(ledger.read_bytes(), b'{"raw":"ledger"}\n')
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache), [])
+            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [])
 
     def test_sqlite_migration_backup_and_rollback_include_wal(self):
         with workspace_directory() as root:

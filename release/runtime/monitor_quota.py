@@ -122,7 +122,7 @@ def compact_quota(data: dict) -> dict:
 def compact_quota_for_debug(compact: dict) -> dict:
     return {key: value for key, value in compact.items() if key != "matches"}
 
-def fetch_usage(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, debug: dict | None = None, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_token_refresh: bool = True) -> dict:
+def fetch_usage(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path | None, timeout: int, debug: dict | None = None, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_token_refresh: bool = True) -> dict:
     debug = debug if debug is not None else {}
     token = refresh_access_token(auth, opener, auth_path, timeout, retries, auth_lock, refreshed_callback, allow_token_refresh)
     headers = {

@@ -75,6 +75,34 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(rows[-1]["tokens"]["inputTokens"], 50)
         self.assertEqual(self.store.index.ledger_cost(self.store.token_ledger_path), monitor_token_ledger.token_cost_snapshot(monitor_token_ledger.token_sessions_from_ledger(rows)))
 
+    def test_new_cost_notification_is_incremental_and_retries_after_order_save_failure(self):
+        self.sync()
+        notify = self.store.index.on_new_cost = mock.Mock()
+        self.sync()
+        notify.assert_not_called()
+        self.write([self.event(2, 150)], append=True)
+        with mock.patch.object(monitor_token_ledger, "load_token_ledger", side_effect=AssertionError("history reload")):
+            self.sync()
+        notify.assert_called_once()
+        self.assertEqual(notify.call_args.args[0]["accountSlotId"], "slot")
+        notify.reset_mock()
+        self.sync()
+        notify.assert_not_called()
+        self.write([self.event(3, 200)], append=True)
+        notify.side_effect = OSError("order save failed")
+        with self.assertRaisesRegex(OSError, "order save failed"):
+            self.sync()
+        notify.side_effect = None
+        notify.reset_mock()
+        self.sync()
+        notify.assert_called_once()
+        self.assertEqual(len(monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)), 3)
+        notify.reset_mock()
+        with self.store.index.transaction() as db:
+            self.store.index.put(db, f"reconcile:{self.root}", True)
+        self.sync()
+        notify.assert_not_called()
+
     def test_crash_after_append_replays_without_duplicate(self):
         append = monitor_token_ledger.append_token_ledger
 

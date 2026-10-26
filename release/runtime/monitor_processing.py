@@ -19,6 +19,7 @@ SOURCE_DISCOVERY_SECONDS = 15 * 60
 SOURCE_CHECK_BATCH = 128
 
 
+
 class SourceWatcher:
     """OS notifications are hints; persistent checkpoints and audits remain authoritative."""
     def __init__(self, home):
@@ -703,7 +704,7 @@ class ProcessingIndex:
                 source_files = [Path(row[0]).name for row in db.execute("SELECT path FROM processing_scan_sources WHERE home=? AND valid=1", (self.home,))]
                 legacy_ids = [f'{json.loads(state)["sessionId"]}:{index}' for state, index in db.execute(
                     "SELECT s.state,o.event_index FROM processing_scan_sources s JOIN processing_occurrences o ON o.source=s.path WHERE s.home=? AND s.valid=1", (self.home,))]
-            sync_token_ledger(path, [], events, slot, label, timeline, record_provenance=provenance, source_files=source_files, legacy_event_ids=legacy_ids, own_machine_id=machine_id)
+            sync_token_ledger(path, [], events, slot, label, timeline, record_provenance=provenance, source_files=source_files, legacy_event_ids=legacy_ids, own_machine_id=machine_id, on_new_cost=getattr(self, "on_new_cost", None))
             self.refresh(path, "tokenLedger", normalize)
             cumulative = {}
             _usage_records(events, _source_highwaters(self.rows(path, "tokenLedger")), slot, label, timeline, cumulative)
@@ -773,6 +774,9 @@ class ProcessingIndex:
                 write_token_ledger(path, updated)
         append_token_ledger(path, additions)
         self.refresh(path, "tokenLedger", normalize)
+        if getattr(self, "on_new_cost", None) is not None:
+            for row in batch["additions"]:
+                self.on_new_cost(row)
         with self.transaction() as db:
             db.executemany("UPDATE processing_scan_events SET ledger_done=1 WHERE event_id=?", ((key,) for key in batch["ids"]))
             db.executemany("INSERT OR REPLACE INTO processing_coverage VALUES(?,?,?,?,?)", ((self.home, *key, encode(value)) for key, value in batch["coverage"]))

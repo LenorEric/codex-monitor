@@ -25,7 +25,7 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RUNTIME_FILE_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 AUTO_UPDATE_RESTART = 75
-DATA_CONTRACT_VERSION = 9
+DATA_CONTRACT_VERSION = 12
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 
@@ -376,7 +376,46 @@ def _migrate_history_to_v9(paths: dict[str, Path]) -> None:
     # Canonical files, v4 peer ownership, collection periods and parser checkpoints are preserved.
 
 
-DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8, 9: _migrate_history_to_v9}
+def _migrate_history_to_v10(paths: dict[str, Path]) -> None:
+    import sqlite3
+    from contextlib import closing
+    from monitor_processing import initialize_processing_index
+    initialize_processing_index(paths["processing_index"])
+    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
+        for table in ("display", "projections", "quota_points", "rank_nodes", "cost_ranges"):
+            db.execute(f"DELETE FROM processing_{table}")
+        for table in ("days", "parts", "day_meta", "blobs", "manifests", "rollups"):
+            db.execute(f"DELETE FROM dashboard_{table}")
+        db.execute("DELETE FROM processing_meta WHERE name IN ('projectionRule','displayRevision','dashboardDeliveryInitialized') OR name LIKE 'displayStats:%'")
+        for (account,) in db.execute("SELECT DISTINCT account FROM processing_facts").fetchall():
+            for view in ("local", "merged"):
+                db.execute("INSERT OR REPLACE INTO processing_dirty VALUES(?,?,?)", (view, account, "cost time migration"))
+    paths["dashboard_cache"].unlink(missing_ok=True)
+
+
+def _migrate_history_to_v11(paths: dict[str, Path]) -> None:
+    import sqlite3
+    from contextlib import closing
+    from monitor_processing import initialize_processing_index
+    initialize_processing_index(paths["processing_index"])
+    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
+        for table in ("parts", "day_meta", "blobs", "manifests", "rollups"):
+            db.execute(f"DELETE FROM dashboard_{table}")
+        db.execute("UPDATE dashboard_days SET dirty=1,revision=revision+1")
+    paths["dashboard_cache"].unlink(missing_ok=True)
+
+
+def _migrate_history_to_v12(paths: dict[str, Path]) -> None:
+    _migrate_history_to_v10(paths)
+    from monitor_accounts import normalized_slot_order
+    for name in ("account_manifest", "legacy_account_manifest"):
+        if name in paths and paths[name].exists():
+            manifest = json.loads(paths[name].read_text(encoding="utf-8"))
+            manifest["slotOrder"] = normalized_slot_order(manifest)
+            _atomic_write(paths[name], (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
+
+
+DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8, 9: _migrate_history_to_v9, 10: _migrate_history_to_v10, 11: _migrate_history_to_v11, 12: _migrate_history_to_v12}
 
 
 def _restore_data_backup(backup: Path, path: Path) -> None:
@@ -400,6 +439,9 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
     if not isinstance(journal, dict) or not isinstance(journal.get("version"), int) or isinstance(journal.get("version"), bool) or not isinstance(journal.get("targets"), dict) or not isinstance(journal.get("backups"), dict) or not isinstance(journal.get("existing"), list):
         raise AutoUpdateError("Cannot recover data migration: invalid journal")
     expected_targets = {name: str(path.resolve()) for name, path in paths.items()}
+    if journal["version"] < 12:
+        expected_targets.pop("account_manifest", None)
+        expected_targets.pop("legacy_account_manifest", None)
     if journal["version"] < 8 and "processing_index" not in journal["targets"]:
         expected_targets.pop("processing_index", None)
     base_targets = {name: target for name, target in expected_targets.items() if not name.startswith("legacy_")}
@@ -513,6 +555,9 @@ def migrate_history_data(
         if paths[current_name].resolve() == (data_home / current_filename).resolve():
             paths[name] = data_home / legacy_filename
     paths["processing_index"] = paths["usage_sync_cache"].with_name(f"{paths['usage_sync_cache'].stem}-v4.sqlite3")
+    paths["account_manifest"] = data_home / "accounts" / "accounts.json"
+    if codex_home is not None:
+        paths["legacy_account_manifest"] = Path(codex_home) / "usage-monitor-accounts" / "accounts.json"
     _recover_data_migration(journal_path, state_path, paths)
     try:
         state = json.loads(state_path.read_text(encoding="utf-8"))
@@ -531,8 +576,10 @@ def migrate_history_data(
         if version == 5:
             migration = lambda migration_paths: _migrate_history_to_v5(migration_paths, codex_home)
         migration_paths = paths
+        if version < 12:
+            migration_paths = {name: path for name, path in migration_paths.items() if name not in {"account_manifest", "legacy_account_manifest"}}
         if version < 8:
-            migration_paths = {name: path for name, path in paths.items() if name != "processing_index"}
+            migration_paths = {name: path for name, path in migration_paths.items() if name != "processing_index"}
         if version < 4:
             migration_paths = {name: path for name, path in migration_paths.items() if not name.startswith("legacy_")}
             for legacy_name, current_name in (("legacy_quota_history", "quota_history"), ("legacy_token_ledger", "token_ledger"), ("legacy_sample_log", "sample_log")):

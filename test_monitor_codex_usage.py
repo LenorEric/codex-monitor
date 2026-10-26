@@ -562,6 +562,24 @@ class MonitorCodexUsageTests(unittest.TestCase):
             saved = json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["tokens"]["refresh_token"], "refresh-rotated")
 
+    def test_in_memory_token_refresh_persists_via_callback_without_auth_file(self):
+        auth = self.account_auth("acct-a", "refresh-original")
+        saved = []
+        with (
+            mock.patch.object(monitor_common, "token_expired", return_value=True),
+            mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-a", "access_token": "access-rotated", "refresh_token": "refresh-rotated"})),
+            mock.patch.object(monitor_common, "write_json", side_effect=AssertionError("in-memory refresh must not write an auth file")),
+        ):
+            self.assertEqual(refresh_access_token(auth, object(), None, 10, refreshed_callback=lambda: saved.append(json.loads(json.dumps(auth)))), "access-rotated")
+        self.assertEqual(saved[0]["tokens"]["refresh_token"], "refresh-rotated")
+        self.assertIn("last_refresh", saved[0])
+
+    def test_in_memory_token_refresh_requires_persistence_before_rotating(self):
+        with mock.patch.object(monitor_common, "token_expired", return_value=True), mock.patch.object(monitor_common, "request_json") as request:
+            with self.assertRaisesRegex(UsageError, "persistence callback"):
+                refresh_access_token(self.account_auth("acct-a", "refresh-a"), object(), None, 10)
+        request.assert_not_called()
+
     def test_token_refresh_starts_when_thirty_percent_of_lifetime_remains(self):
         with mock.patch.object(monitor_common, "jwt_payload", return_value={"iat": 100, "exp": 1100}):
             with mock.patch.object(monitor_common.time, "time", return_value=799.999):
@@ -884,7 +902,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             def usage(auth, _opener, polled_auth_path, *_args, **_kwargs):
                 calls.append((auth["tokens"]["account_id"], polled_auth_path))
-                polled_auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-rotated")), encoding="utf-8")
+                self.assertIsNone(polled_auth_path)
+                auth.update(self.account_auth("acct-b", "refresh-rotated"))
+                _kwargs["refreshed_callback"]()
                 return {"usage": {"windows": {
                     "5h": {"path": "$.rate_limit.primary", "values": {"used_percent": 12, "reset_at": 1893456000}},
                     "7d": {"path": "$.rate_limit.secondary", "values": {"used_percent": 34, "reset_at": 1893888000}},
@@ -898,7 +918,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 self.assertEqual(state.poll_due_inactive_accounts(now=700), 1)
 
             self.assertEqual([account_id for account_id, _path in calls], ["acct-b", "acct-b"])
-            self.assertTrue(all(path != auth_path and path != state.accounts._account_path(second_id) for _account_id, path in calls))
+            self.assertTrue(all(path is None for _account_id, path in calls))
             self.assertEqual(auth_path.read_bytes(), live_auth)
             self.assertEqual(json.loads(state.accounts._account_path(second_id).read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-rotated")
             rows = monitor_history.load_quota_history(args.quota_history)
@@ -914,6 +934,70 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(state.series_response()["status"]["lastSample"]["windows"]["7d"]["usedPercent"], 34.0)
             self.assertTrue(state.wake_event.is_set())
             self.assertFalse(any(state.accounts.root.glob(".inactive-usage-*.json")))
+
+    def test_in_memory_account_checks_preserve_rotation_and_reject_concurrent_changes(self):
+        for operation in ("inactive", "session", "external"):
+            for outcome in ("success", "usage failure", "credentials changed"):
+                with self.subTest(operation=operation, outcome=outcome), self.account_directory() as directory:
+                    auth_path = directory / "auth.json"
+                    auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
+                    manager = AccountManager(auth_path)
+                    second_id = manager.create_account("Second")["activeAccountId"]
+                    auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
+                    manager.status()
+                    manager.switch("ppl-pro")
+                    credential = manager.inactive_ready_credentials()[0] | {"active": False}
+                    live_auth = auth_path.read_bytes()
+                    state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
+                    state.accounts = manager
+                    state.args = SimpleNamespace(auth=auth_path, timeout=10, retry_limit=0, quota_history=directory / "quota.jsonl")
+                    state.opener = object()
+                    state.lock = threading.RLock()
+                    state.cloud = SimpleNamespace(machine_id="machine", usage_account_id=lambda account_id: account_id)
+                    state._update_account_status_locked = mock.Mock()
+                    state._signal_dashboard_cache = mock.Mock()
+                    state.external_auth_validation_fingerprints = set()
+                    state.external_auth_validation_threads = set()
+                    changed = json.dumps(self.account_auth("acct-b", "refresh-newer")).encode()
+
+                    def rotate(*_args, **_kwargs):
+                        if outcome == "credentials changed":
+                            manager._account_path(second_id).write_bytes(changed)
+                        return 200, {"account_id": "acct-b", "access_token": "access-rotated", "refresh_token": "refresh-rotated"}
+
+                    usage_response = {"rate_limit": {
+                        "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
+                        "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
+                    }}
+                    with (
+                        mock.patch.object(monitor_common, "token_expired", return_value=True),
+                        mock.patch.object(monitor_common, "request_json", side_effect=rotate),
+                        mock.patch.object(monitor_quota, "request_json", side_effect=UsageError("usage unavailable") if outcome == "usage failure" else None, return_value=(200, usage_response)),
+                        mock.patch.object(monitor_dashboard.tempfile, "mkstemp", wraps=monitor_dashboard.tempfile.mkstemp) as temporary,
+                        mock.patch("builtins.print"),
+                    ):
+                        if operation == "external":
+                            state._start_external_auth_validation(credential)
+                            state.wait_for_external_auth_validations(2)
+                            self.assertFalse(state.external_auth_validation_threads)
+                            self.assertFalse(state.external_auth_validation_fingerprints)
+                        else:
+                            def check():
+                                return state._poll_inactive_account(credential) if operation == "inactive" else state._retrieve_session_refresh_reset_at(credential, "5h")
+
+                            if outcome == "success":
+                                result = check()
+                                if operation == "session":
+                                    self.assertEqual(result, 1893456000)
+                            else:
+                                with self.assertRaisesRegex(UsageError, "usage unavailable" if outcome == "usage failure" else "credentials changed"):
+                                    check()
+                        self.assertFalse(any(call.kwargs.get("prefix") in {".inactive-usage-", ".session-refresh-usage-", ".external-auth-validation-"} for call in temporary.call_args_list))
+                    self.assertEqual(auth_path.read_bytes(), live_auth)
+                    if outcome == "credentials changed":
+                        self.assertEqual(manager._account_path(second_id).read_bytes(), changed)
+                    else:
+                        self.assertEqual(json.loads(manager._account_path(second_id).read_bytes())["tokens"]["refresh_token"], "refresh-rotated")
 
     def test_session_refresh_config_normalizes_windows_and_validates_shape(self):
         self.assertEqual(normalize_session_refresh_windows([
@@ -4598,9 +4682,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         }
         projected = monitor_dashboard.dashboard_account_status(status, lambda _account_id: "usage-shared", [
             {"accountSlotId": "profile-aaaaa1"}, {"accountSlotId": "profile-bbbbb2"},
-        ])
+        ], ["profile-bbbbb2", "profile-aaaaa1"])
 
-        self.assertEqual(projected["usageGroups"], [{"id": "usage-shared", "label": "Secondary (2)", "profileCount": 2, "isApiAccount": False}])
+        self.assertEqual(projected["usageGroups"], [{"id": "usage-shared", "label": "Secondary", "profileCount": 2, "isApiAccount": False}])
         self.assertEqual({account["usageAccountId"] for account in projected["items"]}, {"usage-shared"})
 
         collided = monitor_dashboard.dashboard_account_status({**status, "items": [{**account, "label": "Shared"} for account in status["items"]]}, lambda _account_id: "usage-shared")
@@ -4683,7 +4767,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('button.setAttribute("aria-pressed",String(getValue()))', html)
         self.assertIn('normalize.setAttribute("aria-pressed",String(normalizedUsage))', html)
         self.assertIn('normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)', html)
-        self.assertIn('setupAccountControls();setupUsageFoldControls();pollStatus(true);load(true)', html)
+        self.assertIn('setupAccountControls();setupUsageFoldControls();setupCostTimeControls();pollStatus(true);load(true)', html)
         self.assertIn('function quotaTimeDomain(points)', html)
         self.assertIn('function quotaPointsInRange(points,domain)', html)
         self.assertIn('compactedBoundary:true', html)
@@ -5703,7 +5787,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         )
         for failure in failures:
             client = SimpleNamespace(ensure_directories=mock.Mock(), get=mock.Mock(side_effect=failure), put=mock.Mock())
-            with self.subTest(category=failure.category, http_status=failure.http_status), mock.patch("monitor_cloud.WebDavClient", return_value=client), self.assertRaises(CloudError):
+            with self.subTest(category=failure.category, http_status=failure.http_status), mock.patch.object(manager, "_contract_client", return_value=client), self.assertRaises(CloudError):
                 manager._connection(True)
             client.put.assert_not_called()
 
@@ -5733,7 +5817,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 return '"etag"'
 
         client = Client()
-        with mock.patch("monitor_cloud.WebDavClient", return_value=client), mock.patch("monitor_cloud.CryptoBox") as crypto:
+        with mock.patch.object(manager, "_contract_client", return_value=client), mock.patch("monitor_cloud.CryptoBox") as crypto:
             crypto.descriptor.return_value = {"version": 1}
             connected_client, connected_box = manager._connection(True)
         self.assertIs(connected_client, client)
@@ -5741,7 +5825,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertEqual(client.put_count, 2)
 
         client = Client(enforce_condition=False)
-        with mock.patch("monitor_cloud.WebDavClient", return_value=client), mock.patch("monitor_cloud.CryptoBox") as crypto:
+        with mock.patch.object(manager, "_contract_client", return_value=client), mock.patch("monitor_cloud.CryptoBox") as crypto:
             crypto.descriptor.return_value = {"version": 1}
             with self.assertRaisesRegex(CloudError, "ignored conditional"):
                 manager._connection(True)
@@ -6479,17 +6563,17 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(cloud.config()["webdav"]["encryptionPassphrase"], "")
             self.assertEqual(cloud.config()["webdav"]["encryptionPassphraseHash"], "")
 
-    def test_cloud_overwrite_removes_remote_root_and_uploads_local_skills(self):
+    def test_cloud_overwrite_preserves_root_contract_and_uploads_local_skills(self):
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
             cloud.update_config({"server": {"host": "127.0.0.1"}, "webdav": {"enabled": True, "baseUrl": "https://example.test", "username": "user", "password": "password", "remoteRoot": "root", "encryptionPassphrase": "", "skillsAutoUpload": True, "usageDataAutoSync": True, "allowOptimisticWrites": True}})
             client = mock.Mock()
 
-            with mock.patch("monitor_cloud.WebDavClient", return_value=client), mock.patch.object(cloud, "upload_skills", return_value={"changed": True}) as upload:
+            client.list.return_value = ["data-contract.json", "crypto.json", "skills", "usage", "accounts"]
+            with mock.patch.object(cloud, "_contract_client", return_value=client), mock.patch.object(cloud, "upload_skills", return_value={"changed": True}) as upload:
                 result = cloud.overwrite_cloud_from_local()
 
-            client.delete.assert_called_once_with("")
-            client.ensure_directories.assert_called_once_with("")
+            self.assertEqual(client.delete.call_args_list, [mock.call(name) for name in ("crypto.json", "skills", "usage", "accounts")])
             upload.assert_called_once_with()
             self.assertTrue(result["overwritten"])
             self.assertFalse(result["encryptionEnabled"])
@@ -6574,7 +6658,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "server": {"host": "127.0.0.1"}, "controlPassword": "new-control-password",
                 "webdav": {"enabled": True, "baseUrl": "https://new.example.test", "username": "new-user", "password": "new-webdav-password", "remoteRoot": "new-root", "encryptionPassphrase": "new passphrase", "skillsAutoUpload": False, "usageDataAutoSync": False, "allowOptimisticWrites": False},
             }
-            with mock.patch("monitor_cloud.WebDavClient", return_value=Client()):
+            with mock.patch.object(cloud, "_contract_client", return_value=Client()):
                 result = cloud.update_config(values)
 
             saved = json.loads(cloud.config_path.read_text(encoding="utf-8"))
@@ -6625,7 +6709,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "server": cloud._config["server"], "controlPassword": "",
                 "webdav": {**{key: cloud._config["webdav"][key] for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")}, "password": "", "encryptionPassphrase": "new passphrase"},
             }
-            with mock.patch("monitor_cloud.WebDavClient", return_value=Client()), self.assertRaisesRegex(CloudError, "Passphrase update failed"):
+            with mock.patch.object(cloud, "_contract_client", return_value=Client()), self.assertRaisesRegex(CloudError, "Passphrase update failed"):
                 cloud.update_config(values)
 
             self.assertEqual(stored, original)
@@ -7719,7 +7803,7 @@ def with_auth_identity(row, account_id):
 
 
 class RawCostUsageTests(unittest.TestCase):
-    def test_turnpoint_period_uses_exact_event_timestamps(self):
+    def test_adjacent_sample_periods_use_exact_event_timestamps(self):
         quota = []
         for minute, percent in ((10, 5), (12, 8), (14, 8), (16, 10)):
             quota.append({
@@ -7731,9 +7815,25 @@ class RawCostUsageTests(unittest.TestCase):
             for index, (timestamp, model, cost) in enumerate((("2030-01-01T00:11:00Z", "a", 2), ("2030-01-01T00:13:00Z", "b", 3), ("2030-01-01T00:15:00Z", "a", 100)), 1)
         ]
         result = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "usage-a"}), ledger, {"a": "usage-a"})["fiveHour"]
-        self.assertEqual(len(result), 1)
-        self.assertEqual((result[0]["startedAt"], result[0]["endedAt"], result[0]["checkedAt"]), ("2030-01-01T00:11:00Z", "2030-01-01T00:15:00Z", "2030-01-01T00:13:00Z"))
-        self.assertEqual((result[0]["deltaPercent"], result[0]["totalCostUsd"], result[0]["costByModelUsd"]), (2.5, 5.0, {"a": 2.0, "b": 3.0}))
+        self.assertEqual(len(result), 2)
+        self.assertEqual([(row["startedAt"], row["endedAt"], row["checkedAt"]) for row in result], [
+            ("2030-01-01T00:10:00Z", "2030-01-01T00:12:00Z", "2030-01-01T00:12:00Z"),
+            ("2030-01-01T00:14:00Z", "2030-01-01T00:16:00Z", "2030-01-01T00:16:00Z")])
+        self.assertEqual([(row["deltaPercent"], row["totalCostUsd"], row["costByModelUsd"]) for row in result], [(3.0, 2.0, {"a": 2.0}), (2.0, 100.0, {"a": 100.0})])
+
+    def test_adjacent_interval_includes_start_and_excludes_end(self):
+        quota = [{"checkedAt": timestamp, "accountSlotId": "a", "windows": {
+            label: {"usedPercent": percent, "resetAt": "2030-01-02T00:00:00Z", "plan": "plus"} for label in ("5h", "7d")}}
+            for timestamp, percent in (("2030-01-01T10:00:00Z", 20), ("2030-01-01T10:01:30Z", 21), ("2030-01-01T10:03:00Z", 22))]
+        ledger = [{"recordType": "usage", "occurredAt": timestamp, "accountSlotId": "a", "rawModel": "m", "cost": {"totalCostUsd": cost}}
+            for timestamp, cost in (("2030-01-01T09:59:59Z", 100), ("2030-01-01T10:00:00Z", 1),
+                ("2030-01-01T10:01:29Z", 2), ("2030-01-01T10:01:30Z", 4), ("2030-01-01T10:03:00Z", 200))]
+        result = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota), ledger)
+        for label in ("fiveHour", "sevenDay"):
+            self.assertEqual([row["totalCostUsd"] for row in result[label]], [3, 4])
+            self.assertEqual([row["deltaPercent"] for row in result[label]], [1, 1])
+            self.assertEqual([row["costPer100PercentUsd"] for row in result[label]], [300, 400])
+            self.assertEqual([row["checkedAt"] for row in result[label]], [quota[1]["checkedAt"], quota[2]["checkedAt"]])
 
     def test_raw_ledger_deduplicates_same_logical_event(self):
         base = {"schemaVersion": 1, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z", "rawModel": "m", "billingModel": "m", "serviceTier": "default", "tokens": monitor_common.empty_token_totals(), "cost": monitor_common.empty_cost_totals() | {"totalCostUsd": 1}}
@@ -7756,8 +7856,8 @@ class RawCostUsageTests(unittest.TestCase):
             )
         ]
         points = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "usage-a"}), [], {"a": "usage-a"})["fiveHour"]
-        self.assertEqual(len(points), 1)
-        self.assertEqual((points[0]["startUsagePercent"], points[0]["endUsagePercent"], points[0]["deltaPercent"]), (30.0, 50.0, 20.0))
+        self.assertEqual(len(points), 3)
+        self.assertEqual((points[0]["startUsagePercent"], points[0]["endUsagePercent"], points[0]["deltaPercent"]), (20.0, 40.0, 20.0))
         self.assertEqual(points[0]["costPer100PercentUsd"], 0.0)
 
     def test_store_syncs_each_ledger_record_and_ignores_old_derived_records(self):

@@ -206,7 +206,7 @@ def dashboard_sample(sample: dict | None) -> dict | None:
         projected["usageAccountId"] = usage_account_id
     return projected
 
-def dashboard_account_status(status: dict, usage_account_resolver=None, activation_history: list[dict] | None = None) -> dict:
+def dashboard_account_status(status: dict, usage_account_resolver=None, activation_history: list[dict] | None = None, slot_order: list | None = None) -> dict:
     items = [{key: account.get(key) for key in ("id", "label", "ready", "active", "pollError", "pollErrorAt", "stale", "accountType", "isApiAccount", "sessionRefresh", "configHeader", "configHeaderToml")} for account in status.get("items", [])]
     label_counts = {}
     for account in items:
@@ -217,18 +217,21 @@ def dashboard_account_status(status: dict, usage_account_resolver=None, activati
     groups = {}
     for account in items:
         groups.setdefault(account["usageAccountId"], []).append(account)
-    activation_ids = [str(row.get("accountSlotId")) for row in reversed(activation_history or []) if row.get("accountSlotId")]
+    priority = {slot: index for index, slot in enumerate(slot_order if slot_order is not None else status.get("slotOrder", []))}
     usage_groups = []
     for usage_account_id, profiles in groups.items():
-        profile_ids = {profile["id"] for profile in profiles}
-        primary_id = next((account_id for account_id in activation_ids if account_id in profile_ids), status.get("activeAccountId") if status.get("activeAccountId") in profile_ids else profiles[0]["id"])
-        primary = next((profile for profile in profiles if profile["id"] == primary_id), profiles[0])
+        primary = min(profiles, key=lambda profile: priority.get(profile["id"], len(priority)))
         usage_groups.append({
             "id": usage_account_id,
-            "label": f"{primary.get('label') or 'Unknown'} ({len(profiles)})" if len(profiles) > 1 else primary.get("label") or "Unknown",
+            "label": primary.get("label") or "Unknown",
             "profileCount": len(profiles),
             "isApiAccount": bool(primary.get("isApiAccount")),
         })
+    known_groups = {group["id"] for group in usage_groups}
+    for row in activation_history or []:
+        if row.get("usageAccountId") and row["usageAccountId"] not in known_groups:
+            usage_groups.append({"id": row["usageAccountId"], "label": row.get("accountLabel") or "Unknown", "profileCount": 0, "isApiAccount": False})
+            known_groups.add(row["usageAccountId"])
     return {
         "activeAccountId": status.get("activeAccountId"),
         "awaitingLogin": bool(status.get("awaitingLogin")),
@@ -279,22 +282,6 @@ def dashboard_cloud_status(status: dict) -> dict:
             "failure": {"message": "Automatic usage synchronization failed"} if usage_sync.get("failure") else None,
         },
     }
-
-def dashboard_points_from_state(state: dict) -> list[dict]:
-    sample = state.get("lastSample")
-    if not isinstance(sample, dict):
-        return []
-    checked_at = sample.get("checkedAt")
-    point = {
-        "checkedAt": checked_at,
-        "timestamp": parse_timestamp(checked_at),
-        "fiveHour": window_point(sample, "5h"),
-        "sevenDay": window_point(sample, "7d"),
-        "cost": sample.get("cost") or empty_cost_totals(),
-    }
-    if usage_account_id := sample.get("usageAccountId") or (sample.get("sync") or {}).get("accountId"):
-        point["usageAccountId"] = usage_account_id
-    return [point]
 
 def dashboard_usage_account_id(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> str:
     return str(row.get("usageAccountId") or (row.get("sync") or {}).get("accountId") or (slot_usage_accounts or {}).get(str(row.get("accountSlotId") or "")) or row.get("accountSlotId") or row.get("accountLabel") or "unknown")
@@ -635,47 +622,30 @@ def dashboard_cost_usage(quota_points: list[dict], ledger: list[dict], slot_usag
         for point in quota_points:
             accounts.setdefault(point["usageAccountId"], []).append(point)
         for account_id, points in accounts.items():
-            turnpoint_groups, turnpoints = [], []
             points.sort(key=lambda point: point["timestamp"] if point["timestamp"] is not None else float("inf"))
-            previous = None
-            for point in points:
-                if previous is None or not _same_cost_usage_cycle(previous, point, label):
-                    if turnpoints:
-                        turnpoint_groups.append(turnpoints)
-                    turnpoints = []
-                elif point[label]["continuous"] < previous[label]["continuous"]:
-                    if turnpoints:
-                        turnpoint_groups.append(turnpoints)
-                    turnpoints = []
-                elif point[label]["continuous"] > previous[label]["continuous"]:
-                    multiplier = PLAN_MULTIPLIERS.get(point[label].get("plan") or "plus", 1.0)
-                    turnpoints.append({
-                        "timestamp": (previous["timestamp"] + point["timestamp"]) / 2,
-                        "usage": (previous[label]["continuous"] + point[label]["continuous"]) * multiplier / 2,
-                        "accountSlotId": point.get("accountSlotId"), "accountLabel": point.get("accountLabel"), "plan": point[label].get("plan") or "plus", "planMultiplier": multiplier,
-                    })
-                previous = point
-            if turnpoints:
-                turnpoint_groups.append(turnpoints)
             account_events = usage_events.get(account_id, [])
             event_times = [event[0] for event in account_events]
-            for group in turnpoint_groups:
-                for start, end in zip(group, group[1:]):
-                    delta = end["usage"] - start["usage"]
-                    if delta <= 0 or end["timestamp"] <= start["timestamp"]:
-                        continue
-                    by_model = {}
-                    for _, model, cost in account_events[bisect.bisect_left(event_times, start["timestamp"]):bisect.bisect_left(event_times, end["timestamp"])]:
-                        by_model[model] = round(by_model.get(model, 0.0) + cost, 8)
-                    total_cost = round(sum(by_model.values()), 8)
-                    midpoint = (start["timestamp"] + end["timestamp"]) / 2
-                    result[output_name].append({
-                        "window": "5h" if label == "fiveHour" else "7d", "checkedAt": datetime.fromtimestamp(midpoint, timezone.utc).isoformat().replace("+00:00", "Z"), "timestamp": midpoint,
-                        "startedAt": datetime.fromtimestamp(start["timestamp"], timezone.utc).isoformat().replace("+00:00", "Z"), "endedAt": datetime.fromtimestamp(end["timestamp"], timezone.utc).isoformat().replace("+00:00", "Z"),
-                        "startUsagePercent": round(start["usage"], 8), "endUsagePercent": round(end["usage"], 8), "deltaPercent": round(delta, 8), "totalCostUsd": total_cost,
-                        "costByModelUsd": by_model, "costPer100PercentUsd": round(total_cost / delta * 100, 8), "accountSlotId": end.get("accountSlotId"), "accountLabel": end.get("accountLabel"),
-                        "usageAccountId": account_id, "plan": end["plan"], "planMultiplier": end["planMultiplier"],
-                    })
+            for previous, current in zip(points, points[1:]):
+                if not _same_cost_usage_cycle(previous, current, label):
+                    continue
+                multiplier = PLAN_MULTIPLIERS.get(current[label].get("plan") or "plus", 1.0)
+                start = {"timestamp": previous["timestamp"], "usage": previous[label]["continuous"] * multiplier}
+                end = {"timestamp": current["timestamp"], "usage": current[label]["continuous"] * multiplier,
+                    "accountSlotId": current.get("accountSlotId"), "accountLabel": current.get("accountLabel"), "plan": current[label].get("plan") or "plus", "planMultiplier": multiplier}
+                delta = end["usage"] - start["usage"]
+                if delta <= 0:
+                    continue
+                by_model = {}
+                for _, model, cost in account_events[bisect.bisect_left(event_times, start["timestamp"]):bisect.bisect_left(event_times, end["timestamp"])]:
+                    by_model[model] = round(by_model.get(model, 0.0) + cost, 8)
+                total_cost = round(sum(by_model.values()), 8)
+                result[output_name].append({
+                    "window": "5h" if label == "fiveHour" else "7d", "checkedAt": datetime.fromtimestamp(end["timestamp"], timezone.utc).isoformat().replace("+00:00", "Z"), "timestamp": end["timestamp"],
+                    "startedAt": datetime.fromtimestamp(start["timestamp"], timezone.utc).isoformat().replace("+00:00", "Z"), "endedAt": datetime.fromtimestamp(end["timestamp"], timezone.utc).isoformat().replace("+00:00", "Z"),
+                    "startUsagePercent": round(start["usage"], 8), "endUsagePercent": round(end["usage"], 8), "deltaPercent": round(delta, 8), "totalCostUsd": total_cost,
+                    "costByModelUsd": by_model, "costPer100PercentUsd": round(total_cost / delta * 100, 8), "accountSlotId": end.get("accountSlotId"), "accountLabel": end.get("accountLabel"),
+                    "usageAccountId": account_id, "plan": end["plan"], "planMultiplier": end["planMultiplier"],
+                })
     for values in result.values():
         values.sort(key=lambda row: (row["timestamp"], row["usageAccountId"]))
     return result
@@ -698,6 +668,21 @@ def dashboard_cost_usage_delta_events(cost_usage: dict[str, list[dict]]) -> list
             events.extend(compact_delta_event(event) for event in model_events)
     return events
 
+def dashboard_cost_time(ledger: list[dict], slot_usage_accounts: dict[str, str] | None = None) -> list[dict]:
+    rows = []
+    for event in ledger:
+        timestamp = parse_timestamp(event.get("occurredAt"))
+        cost = coerce_float((event.get("cost") or {}).get("totalCostUsd"))
+        if event.get("recordType") != "usage" or timestamp is None or cost is None or not math.isfinite(cost) or cost < 0:
+            continue
+        account = dashboard_usage_account_id(event, slot_usage_accounts)
+        model = str(event.get("rawModel") or event.get("billingModel") or "unknown")
+        rows.append({"_key": _dashboard_row_key("costTime", (account, event.get("eventId") or _dashboard_revision(event))),
+            "timestamp": timestamp, "usageAccountId": account, "accountSlotId": event.get("accountSlotId"), "accountLabel": event.get("accountLabel"),
+            "costByModelUsd": {model: cost}, "totalCostUsd": cost})
+    return sorted(rows, key=lambda row: (row["timestamp"], row["_key"]))
+
+
 def _dashboard_display_data(quota_history: list[dict], token_ledger: list[dict], accounts: dict, now: float | None = None) -> dict:
     now = time.time() if now is None else now
     slot_usage_accounts = {str(account.get("id")): str(account.get("usageAccountId")) for account in accounts.get("items", []) if account.get("id") and account.get("usageAccountId")}
@@ -712,6 +697,7 @@ def _dashboard_display_data(quota_history: list[dict], token_ledger: list[dict],
     return {
         "quotaPoints": _dashboard_key_rows("quota", dashboard_compact_quota_points(quota_points, now)),
         "tokenSessions": _dashboard_key_rows("token", [dashboard_token_session(row, slot_usage_accounts) for row in token_sessions]),
+        "costTime": dashboard_cost_time(token_ledger, slot_usage_accounts),
         "costUsage": {name: _dashboard_key_rows("costUsage", values) for name, values in cost_usage.items()},
         "historyStats": {
             "quotaRows": len(quota_history), "tokenLedgerRows": len(token_ledger),
@@ -756,7 +742,7 @@ def _dashboard_collection_changes(before: list[dict], after: list[dict]) -> dict
 
 def dashboard_view_changes(before: dict, after: dict) -> dict:
     changes = {}
-    for name in ("quotaPoints", "tokenSessions"):
+    for name in ("quotaPoints", "tokenSessions", "costTime"):
         if collection := _dashboard_collection_changes(before.get(name) or [], after.get(name) or []):
             changes[name] = collection
     cost_usage_changes = {}
@@ -774,6 +760,7 @@ def dashboard_transfer_view(display: dict | None) -> dict:
     return {
         "quotaPoints": display.get("quotaPoints") or [],
         "tokenSessions": display.get("tokenSessions") or [],
+        "costTime": display.get("costTime") or [],
         "costUsage": {
             "fiveHour": (display.get("costUsage") or {}).get("fiveHour") or [],
             "sevenDay": (display.get("costUsage") or {}).get("sevenDay") or [],
@@ -861,6 +848,7 @@ class UsageDashboardState:
         self.args.processing_index = self.usage_data.index
         self.usage_data.initialize_processing()
         self.usage_data.initialize_v4_index()
+        self.usage_data.index.on_new_cost = self.accounts.promote_active_slot_on_cost
         from monitor_projection import DashboardProjector
         self.projector = DashboardProjector(self.usage_data)
         from monitor_delivery import DashboardDelivery
@@ -870,11 +858,10 @@ class UsageDashboardState:
             self.usage_data.needs_remote_rebuild = False
         self.cloud.configure_usage_sync(self.usage_data)
         try:
-            self.recovered_account_transition = self.cloud.recover_account_transition()
+            self.cloud.recover_account_transition()
         except CloudError as exc:
-            self.recovered_account_transition = None
             self.accounts.error = f"Cloud account recovery requires attention: {exc}"
-        self.projection_errors = self.skills.reconcile()
+        self.skills.reconcile()
         self.skills.status()
         self.skill_scan_snapshot = []
         self.skill_scan_requested = True
@@ -1006,7 +993,8 @@ class UsageDashboardState:
     def _dashboard_accounts_locked(self) -> dict:
         status = dashboard_accounts(self)
         for account in status["items"]:
-            if error := getattr(self, "inactive_account_poll_errors", {}).get(account["id"]):
+            errors = getattr(self, "inactive_account_poll_errors", {})
+            if error := errors.get(account["usageAccountId"]) or errors.get(account["id"]):
                 account.update({"pollError": True, "pollErrorAt": error["at"], "stale": True})
         return status
 
@@ -1280,6 +1268,7 @@ class UsageDashboardState:
         account_status = self.accounts.status()
         with self.lock:
             self.last_acquire_started_at = time.monotonic()
+            self.inactive_account_poll_started_at[self.cloud.usage_account_id(account_status["activeAccountId"])] = self.last_acquire_started_at
             previous_token_usage = self.runtime_state.get("tokenUsage")
             if getattr(self.args, "background_token_capture", False):
                 previous_token_usage = (self.runtime_state.get("lastSample") or {}).get("tokenUsage") or previous_token_usage
@@ -1317,6 +1306,7 @@ class UsageDashboardState:
                     self.accounts.attribution_timeline(),
                     record_provenance=lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
                     source_files=token_usage.get("sourceFiles"), legacy_event_ids=token_usage.get("legacyEventIds"), own_machine_id=self.cloud.machine_id,
+                    on_new_cost=self.accounts.promote_active_slot_on_cost,
                 )
                 sample["cost"], sample["costByModel"] = token_cost_snapshot(token_sessions)
                 token_usage.pop("sessions", None)
@@ -1338,56 +1328,61 @@ class UsageDashboardState:
             self._signal_dashboard_cache()
             self.last_sample = sample
             self._update_account_status_locked(account_status["activeAccountId"], sample)
+            self.inactive_account_poll_errors.pop(sample["usageAccountId"], None)
             self.last_error = None
             self._print_usage_console_events(sample)
             return sample
 
     def _poll_inactive_account(self, credential: dict) -> None:
-        fd, temp_name = tempfile.mkstemp(prefix=".inactive-usage-", suffix=".json", dir=self.accounts.root)
-        temp_path = Path(temp_name)
+        auth = json.loads(credential["data"].decode("utf-8"))
+        if is_api_auth(auth):
+            return
         expected_fingerprint = credential["fingerprint"]
-        try:
-            with os.fdopen(fd, "wb") as stream:
-                stream.write(credential["data"])
-                stream.flush()
-                os.fsync(stream.fileno())
-            auth = json.loads(credential["data"].decode("utf-8"))
-            if is_api_auth(auth):
-                return
 
-            def commit_refreshed_credentials():
-                nonlocal expected_fingerprint
-                data = temp_path.read_bytes()
-                if not self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, data):
-                    raise UsageError("recorded credentials changed during token refresh")
-                expected_fingerprint = auth_fingerprint(data)
+        def commit_refreshed_credentials():
+            nonlocal expected_fingerprint
+            data = (json.dumps(auth, indent=2) + "\n").encode("utf-8")
+            if not self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, data):
+                raise UsageError("recorded credentials changed during token refresh")
+            expected_fingerprint = auth_fingerprint(data)
 
-            debug = {}
-            output = fetch_usage_with_percent_arbitration(
-                auth, self.opener, temp_path, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials,
-            )
-            usage_account_id = self.cloud.usage_account_id(credential["id"])
-            output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"], "remoteUsage": debug, "sync": {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": usage_account_id}})
-            sample = make_history_sample(output, None)
-            with self.lock:
-                append_quota_history_sample(self.args.quota_history, sample)
-                self._update_account_status_locked(credential["id"], sample)
-        finally:
-            try:
-                if temp_path.exists():
-                    self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, temp_path.read_bytes())
-            finally:
-                temp_path.unlink(missing_ok=True)
+        debug = {}
+        output = fetch_usage_with_percent_arbitration(
+            auth, self.opener, None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials,
+        )
+        usage_account_id = self.cloud.usage_account_id(credential["id"])
+        output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"], "usageAccountId": usage_account_id,
+            "remoteUsage": debug, "sync": {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": usage_account_id}})
+        sample = make_history_sample(output, None)
+        with self.lock:
+            append_quota_history_sample(self.args.quota_history, sample)
+            self._update_account_status_locked(credential["id"], sample)
+
+    def _inactive_usage_credentials(self) -> list[dict]:
+        status = self.accounts.status()
+        active = self.cloud.usage_account_id(status["activeAccountId"]) if status.get("activeAccountId") else None
+        priority = {slot: -index for index, slot in enumerate(status.get("slotOrder", []))}
+        groups = {}
+        for credential in self.accounts.inactive_ready_credentials():
+            account = self.cloud.usage_account_id(credential["id"])
+            if account == active:
+                continue
+            if account not in groups or priority.get(credential["id"], float("-inf")) > priority.get(groups[account]["id"], float("-inf")):
+                groups[account] = credential | {"usageAccountId": account}
+        return list(groups.values())
 
     def poll_due_inactive_accounts(self, now: float | None = None) -> int:
         if self.args.local_only or self.opener is None:
             return 0
         now = time.monotonic() if now is None else now
         polled = 0
-        for credential in self.accounts.inactive_ready_credentials():
-            if now - self.inactive_account_poll_started_at.get(credential["id"], float("-inf")) < INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS:
+        for credential in self._inactive_usage_credentials():
+            active_id = self.accounts.status().get("activeAccountId")
+            if active_id and self.cloud.usage_account_id(active_id) == credential["usageAccountId"]:
                 continue
-            self.inactive_account_poll_started_at[credential["id"]] = now
+            if now - self.inactive_account_poll_started_at.get(credential["usageAccountId"], float("-inf")) < INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS:
+                continue
+            self.inactive_account_poll_started_at[credential["usageAccountId"]] = now
             try:
                 if is_api_auth(json.loads(credential["data"].decode("utf-8"))):
                     continue
@@ -1397,10 +1392,11 @@ class UsageDashboardState:
                 self._poll_inactive_account(credential)
                 with self.lock:
                     self.inactive_account_poll_errors.pop(credential["id"], None)
+                    self.inactive_account_poll_errors.pop(credential["usageAccountId"], None)
                 polled += 1
             except Exception as exc:
                 with self.lock:
-                    self.inactive_account_poll_errors[credential["id"]] = {"at": now_iso(), "error": str(exc)}
+                    self.inactive_account_poll_errors[credential["usageAccountId"]] = {"at": now_iso(), "error": str(exc)}
                 print(f"Inactive account usage polling failed for {credential['label']!r}: {exc}", file=sys.stderr, flush=True)
         if polled:
             with self.lock:
@@ -1411,7 +1407,7 @@ class UsageDashboardState:
 
     def inactive_account_poll_wait_seconds(self, now: float | None = None) -> float:
         now = time.monotonic() if now is None else now
-        return min((max(INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS - (now - self.inactive_account_poll_started_at.get(credential["id"], float("-inf"))), 0) for credential in self.accounts.inactive_ready_credentials()), default=INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS)
+        return min((max(INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS - (now - self.inactive_account_poll_started_at.get(credential["usageAccountId"], float("-inf"))), 0) for credential in self._inactive_usage_credentials()), default=INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS)
 
     def run_inactive_account_polling(self) -> None:
         while self.running:
@@ -1462,41 +1458,27 @@ class UsageDashboardState:
         auth_path = self.args.auth if credential["active"] else self.accounts._account_path(credential["id"])
         auth_data = auth_path.read_bytes()
         expected_fingerprint = auth_fingerprint(auth_data)
-        temp_path = auth_path
-        try:
-            if not credential["active"]:
-                fd, temp_name = tempfile.mkstemp(prefix=".session-refresh-usage-", suffix=".json", dir=self.accounts.root)
-                temp_path = Path(temp_name)
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(auth_data)
-                    stream.flush()
-                    os.fsync(stream.fileno())
+        auth = json.loads(auth_data.decode("utf-8"))
 
-            def commit_refreshed_credentials():
-                nonlocal expected_fingerprint
-                if credential["active"]:
-                    self.sync_active_account_from_live()
-                    return
-                data = temp_path.read_bytes()
-                if not self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, data):
-                    raise UsageError("recorded credentials changed during token refresh")
-                expected_fingerprint = auth_fingerprint(data)
+        def commit_refreshed_credentials():
+            nonlocal expected_fingerprint
+            if credential["active"]:
+                self.sync_active_account_from_live()
+                return
+            data = (json.dumps(auth, indent=2) + "\n").encode("utf-8")
+            if not self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, data):
+                raise UsageError("recorded credentials changed during token refresh")
+            expected_fingerprint = auth_fingerprint(data)
 
-            output = fetch_usage_with_percent_arbitration(
-                json.loads(auth_data.decode("utf-8")), self.opener, temp_path, max(self.args.timeout, 1), {}, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT),
-                auth_lock=self.accounts.lock if credential["active"] else None, refreshed_callback=commit_refreshed_credentials,
-            )
-            output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"]})
-            sample = make_history_sample(output, None)
-            with self.lock:
-                self._update_account_status_locked(credential["id"], sample)
-            return parse_timestamp(((sample.get("windows") or {}).get(label) or {}).get("resetAt"))
-        finally:
-            if not credential["active"] and temp_path.exists():
-                try:
-                    self.accounts.commit_polled_credentials(credential["id"], expected_fingerprint, temp_path.read_bytes())
-                finally:
-                    temp_path.unlink(missing_ok=True)
+        output = fetch_usage_with_percent_arbitration(
+            auth, self.opener, auth_path if credential["active"] else None, max(self.args.timeout, 1), {}, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT),
+            auth_lock=self.accounts.lock if credential["active"] else None, refreshed_callback=commit_refreshed_credentials,
+        )
+        output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"]})
+        sample = make_history_sample(output, None)
+        with self.lock:
+            self._update_account_status_locked(credential["id"], sample)
+        return parse_timestamp(((sample.get("windows") or {}).get(label) or {}).get("resetAt"))
 
     def _due_session_refreshes(self) -> list[tuple[dict, str]]:
         now = time.time()
@@ -1718,25 +1700,18 @@ class UsageDashboardState:
             self.external_auth_validation_fingerprints.add(fingerprint)
 
         def validate():
-            fd, temp_name = tempfile.mkstemp(prefix=".external-auth-validation-", suffix=".json", dir=self.accounts.root)
-            temp_path = Path(temp_name)
             expected_fingerprint = external_update["fingerprint"]
             try:
-                with os.fdopen(fd, "wb") as stream:
-                    stream.write(external_update["data"])
-                    stream.flush()
-                    os.fsync(stream.fileno())
-
                 def commit_refreshed_credentials():
                     nonlocal expected_fingerprint
-                    data = temp_path.read_bytes()
+                    data = (json.dumps(auth, indent=2) + "\n").encode("utf-8")
                     if not self.accounts.commit_polled_credentials(external_update["id"], expected_fingerprint, data):
                         raise UsageError("recorded credentials changed during external auth validation")
                     expected_fingerprint = auth_fingerprint(data)
 
                 auth = json.loads(external_update["data"].decode("utf-8"))
-                output = fetch_usage_with_percent_arbitration(auth, self.opener, temp_path, max(self.args.timeout, 1), {}, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials)
-                data = temp_path.read_bytes()
+                output = fetch_usage_with_percent_arbitration(auth, self.opener, None, max(self.args.timeout, 1), {}, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials)
+                data = (json.dumps(auth, indent=2) + "\n").encode("utf-8")
                 if not self.accounts.commit_polled_credentials(external_update["id"], expected_fingerprint, data):
                     raise UsageError("recorded credentials changed during external auth validation")
                 usage_account_id = self.cloud.usage_account_id(external_update["id"])
@@ -1750,7 +1725,6 @@ class UsageDashboardState:
             except Exception as exc:
                 print(f"External credentials for {external_update['label']!r} were not saved because background validation failed: {exc}", file=sys.stderr, flush=True)
             finally:
-                temp_path.unlink(missing_ok=True)
                 with self.lock:
                     self.external_auth_validation_fingerprints.discard(fingerprint)
                     self.external_auth_validation_threads.discard(threading.current_thread())

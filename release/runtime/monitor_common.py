@@ -114,26 +114,39 @@ def load_json(path: Path) -> dict:
     except FileNotFoundError as exc:
         raise UsageError(f"missing {path}") from exc
 
-def write_json(path: Path, data: dict) -> None:
+def atomic_write_bytes(path: Path, data: bytes, *, private: bool = False, replace_attempts: int = 1) -> None:
+    if replace_attempts < 1:
+        raise ValueError("replace_attempts must be positive")
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
     try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(data, f, indent=2)
-            f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        try:
-            os.chmod(temp_name, 0o600)
-        except OSError:
-            pass
-        os.replace(temp_name, path)
-    except Exception:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if private:
+            try:
+                os.chmod(temp_name, 0o600)
+            except OSError:
+                pass
+        for attempt in range(replace_attempts):
+            try:
+                os.replace(temp_name, path)
+                break
+            except PermissionError:
+                if attempt == replace_attempts - 1 or os.name != "nt":
+                    raise
+                time.sleep(0.02 * (attempt + 1))
+    except BaseException:
         try:
             os.unlink(temp_name)
         except OSError:
             pass
         raise
+
+
+def write_json(path: Path, data: dict) -> None:
+    atomic_write_bytes(path, (json.dumps(data, indent=2) + "\n").encode("utf-8"), private=True)
 
 def jwt_payload(token: str) -> dict:
     try:
@@ -256,11 +269,13 @@ def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, h
         attempt += 1
         stop.wait(1) if stop is not None else time.sleep(1)
 
-def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path, timeout: int, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_refresh: bool = True, force_refresh: bool = False) -> str:
+def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path | None, timeout: int, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_refresh: bool = True, force_refresh: bool = False) -> str:
     tokens = auth.get("tokens") or {}
     access_token = tokens.get("access_token")
     if not force_refresh and access_token and not (token_expired(access_token) if allow_refresh else token_expired(access_token, 0, 0, 0)):
         return access_token
+    if auth_path is None and (auth_lock is not None or refreshed_callback is None):
+        raise UsageError("in-memory token refresh requires a persistence callback and no file lock")
     if auth_lock is not None:
         with auth_lock:
             auth.clear()
@@ -286,7 +301,8 @@ def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth
         raise UsageError("token refresh returned credentials for an unverifiable or different account")
     tokens.update({k: refreshed[k] for k in ("access_token", "id_token", "refresh_token") if refreshed.get(k)})
     auth["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    write_json(auth_path, auth)
+    if auth_path is not None:
+        write_json(auth_path, auth)
     if refreshed_callback is not None:
         refreshed_callback()
     return tokens["access_token"]

@@ -4,7 +4,7 @@
 
 **一个本地优先的 Codex 配额、Token、成本、账号、技能与加密同步仪表盘，并提供 VS Code 集成。**
 
-[![Version](https://img.shields.io/badge/version-1.5.0-4f8cff)](#快速开始)
+[![Version](https://img.shields.io/badge/version-1.5.13-4f8cff)](#快速开始)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#运行要求)
@@ -42,7 +42,7 @@ flowchart LR
     M <--> W[可选的加密 WebDAV]
 ```
 
-Python 监控服务是权威数据源。仪表盘首次连接时从 `/api/series` 一次取得相互独立的完整本地和合并数据集，之后每五秒携带 ETag 轮询 `/api/status`。本地可见数据发生变化时，会为两个视图传输连续编号的增量补丁；云端补充数据可能改写历史点，因此其语义变化会替换整个合并视图。服务重启或保留的索引不完整时，会自动通过完整快照恢复。
+Python 监控服务是权威数据源。仪表盘通过 `/api/dashboard` 获取所选视图和时间范围的清单及不可变数据块，之后每五秒携带 ETag 轮询 `/api/status`。清单未变化时复用已下载的数据块；本地及同步数据的变化由后端生成更新后的视图。旧的 `/api/series` 快照与补丁接口继续保留兼容性。
 
 ## 运行要求
 
@@ -76,7 +76,7 @@ python codex_monitor_daemon.py
 
 ### 2. 安装 VS Code 扩展
 
-在 VS Code 中安装 `release/codex-usage-monitor-1.3.0.vsix`：
+在 VS Code 中安装 `release/codex-usage-monitor-1.5.13.vsix`：
 
 1. 打开 **扩展**。
 2. 选择 **视图和更多操作 (…) → 从 VSIX 安装…**。
@@ -85,7 +85,7 @@ python codex_monitor_daemon.py
 也可以使用命令行：
 
 ```console
-code --install-extension release/codex-usage-monitor-1.3.0.vsix
+code --install-extension release/codex-usage-monitor-1.5.13.vsix
 ```
 
 ### 3. 完成首次设置
@@ -200,6 +200,8 @@ API 账号采用复制语义：
 | Allow optimistic writes | 兼容忽略条件写入的服务器；此时账号独占只能尽力保证。 |
 
 Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.jianguoyun.com/dav/` 与应用密码。
+
+同步根目录通过 `data-contract.json` 保存统一的云端数据契约版本。每项操作在独占递归 WebDAV 锁内检查版本：较旧的云端版本自动迁移，版本相同才允许访问，云端版本较新时阻止访问并要求更新本地脚本。服务器必须支持有限租期的 `LOCK`/`UNLOCK`；乐观写入不能绕过此保护。请更新所有参与同步的客户端，详情见[云端契约与恢复说明](cloud-data-contract.md)。
 
 手动与自动 WebDAV 操作共用服务器端队列，按顺序逐个执行。管理页右下角显示加载图标及“执行中 + 等待中”的数量；点击可查看操作或移除尚未执行的任务。
 技能 Share/Unshare 和 Unmanage 在任务开始执行时才修改本地状态，因此移除等待中的任务也会阻止这些本地修改。每项操作各有一条入队/开始通知和一条结果通知，明确说明成功、失败、跳过、取消或部分完成。

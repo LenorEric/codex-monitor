@@ -43,11 +43,39 @@ def initialize_delivery(db):
 
 
 def encoded(value):
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return json.dumps(transfer_data(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+
+
+def transfer_data(value):
+    """Keep record identity, but transmit account identity only once and time numerically."""
+    if isinstance(value, list):
+        return [transfer_data(row) for row in value]
+    if not isinstance(value, dict):
+        return value
+    omitted = {"accountSlotId", "accountLabel"} if value.get("usageAccountId") else set()
+    if value.get("timestamp") is not None:
+        omitted.add("checkedAt")
+    return {key: transfer_data(item) for key, item in value.items() if key not in omitted}
 
 
 def empty_view():
-    return {"quotaPoints": [], "tokenSessions": [], "costUsage": {"fiveHour": [], "sevenDay": []}, "historyStats": {}}
+    return {"quotaPoints": [], "tokenSessions": [], "costTime": [], "costUsage": {"fiveHour": [], "sevenDay": []}, "historyStats": {}}
+
+
+def reduce_cost_time(rows, seconds):
+    """Cost buckets retain sums and model/account identity, never average dollar values."""
+    groups = {}
+    for row in rows:
+        key = (row["usageAccountId"], int(row["timestamp"] // seconds) if seconds else 0)
+        if key not in groups:
+            groups[key] = row | {"costByModelUsd": {}, "totalCostUsd": 0}
+            groups[key]["_key"] = f"costTime:{key[0]}:{key[1]}:{seconds}"
+        value = groups[key]
+        value["timestamp"] = min(value["timestamp"], row["timestamp"])
+        for model, cost in row["costByModelUsd"].items():
+            value["costByModelUsd"][model] = round(value["costByModelUsd"].get(model, 0) + cost, 8)
+        value["totalCostUsd"] = round(sum(value["costByModelUsd"].values()), 8)
+    return sorted(groups.values(), key=lambda row: (row["timestamp"], row["usageAccountId"]))
 
 
 def session_groups(rows):
@@ -75,61 +103,65 @@ def session_groups(rows):
 
 
 def reduce_quota(rows, seconds):
+    """Average each account/cycle bucket; retain totals for lossless multiday regrouping."""
     if not seconds:
         return rows
-    buckets, retained = defaultdict(list), {}
-    by_account = defaultdict(list)
-    for row in rows:
-        by_account[row["usageAccountId"]].append(row)
-    for points in by_account.values():
-        segment = 0
-        buckets[(points[0]["usageAccountId"], int(points[0]["timestamp"] // seconds), segment)].append(points[0])
-        for index, (left, right) in enumerate(zip(points, points[1:])):
-            covered = any((row.get("overviewBucket") or {}).get("start", math.inf) <= left["timestamp"] and right["timestamp"] <= (row.get("overviewBucket") or {}).get("end", -math.inf) for row in (left, right))
-            changed = right["timestamp"] - left["timestamp"] > 4 * 3600 and not covered
+    buckets, previous, segments = {}, {}, defaultdict(int)
+    for row in sorted(rows, key=lambda row: (row["timestamp"], row["usageAccountId"], row["_key"])):
+        account = row["usageAccountId"]
+        if account in previous:
+            left = previous[account]
+            changed = (row.get("overviewBucket") or {}).get("start", row["timestamp"]) - (left.get("overviewBucket") or {}).get("end", left["timestamp"]) > 4 * 3600
             for label in ("fiveHour", "sevenDay"):
-                a, b = left.get(label) or {}, right.get(label) or {}
-                changed |= any(a.get(k) != b.get(k) for k in ("resetAt", "plan"))
-                changed |= (a.get("continuous") is None) != (b.get("continuous") is None)
+                a, b = left.get(label) or {}, row.get(label) or {}
+                changed |= any(a.get(field) != b.get(field) for field in ("resetAt", "plan"))
+                for field in ("raw", "continuous"):
+                    changed |= (a.get(field) is None) != (b.get(field) is None)
                 changed |= a.get("continuous") is not None and b.get("continuous") is not None and b["continuous"] < a["continuous"]
-                # Keep the ends of flat runs without retaining every observation inside them.
-                if a.get("continuous") == b.get("continuous"):
-                    if index == 0 or (points[index - 1].get(label) or {}).get("continuous") != a.get("continuous"):
-                        retained[left["_key"]] = left
-                    if index + 2 == len(points) or (points[index + 2].get(label) or {}).get("continuous") != b.get("continuous"):
-                        retained[right["_key"]] = right
             if changed:
-                retained[left["_key"]], retained[right["_key"]] = left, right
-                segment += 1
-            buckets[(right["usageAccountId"], int(right["timestamp"] // seconds), segment)].append(right)
-    for points in buckets.values():
-        keep = {0, len(points) - 1}
+                segments[account] += 1
+        previous[account] = row
+        key = (account, int(row["timestamp"] // seconds), segments[account])
+        if key not in buckets:
+            buckets[key] = []
+        buckets[key].append(row)
+    result = []
+    for key, points in buckets.items():
+        value = points[0] | {"_key": "quotaBucket:" + hashlib.sha256(encoded([seconds, *key])).hexdigest()}
+        value["overviewBucket"] = {
+            "start": min((row.get("overviewBucket") or {}).get("start", row["timestamp"]) for row in points),
+            "end": max((row.get("overviewBucket") or {}).get("end", row["timestamp"]) for row in points),
+            "count": sum((row.get("overviewBucket") or {}).get("count", 1) for row in points), "totals": {}}
         for label in ("fiveHour", "sevenDay"):
+            value[label] = dict(points[0].get(label) or {})
+            value["overviewBucket"]["totals"][label] = {}
             for field in ("raw", "continuous"):
-                candidates = [i for i, row in enumerate(points) if isinstance((row.get(label) or {}).get(field), (float, int))]
-                if candidates:
-                    keep.update((min(candidates, key=lambda i: points[i][label][field]), max(candidates, key=lambda i: points[i][label][field])))
-        for i in keep:
-            retained[points[i]["_key"]] = points[i] | {"overviewBucket": {"start": min((row.get("overviewBucket") or {}).get("start", row["timestamp"]) for row in points),
-                "end": max((row.get("overviewBucket") or {}).get("end", row["timestamp"]) for row in points), "count": len(points)}}
-    return sorted(retained.values(), key=lambda row: (row["timestamp"], row["usageAccountId"], row["_key"]))
+                total, count = 0, 0
+                for row in points:
+                    saved = (row.get("overviewBucket") or {}).get("totals", {}).get(label, {}).get(field)
+                    if saved is not None:
+                        total += saved["sum"]
+                        count += saved["count"]
+                    elif isinstance((row.get(label) or {}).get(field), (int, float)):
+                        total += row[label][field]
+                        count += 1
+                value[label][field] = round(total / count, 1) if count else None
+                value["overviewBucket"]["totals"][label][field] = {"sum": total, "count": count}
+        result.append(value)
+    return sorted(result, key=lambda row: (row["timestamp"], row["usageAccountId"], row["_key"]))
 
 
 def reduce_cost(rows, seconds):
     if not seconds:
         return rows
-    groups, previous, segments = {}, {}, defaultdict(int)
+    groups = {}
     for row in rows:
-        account = row.get("usageAccountId")
-        if account in previous and (previous[account].get("endedAt") != row.get("startedAt") or previous[account].get("plan") != row.get("plan")):
-            segments[account] += 1
-        previous[account] = row
-        key = (account, row.get("plan"), int(row["timestamp"] // seconds), segments[account])
+        key = (row.get("usageAccountId"), row.get("plan"), int(row["timestamp"] // seconds))
         if key not in groups:
-            groups[key] = row | {"costByModelUsd": dict(row.get("costByModelUsd") or {}), "mergedCount": 1}
+            groups[key] = row | {"costByModelUsd": dict(row.get("costByModelUsd") or {}), "mergedCount": row.get("mergedCount", 1)}
             continue
         value = groups[key]
-        value["mergedCount"] += 1
+        value["mergedCount"] += row.get("mergedCount", 1)
         value["startedAt"] = min(value["startedAt"], row["startedAt"])
         value["endedAt"] = max(value["endedAt"], row["endedAt"])
         value["deltaPercent"] += row.get("deltaPercent", 0)
@@ -180,9 +212,9 @@ class DashboardDelivery:
             row = json.loads(data)
             row["_key"] = f"quota:{account}:{key}"
             result["quotaPoints"].append(row)
-        for kind in ("tokenSessions", "costUsage:fiveHour", "costUsage:sevenDay"):
+        for kind in ("tokenSessions", "costTime", "costUsage:fiveHour", "costUsage:sevenDay"):
             rows = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_display WHERE view=? AND kind=? AND event_at>=? AND event_at<? ORDER BY event_at,account,record_key", (view, kind, start, end))]
-            if kind == "tokenSessions":
+            if kind in {"tokenSessions", "costTime"}:
                 result[kind] = rows
             else:
                 result["costUsage"][kind.split(":")[1]] = rows
@@ -199,15 +231,19 @@ class DashboardDelivery:
                     # Capture the source rows and claim from one committed generation.
                     claim = db.execute("SELECT revision FROM dashboard_days WHERE view=? AND day=?", (view, day)).fetchone()[0]
                     exact = self._load(db, view, day * DAY, (day + 1) * DAY)
-                meta = {"tokens": session_groups(exact["tokenSessions"]), "quotaMax": max((r["timestamp"] for r in exact["quotaPoints"]), default=None),
+                meta = {"accountLabels": self._account_labels(exact), "tokens": session_groups(exact["tokenSessions"]), "quotaMax": max((r["timestamp"] for r in exact["quotaPoints"]), default=None),
                     "costMax": max((r["timestamp"] for values in exact["costUsage"].values() for r in values), default=None),
                     "tokenMax": max((parse_timestamp(r.get("updatedAt") or r.get("startedAt")) for r in exact["tokenSessions"]), default=None),
+                    "costTimeMax": max((r["timestamp"] for r in exact["costTime"]), default=None),
+                    "costTimeMin": min((r["timestamp"] for r in exact["costTime"]), default=None),
+                    "costTimeTotals": reduce_cost_time(exact["costTime"], 0),
                     "rates": {name: cost_groups(rows) for name, rows in exact["costUsage"].items()}}
                 artifacts = []
                 for level in LEVELS:
                     frame = empty_view()
                     frame["quotaPoints"] = reduce_quota(exact["quotaPoints"], level)
                     frame["costUsage"] = {name: reduce_cost(rows, level) for name, rows in exact["costUsage"].items()}
+                    frame["costTime"] = reduce_cost_time(exact["costTime"], DAY if level >= DAY else 3600 if level else 60)
                     # Encoding and compression happen outside the database writer lock.
                     from monitor_dashboard import dashboard_safe_json
                     body = encoded(dashboard_safe_json(frame))
@@ -249,13 +285,16 @@ class DashboardDelivery:
             current = list(db.execute("SELECT signature FROM dashboard_manifests WHERE scope IN (?,?,?,?,?)", tuple(f"{view}:{selected}" for selected in RANGES)))
             if len(current) == len(RANGES) and all(row[0] == signature for row in current):
                 return
-            maxima = {name: max((meta[name] for _, _, meta in days if meta[name] is not None), default=None) for name in ("quotaMax", "costMax", "tokenMax")}
+            maxima = {name: max((meta.get(name) for _, _, meta in days if meta.get(name) is not None), default=None) for name in ("quotaMax", "costMax", "tokenMax", "costTimeMax")}
+            cost_start = min((meta["costTimeMin"] for _, _, meta in days if meta.get("costTimeMin") is not None), default=None)
             manifests = []
             for selected, seconds in RANGES.items():
-                chunks, tokens = [], []
+                chunks, tokens, cost_totals = [], [], []
+                cost_resolution = 60
                 rates = {"fiveHour": [], "sevenDay": []}
                 rollups = defaultdict(list)
                 bounds = {name: ((stamp - seconds) if seconds and stamp is not None else None) for name, stamp in maxima.items()}
+                cost_bounds = [bounds["costTimeMax"] if seconds else cost_start, maxima["costTimeMax"]]
                 for day, _, meta in days:
                     if seconds and not any(stamp is not None and day * DAY <= stamp and (day + 1) * DAY > stamp - seconds for stamp in maxima.values()):
                         continue
@@ -265,14 +304,26 @@ class DashboardDelivery:
                         level = 0
                     if selected == "All" and len(days) > 365 and age > 30 * DAY:
                         level = max(level, 86400)
+                    if meta.get("costTimeMax") is not None and (cost_bounds[0] is None or meta["costTimeMax"] >= cost_bounds[0]):
+                        cost_resolution = max(cost_resolution, DAY if level >= DAY else 3600 if level else 60)
                     part = db.execute("SELECT digest FROM dashboard_parts WHERE view=? AND day=? AND level=?", (view, day, level)).fetchone()
                     if part:
+                        digest = part[0]
+                        if seconds and cost_bounds[0] is not None and day * DAY < cost_bounds[0] < (day + 1) * DAY:
+                            # Only the lower boundary day needs exact rows instead of its shared overview buckets.
+                            frame = json.loads(db.execute("SELECT body FROM dashboard_blobs WHERE digest=?", (digest,)).fetchone()[0])
+                            frame["costTime"] = reduce_cost_time(self._load_cost_time(db, view, cost_bounds[0], (day + 1) * DAY), 3600 if level else 60)
+                            digest = self._store_frame(frame, now)
                         if selected == "All" and level == 86400:
                             # Stable partitions span days only for very old, long histories.
                             width = 7 if len(days) <= 2000 else 30 if len(days) <= 10000 else 180
-                            rollups[(day // width, width)].append(part[0])
+                            rollups[(day // width, width)].append(digest)
                         else:
-                            chunks.append(part[0])
+                            chunks.append(digest)
+                    if cost_bounds[0] is None or day * DAY >= cost_bounds[0]:
+                        cost_totals.extend(meta.get("costTimeTotals", []))
+                    elif (day + 1) * DAY > cost_bounds[0]:
+                        cost_totals.extend(self._load_cost_time(db, view, cost_bounds[0], (day + 1) * DAY))
                     if bounds["tokenMax"] is None or day * DAY >= bounds["tokenMax"]:
                         tokens.extend(meta["tokens"])
                     elif (day + 1) * DAY > bounds["tokenMax"]:
@@ -286,7 +337,9 @@ class DashboardDelivery:
                 for (_, width), digests in sorted(rollups.items()):
                     chunks.append(self._rollup(db, digests, width * DAY, now))
                 manifests.append((f"{view}:{selected}", signature, self._manifest(view, selected, chunks, session_groups(tokens), maxima, now,
-                    rates={name: cost_groups(rows) for name, rows in rates.items()})))
+                    rates={name: cost_groups(rows) for name, rows in rates.items()}, cost_bounds=cost_bounds,
+                    cost_totals=reduce_cost_time(cost_totals, 0), cost_resolution=cost_resolution,
+                    account_labels={key: label for _, _, meta in days for key, label in meta.get("accountLabels", {}).items()})))
         with self.index.transaction() as db:
             # If a projection committed while encoding, leave the old published generation intact.
             actual = list(db.execute("SELECT day,revision FROM dashboard_days WHERE view=? ORDER BY day", (view,)))
@@ -304,10 +357,13 @@ class DashboardDelivery:
         for digest in digests:
             part = json.loads(reader.execute("SELECT body FROM dashboard_blobs WHERE digest=?", (digest,)).fetchone()[0])
             frame["quotaPoints"].extend(part["quotaPoints"])
+            frame["costTime"].extend(part.get("costTime", []))
             for name in frame["costUsage"]:
                 frame["costUsage"][name].extend(part["costUsage"][name])
         frame["quotaPoints"] = reduce_quota(sorted(frame["quotaPoints"], key=lambda row: (row["timestamp"], row["usageAccountId"])), seconds)
         frame["costUsage"] = {name: reduce_cost(sorted(rows, key=lambda row: row["timestamp"]), seconds) for name, rows in frame["costUsage"].items()}
+        # Daily cost buckets can be regrouped into any whole-day chart interval without losing sums.
+        frame["costTime"] = reduce_cost_time(frame["costTime"], DAY)
         body = encoded(frame)
         digest = hashlib.sha256(body).hexdigest()
         compressed = gzip.compress(body, compresslevel=3, mtime=0)
@@ -318,13 +374,35 @@ class DashboardDelivery:
         return digest
 
     @staticmethod
+    def _load_cost_time(db, view, start, end):
+        return [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_display WHERE view=? AND kind='costTime' AND event_at>=? AND event_at<? ORDER BY event_at,account,record_key", (view, start, end))]
+
+    def _store_frame(self, frame, now):
+        from monitor_dashboard import dashboard_safe_json
+        body = encoded(dashboard_safe_json(frame))
+        digest = hashlib.sha256(body).hexdigest()
+        compressed = gzip.compress(body, compresslevel=3, mtime=0)
+        with self.index.transaction() as db:
+            db.execute("INSERT OR IGNORE INTO dashboard_blobs VALUES(?,?,?,?)", (digest, body, compressed, now))
+        self.metrics["chunksEncoded"] += 1
+        return digest
+
+    @staticmethod
     def _load_tokens(db, view, start, end):
         return [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_display WHERE view=? AND kind='tokenSessions' AND event_at>=? AND event_at<?", (view, start, end))]
 
     @staticmethod
-    def _manifest(view, selected, chunks, tokens, maxima, now, bounds=None, rates=None):
+    def _account_labels(frame):
+        return {row["usageAccountId"]: row["accountLabel"] for rows in (frame["quotaPoints"], frame["tokenSessions"], frame.get("costTime", []), *frame["costUsage"].values())
+            for row in rows if row.get("usageAccountId") and row.get("accountLabel")}
+
+    @staticmethod
+    def _manifest(view, selected, chunks, tokens, maxima, now, bounds=None, rates=None, cost_bounds=None, cost_totals=None, cost_resolution=60, account_labels=None):
         value = {"protocolVersion": PROTOCOL_VERSION, "view": view, "range": selected, "chunks": list(dict.fromkeys(chunks)), "tokenSessions": tokens,
             "maxima": maxima, "bounds": bounds, "builtAt": now, "rateRows": rates or {"fiveHour": [], "sevenDay": []}}
+        value.update({"costTimeBounds": cost_bounds, "costTimeTotals": cost_totals or [], "costTimeResolution": cost_resolution})
+        value["accountLabels"] = account_labels or {}
+        value = transfer_data(value)
         value["generation"] = hashlib.sha256(encoded(value | {"builtAt": 0})).hexdigest()
         return value
 
@@ -362,23 +440,25 @@ class DashboardDelivery:
                 return json.loads(cached[1])
             frame = self._load(db, view, start, end)
             frame["quotaPoints"] = sorted(frame["quotaPoints"] + context, key=lambda row: (row["timestamp"], row["usageAccountId"], row["_key"]))
+        account_labels = self._account_labels(frame)
         tokens = session_groups(frame.pop("tokenSessions"))
         rates = {name: cost_groups(rows) for name, rows in frame["costUsage"].items()}
         frame["tokenSessions"] = []
         # Bound individual immutable responses even for an unusually dense day.
         artifacts = []
         from monitor_dashboard import dashboard_safe_json
-        for kind, rows in (("quotaPoints", frame["quotaPoints"]), ("fiveHour", frame["costUsage"]["fiveHour"]), ("sevenDay", frame["costUsage"]["sevenDay"])):
+        for kind, rows in (("quotaPoints", frame["quotaPoints"]), ("costTime", frame["costTime"]), ("fiveHour", frame["costUsage"]["fiveHour"]), ("sevenDay", frame["costUsage"]["sevenDay"])):
             for offset in range(0, len(rows), 1000):
                 part = empty_view()
-                (part if kind == "quotaPoints" else part["costUsage"])[kind] = rows[offset:offset + 1000]
+                (part if kind in {"quotaPoints", "costTime"} else part["costUsage"])[kind] = rows[offset:offset + 1000]
                 body = encoded(dashboard_safe_json(part))
                 artifacts.append((hashlib.sha256(body).hexdigest(), body, gzip.compress(body, compresslevel=3, mtime=0)))
         now = time.time()
         with self.index.transaction() as db:
             for digest, body, compressed in artifacts:
                 db.execute("INSERT OR IGNORE INTO dashboard_blobs VALUES(?,?,?,?)", (digest, body, compressed, now))
-            manifest = self._manifest(view, selected, [digest for digest, _, _ in artifacts], tokens, {}, now, [start, end], rates)
+            manifest = self._manifest(view, selected, [digest for digest, _, _ in artifacts], tokens, {}, now, [start, end], rates,
+                cost_bounds=[start, end], cost_totals=reduce_cost_time(frame["costTime"], 0), account_labels=account_labels)
             db.execute("INSERT OR REPLACE INTO dashboard_manifests VALUES(?,?,?,?)", (scope, signature, encoded(manifest).decode(), now))
             # Access tracking is in memory so a warm day request remains read-only.
             with self.cache_lock:

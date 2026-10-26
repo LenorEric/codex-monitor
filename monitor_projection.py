@@ -164,15 +164,8 @@ class DashboardProjector:
             state["windows"][label] = _usage_time_continuous_values(records, label, rank.percentile(label))
             if records and all(record["raw"] is None for record in records):
                 state["windows"][label]["safe"] = True
-            turnpoint = None
-            for previous, current in zip(points, points[1:]):
-                if not _same_cost_usage_cycle(previous, current, label) or current[label]["continuous"] < previous[label]["continuous"]:
-                    turnpoint = None
-                elif current[label]["continuous"] > previous[label]["continuous"]:
-                    turnpoint = [previous, current]
-            self.index.put(db, f"turnpoint:{view}:{account}:{label}", turnpoint)
         self.index.put(db, f"quotaState:{view}:{account}", state)
-        for kind in ("quotaPoints", "tokenSessions"):
+        for kind in ("quotaPoints", "tokenSessions", "costTime"):
             self._replace(db, view, account, kind, frame[kind], patches)
         for label, values in frame["costUsage"].items():
             self._replace(db, view, account, f"costUsage:{label}", values, patches)
@@ -241,29 +234,14 @@ class DashboardProjector:
         return True
 
     def _tail_cost(self, db, view, account, previous, point, patches):
-        from monitor_dashboard import _same_cost_usage_cycle, dashboard_cost_usage, _dashboard_key_rows
+        from monitor_dashboard import dashboard_cost_usage, _dashboard_key_rows
+        costs = dashboard_cost_usage([previous, point], [])
         for label in ("fiveHour", "sevenDay"):
-            key = f"turnpoint:{view}:{account}:{label}"
-            prior = self.index.get(db, key)
-            if not _same_cost_usage_cycle(previous, point, label) or point[label]["continuous"] < previous[label]["continuous"]:
-                self.index.put(db, key, None)
-                continue
-            if point[label]["continuous"] == previous[label]["continuous"]:
-                continue
-            if prior is not None:
-                minimal = prior + [point]
-                # Intermediate unchanged quota points matter for the new midpoint.
-                if minimal[-2]["checkedAt"] != previous["checkedAt"]:
-                    minimal.insert(-1, previous)
-                start = (prior[0]["timestamp"] + prior[1]["timestamp"]) / 2
-                end = (previous["timestamp"] + point["timestamp"]) / 2
-                costs = dashboard_cost_usage(minimal, [])[label]
-                for row in _dashboard_key_rows("costUsage", costs[-1:]):
-                    row["costByModelUsd"] = self._range_costs(db, view, account, start, end)
-                    row["totalCostUsd"] = round(sum(row["costByModelUsd"].values()), 8)
-                    row["costPer100PercentUsd"] = round(row["totalCostUsd"] / row["deltaPercent"] * 100, 8)
-                    self._row(db, view, account, f"costUsage:{label}", row, patches)
-            self.index.put(db, key, [previous, point])
+            for row in _dashboard_key_rows("costUsage", costs[label]):
+                row["costByModelUsd"] = self._range_costs(db, view, account, previous["timestamp"], point["timestamp"])
+                row["totalCostUsd"] = round(sum(row["costByModelUsd"].values()), 8)
+                row["costPer100PercentUsd"] = round(row["totalCostUsd"] / row["deltaPercent"] * 100, 8)
+                self._row(db, view, account, f"costUsage:{label}", row, patches)
 
     def _ledger_range(self, db, view, account, start, end):
         if view == "merged":
@@ -301,6 +279,19 @@ class DashboardProjector:
             for row in desired:
                 self._row(db, view, account, "tokenSessions", row, patches)
 
+    def _cost_time(self, db, view, account, changes, patches):
+        from monitor_dashboard import dashboard_cost_time
+        for kind, key, _, _, _ in changes:
+            if kind != "tokenLedger":
+                continue
+            if view == "merged":
+                records = db.execute("SELECT data FROM processing_effective WHERE account=? AND record_key=?", (account, key))
+            else:
+                records = db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' AND account=? AND record_key=?",
+                    (str(self.store.token_ledger_path.resolve()), account, key))
+            for row in dashboard_cost_time([json.loads(record[0]) | {"usageAccountId": account} for record in records]):
+                self._row(db, view, account, "costTime", row, patches)
+
     def _stats(self, db, view, account):
         def count(scope, kind):
             return db.execute("SELECT COALESCE(SUM(count),0) FROM processing_counts WHERE scope=? AND account=? AND kind=?", (scope, account, kind)).fetchone()[0]
@@ -333,6 +324,7 @@ class DashboardProjector:
                 else:
                     self._refresh_cost_intervals(db, view, account, rows, changes[view])
                     self._sessions(db, view, account, rows, accounts, changes[view])
+                    self._cost_time(db, view, account, rows, changes[view])
                     metadata = db.execute("SELECT data FROM processing_projections WHERE view=? AND account=?", (view, account)).fetchone()
                     frame = json.loads(metadata[0]) if metadata else {}
                     frame["historyStats"] = self._stats(db, view, account)
@@ -390,16 +382,17 @@ class DashboardProjector:
             db.execute("PRAGMA query_only=ON")
             db.execute("BEGIN")
             stats = self.stats(db, view)
-            remaining = [4]
+            remaining = [5]
             def release():
                 remaining[0] -= 1
                 if not remaining[0]:
                     db.close()
             return {"quotaPoints": Records(lambda: rows(db, "quotaPoints"), release), "tokenSessions": Records(lambda: rows(db, "tokenSessions"), release),
+                "costTime": Records(lambda: rows(db, "costTime"), release),
                 "costUsage": {label: Records(lambda label=label: rows(db, f"costUsage:{label}"), release) for label in ("fiveHour", "sevenDay")}, "historyStats": stats}
-        result = {"quotaPoints": [], "tokenSessions": [], "costUsage": {label: [] for label in ("fiveHour", "sevenDay")}}
+        result = {"quotaPoints": [], "tokenSessions": [], "costTime": [], "costUsage": {label: [] for label in ("fiveHour", "sevenDay")}}
         with self.index.transaction() as db:
-            for kind in ("quotaPoints", "tokenSessions", "costUsage:fiveHour", "costUsage:sevenDay"):
+            for kind in ("quotaPoints", "tokenSessions", "costTime", "costUsage:fiveHour", "costUsage:sevenDay"):
                 for row in rows(db, kind):
                     (result["costUsage"][kind.split(":", 1)[1]] if kind.startswith("costUsage:") else result[kind]).append(row)
             result["historyStats"] = self.stats(db, view)
