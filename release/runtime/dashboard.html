@@ -179,7 +179,7 @@ const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelect
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
 let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}};
 let pendingStatusRequest=null, statusEtag=null, currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
-let historyScope=null,historyGeneration=null,drawGeneration=0,chunkCacheBytes=0;
+let historyScope=null,displayedScope=null,historyGeneration=null,drawGeneration=0,chunkCacheBytes=0;
 let curveColors=new Map();
 let availableScopeAccounts=new Map();
 let costTimeMode="spending", costTimeFrame=null;
@@ -632,13 +632,7 @@ async function load(force=false){
     historyScope=key;historyGeneration=null;
     if(cached)showScope(key,cached);
     else{
-      drawGeneration++;deferredCharts.clear();
-      payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]},accounts:currentStatus?.accounts,scopedHistory:true};
-      if(costTimeFrame!==null)cancelAnimationFrame(costTimeFrame);costTimeFrame=null;hideTip();
-      for(const id of ["usageTime5h","usageTime7d","scatter5h","scatter7d","costTime"]){const canvas=document.getElementById(id);if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);if(usageTimeChartStates[id]?.frame)cancelAnimationFrame(usageTimeChartStates[id].frame);delete chartStates[id];delete usageTimeChartStates[id];canvas.getContext("2d").clearRect(0,0,canvas.width,canvas.height);canvas.onmousemove=null;document.getElementById(`${id}Legend`).replaceChildren()}
-      document.getElementById("costTimeTotal").textContent="Total: —";document.getElementById("costTimeInterval").textContent="Loading…";
-      for(const id of ["tokenInput","tokenCachedInput","tokenOutput","tokenCacheWrite","tokenCacheHit","tokenCost","tokenSessionCount"])document.getElementById(id).textContent="—";
-      document.getElementById("tokenTimeSpan").hidden=true;
+      drawGeneration++;deferredCharts.clear();hideTip();
       document.getElementById("historyStatus").textContent="Loading selected history…";
     }
   }
@@ -647,9 +641,6 @@ async function load(force=false){
     if(sequence!==seriesLoadSequence)return;
     if(!manifest||manifest.protocolVersion!==4||manifest.view!==scope.view||manifest.range!==scope.range||!Array.isArray(manifest.chunks))throw new Error("Incompatible dashboard scope response");
     if(historyGeneration===manifest.generation)return;
-    payload={...payload,tokenSessions:manifest.tokenSessions||[],rateRows:manifest.rateRows,accountLabels:manifest.accountLabels,maxima:manifest.maxima,accounts:currentStatus?.accounts,scopedHistory:true};
-    updateTokenSummary(accountFilteredEvents(payload.tokenSessions));
-    if(payload.rateRows){updateRate("rate5h",modelFilteredEvents(accountFilteredEvents(payload.rateRows.fiveHour)));updateRate("rate7d",modelFilteredEvents(accountFilteredEvents(payload.rateRows.sevenDay)))}
     document.getElementById("historyStatus").textContent="Loading selected charts…";
     const frames=new Array(manifest.chunks.length);let next=0;
     await Promise.all(Array.from({length:Math.min(4,frames.length)},async()=>{
@@ -685,7 +676,8 @@ function showScope(key,entry){
   if(historyScope!==key)return;
   payload={...entry.value,accounts:currentStatus?.accounts,lastSample:currentStatus?.lastSample,display:currentStatus?.display};historyGeneration=entry.manifest.generation;
   document.getElementById("historyStatus").textContent="";
-  drawAll();
+  drawAll(displayedScope!==null&&displayedScope!==key);
+  displayedScope=key;
 }
 function setupDataView(){
   document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();setupDataView();load(true)}});
@@ -1353,7 +1345,7 @@ function drawCostTimeChart(animate=false){
   costTimeFrame=requestAnimationFrame(step);
 }
 function drawAll(animate=false){
-  if(payload.scopedHistory&&!historyGeneration)return;
+  if(historyScope&&!historyGeneration)return;
   const generation=++drawGeneration;deferredCharts.clear();
   const e=payload.costUsage||{}, fiveInRange=filteredEvents(e.fiveHour||[]), sevenInRange=filteredEvents(e.sevenDay||[]), quotaPoints=payload.quotaPoints||[], quotaInRange=quotaPointsInRange(quotaPoints,quotaTimeDomain(quotaPoints)), tokenSessions=filteredTokenSessions(payload.tokenSessions||[]);
   const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], labels=new Map([...quotaPoints,...fiveInRange,...sevenInRange].map(row=>[usageAccountId(row),row.accountLabel]));

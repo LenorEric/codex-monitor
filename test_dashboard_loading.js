@@ -99,6 +99,56 @@ test("changed scopes download only new chunks and unchanged manifests do not red
     assert.equal(h.run("payload.quotaPoints.length"), 2);
 });
 
+test("scope transitions wait for all chunks and preserve the previous chart state", async () => {
+    const h = harness(), draws = [];
+    let finishChunk;
+    h.context.drawAll = animate => draws.push({ animate, point: h.run("payload.quotaPoints[0]?._key") });
+    h.context.requestDashboard = async scope => ({ payload: scope.chunkId ? frame("old") : manifest("Date", "day", ["old"]) });
+    await h.run("load(true)");
+    h.run("selected='All';chartStates.scatter5h={lineLayer:'previous'};usageTimeChartStates.usageTime5h={labelLayer:'previous'}");
+    h.context.requestDashboard = scope => scope.chunkId ? new Promise(resolve => finishChunk = resolve) :
+        Promise.resolve({ payload: { ...manifest("All", "all", ["new"]), tokenSessions: [{ _key: "new-session" }] } });
+    const pending = h.run("load(true)");
+    await flush();
+    assert.equal(draws.length, 1);
+    assert.equal(h.run("payload.quotaPoints[0]._key"), "old");
+    assert.equal(h.run("payload.tokenSessions.length"), 0);
+    assert.equal(h.run("chartStates.scatter5h.lineLayer"), "previous");
+    assert.equal(h.run("usageTimeChartStates.usageTime5h.labelLayer"), "previous");
+    finishChunk({ payload: frame("new") });
+    await pending;
+    assert.deepEqual(draws, [{ animate: false, point: "old" }, { animate: true, point: "new" }]);
+});
+
+test("cached scope switches animate immediately and unchanged refreshes do not redraw", async () => {
+    const h = harness(), draws = [];
+    h.context.drawAll = animate => draws.push(animate);
+    h.context.requestDashboard = async scope => ({ payload: manifest(scope.range, scope.range) });
+    await h.run("load(true)");
+    h.run("selected='All'");
+    await h.run("load(true)");
+    h.run("selected='Date'");
+    h.context.requestDashboard = async () => ({ notModified: true });
+    await h.run("load(true)");
+    await h.run("load(true)");
+    assert.deepEqual(draws, [false, true, true]);
+});
+
+test("a scope that is still preparing animates on retry once ready", async () => {
+    const h = harness(), draws = [];
+    h.context.drawAll = animate => draws.push(animate);
+    h.context.requestDashboard = async () => ({ payload: manifest("Date", "day") });
+    await h.run("load(true)");
+    h.run("selected='All'");
+    h.context.requestDashboard = async () => { throw Object.assign(new Error("Preparing"), { preparing: true }); };
+    await h.run("load(true)");
+    assert.deepEqual(draws, [false]);
+    assert.equal(h.run("displayedScope"), h.run("new URLSearchParams({view:'merged',range:'Date',start:String(selectedDateBounds().startMs/1000),end:String(selectedDateBounds().endMs/1000)}).toString()"));
+    h.context.requestDashboard = async () => ({ payload: manifest("All", "ready") });
+    await h.run("load(true)");
+    assert.deepEqual(draws, [false, true]);
+});
+
 test("prepared summaries preserve exact model-selected session counts", () => {
     const h = harness();
     h.context.sessions = [{ sessionCount: 3, byModel: { m: { usageTokens: { outputTokens: 10 } } } },

@@ -2,7 +2,7 @@
   "name": "codex-usage-monitor",
   "displayName": "Codex Usage Monitor",
   "description": "Shows Python-backed Codex rate-limit usage in the VS Code status bar and a details view.",
-  "version": "1.5.16",
+  "version": "1.5.17",
   "dataContractVersion": 14,
   "cloudDataContractVersion": 2,
   "publisher": "lenor",
