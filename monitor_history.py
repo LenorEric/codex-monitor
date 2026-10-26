@@ -25,10 +25,6 @@ MAX_PERCENT_ARBITRATION_RESPONSES = 5
 SAMPLE_LOG_COMPACT_RATIO = 0.8
 QUOTA_HISTORY_DISCONTINUITY_SECONDS = 4 * 60 * 60
 JSONL_COPY_CHUNK_BYTES = 1024 * 1024
-DEFAULT_DATA_FILES = (
-    "usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_sessions.jsonl", "usage_monitor_token_ledger.jsonl", "usage_monitor_samples.jsonl",
-    "usage_monitor_quota_readings.jsonl", "usage_monitor_token_events.jsonl", "usage_monitor_diagnostic_samples.jsonl", "usage_monitor_state.json", "usage_monitor_dashboard_cache.json",
-)
 
 def default_history_path(data_home: Path | None = None) -> Path:
     return (Path(data_home) if data_home is not None else codex_switch_home()) / "usage_monitor_history.jsonl"
@@ -74,34 +70,6 @@ def normalize_token_session_row(row: dict) -> dict | None:
         normalized["sync"] = row["sync"]
     return normalized
 
-def migrate_default_monitor_data(legacy_home: Path, data_home: Path | None = None) -> list[str]:
-    data_home = Path(data_home) if data_home is not None else codex_switch_home()
-    data_home.mkdir(parents=True, exist_ok=True)
-    moved = []
-    for name in DEFAULT_DATA_FILES:
-        source, target = Path(legacy_home) / name, data_home / name
-        if not source.exists() or target.exists() or source.resolve() == target.resolve():
-            continue
-        fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-        try:
-            with source.open("rb") as input_stream, os.fdopen(fd, "wb") as output_stream:
-                shutil.copyfileobj(input_stream, output_stream)
-                output_stream.flush()
-                os.fsync(output_stream.fileno())
-            try:
-                os.chmod(temp_name, 0o600)
-            except OSError:
-                pass
-            os.replace(temp_name, target)
-            source.unlink()
-        except Exception:
-            try:
-                os.unlink(temp_name)
-            except OSError:
-                pass
-            raise
-        moved.append(name)
-    return moved
 
 def quota_used_percent(values: dict) -> float | None:
     used = coerce_float(first_value(values, "used_percent", "usedPercent", "utilization"))
@@ -466,11 +434,11 @@ def parse_history_jsonl_rows(text: str) -> list[dict]:
     return rows
 
 def is_grouped_delta_event_row(row: dict) -> bool:
-    return isinstance(row, dict) and row.get("window") in TARGET_WINDOWS and isinstance(row.get("delta") if "delta" in row else row.get("events"), list)
+    return isinstance(row, dict) and row.get("window") in TARGET_WINDOWS and isinstance(row.get("delta"), list)
 
 def expand_grouped_delta_event_row(row: dict) -> list[dict]:
     result = []
-    for item in row.get("delta") if "delta" in row else row.get("events"):
+    for item in row["delta"]:
         if isinstance(item, dict) and isinstance(item.get("models"), list):
             result.extend(expand_model_delta_event(item, row["window"]))
             continue

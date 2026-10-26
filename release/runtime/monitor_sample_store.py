@@ -1,6 +1,6 @@
 """Typed sampled history and transactional ownership. JSON exists only at codec boundaries.
 
-The public SQL views are read compatibility boundaries for processing and sync. Their
+The public SQL views are read interfaces for processing and sync. Their
 JSON columns are computed, never stored. All writes go through this repository.
 """
 
@@ -130,7 +130,7 @@ def insert_sample(db, kind, row):
     if found:
         return found[0], canonical(_attribution(row))
     subtype = row.get("recordType") if isinstance(row, dict) else None
-    known = isinstance(row, dict) and (kind == "quota" or kind == "tokenLedger" and subtype in {"usage", "legacyBaseline"})
+    known = isinstance(row, dict) and (kind == "quota" or kind == "tokenLedger" and subtype in {"usage", "sessionBaseline"})
     children = {"sync"}
     children |= {"windows", "compaction"} if kind == "quota" else {"tokens", "cost"} if subtype == "usage" else {"session", "sourceTotals"}
     event = row.get("checkedAt") or row.get("occurredAt") or ((row.get("session") or {}).get("updatedAt") if isinstance(row.get("session"), dict) else None) if isinstance(row, dict) else None
@@ -244,7 +244,7 @@ def select_sample(db, sample, attribution="{}"):
             for key, fields in (("tokens", TOKENS), ("cost", COSTS)):
                 if isinstance(row.get(key), dict):
                     row[key].update({name: value for name, value in totals.items() if name in fields})
-        elif subtype == "legacyBaseline":
+        elif subtype == "sessionBaseline":
             session = _read_node(db, "baseline_sessions", "sample_id=?", (sample,))
             if session is not None:
                 saved = row["session"]
@@ -389,7 +389,7 @@ def initialize(db):
         "processing_fact_source_key": "source,kind,record_key", "processing_fact_account_key": "account,kind,record_key,source"}.items():
         fields = ','.join(field + '_id' if field in {'source', 'account', 'session'} else field for field in fields.split(','))
         db.execute(f"CREATE INDEX IF NOT EXISTS {name} ON processing_fact_refs({fields})")
-    db.execute("CREATE INDEX IF NOT EXISTS processing_baselines ON processing_fact_refs(source_id,session_id) WHERE subtype='legacyBaseline'")
+    db.execute("CREATE INDEX IF NOT EXISTS processing_baselines ON processing_fact_refs(source_id,session_id) WHERE subtype='sessionBaseline'")
     db.execute("CREATE INDEX IF NOT EXISTS processing_fact_source_session ON processing_fact_refs(source_id,session_id,kind,event_at)")
     db.execute("CREATE INDEX IF NOT EXISTS local_records_period ON local_record_refs(period)")
     db.execute("CREATE INDEX IF NOT EXISTS remote_records_day ON remote_record_refs(device_id,day,part_id)")
@@ -411,62 +411,7 @@ def create_views(db):
 def prepare(db):
     """Initialize fresh stores. Existing legacy stores are converted by migration 14."""
     if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name IN ('processing_facts','local_records','remote_records')").fetchone():
-        db.execute(('CREATE TABLE IF NOT EXISTS processing_facts(source TEXT NOT NULL,position INTEGER NOT NULL,kind TEXT NOT NULL,record_key TEXT NOT NULL,account TEXT NOT NULL,'
-            'session TEXT NOT NULL,event_id TEXT NOT NULL,event_at REAL,data TEXT NOT NULL,PRIMARY KEY(source,position))'))
-        return False
+        raise ValueError("Sample store requires startup data migration")
     initialize(db)
     create_views(db)
     return True
-
-
-def migrate(path, batch_size=256):
-    """One atomic bounded-memory conversion, protected additionally by startup's journal."""
-    with closing(connect(path)) as db, db:
-        old = {name for name, in db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name IN ('processing_facts','local_records','remote_records')")}
-        # Remove old index names before creating their typed replacements. All DDL is
-        # inside the same transaction, so an interruption leaves the old DB intact.
-        db.execute("BEGIN IMMEDIATE")
-        for table in old:
-            for name, in db.execute("SELECT name FROM sqlite_master WHERE type IN ('index','trigger') AND tbl_name=? AND sql IS NOT NULL", (table,)).fetchall():
-                typ = db.execute("SELECT type FROM sqlite_master WHERE name=?", (name,)).fetchone()[0]
-                db.execute(f'DROP {typ} "{name}"')
-        initialize(db)
-        for table in ("processing_facts", "local_records", "remote_records"):
-            if table not in old:
-                continue
-            count = 0
-            cursor = db.execute(f"SELECT * FROM {table}")
-            while batch := cursor.fetchmany(batch_size):
-                for values in batch:
-                    if table == "processing_facts":
-                        put_fact(db, values)
-                        stored = db.execute("SELECT sample_id,attribution FROM processing_fact_refs WHERE source_id=(SELECT id FROM sample_sources WHERE value=?) AND position=?", values[:2]).fetchone()
-                        reconstructed = select_sample(db, *stored)
-                        original = json.loads(values[8])
-                    elif table == "local_records":
-                        original = json.loads(values[3])
-                        put_local(db, *values[:3], original)
-                        stored = db.execute("SELECT sample_id,attribution,record_meta FROM local_record_refs WHERE record_key=?", values[:1]).fetchone()
-                        reconstructed = _record(db, *stored)
-                    else:
-                        original = json.loads(values[5])
-                        put_remote(db, *values[:5], original)
-                        stored = db.execute("SELECT sample_id,attribution FROM remote_record_refs WHERE device_id=(SELECT id FROM sample_devices WHERE value=?) AND record_key=?", (values[0], values[3])).fetchone()
-                        metadata = db.execute(('SELECT record_meta,envelope_meta,schema_version,collection_period,event_at FROM remote_record_refs WHERE device_id=(SELECT id FROM sample_devices WHERE '
-                            'value=?) AND record_key=?'), (values[0], values[3])).fetchone()
-                        reconstructed = _envelope(db, *stored, *metadata, values[0], values[3], values[4])
-                    if canonical(original) != canonical(reconstructed):
-                        raise ValueError(f"Sample round-trip failed: {table} record {count}")
-                    if table != "processing_facts":
-                        record = reconstructed if table == "local_records" else reconstructed["record"]
-                        if hashlib.sha256(canonical(record).encode()).hexdigest() != values[2 if table == "local_records" else 4]:
-                            raise ValueError(f"Sample synchronization hash mismatch: {table} record {count}")
-                    count += 1
-            target = {"processing_facts": "processing_fact_refs", "local_records": "local_record_refs", "remote_records": "remote_record_refs"}[table]
-            if count != db.execute(f"SELECT COUNT(*) FROM {target}").fetchone()[0]:
-                raise ValueError(f"Sample ownership count mismatch: {table}")
-        for table in old:
-            db.execute(f"DROP TABLE {table}")
-        create_views(db)
-        if db.execute("PRAGMA foreign_key_check").fetchone():
-            raise ValueError("Sample ownership foreign key check failed")

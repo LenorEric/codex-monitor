@@ -80,16 +80,6 @@ class RankIndex:
         self.index.put(self.db, f"rankRoot:{self.scope}", None)
 
 
-class IndexedViews(dict):
-    def __init__(self, projector):
-        super().__init__({"local": None, "merged": None})
-        self.projector = projector
-
-    def __getitem__(self, view):
-        return self.projector.snapshot(view)
-
-    def get(self, view, default=None):
-        return self[view] if view in self else default
 
 
 class DashboardProjector:

@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
-import monitor_auto_update
+import monitor_migrations
 import monitor_history
 import monitor_token_ledger
 from monitor_common import empty_cost_totals, empty_token_totals
@@ -39,7 +39,7 @@ class LocalContractV3Tests(unittest.TestCase):
         with workspace_directory() as directory:
             root = Path(directory)
             history, quota, sessions, ledger, samples = (root / name for name in ("history.jsonl", "quota.jsonl", "sessions.jsonl", "ledger.jsonl", "samples.jsonl"))
-            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state = root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
             state.write_text('{"dataContractVersion":1}\n', encoding="utf-8")
             source_tokens = empty_token_totals() | {"inputTokens": 10, "freshInputTokens": 10, "totalTokens": 10, "requests": 1}
             source_cost = empty_cost_totals() | {"inputCostUsd": 0.1, "totalCostUsd": 0.1}
@@ -55,35 +55,35 @@ class LocalContractV3Tests(unittest.TestCase):
             ledger.write_text(json.dumps(partial) + "\n", encoding="utf-8")
             originals = {path: path.read_bytes() for path in (sessions, ledger, state)}
 
-            with self.assertRaisesRegex(monitor_auto_update.AutoUpdateError, "does not cover all historical"):
-                monitor_auto_update.migrate_history_data(root, history, quota, sessions, ledger, samples, 2)
+            with self.assertRaisesRegex(monitor_migrations.MigrationError, "does not cover all historical"):
+                monitor_migrations.migrate_history_data(root, history, quota, sessions, ledger, samples, 2)
 
             self.assertEqual({path: path.read_bytes() for path in originals}, originals)
-            self.assertFalse((root / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).exists())
+            self.assertFalse((root / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).exists())
 
     def test_checkpoint_failure_rolls_back_changed_data_and_retry_succeeds(self):
         with workspace_directory() as directory:
             root = Path(directory)
             history, quota, sessions, ledger, samples = (root / name for name in ("history.jsonl", "quota.jsonl", "sessions.jsonl", "ledger.jsonl", "samples.jsonl"))
-            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state = root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
             state.write_text('{"dataContractVersion":2}\n', encoding="utf-8")
             history.write_text('{"derived":true}\n', encoding="utf-8")
             quota.write_text(json.dumps(quota_row("2026-01-01T00:00:00Z"), indent=2) + "\n", encoding="utf-8")
             ledger.write_text(json.dumps(usage_row(1) | {"pricingId": "old-price"}) + "\n", encoding="utf-8")
             originals = {path: path.read_bytes() for path in (history, quota, ledger, state)}
-            atomic_write = monitor_auto_update._atomic_write
+            atomic_write = monitor_migrations._atomic_write
 
             def fail_checkpoint(path, data):
                 if Path(path) == state:
                     raise OSError("checkpoint failed")
                 return atomic_write(path, data)
 
-            with mock.patch("monitor_auto_update._atomic_write", side_effect=fail_checkpoint), self.assertRaisesRegex(OSError, "checkpoint failed"):
-                monitor_auto_update.migrate_history_data(root, history, quota, sessions, ledger, samples, 3)
+            with mock.patch("monitor_migrations._atomic_write", side_effect=fail_checkpoint), self.assertRaisesRegex(OSError, "checkpoint failed"):
+                monitor_migrations.migrate_history_data(root, history, quota, sessions, ledger, samples, 3)
 
             self.assertEqual({path: path.read_bytes() for path in originals}, originals)
-            self.assertFalse((root / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).exists())
-            self.assertEqual(monitor_auto_update.migrate_history_data(root, history, quota, sessions, ledger, samples, 3), [3])
+            self.assertFalse((root / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).exists())
+            self.assertEqual(monitor_migrations.migrate_history_data(root, history, quota, sessions, ledger, samples, 3), [3])
             self.assertFalse(history.exists())
             self.assertEqual(json.loads(state.read_text(encoding="utf-8"))["dataContractVersion"], 3)
 
@@ -119,7 +119,7 @@ class LocalContractV3Tests(unittest.TestCase):
         with workspace_directory() as directory:
             path = Path(directory) / "ledger.jsonl"
             event = {"eventId": "session:1", "sessionId": "session", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 10, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}}
-            monitor_token_ledger.sync_token_ledger(path, [], [event], "account", "Account", record_provenance=lambda row: row | {"sync": {"version": 1, "originMachineId": "machine", "accountId": "usage-account"}})
+            monitor_token_ledger.sync_token_ledger(path, [event], "account", "Account", record_provenance=lambda row: row | {"sync": {"version": 1, "originMachineId": "machine", "accountId": "usage-account"}})
 
             rows = monitor_token_ledger.load_token_ledger(path)
             self.assertEqual(rows[0]["sync"], {"version": 1, "originMachineId": "machine", "accountId": "usage-account"})
@@ -138,7 +138,7 @@ class LocalContractV3Tests(unittest.TestCase):
             root = Path(directory)
             history, quota, sessions, ledger, samples = (root / name for name in ("old-history.jsonl", "custom-quota.jsonl", "sessions.jsonl", "custom-ledger.jsonl", "samples.jsonl"))
             dashboard_cache, sync_cache = root / "custom-dashboard.json", root / "custom-sync.json"
-            (root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":2}\n', encoding="utf-8")
+            (root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":2}\n', encoding="utf-8")
             history.write_text('{"derived":true}\n', encoding="utf-8")
             dashboard_cache.write_text("{}", encoding="utf-8")
             sync_cache.write_text('{"keep":"sync migration owns this"}', encoding="utf-8")
@@ -147,7 +147,7 @@ class LocalContractV3Tests(unittest.TestCase):
             price = {"schemaVersion": 1, "recordType": "priceEpoch", "pricingId": "old-price", "rates": {}}
             ledger.write_text("\n".join(json.dumps(row) for row in (price, old_usage)) + "\n", encoding="utf-8")
 
-            self.assertEqual(monitor_auto_update.migrate_history_data(root, history, quota, sessions, ledger, samples, 3, dashboard_cache_path=dashboard_cache, usage_sync_cache_path=sync_cache), [3])
+            self.assertEqual(monitor_migrations.migrate_history_data(root, history, quota, sessions, ledger, samples, 3, dashboard_cache_path=dashboard_cache, usage_sync_cache_path=sync_cache), [3])
             migrated = monitor_token_ledger.load_token_ledger(ledger)
             self.assertEqual(len(migrated), 1)
             self.assertEqual(migrated[0]["schemaVersion"], 2)
@@ -160,7 +160,7 @@ class LocalContractV3Tests(unittest.TestCase):
         with workspace_directory() as directory:
             root = Path(directory)
             history, quota, sessions, ledger, samples = (root / name for name in ("history.jsonl", "quota.jsonl", "sessions.jsonl", "ledger.jsonl", "samples.jsonl"))
-            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state = root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
             state.write_text('{"dataContractVersion":2}\n', encoding="utf-8")
             quota.write_text(json.dumps(quota_row("2026-01-01T00:00:00Z")) + "\n", encoding="utf-8")
             backup = root / ".quota.jsonl.backup"
@@ -171,14 +171,14 @@ class LocalContractV3Tests(unittest.TestCase):
                 "runtime_state": root / "usage_monitor_state.json", "dashboard_cache": root / "usage_monitor_dashboard_cache.json",
                 "usage_sync_cache": root / "usage_monitor_sync_cache.json", "cloud_state": root / "cloud-state.json",
             }
-            (root / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).write_text(json.dumps({
+            (root / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).write_text(json.dumps({
                 "version": 3, "existing": ["quota_history"], "backups": {"quota_history": str(backup.resolve())},
                 "targets": {name: str(path.resolve()) for name, path in paths.items()},
             }), encoding="utf-8")
 
-            self.assertEqual(monitor_auto_update.migrate_history_data(root, history, quota, sessions, ledger, samples, 3), [3])
+            self.assertEqual(monitor_migrations.migrate_history_data(root, history, quota, sessions, ledger, samples, 3), [3])
             self.assertEqual(monitor_history.load_quota_history(quota)[0]["checkedAt"], "2026-01-01T00:00:00Z")
-            self.assertFalse((root / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).exists())
+            self.assertFalse((root / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).exists())
 
 
 if __name__ == "__main__":

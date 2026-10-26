@@ -9,7 +9,6 @@ const TOOLTIP_HOVER_DELAY_SECONDS = 3;
 const DASHBOARD_URL = new URL("http://127.0.0.1:8765/");
 const MANAGEMENT_URL = new URL("http://127.0.0.1:8765/manage");
 const STATUS_API_URL = new URL("http://127.0.0.1:8765/api/status");
-const SERIES_API_URL = new URL("http://127.0.0.1:8765/api/series");
 const DASHBOARD_API_URL = new URL("http://127.0.0.1:8765/api/dashboard");
 const ACCOUNT_CREATE_URL = new URL("http://127.0.0.1:8765/api/accounts");
 const ACCOUNT_SWITCH_URL = new URL("http://127.0.0.1:8765/api/accounts/switch");
@@ -63,7 +62,6 @@ class PythonMonitor {
     constructor(statusBar) {
         this.statusBar = statusBar;
         this.pendingStatusRequest = null;
-        this.pendingSeriesRequest = null;
         this.pendingDashboardRequests = new Map();
         this.cachedStatus = null;
         this.statusEtag = null;
@@ -97,22 +95,6 @@ class PythonMonitor {
 
     async getStatus() {
         return (await this.getStatusResponse()).payload;
-    }
-
-    async getSeries(cursor = {}) {
-        if (this.pendingSeriesRequest) return this.pendingSeriesRequest;
-        const url = new URL(SERIES_API_URL);
-        for (const name of ("streamId" in cursor ? ["streamId", "includedIndex", "mergedRevision"] : [])) url.searchParams.set(name, cursor[name]);
-        this.pendingSeriesRequest = requestJson(url).then(payload => {
-            if (payload.mode === "snapshot" && payload.status) {
-                this.cachedStatus = payload.status;
-                this.statusEtag = payload.statusEtag || null;
-            }
-            return payload;
-        }).finally(() => {
-            this.pendingSeriesRequest = null;
-        });
-        return this.pendingSeriesRequest;
     }
 
     async getDashboard(scope, etag) {
@@ -333,13 +315,6 @@ function activate(context) {
                         target.webview.postMessage({ type: "codexUsageStatus", error: error.message || String(error) });
                     }
                     return;
-                }
-                if (message.type === "getCodexUsageSeries") {
-                    try {
-                        target.webview.postMessage({ type: "codexUsageSeries", payload: await monitor.getSeries(message.cursor || {}) });
-                    } catch (error) {
-                        target.webview.postMessage({ type: "codexUsageSeries", error: error.message || String(error) });
-                    }
                 }
             });
             panel.onDidDispose(() => {

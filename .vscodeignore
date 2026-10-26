@@ -26,6 +26,7 @@ incremental-processing-validation.md
 usage-v4-contract.md
 startup-optimization-plan.md
 dashboard-delivery.md
+legacy-format-audit.md
 .test-delivery-*/**
 .test-console-state-*/**
 .dashboard-benchmark-*/**

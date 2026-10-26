@@ -8,8 +8,9 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
+import monitor_migrations
 import monitor_processing
-from monitor_auto_update import _migrate_history_to_v13
+from monitor_migrations import _migrate_history_to_v13
 from monitor_processing import ProcessingIndex
 from monitor_usage_sync import initialize_v4_cache
 
@@ -111,21 +112,20 @@ class SQLiteMaintenanceTests(unittest.TestCase):
             self.assertEqual(db.execute("PRAGMA auto_vacuum").fetchone()[0], 0)
 
     def test_12_to_13_conversion_rolls_back_and_preserves_tables_on_retry(self):
-        import monitor_auto_update
         self.fill()
-        state = self.root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+        state = self.root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
         state.write_text('{"dataContractVersion":12}', encoding="utf-8")
         # Use the configured sync database filename, including any committed WAL data.
         with closing(sqlite3.connect(self.path)) as source, closing(sqlite3.connect(self.root / "sync-v4.sqlite3")) as target:
             source.backup(target)
         def migrate():
-            return monitor_auto_update.migrate_history_data(self.root, self.root / "history", self.root / "quota", self.root / "sessions",
+            return monitor_migrations.migrate_history_data(self.root, self.root / "history", self.root / "quota", self.root / "sessions",
                 self.root / "ledger", self.root / "samples", usage_sync_cache_path=self.root / "sync.json", target_version=13)
-        original = monitor_auto_update.DATA_MIGRATIONS[13]
+        original = monitor_migrations.DATA_MIGRATIONS[13]
         def interrupted(paths):
             original(paths)
             raise RuntimeError("interrupted conversion")
-        with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {13: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted conversion"):
+        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {13: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted conversion"):
             migrate()
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 12)
         with closing(sqlite3.connect(self.root / "sync-v4.sqlite3")) as db:

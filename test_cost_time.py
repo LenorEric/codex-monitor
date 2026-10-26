@@ -2,10 +2,10 @@ import json
 import unittest
 from unittest import mock
 
-import monitor_auto_update
+import monitor_migrations
 import test_delivery
 import test_processing
-from monitor_auto_update import DATA_MIGRATION_STATE_FILENAME, migrate_history_data
+from monitor_migrations import DATA_MIGRATION_STATE_FILENAME, migrate_history_data
 from monitor_dashboard import dashboard_cost_time
 from monitor_delivery import DAY, reduce_cost_time
 from monitor_projection import DashboardProjector
@@ -149,11 +149,11 @@ class CostTimeProcessingTests(unittest.TestCase):
         def migrate(target=10):
             return migrate_history_data(self.root, self.root / "history", self.store.quota_path, self.root / "sessions-old", self.store.token_ledger_path,
                 self.root / "samples", usage_sync_cache_path=cache, target_version=target)
-        migration = monitor_auto_update.DATA_MIGRATIONS[10]
+        migration = monitor_migrations.DATA_MIGRATIONS[10]
         def interrupted(paths):
             migration(paths)
             raise RuntimeError("interrupted")
-        with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {10: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted"):
+        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {10: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted"):
             migrate()
         self.assertEqual(projector.snapshot("local")["costTime"], before)
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 9)

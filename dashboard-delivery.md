@@ -1,6 +1,6 @@
 # Dashboard delivery and startup
 
-Local data contract: 12. Scoped dashboard HTTP protocol: 4. The existing v3 series endpoint remains available for older clients.
+Pending local data contract: 15. Scoped dashboard HTTP protocol: 4. The v3 series endpoint returns 410; the extension and benchmark use scoped manifests and chunks. Projection maintenance deadlines live in SQLite, without a JSON display-cache fallback.
 
 ## Loading order
 
@@ -48,7 +48,7 @@ Day detail reflects retained canonical/exact history. Data already removed by a 
 
 Migration 9 adds delivery indexes and fixes missing session timestamp indexes without rewriting canonical histories or deleting synchronization ownership metadata. The delivery worker builds the new artifacts automatically. Existing migration backup/rollback includes committed SQLite WAL data.
 
-package.json and DATA_CONTRACT_VERSION both declare 12. Runtime packaging includes monitor_delivery.py and propagates the contract into version.json. The implementation does not publish a release or restart an existing monitor automatically.
+package.json and DATA_CONTRACT_VERSION both declare the pending contract 15; released contracts remain immutable. See [the unified-format audit](legacy-format-audit.md) for migration coverage. Runtime packaging includes monitor_delivery.py and propagates the contract into version.json. The implementation does not publish a release or restart an existing monitor automatically.
 
 Startup validates the saved console checkpoint's window and model cumulative totals. Missing totals are rebuilt once from retained local history, and the repaired checkpoint is persisted. Healthy checkpoints avoid this replay.
 

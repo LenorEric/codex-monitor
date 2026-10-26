@@ -9,7 +9,7 @@ from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL
 from monitor_tokens import add_cost_delta, add_token_delta, normalize_codex_model, normalize_saved_token_totals, pricing_epoch_for_model, sum_cost_totals, token_totals_delta
 
 LEDGER_SCHEMA_VERSION = 2
-SUPPORTED_LEDGER_SCHEMA_VERSIONS = {1, LEDGER_SCHEMA_VERSION}
+SUPPORTED_LEDGER_SCHEMA_VERSIONS = {LEDGER_SCHEMA_VERSION}
 TOKEN_KEYS = tuple(empty_token_totals())
 
 def default_token_ledger_path(history_path: Path) -> Path:
@@ -31,7 +31,7 @@ def load_token_ledger(path: Path) -> list[dict]:
             if index == len(lines) - 1 and not content.endswith((b"\n", b"\r")):
                 break
             raise ValueError(f"Invalid token ledger row {index + 1}: {exc}") from exc
-        if not isinstance(row, dict) or row.get("schemaVersion") not in SUPPORTED_LEDGER_SCHEMA_VERSIONS or row.get("recordType") not in {"priceEpoch", "legacyBaseline", "usage"}:
+        if not isinstance(row, dict) or row.get("schemaVersion") not in SUPPORTED_LEDGER_SCHEMA_VERSIONS or row.get("recordType") not in {"sessionBaseline", "usage"}:
             raise ValueError(f"Unsupported token ledger row {index + 1}")
         rows.append(row)
     return rows
@@ -76,7 +76,7 @@ def write_token_ledger(path: Path, rows: list[dict]) -> None:
     try:
         with os.fdopen(descriptor, "wb") as stream:
             for row in rows:
-                if not isinstance(row, dict) or row.get("schemaVersion") not in SUPPORTED_LEDGER_SCHEMA_VERSIONS or row.get("recordType") not in {"priceEpoch", "legacyBaseline", "usage"}:
+                if not isinstance(row, dict) or row.get("schemaVersion") not in SUPPORTED_LEDGER_SCHEMA_VERSIONS or row.get("recordType") not in {"sessionBaseline", "usage"}:
                     raise ValueError("Unsupported token ledger row")
                 stream.write((json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
             stream.flush()
@@ -102,43 +102,43 @@ def _tier_totals(value: dict) -> dict[str, dict]:
     fast = normalize_saved_token_totals(value.get("fastTokens"))
     return {"default": _subtract_tokens(value.get("tokens"), fast), "fast": fast}
 
-def _legacy_baseline(session: dict) -> dict:
-    return {"schemaVersion": LEDGER_SCHEMA_VERSION, "recordType": "legacyBaseline", "session": session}
-
-def _legacy_baselines(sessions: list[dict]) -> list[dict]:
-    return [_legacy_baseline(session) for session in sessions if session.get("sessionId")]
-
-def legacy_baselines_from_sessions(sessions: list[dict]) -> list[dict]:
-    return _legacy_baselines(sessions)
-
 def canonical_token_ledger_rows(rows: list[dict]) -> list[dict]:
-    canonical = []
     for row in rows:
-        if row.get("recordType") == "priceEpoch":
-            continue
-        normalized = {key: value for key, value in row.items() if key not in {"pricingId", "pricingBasis"}} | {"schemaVersion": LEDGER_SCHEMA_VERSION}
-        if normalized.get("recordType") == "legacyBaseline" and isinstance(normalized.get("sourceTotals"), dict):
-            session = normalized.get("session") or {}
-            by_model = session.get("byModel") or {"gpt-5.5": {"tokens": session.get("tokens"), "cost": session.get("cost")}}
-            derived = {model: _tier_totals(value) for model, value in by_model.items() if isinstance(value, dict)}
-            if derived == normalized["sourceTotals"]:
-                normalized.pop("sourceTotals")
-        canonical.append(normalized)
-    return canonical
+        if row.get("schemaVersion") != LEDGER_SCHEMA_VERSION or row.get("recordType") not in {"usage", "sessionBaseline"}:
+            raise ValueError("Token ledger requires data migration")
+        if any(key in row for key in ("pricingId", "pricingBasis")):
+            raise ValueError("Token ledger contains obsolete pricing metadata")
+        if "sourceCoverage" in row:
+            validate_source_coverage(row["sourceCoverage"])
+    return rows
+
+
+def validate_source_coverage(coverage):
+    if not isinstance(coverage, dict):
+        raise ValueError("Invalid token source coverage")
+    for model, tiers in coverage.items():
+        if not isinstance(model, str) or not model or not isinstance(tiers, dict) or not set(tiers).issubset({"default", "fast"}):
+            raise ValueError("Invalid token source coverage")
+        for totals in tiers.values():
+            if not isinstance(totals, dict) or set(totals) != set(TOKEN_KEYS) or any(type(value) is not int or value < 0 for value in totals.values()):
+                raise ValueError("Invalid token source coverage")
+
 
 def _source_highwaters(rows: list[dict]) -> dict[tuple[str, str, str], dict]:
     result = {}
     for row in rows:
-        if row.get("recordType") == "legacyBaseline":
-            session = row.get("session") or {}
+        if row.get("recordType") == "sessionBaseline" or row.get("sourceCoverage"):
+            session = row.get("session") or row
             session_id = str(session.get("sessionId") or "")
-            source_totals = row.get("sourceTotals")
+            source_totals = row.get("sourceCoverage") or row.get("sourceTotals")
             if not isinstance(source_totals, dict):
                 by_model = session.get("byModel") or {"gpt-5.5": {"tokens": session.get("tokens"), "cost": session.get("cost")}}
                 source_totals = {model: _tier_totals(value) for model, value in by_model.items() if isinstance(value, dict)}
             for model, tiers in source_totals.items():
                 for tier, totals in (tiers or {}).items():
-                    result[(session_id, str(model), str(tier))] = normalize_saved_token_totals(totals)
+                    key = (session_id, str(model), str(tier))
+                    value = normalize_saved_token_totals(totals)
+                    result[key] = {name: max(value[name], result.get(key, {}).get(name, 0)) for name in TOKEN_KEYS}
     return result
 
 def _account_for_event(event: dict, account_slot_id: str, account_label: str, account_timeline: list[dict]) -> tuple[str, str]:
@@ -183,7 +183,7 @@ def _empty_session(row: dict) -> dict:
 def token_sessions_from_ledger(rows: list[dict]) -> list[dict]:
     sessions = {}
     for row in rows:
-        if row.get("recordType") == "legacyBaseline" and isinstance(row.get("session"), dict):
+        if row.get("recordType") == "sessionBaseline" and isinstance(row.get("session"), dict):
             session = row["session"]
             sessions[(str(session.get("sessionId")), str(session.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID))] = json.loads(json.dumps(session))
             if (row.get("sync") or {}).get("accountId"):
@@ -216,36 +216,29 @@ def token_cost_snapshot(sessions: list[dict]) -> tuple[dict, dict[str, dict]]:
     return sum_cost_totals(*(session.get("cost") for session in sessions)), by_model
 
 def sync_token_ledger(
-    path: Path, legacy_sessions: list[dict], events: list[dict], account_slot_id: str, account_label: str,
-    account_timeline: list[dict] | None = None, record_provenance=None, source_files=None, legacy_event_ids=None, own_machine_id: str | None = None, on_new_cost=None,
+    path: Path, events: list[dict], account_slot_id: str, account_label: str,
+    account_timeline: list[dict] | None = None, record_provenance=None, source_files=None, own_machine_id: str | None = None, on_new_cost=None,
 ) -> list[dict]:
     rows = load_token_ledger(path)
-    additions = _legacy_baselines(legacy_sessions) if not any(row.get("recordType") in {"legacyBaseline", "usage"} for row in rows) else []
-    combined = rows + additions
-    if record_provenance is not None:
-        additions = [record_provenance(row) for row in additions]
-        combined = rows + additions
     timeline = sorted(account_timeline or [], key=lambda row: parse_timestamp(row.get("checkedAt")) or 0)
-    usages = _usage_records(events, _source_highwaters(combined), account_slot_id, account_label, timeline)
-    source_files, legacy_event_ids = set(source_files or ()), set(legacy_event_ids or ())
+    usages = _usage_records(events, _source_highwaters(rows), account_slot_id, account_label, timeline)
+    source_files = set(source_files or ())
     canonical = {row["eventId"]: row for row in usages if row.get("eventId")}
-    retained, existing, legacy_by_occurrence = [], {}, {}
-    for row in combined:
+    retained, existing = [], {}
+    for row in rows:
         if row.get("recordType") != "usage":
             retained.append(row)
             continue
         event_id = str(row.get("eventId") or "")
         local_origin = own_machine_id is None or not (row.get("sync") or {}).get("originMachineId") or (row.get("sync") or {}).get("originMachineId") == own_machine_id
-        if local_origin and (event_id in canonical or row.get("sourceFile") in source_files or not row.get("sourceFile") and event_id in legacy_event_ids):
+        if local_origin and (event_id in canonical or row.get("sourceFile") in source_files):
             if event_id in canonical:
                 existing[event_id] = row
-            elif not row.get("sourceFile"):
-                legacy_by_occurrence[(row.get("sessionId"), row.get("occurredAt"), row.get("rawModel"))] = row
             continue
         retained.append(row)
     reconciled, new_costs = [], []
     for usage in usages:
-        if (previous := existing.get(usage["eventId"]) or legacy_by_occurrence.get((usage.get("sessionId"), usage.get("occurredAt"), usage.get("rawModel")))) is not None:
+        if (previous := existing.get(usage["eventId"])) is not None:
             if previous.get("accountSlotId") not in {None, "", UNKNOWN_EVENT_ACCOUNT_ID}:
                 usage = usage | {"accountSlotId": previous["accountSlotId"], "accountLabel": previous.get("accountLabel") or usage["accountLabel"]}
             if previous.get("sync") and previous.get("accountSlotId") not in {None, "", UNKNOWN_EVENT_ACCOUNT_ID}:

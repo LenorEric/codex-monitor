@@ -6,8 +6,8 @@ from pathlib import Path
 if sys.version_info < (3, 12):
     raise SystemExit("Codex Usage Monitor requires Python 3.12 or newer.")
 
-from monitor_accounts import migrate_account_vault
-from monitor_auto_update import AUTO_UPDATE_RESTART, check_startup_update, installed_version, migrate_installed_usage_data, restart_process
+from monitor_auto_update import AUTO_UPDATE_RESTART, check_startup_update, installed_version, restart_process
+from monitor_migrations import migrate_installed_data
 from monitor_cloud import CloudManager
 from monitor_common import *
 from monitor_dashboard import *
@@ -17,6 +17,7 @@ from monitor_quota import *
 from monitor_skills import SkillManager
 from monitor_token_ledger import default_token_ledger_path
 from monitor_tokens import *
+from monitor_usage_sync import default_usage_sync_cache_path
 
 
 def _main(instance_lock) -> int:
@@ -49,7 +50,6 @@ def _main(instance_lock) -> int:
         restart_process(Path(sys.argv[0]).resolve())
         return 0
     args.startup_update_checked = True
-    migrate_default_monitor_data(Path(__file__).resolve().parent, args.data_home)
     legacy_history = default_history_path(args.data_home)
     args.quota_history = args.quota_history or default_quota_history_path(legacy_history)
     args.token_ledger = args.token_ledger or default_token_ledger_path(legacy_history)
@@ -57,14 +57,12 @@ def _main(instance_lock) -> int:
     args.usage_sync_cache = default_usage_sync_cache_path(args.quota_history)
     args.state = args.data_home / "usage_monitor_state.json"
     args.dashboard_cache = default_dashboard_cache_path(args.quota_history)
-    migrate_installed_usage_data(
+    migrate_installed_data(
         Path(__file__).resolve().parent, args.data_home, args.quota_history, args.token_ledger, args.sample_log,
         runtime_state_path=args.state, dashboard_cache_path=args.dashboard_cache, usage_sync_cache_path=args.usage_sync_cache,
         codex_home=args.codex_home,
     )
     args.account_root = args.data_home / "accounts"
-    args.legacy_account_root = args.auth.parent / "usage-monitor-accounts"
-    migrate_account_vault(args.legacy_account_root, args.account_root)
     from monitor_processing import ProcessingIndex
     index = ProcessingIndex(args.usage_sync_cache.with_name(f"{args.usage_sync_cache.stem}-v4.sqlite3"))
     if args.repair_processing:

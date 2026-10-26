@@ -91,7 +91,7 @@ def initialize_processing_index(path: Path) -> None:
         db.executescript("""
             CREATE TABLE IF NOT EXISTS processing_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS processing_files (path TEXT PRIMARY KEY, signature TEXT NOT NULL, offset INTEGER NOT NULL);
-            CREATE TABLE IF NOT EXISTS processing_scan_sources (path TEXT PRIMARY KEY, home TEXT NOT NULL, state TEXT NOT NULL, valid INTEGER NOT NULL);
+            CREATE TABLE IF NOT EXISTS processing_scan_sources (path TEXT PRIMARY KEY, home TEXT NOT NULL, state TEXT NOT NULL, valid INTEGER NOT NULL, modified_ns INTEGER NOT NULL DEFAULT 0);
             CREATE INDEX IF NOT EXISTS processing_scan_home ON processing_scan_sources(home);
             CREATE TABLE IF NOT EXISTS processing_scan_events (
                 event_id TEXT PRIMARY KEY, home TEXT NOT NULL, session TEXT NOT NULL, event_at REAL,
@@ -134,8 +134,6 @@ def initialize_processing_index(path: Path) -> None:
             CREATE TABLE IF NOT EXISTS processing_peer_rows(source TEXT NOT NULL,record_key TEXT NOT NULL,position INTEGER NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(source,record_key));
         """)
         db.execute("INSERT OR IGNORE INTO processing_meta VALUES('schemaVersion', ?)", (str(PROCESSING_SCHEMA_VERSION),))
-        if "modified_ns" not in {row[1] for row in db.execute("PRAGMA table_info(processing_scan_sources)")}:
-            db.execute("ALTER TABLE processing_scan_sources ADD COLUMN modified_ns INTEGER NOT NULL DEFAULT 0")
         db.execute("CREATE INDEX IF NOT EXISTS processing_scan_active ON processing_scan_sources(home,modified_ns)")
         db.execute("CREATE TABLE IF NOT EXISTS processing_counts(scope TEXT NOT NULL,account TEXT NOT NULL,kind TEXT NOT NULL,count INTEGER NOT NULL,PRIMARY KEY(scope,account,kind))")
         for table, scope, account, kind in (("facts", "NEW.source", "NEW.account", "NEW.kind"), ("effective", "'effective'", "NEW.account", "'tokenLedger'"),
@@ -283,7 +281,7 @@ class ProcessingIndex:
                 continue
             db.execute("INSERT OR REPLACE INTO processing_changes VALUES(?,?,?,?,?,?,?)", (view, account, kind, record_key(kind, row),
                 parse_timestamp(row.get("checkedAt") or row.get("occurredAt") or session.get("updatedAt")), str(session.get("sessionId") or ""),
-                "replace" if previous or duplicate or row.get("recordType") == "legacyBaseline" else "append"))
+                "replace" if previous or duplicate or row.get("recordType") == "sessionBaseline" else "append"))
         if not source.startswith("peer:"):
             db.execute("INSERT OR REPLACE INTO processing_pending_records VALUES(?,?,?)", (record_key(kind, row), kind, data))
         self.metrics["recordsImported"] += 1
@@ -443,13 +441,13 @@ class ProcessingIndex:
         from monitor_token_ledger import _empty_session, _add_tokens
         from monitor_tokens import normalize_codex_model, sum_cost_totals
         from monitor_common import empty_cost_totals
-        if row.get("recordType") not in {"usage", "legacyBaseline"}:
+        if row.get("recordType") not in {"usage", "sessionBaseline"}:
             return
         value = row.get("session") or row
         key = (source, str(value.get("sessionId") or ""), str(value.get("accountSlotId") or "unknown"))
         previous = db.execute("SELECT data FROM processing_ledger_sessions WHERE source=? AND session=? AND slot=?", key).fetchone()
         session = json.loads(previous[0]) if previous else _empty_session(row)
-        if row.get("recordType") == "legacyBaseline":
+        if row.get("recordType") == "sessionBaseline":
             session = json.loads(encode(value))
             if (row.get("sync") or {}).get("accountId"):
                 session.setdefault("usageAccountId", row["sync"]["accountId"])
@@ -729,9 +727,7 @@ class ProcessingIndex:
             with self.transaction() as db:
                 events = [json.loads(row[1]) for row in self._scan_rows(db)]
                 source_files = [Path(row[0]).name for row in db.execute("SELECT path FROM processing_scan_sources WHERE home=? AND valid=1", (self.home,))]
-                legacy_ids = [f'{json.loads(state)["sessionId"]}:{index}' for state, index in db.execute(
-                    "SELECT s.state,o.event_index FROM processing_scan_sources s JOIN processing_occurrences o ON o.source=s.path WHERE s.home=? AND s.valid=1", (self.home,))]
-            sync_token_ledger(path, [], events, slot, label, timeline, record_provenance=provenance, source_files=source_files, legacy_event_ids=legacy_ids, own_machine_id=machine_id, on_new_cost=getattr(self, "on_new_cost", None))
+                sync_token_ledger(path, events, slot, label, timeline, record_provenance=provenance, source_files=source_files, own_machine_id=machine_id, on_new_cost=getattr(self, "on_new_cost", None))
             self.refresh(path, "tokenLedger", normalize)
             cumulative = {}
             _usage_records(events, _source_highwaters(self.rows(path, "tokenLedger")), slot, label, timeline, cumulative)
@@ -764,7 +760,7 @@ class ProcessingIndex:
                 return self.sync_ledger(path, slot, label, timeline, provenance, normalize, machine_id)
             with self.transaction() as db:
                 baselines = [json.loads(row[0]) for session in sessions for row in db.execute("SELECT data FROM processing_facts WHERE source=? AND session=? "
-                    "AND subtype='legacyBaseline'", (str(Path(path).resolve()), session))]
+                    "AND subtype='sessionBaseline'", (str(Path(path).resolve()), session))]
                 additions, replacements = [], {}
                 for event_id, data, source, index in pending:
                     event = json.loads(data)

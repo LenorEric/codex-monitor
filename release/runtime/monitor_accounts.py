@@ -18,7 +18,7 @@ from pathlib import Path
 import tomlkit
 
 from monitor_common import atomic_write_bytes as _write_atomic_bytes
-from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, auth_account_id, jwt_payload, now_iso as timestamp, parse_timestamp
+from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, codex_switch_home, auth_account_id, jwt_payload, now_iso as timestamp, parse_timestamp
 
 
 LATEST_SESSION_PROVIDER_UPDATE_LIMIT = 200
@@ -64,9 +64,9 @@ def normalize_session_refresh_windows(windows: object) -> list[dict]:
     return [{"start": session_refresh_time_text(start), "end": session_refresh_time_text(end)} for start, end in merged]
 
 
-def normalize_session_refresh(value: object, legacy_enabled: bool = False) -> dict:
+def normalize_session_refresh(value: object) -> dict:
     if value is None:
-        return default_session_refresh(legacy_enabled)
+        return default_session_refresh()
     if not isinstance(value, dict):
         raise AccountError("Session refresh configuration must be an object")
     five_hour, seven_day = value.get("fiveHour"), value.get("sevenDay")
@@ -178,45 +178,16 @@ def auth_fingerprint(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def migrate_account_vault(legacy_root: Path, root: Path) -> bool:
-    legacy_root, root = Path(legacy_root), Path(root)
-    if not legacy_root.exists() or root.exists() or legacy_root.resolve() == root.resolve():
-        return False
-    root.parent.mkdir(parents=True, exist_ok=True)
-    temp_root = root.parent / f".{root.name}.{uuid.uuid4().hex}.tmp"
-    temp_root.mkdir()
-    try:
-        for source in legacy_root.rglob("*"):
-            target = temp_root / source.relative_to(legacy_root)
-            if source.is_dir():
-                target.mkdir(parents=True, exist_ok=True)
-            else:
-                atomic_write_bytes(target, source.read_bytes())
-        for attempt in range(5):
-            try:
-                os.replace(temp_root, root)
-                break
-            except PermissionError:
-                if attempt == 4:
-                    raise
-                time.sleep(0.02 * (attempt + 1))
-        shutil.rmtree(legacy_root)
-        return True
-    except Exception:
-        shutil.rmtree(temp_root, ignore_errors=True)
-        raise
-
-
 def normalized_slot_order(manifest: dict) -> list[str]:
     slots = [account["id"] for account in manifest.get("accounts", [])]
     return list(dict.fromkeys([slot for slot in manifest.get("slotOrder", []) if slot in slots] + slots))
 
 
 class AccountManager:
-    def __init__(self, auth_path: Path, root: Path | None = None, legacy_root: Path | None = None):
+    def __init__(self, auth_path: Path, root: Path | None = None):
         self.auth_path = Path(auth_path)
         self.config_path = self.auth_path.parent / "config.toml"
-        self.root = Path(root) if root is not None else self.auth_path.parent / "usage-monitor-accounts"
+        self.root = Path(root) if root is not None else codex_switch_home() / "accounts"
         self.manifest_path = self.root / "accounts.json"
         self.lock = threading.RLock()
         self._config_fingerprint = None
@@ -225,8 +196,6 @@ class AccountManager:
         self.message = None
         self.cloud = None
         with self.lock:
-            if legacy_root is not None:
-                migrate_account_vault(legacy_root, self.root)
             self.manifest = self._load_or_bootstrap()
             self.reconcile_pending_login()
 
@@ -246,7 +215,7 @@ class AccountManager:
             "identity": identity,
             "accountType": auth_account_type(auth),
             "sessionRefresh": default_session_refresh(),
-            "configHeader": {},
+            "configHeaderToml": "",
             "fingerprint": auth_fingerprint(data) if data is not None else None,
             "cloud": {"accountKey": None, "keyType": None},
         }
@@ -265,21 +234,13 @@ class AccountManager:
                 manifest = json.loads(self.manifest_path.read_text(encoding="utf-8"))
             except (OSError, json.JSONDecodeError) as exc:
                 raise AccountError(f"Cannot read account manifest: {exc}", 500) from exc
-            if not isinstance(manifest, dict) or manifest.get("version") not in {1, 2, 3} or not isinstance(manifest.get("accounts"), list):
+            if not isinstance(manifest, dict) or manifest.get("version") != 3 or not isinstance(manifest.get("accounts"), list):
                 raise AccountError("Unsupported or invalid account manifest", 500)
-            changed = manifest.get("version") in {1, 2}
-            if manifest.get("version") == 1:
-                manifest["version"] = 2
-                for account in manifest["accounts"]:
-                    account["cloud"] = {"accountKey": None, "keyType": None}
-            if manifest.get("version") == 2:
-                manifest["version"] = 3
+            changed = False
             for account in manifest["accounts"]:
-                session_refresh = normalize_session_refresh(account.get("sessionRefresh"), bool(account.get("sessionRefreshEnabled")))
-                if account.get("sessionRefresh") != session_refresh or "sessionRefreshEnabled" in account:
-                    account["sessionRefresh"] = session_refresh
-                    account.pop("sessionRefreshEnabled", None)
-                    changed = True
+                normalize_session_refresh(account["sessionRefresh"])
+                if "sessionRefreshEnabled" in account or "configHeader" in account:
+                    raise AccountError("Account manifest requires data migration", 500)
                 credential_path = self._account_path(str(account.get("id") or ""))
                 if not account.get("ready") or not credential_path.exists():
                     continue
@@ -292,7 +253,6 @@ class AccountManager:
                     account["fingerprint"] = auth_fingerprint(data)
                     changed = True
                 account.setdefault("accountType", (account.get("identity") or {}).get("accountType", "account"))
-                account.setdefault("configHeader", {})
             normalized_activation_history = self._normalized_activation_history(manifest)
             if normalized_activation_history != manifest.get("activationHistory"):
                 manifest["activationHistory"] = normalized_activation_history
@@ -690,7 +650,7 @@ class AccountManager:
             if normalized == current_header:
                 return False
             if is_api:
-                active.update({"configHeaderToml": normalized, "configHeader": {}, "updatedAt": timestamp()})
+                active.update({"configHeaderToml": normalized, "updatedAt": timestamp()})
             else:
                 self.manifest["commonAccountHeaderToml"] = normalized
             self._save_manifest()
@@ -1163,7 +1123,6 @@ class AccountManager:
             common_toml, _ = self._config_editor_parts(header_toml if account is active else self._header_for(active))
             self._validate_config_parts(common_toml, (header_toml,))
             account["configHeaderToml"] = header_toml.strip() + "\n" if header_toml.strip() else ""
-            account["configHeader"] = {}
             account["updatedAt"] = timestamp()
             if account["id"] == self.manifest.get("activeAccountId"):
                 self._write_config(self._compose_toml_parts(common_toml, header_toml))
@@ -1226,7 +1185,6 @@ class AccountManager:
                     "accountType": account.get("accountType") or (account.get("identity") or {}).get("accountType", "account"),
                     "isApiAccount": (account.get("accountType") or (account.get("identity") or {}).get("accountType")) == "api",
                     "sessionRefresh": normalize_session_refresh(account.get("sessionRefresh")),
-                    "configHeader": dict(account.get("configHeader") or {}),
                     "configHeaderToml": account.get("configHeaderToml", ""),
                 })
             active = self._find(active_id)
@@ -1264,7 +1222,6 @@ class AccountManager:
             if identity.get("accountId") or identity.get("idTokenHash"):
                 account["identity"] = identity
             account["accountType"] = account_type
-            account["configHeader"] = dict(state.get("configHeader") or {})
             account["configHeaderToml"] = state.get("configHeaderToml", "")
             account["cloud"] = {"accountKey": state["accountKey"], "keyType": state.get("keyType", "opaque")}
             old_live = self.auth_path.read_bytes() if self.auth_path.exists() else None
@@ -1372,7 +1329,7 @@ class AccountManager:
                 identity = auth_identity(auth)
                 cloud.release_account(
                     account_key, data, {"accountId": identity.get("accountId") or stored_identity.get("accountId"), "email": identity.get("email") or stored_identity.get("email")}, target["label"],
-                    ready=bool(target.get("ready")), key_type=key_type, config_header=target.get("configHeader"), account_type=target.get("accountType", "account"), config_header_toml=target.get("configHeaderToml", ""),
+                    ready=bool(target.get("ready")), key_type=key_type, account_type=target.get("accountType", "account"), config_header_toml=target.get("configHeaderToml", ""),
                 )
             except Exception as exc:
                 cloud.clear_account_transition()
@@ -1399,7 +1356,7 @@ class AccountManager:
             if cloud.find_remote_api_accounts(api_identity_id(identity)):
                 raise AccountError("This API account is already shared", 409)
             account_key = (target.get("cloud") or {}).get("accountKey") or cloud.api_account_key(identity)
-            cloud.release_account(account_key, data, identity, target["label"], ready=bool(target.get("ready")), key_type=(target.get("cloud") or {}).get("keyType") or "api-identity", config_header=target.get("configHeader"), account_type="api", config_header_toml=target.get("configHeaderToml", ""), reject_existing=True)
+            cloud.release_account(account_key, data, identity, target["label"], ready=bool(target.get("ready")), key_type=(target.get("cloud") or {}).get("keyType") or "api-identity", account_type="api", config_header_toml=target.get("configHeaderToml", ""), reject_existing=True)
             target["cloud"] = {"accountKey": account_key, "keyType": (target.get("cloud") or {}).get("keyType") or "api-identity"}
             self._save_manifest()
             return self.status()

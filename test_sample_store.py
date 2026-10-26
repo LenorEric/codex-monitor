@@ -8,7 +8,7 @@ from contextlib import closing
 from pathlib import Path
 from unittest import mock
 
-import monitor_auto_update
+import monitor_migrations
 import monitor_sample_store as samples
 from monitor_processing import ProcessingIndex
 from monitor_usage_sync import content_hash, v4_record_envelope, v4_logical_hash
@@ -36,13 +36,13 @@ class SampleStoreTests(unittest.TestCase):
                 "cost": {name: i * .000000000013 for i, name in enumerate(samples.COSTS)} | {"future": None, "inputTokens": 92}}),
             ("tokenLedger", {"schemaVersion": 2.0, "recordType": "usage", "tokens": {"inputTokens": 0.0, "outputTokens": None, "requests": True},
                 "cost": {"inputCostUsd": 1, "totalCostUsd": -0.0, "outputCostUsd": 2**60 + 1}, "serviceTier": None}),
-            ("tokenLedger", {"schemaVersion": 1, "recordType": "legacyBaseline", "sync": sync,
+            ("tokenLedger", {"schemaVersion": 1, "recordType": "sessionBaseline", "sync": sync,
                 "session": {"sessionId": "session", "accountSlotId": "old", "accountLabel": None, "startedAt": None,
                     "tokens": {"inputTokens": 23}, "cost": {"totalCostUsd": .12345678901234568}, "fastTokens": None,
                     "byModel": {"gpt-5": {"tokens": {"requests": 3}, "cost": {"inputCostUsd": 1.0}, "fastTokens": {"requests": 1}, "future": []},
                         "empty": {"tokens": None, "cost": {}, "fastTokens": {}}, "unknown": None}},
                 "sourceTotals": {"gpt-5": {"fast": {"requests": 7}, "default": {}}, "empty": {}, "unknown": None}}),
-            ("tokenLedger", {"recordType": "legacyBaseline", "session": None, "sourceTotals": None}),
+            ("tokenLedger", {"recordType": "sessionBaseline", "session": None, "sourceTotals": None}),
             ("futureKind", {"payload": [None, 1, 1.0, True], "session": {"accountLabel": "Name"}}),
         ]
 
@@ -104,14 +104,14 @@ class SampleStoreTests(unittest.TestCase):
 
     def test_migration_bounded_verify_rollback_retry_restart_and_unknown_envelopes(self):
         row, record, envelope = self.legacy()
-        with mock.patch.object(samples, "select_sample", side_effect=RuntimeError("interrupted")):
+        with mock.patch.object(__import__("monitor_migration_samples"), "select_sample", side_effect=RuntimeError("interrupted")):
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
-                samples.migrate(self.path, batch_size=1)
+                __import__("monitor_migrations").migrate_sample_store(self.path, batch_size=1)
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(json.loads(db.execute("SELECT data FROM processing_facts").fetchone()[0]), row)
             self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records'").fetchone())
-        samples.migrate(self.path, batch_size=1)
-        samples.migrate(self.path, batch_size=1)
+        __import__("monitor_migrations").migrate_sample_store(self.path, batch_size=1)
+        __import__("monitor_migrations").migrate_sample_store(self.path, batch_size=1)
         with closing(samples.connect(self.path)) as db, db:
             self.assertEqual(json.loads(db.execute("SELECT data FROM processing_facts").fetchone()[0]), row)
             self.assertEqual(json.loads(db.execute("SELECT record_json FROM local_records").fetchone()[0]), record)
@@ -135,14 +135,14 @@ class SampleStoreTests(unittest.TestCase):
         quota.write_bytes(b'authoritative original\n')
         paths = {"processing_index": self.path, "quota_history": quota}
         def interrupted(paths):
-            samples.migrate(paths["processing_index"])
+            __import__("monitor_migrations").migrate_sample_store(paths["processing_index"])
             raise RuntimeError("after conversion")
         with self.assertRaisesRegex(RuntimeError, "after conversion"):
-            monitor_auto_update._run_data_migration(interrupted, paths, 14, state, journal)
+            monitor_migrations._run_data_migration(interrupted, paths, 14, state, journal)
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 13)
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute("SELECT type FROM sqlite_master WHERE name='processing_facts'").fetchone()[0], "table")
-        monitor_auto_update._run_data_migration(monitor_auto_update.DATA_MIGRATIONS[14], paths, 14, state, journal)
+        monitor_migrations._run_data_migration(monitor_migrations.DATA_MIGRATIONS[14], paths, 14, state, journal)
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 14)
         self.assertEqual(quota.read_bytes(), b'authoritative original\n')
         self.assertFalse(journal.exists())
@@ -154,29 +154,29 @@ class SampleStoreTests(unittest.TestCase):
         state.write_text('{"dataContractVersion":13}')
         paths = {"processing_index": self.path}
         def crash(paths):
-            samples.migrate(paths["processing_index"])
+            __import__("monitor_migrations").migrate_sample_store(paths["processing_index"])
             raise SystemExit("simulated power interruption after DB commit")
         with self.assertRaises(SystemExit):
-            monitor_auto_update._run_data_migration(crash, paths, 14, state, journal)
+            monitor_migrations._run_data_migration(crash, paths, 14, state, journal)
         self.assertTrue(journal.exists())
-        monitor_auto_update._recover_data_migration(journal, state, paths)
+        monitor_migrations._recover_data_migration(journal, state, paths)
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(json.loads(db.execute("SELECT data FROM processing_facts").fetchone()[0]), row)
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 13)
-        samples.migrate(self.path)
+        __import__("monitor_migrations").migrate_sample_store(self.path)
 
     def test_hash_mismatch_preserves_original_and_idle_has_no_sample_scan(self):
         self.legacy()
         with closing(sqlite3.connect(self.path)) as db, db:
             db.execute("UPDATE local_records SET content_hash='damaged'")
         with self.assertRaisesRegex(ValueError, "synchronization hash mismatch"):
-            samples.migrate(self.path)
+            __import__("monitor_migrations").migrate_sample_store(self.path)
         with closing(sqlite3.connect(self.path)) as db, db:
             self.assertEqual(db.execute("SELECT type FROM sqlite_master WHERE name='processing_facts'").fetchone()[0], "table")
         other = ProcessingIndex(self.root / "idle.sqlite3")
         with other.transaction() as db:
             samples.put_fact(db, ("source", 0, "quota", "key", "account", "", "", 0, '{}'))
-        with mock.patch.object(samples, "select_sample", side_effect=AssertionError("idle payload read")):
+        with mock.patch.object(__import__("monitor_migration_samples"), "select_sample", side_effect=AssertionError("idle payload read")):
             with other.transaction() as db:
                 self.assertEqual(db.execute("SELECT 1 FROM processing_facts LIMIT 1").fetchone()[0], 1)
                 self.assertEqual(db.execute("SELECT count(*) FROM sample_releases").fetchone()[0], 0)

@@ -24,8 +24,6 @@ MAX_SYNC_RECORD_BYTES = 256 * 1024
 MAX_SYNC_STRING_LENGTH = 4096
 MAX_SYNC_COLLECTION_ITEMS = 4096
 MAX_SYNC_NESTING_DEPTH = 12
-CACHE_VERSION = 3
-CACHE_LAYOUT = "origin-pack-shards-v1"
 
 
 def canonical_json(value) -> bytes:
@@ -51,7 +49,7 @@ def is_cost_interval_row(row: dict) -> bool:
 
 
 def record_account_key(row: dict) -> str:
-    return str(sync_meta(row).get("accountId") or f"local:{sync_meta(row).get('originMachineId') or 'legacy'}:{row.get('accountSlotId') or 'unknown'}")
+    return str(sync_meta(row).get("accountId") or f"local:{sync_meta(row).get('originMachineId') or 'unknown'}:{row.get('accountSlotId') or 'unknown'}")
 
 
 def record_key(kind: str, row: dict) -> str:
@@ -60,7 +58,7 @@ def record_key(kind: str, row: dict) -> str:
         if row.get("recordType") == "usage":
             return f"tokenLedger:usage:{record_account_key(row)}:{row.get('eventId')}"
         session = row.get("session") or {}
-        return f"tokenLedger:legacyBaseline:{record_account_key(row)}:{session.get('sessionId')}"
+        return f"tokenLedger:sessionBaseline:{record_account_key(row)}:{session.get('sessionId')}"
     if meta.get("recordId"):
         return f"{kind}:{meta['recordId']}"
     return f"{kind}:{content_hash(row)}"
@@ -96,13 +94,16 @@ def _validate_sync_value(value, depth: int = 0) -> None:
 
 
 def _validate_token_ledger_row(row: dict) -> None:
-    if row.get("schemaVersion") not in {1, 2}:
+    if row.get("schemaVersion") != 2:
         raise ValueError("Invalid synchronized token ledger schema")
     meta = sync_meta(row)
-    if meta.get("version") != 1 or not isinstance(meta.get("originMachineId"), str) or not meta["originMachineId"] or not isinstance(meta.get("accountId"), str) or not meta["accountId"]:
+    if meta.get("version") != 1 or not isinstance(meta.get("originMachineId"), str) or not meta["originMachineId"] or not isinstance(meta.get("accountId"), str) or not meta["accountId"].startswith("v3:"):
         raise ValueError("Invalid synchronized token ledger provenance")
     if meta.get("localOnly") not in {None, False}:
         raise ValueError("Local-only token ledger records cannot be synchronized")
+    if "sourceCoverage" in row:
+        from monitor_token_ledger import validate_source_coverage
+        validate_source_coverage(row["sourceCoverage"])
     if row.get("recordType") == "usage":
         if (
             not isinstance(row.get("eventId"), str) or not row["eventId"] or not isinstance(row.get("sessionId"), str) or not row["sessionId"] or parse_timestamp(row.get("occurredAt")) is None
@@ -111,7 +112,7 @@ def _validate_token_ledger_row(row: dict) -> None:
             raise ValueError("Invalid synchronized token usage record")
         _validate_totals(row.get("tokens"), empty_token_totals(), integral=True, label="token")
         _validate_totals(row.get("cost"), empty_cost_totals(), integral=False, label="cost")
-    elif row.get("recordType") == "legacyBaseline":
+    elif row.get("recordType") == "sessionBaseline":
         session = row.get("session")
         if not isinstance(session, dict) or not isinstance(session.get("sessionId"), str) or not session["sessionId"]:
             raise ValueError("Invalid synchronized token baseline record")
@@ -142,7 +143,7 @@ def _validate_quota_row(row: dict) -> None:
     meta, windows = sync_meta(row), row.get("windows")
     if parse_timestamp(row.get("checkedAt")) is None or not isinstance(windows, dict) or not windows or not set(windows).issubset({"5h", "7d"}):
         raise ValueError("Invalid synchronized quota record")
-    if meta.get("version") != 1 or not all(isinstance(meta.get(key), str) and meta[key] for key in ("originMachineId", "accountId", "recordId")) or meta.get("localOnly") not in {None, False}:
+    if meta.get("version") != 1 or (not all(isinstance(meta.get(key), str) and meta[key] for key in ("originMachineId", "accountId", "recordId")) or not meta["accountId"].startswith("v3:")) or meta.get("localOnly") not in {None, False}:
         raise ValueError("Invalid synchronized quota provenance")
     for window in windows.values():
         used = window.get("usedPercent") if isinstance(window, dict) else None
@@ -188,7 +189,7 @@ def add_record_provenance(kind: str, row: dict, machine_id: str, account_id: str
     elif kind == "tokenLedger" and row.get("recordType") == "usage":
         identity = f"tokenLedger:usage:{account_id}:{row.get('eventId')}"
     elif kind == "tokenLedger":
-        identity = f"tokenLedger:legacyBaseline:{account_id}:{(row.get('session') or {}).get('sessionId')}"
+        identity = f"tokenLedger:sessionBaseline:{account_id}:{(row.get('session') or {}).get('sessionId')}"
     else:
         raise ValueError(f"Unsupported synchronized usage kind: {kind}")
     meta = {"version": 1, "originMachineId": machine_id, "accountId": account_id}
@@ -221,30 +222,22 @@ def _ledger_identity(row: dict) -> tuple | None:
     if record_type == "usage" and row.get("eventId"):
         return record_type, record_account_key(row), str(row["eventId"])
     session = row.get("session") or {}
-    if record_type == "legacyBaseline" and session.get("sessionId"):
+    if record_type == "sessionBaseline" and session.get("sessionId"):
         return record_type, record_account_key(row), str(session["sessionId"])
     return None
 
 
 def _ledger_content(row: dict) -> dict:
     value = {key: item for key, item in row.items() if key not in {"accountSlotId", "accountLabel", SYNC_META_KEY}}
-    if row.get("recordType") == "legacyBaseline" and isinstance(value.get("session"), dict):
+    if row.get("recordType") == "sessionBaseline" and isinstance(value.get("session"), dict):
         value["session"] = {key: item for key, item in value["session"].items() if key not in {"accountSlotId", "accountLabel", SYNC_META_KEY}}
     return value
 
 
-def canonical_ledger_row(row: dict, preserve_legacy_highwater: bool = False) -> dict | None:
-    if row.get("recordType") == "priceEpoch":
-        return None
-    if preserve_legacy_highwater:
-        from monitor_token_ledger import canonical_token_ledger_rows
-        output = canonical_token_ledger_rows([row])[0]
-    else:
-        output = {key: value for key, value in row.items() if key not in {"pricingId", "pricingBasis", "sourceTotals"}} | {"schemaVersion": 2}
-    meta = sync_meta(output)
-    if meta:
-        output[SYNC_META_KEY] = {key: value for key, value in meta.items() if key not in {"recordId", "localOnly"} or key == "localOnly" and value}
-    return output
+def canonical_ledger_row(row: dict, preserve_highwater: bool = False) -> dict:
+    from monitor_token_ledger import canonical_token_ledger_rows
+    canonical_token_ledger_rows([row])
+    return row if preserve_highwater else {key: value for key, value in row.items() if key != "sourceTotals"}
 
 
 def merge_token_ledger_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -262,7 +255,7 @@ def merge_token_ledger_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     def sort_key(row: dict) -> tuple:
         if row.get("recordType") == "usage":
             return 2, parse_timestamp(row.get("occurredAt")) or 0, str(row.get("eventId") or "")
-        if row.get("recordType") == "legacyBaseline":
+        if row.get("recordType") == "sessionBaseline":
             return 1, 0, str((row.get("session") or {}).get("sessionId") or "")
         return 0, 0, ""
     return sorted(merged.values(), key=sort_key), conflicts
@@ -278,7 +271,7 @@ def quota_sync_boundary_rows(rows: list[dict], machine_id: str) -> list[dict]:
 def _cycle_key(row: dict) -> tuple:
     meta = sync_meta(row)
     reset_at = parse_timestamp(row.get("resetAt"))
-    return record_account_key(row), row.get("window"), row.get("plan") or "unknown", coerce_float(row.get("planMultiplier")) or 1.0, reset_at, None if reset_at is not None else meta.get("originMachineId") or "legacy"
+    return record_account_key(row), row.get("window"), row.get("plan") or "unknown", coerce_float(row.get("planMultiplier")) or 1.0, reset_at, None if reset_at is not None else meta.get("originMachineId") or "unknown"
 
 
 def _normalized_cost_interval(row: dict, index: int) -> dict | None:
@@ -383,37 +376,28 @@ def active_records(quota: list[dict], ledger: list[dict], machine_id: str, accou
         if syncable_record("quota", row, machine_id):
             records[record_key("quota", row)] = {"kind": "quota", "row": {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}}
     for source in ledger:
-        legacy_schema = source.get("schemaVersion") == 1
         if (source := canonical_ledger_row(source)) is None:
             continue
         session = source.get("session") or {}
         account_id = account_id_resolver(source.get("accountSlotId") or session.get("accountSlotId"))
-        if legacy_schema and sync_meta(source).get("accountId") != account_id:
-            source = {key: value for key, value in source.items() if key != SYNC_META_KEY}
         row = add_record_provenance("tokenLedger", source, machine_id, account_id)
         if not syncable_record("tokenLedger", row, machine_id):
             continue
         transport = {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}
-        if source.get("recordType") == "legacyBaseline" and isinstance(transport.get("session"), dict):
+        if source.get("recordType") == "sessionBaseline" and isinstance(transport.get("session"), dict):
             transport["session"] = {key: value for key, value in transport["session"].items() if key not in {"accountSlotId", "accountLabel"}}
         records[record_key("tokenLedger", row)] = {"kind": "tokenLedger", "row": transport}
     return records
 
 
 def initialize_v4_cache(path: Path) -> None:
-    """Create the local v4 index without altering the original history or legacy cache."""
+    """Create the local v4 index without altering canonical histories."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(samples.connect(path)) as db, db:
         db.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        normalized = samples.prepare(db)
-        if not normalized:
-            db.execute("CREATE TABLE IF NOT EXISTS local_records (record_key TEXT PRIMARY KEY, period TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL)")
-            db.execute("CREATE INDEX IF NOT EXISTS local_records_period ON local_records(period)")
+        samples.prepare(db)
         db.execute("CREATE TABLE IF NOT EXISTS remote_days (machine_id TEXT NOT NULL, day TEXT NOT NULL, logical_hash TEXT NOT NULL, layout_json TEXT NOT NULL, PRIMARY KEY(machine_id, day))")
-        if not normalized:
-            db.execute("CREATE TABLE IF NOT EXISTS remote_records (machine_id TEXT NOT NULL, day TEXT NOT NULL, part_id TEXT NOT NULL, record_key TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL, PRIMARY KEY(machine_id, record_key))")
-            db.execute("CREATE INDEX IF NOT EXISTS remote_records_day ON remote_records(machine_id, day, part_id)")
         db.execute("CREATE TABLE IF NOT EXISTS remote_origins (machine_id TEXT PRIMARY KEY)")
         db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
 
@@ -458,11 +442,9 @@ class UsageDataStore:
         self.machine_id, self.account_id_resolver, self.lock, self.account_mapper = machine_id, account_id_resolver, lock, account_mapper
         self.account_revision_resolver = account_revision_resolver
         self.conflicts = []
-        self.needs_remote_rebuild = not self.cache_path.exists()
         self._local_datasets_cache = None
         self._merged_datasets_cache = None
         self._account_revision = None
-        self._cache_repair_needed = False
         self._v4_source_stats = None
         from monitor_processing import ProcessingIndex
         initialize_v4_cache(self.v4_cache_path)
@@ -471,13 +453,21 @@ class UsageDataStore:
     def normalize_new_quota(self, row):
         from monitor_history import normalize_quota_history_row
         row = normalize_quota_history_row(row)
-        return add_record_provenance("quota", row, self.machine_id, self.account_id_resolver(row.get("accountSlotId"))) if row is not None else None
+        if row is None:
+            return None
+        row = add_record_provenance("quota", row, self.machine_id, self.account_id_resolver(row.get("accountSlotId")))
+        if not str(sync_meta(row).get("accountId")).startswith("v3:"):
+            raise ValueError("Quota identity requires data migration")
+        return row
 
     def normalize_new_ledger(self, row):
-        if (row := canonical_ledger_row(row, preserve_legacy_highwater=True)) is None:
+        if (row := canonical_ledger_row(row, preserve_highwater=True)) is None:
             return None
         source = row.get("session") or row
-        return add_record_provenance("tokenLedger", row, self.machine_id, self.account_id_resolver(source.get("accountSlotId")))
+        row = add_record_provenance("tokenLedger", row, self.machine_id, self.account_id_resolver(source.get("accountSlotId")))
+        if not str(sync_meta(row).get("accountId")).startswith("v3:"):
+            raise ValueError("Ledger identity requires data migration")
+        return row
 
     def ingest_local(self):
         with self.lock:
@@ -526,11 +516,6 @@ class UsageDataStore:
             revision = [manifest[0] if manifest else None, self.account_revision_resolver() if self.account_revision_resolver else None]
             if not force and self.index.get(db, f"peerRevision:{source}", "uninitialized") == revision:
                 return
-            legacy = f"peer:{machine_id}:legacy"
-            for (account,) in list(db.execute("SELECT DISTINCT account FROM processing_facts WHERE source=?", (legacy,))):
-                self.index.dirty(db, account, "peer update", ("merged",))
-            legacy_keys = [row[0] for row in db.execute("SELECT record_key FROM processing_facts WHERE source=? AND kind='tokenLedger'", (legacy,))]
-            db.execute("DELETE FROM processing_facts WHERE source=?", (legacy,))
             previous_revision = self.index.get(db, f"peerRevision:{source}")
             remap = force or previous_revision is None or previous_revision[1] != revision[1]
             def remove(position):
@@ -558,10 +543,7 @@ class UsageDataStore:
                 db.execute("INSERT OR REPLACE INTO processing_peer_rows VALUES(?,?,?,?)", (source, key, target, digest))
                 if not previous:
                     position += 1
-            for key in legacy_keys:
-                self.index._effective(db, key)
             db.execute("DELETE FROM processing_ledger_sessions WHERE source=?", (source,))
-            db.execute("DELETE FROM processing_ledger_sessions WHERE source=?", (legacy,))
             self.index.put(db, f"peerRevision:{source}", revision)
             self.index.put(db, "factRevision", self.index.get(db, "factRevision", 0) + 1)
         self._merged_datasets_cache = None
@@ -574,15 +556,7 @@ class UsageDataStore:
         for machine_id, day in peers:
             self.refresh_peer_partition(machine_id, day)
         if not initialized:
-            # Preserve provisional legacy peers until their v4 origin becomes authoritative.
-            cache, _ = self._load_cache()
             with self.index.transaction() as db:
-                origins = {row[0] for row in db.execute("SELECT machine_id FROM remote_origins")}
-                for position, entry in enumerate(cache.values()):
-                    record = entry["record"]
-                    if entry["sourceMachineId"] not in origins and entry["sourceMachineId"] != self.machine_id and record["kind"] in {"quota", "tokenLedger"}:
-                        if (row := self._map_account(record["kind"], record["row"])) is not None:
-                            self.index.fact(db, f'peer:{entry["sourceMachineId"]}:legacy', position, record["kind"], row)
                 self.index.put(db, "peersInitialized", True)
 
     def initialize_v4_index(self, now=None):
@@ -684,7 +658,7 @@ class UsageDataStore:
                             for key, record in active_records(rows, [], self.machine_id, self.account_id_resolver, False).items():
                                 validate_sync_operation({"action": "upsert", "key": key, "record": record})
                             local = self._local_datasets_cache[0] + rows, self._local_datasets_cache[1]
-                            self._materialize_datasets(local, self._load_cache()[0])
+                            self._materialize_datasets(local)
                             self._v4_source_stats = quota_stat, ledger_stat
                             return local
                     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
@@ -698,160 +672,9 @@ class UsageDataStore:
         from monitor_token_ledger import load_token_ledger
         return load_quota_history(self.quota_path), load_token_ledger(self.token_ledger_path)
 
-    def _load_cache(self) -> tuple[dict[tuple[str, str], dict], dict[str, dict[str, str]]]:
-        try:
-            payload = json.loads(self.cache_path.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {}, {}
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-            raise ValueError(f"Cannot read synchronized usage cache: {exc}") from exc
-        if not isinstance(payload, dict) or payload.get("version") not in {1, 2, CACHE_VERSION}:
-            raise ValueError("Unsupported or invalid synchronized usage cache")
-        if payload.get("layout") == CACHE_LAYOUT:
-            return self._load_sharded_cache(payload)
-        if not isinstance(payload.get("records"), list):
-            raise ValueError("Unsupported or invalid synchronized usage cache")
-        legacy_cache = payload.get("version") != CACHE_VERSION
-        if not legacy_cache:
-            self._cache_repair_needed = True
-        if legacy_cache:
-            self.needs_remote_rebuild = True
-            self._cache_repair_needed = True
-        raw_packs = payload.get("packs", {}) if payload.get("version") == CACHE_VERSION else {}
-        if not isinstance(raw_packs, dict):
-            raise ValueError("Invalid synchronized usage pack inventory")
-        packs = {}
-        for machine_id, inventory in raw_packs.items():
-            if not isinstance(machine_id, str) or not machine_id or not isinstance(inventory, dict):
-                raise ValueError("Invalid synchronized usage pack inventory")
-            packs[machine_id] = {}
-            for pack_id, pack_hash in inventory.items():
-                if not isinstance(pack_id, str) or not pack_id or len(pack_id) > 128 or not isinstance(pack_hash, str) or len(pack_hash) != 64 or any(character not in "0123456789abcdef" for character in pack_hash):
-                    raise ValueError("Invalid synchronized usage pack hash")
-                packs[machine_id][pack_id] = pack_hash
-        records, observed_packs = {}, set()
-        for entry in payload["records"]:
-            if not isinstance(entry, dict) or not isinstance(entry.get("sourceMachineId"), str) or not entry["sourceMachineId"] or not isinstance(entry.get("key"), str):
-                raise ValueError("Invalid synchronized usage cache entry")
-            if legacy_cache and (entry.get("record") or {}).get("kind") != "quota":
-                continue
-            validate_sync_operation({"action": "upsert", "key": entry["key"], "record": entry.get("record")})
-            if sync_meta(entry["record"]["row"]).get("originMachineId") != entry["sourceMachineId"]:
-                raise ValueError("Synchronized usage cache origin does not match its record")
-            pack_id, pack_hash = entry.get("sourcePackId"), entry.get("sourcePackHash")
-            if (pack_id is None) != (pack_hash is None) or pack_id is not None and packs.get(entry["sourceMachineId"], {}).get(pack_id) != pack_hash:
-                self.needs_remote_rebuild = True
-                self._cache_repair_needed = True
-                continue
-            if pack_id is not None:
-                observed_packs.add((entry["sourceMachineId"], pack_id))
-            records[(entry["sourceMachineId"], entry["key"])] = entry
-        for machine_id, inventory in list(packs.items()):
-            missing = set(inventory) - {pack_id for source, pack_id in observed_packs if source == machine_id}
-            if missing:
-                self.needs_remote_rebuild = True
-                self._cache_repair_needed = True
-                for pack_id in missing:
-                    inventory.pop(pack_id)
-            if not inventory:
-                packs.pop(machine_id)
-        return records, packs
-
-    @property
-    def _cache_shard_path(self) -> Path:
-        return self.cache_path.with_name(f"{self.cache_path.name}.d")
-
     @staticmethod
     def _atomic_write(path: Path, data: bytes) -> None:
         _write_atomic_bytes(path, data)
-
-    def _load_sharded_cache(self, payload: dict) -> tuple[dict[tuple[str, str], dict], dict[str, dict[str, str]]]:
-        origins = payload.get("origins")
-        if not isinstance(origins, dict):
-            raise ValueError("Invalid synchronized usage shard inventory")
-        records, packs = {}, {}
-        for machine_id, origin in origins.items():
-            if not isinstance(machine_id, str) or not machine_id or not isinstance(origin, dict) or not isinstance(origin.get("shards"), dict):
-                raise ValueError("Invalid synchronized usage shard inventory")
-            origin_records, origin_packs, valid = {}, {}, True
-            for shard_id, descriptor in origin["shards"].items():
-                if (
-                    not isinstance(shard_id, str) or not isinstance(descriptor, dict) or not isinstance(descriptor.get("file"), str) or Path(descriptor["file"]).name != descriptor["file"]
-                    or not isinstance(descriptor.get("contentHash"), str) or len(descriptor["contentHash"]) != 64 or any(character not in "0123456789abcdef" for character in descriptor["contentHash"])
-                    or isinstance(descriptor.get("recordCount"), bool) or not isinstance(descriptor.get("recordCount"), int) or descriptor["recordCount"] < 0
-                ):
-                    raise ValueError("Invalid synchronized usage shard descriptor")
-                try:
-                    data = (self._cache_shard_path / descriptor["file"]).read_bytes()
-                    entries = json.loads(data)
-                except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-                    valid = False
-                    break
-                if not isinstance(entries, list) or content_hash(entries) != descriptor["contentHash"] or len(entries) != descriptor["recordCount"]:
-                    valid = False
-                    break
-                pack_id = None if shard_id == "loose" else shard_id
-                if pack_id is not None:
-                    pack_hash = descriptor.get("packHash")
-                    if not isinstance(pack_hash, str) or len(pack_hash) != 64 or any(character not in "0123456789abcdef" for character in pack_hash):
-                        raise ValueError("Invalid synchronized usage pack hash")
-                    origin_packs[pack_id] = pack_hash
-                for entry in entries:
-                    if (
-                        not isinstance(entry, dict) or entry.get("sourceMachineId") != machine_id or entry.get("sourcePackId") != pack_id or not isinstance(entry.get("key"), str)
-                        or pack_id is not None and entry.get("sourcePackHash") != origin_packs[pack_id]
-                    ):
-                        valid = False
-                        break
-                    validate_sync_operation({"action": "upsert", "key": entry["key"], "record": entry.get("record")})
-                    if sync_meta(entry["record"]["row"]).get("originMachineId") != machine_id:
-                        valid = False
-                        break
-                    origin_records[(machine_id, entry["key"])] = entry
-                if not valid:
-                    break
-            if not valid:
-                self.needs_remote_rebuild = True
-                self._cache_repair_needed = True
-                continue
-            records.update(origin_records)
-            if origin_packs:
-                packs[machine_id] = origin_packs
-        return records, packs
-
-    def _store_cache(self, records: dict[tuple[str, str], dict], packs: dict[str, dict[str, str]]) -> None:
-        origins, referenced = {}, set()
-        for machine_id in sorted({key[0] for key in records} | set(packs)):
-            shards = {}
-            grouped = {pack_id: [] for pack_id in packs.get(machine_id, {})}
-            for (source, _), entry in records.items():
-                if source == machine_id:
-                    grouped.setdefault(entry.get("sourcePackId") or "loose", []).append(entry)
-            for shard_id, entries in sorted(grouped.items()):
-                entries.sort(key=lambda entry: entry["key"])
-                if shard_id != "loose" and shard_id not in packs.get(machine_id, {}):
-                    continue
-                digest = content_hash(entries)
-                filename = f"{hashlib.sha256(machine_id.encode()).hexdigest()[:16]}-{hashlib.sha256(shard_id.encode()).hexdigest()[:16]}-{digest}.json"
-                shard_path = self._cache_shard_path / filename
-                if not shard_path.exists():
-                    self._atomic_write(shard_path, canonical_json(entries) + b"\n")
-                referenced.add(filename)
-                descriptor = {"file": filename, "contentHash": digest, "recordCount": len(entries)}
-                if shard_id != "loose":
-                    descriptor["packHash"] = packs[machine_id][shard_id]
-                shards[shard_id] = descriptor
-            if shards:
-                origins[machine_id] = {"shards": shards}
-        self._atomic_write(self.cache_path, canonical_json({"version": CACHE_VERSION, "layout": CACHE_LAYOUT, "origins": origins}) + b"\n")
-        if self._cache_shard_path.exists():
-            for path in self._cache_shard_path.iterdir():
-                if path.is_file() and path.name not in referenced:
-                    try:
-                        path.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-        self._cache_repair_needed = False
 
     def _map_account(self, kind: str, row: dict) -> dict | None:
         account_id = sync_meta(row).get("accountId")
@@ -862,25 +685,22 @@ class UsageDataStore:
         if mapped is None:
             return None
         slot_id, label = mapped
-        projected = row
         if not str(account_id).startswith("v3:"):
-            projected = row | {SYNC_META_KEY: sync_meta(row) | {"accountId": self.account_id_resolver(slot_id)}}
-        if kind == "tokenLedger" and row.get("recordType") == "legacyBaseline":
+            raise ValueError("Account identity requires data migration")
+        projected = row
+        if kind == "tokenLedger" and row.get("recordType") == "sessionBaseline":
             return projected | {"session": source | {"accountSlotId": slot_id, "accountLabel": label}}
         return projected | {"accountSlotId": slot_id, "accountLabel": label}
 
-    def _materialize_datasets(self, local: tuple[list[dict], list[dict]], cache: dict[tuple[str, str], dict]) -> None:
-        v4_records, v4_origins = self._v4_remote_cache()
-        mapped = [(record["kind"], row) for entry in [*(entry for entry in cache.values() if entry.get("sourceMachineId") not in v4_origins), *v4_records] if entry.get("sourceMachineId") != self.machine_id and (record := entry["record"]) and record.get("kind") in {"quota", "tokenLedger"} and (row := self._map_account(record["kind"], record["row"])) is not None]
+    def _materialize_datasets(self, local: tuple[list[dict], list[dict]]) -> None:
+        v4_records, _ = self._v4_remote_cache()
+        mapped = [(record["kind"], row) for entry in v4_records if entry.get("sourceMachineId") != self.machine_id and (record := entry["record"]) and record.get("kind") in {"quota", "tokenLedger"} and (row := self._map_account(record["kind"], record["row"])) is not None]
         local_ledger = []
         for source in local[1]:
-            legacy_schema = source.get("schemaVersion") == 1
             if (row := canonical_ledger_row(source)) is None:
                 continue
             session = row.get("session") or {}
             account_id = self.account_id_resolver(row.get("accountSlotId") or session.get("accountSlotId"))
-            if legacy_schema and sync_meta(row).get("accountId") != account_id:
-                row = {key: value for key, value in row.items() if key != SYNC_META_KEY}
             local_ledger.append(add_record_provenance("tokenLedger", row, self.machine_id, account_id))
         ledger, self.conflicts = merge_token_ledger_rows(local_ledger + [row for kind, row in mapped if kind == "tokenLedger"])
         self._local_datasets_cache = local
@@ -892,7 +712,7 @@ class UsageDataStore:
         if kind == "tokenLedger":
             row = canonical_ledger_row(row)
         transport = {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}
-        if kind == "tokenLedger" and row.get("recordType") == "legacyBaseline" and isinstance(transport.get("session"), dict):
+        if kind == "tokenLedger" and row.get("recordType") == "sessionBaseline" and isinstance(transport.get("session"), dict):
             transport["session"] = {key: value for key, value in transport["session"].items() if key not in {"accountSlotId", "accountLabel"}}
         return {"kind": kind, "row": transport}
 
@@ -903,62 +723,39 @@ class UsageDataStore:
 
     def _normalize_local(self) -> tuple[list[dict], list[dict]]:
         quota, ledger = self._load()
-        cache, packs = self._load_cache()
-        cache_changed = not self.cache_path.exists() or self._cache_repair_needed
         def normalize_quota(row: dict) -> dict | None:
-            nonlocal cache_changed
             meta = sync_meta(row)
             if meta.get("originMachineId") and meta["originMachineId"] != self.machine_id:
-                key = record_key("quota", row)
-                cache[(meta["originMachineId"], key)] = {"sourceMachineId": meta["originMachineId"], "key": key, "record": self._transport_record("quota", row)}
-                cache_changed = True
-                self.needs_remote_rebuild = True
-                return None
+                raise ValueError("Foreign records in local history require data migration")
             account_id = meta.get("accountId") or self.account_id_resolver(row.get("accountSlotId"))
             if not meta.get("accountId") or not meta.get("recordId"):
                 row = {key: value for key, value in row.items() if key != SYNC_META_KEY}
-            if str(meta.get("accountId") or "").startswith("local:"):
-                resolved = self.account_id_resolver(row.get("accountSlotId"))
-                if not str(resolved).startswith("local:"):
-                    row = {key: value for key, value in row.items() if key != SYNC_META_KEY}
-                    account_id = resolved
-            elif meta.get("originMachineId") == self.machine_id and not str(account_id).startswith("v3:") and self.account_mapper is not None:
-                mapped = self.account_mapper(account_id, row.get("accountSlotId"), row.get("accountLabel"))
-                if mapped is not None:
-                    row, account_id = {key: value for key, value in row.items() if key != SYNC_META_KEY}, self.account_id_resolver(mapped[0])
+            if not str(account_id).startswith("v3:"):
+                raise ValueError("Quota identity requires data migration")
             return add_record_provenance("quota", row, self.machine_id, account_id) if not sync_meta(row).get("recordId") else row
 
         def normalize_ledger(row: dict) -> dict | None:
-            nonlocal cache_changed
-            if (row := canonical_ledger_row(row, preserve_legacy_highwater=True)) is None:
+            if (row := canonical_ledger_row(row, preserve_highwater=True)) is None:
                 return None
             meta, source = sync_meta(row), row.get("session") or row
             if meta.get("originMachineId") and meta["originMachineId"] != self.machine_id:
-                key = record_key("tokenLedger", row)
-                cache[(meta["originMachineId"], key)] = {"sourceMachineId": meta["originMachineId"], "key": key, "record": self._transport_record("tokenLedger", row)}
-                cache_changed = True
-                self.needs_remote_rebuild = True
-                return None
+                raise ValueError("Foreign records in local history require data migration")
             if not meta.get("originMachineId") or not meta.get("accountId"):
                 return add_record_provenance("tokenLedger", {key: value for key, value in row.items() if key != SYNC_META_KEY}, self.machine_id, self.account_id_resolver(source.get("accountSlotId")))
-            if not str(meta.get("accountId") or "").startswith("v3:") and self.account_mapper is not None:
-                mapped = self.account_mapper(meta.get("accountId"), source.get("accountSlotId"), source.get("accountLabel"))
-                if mapped is not None:
-                    return add_record_provenance("tokenLedger", {key: value for key, value in row.items() if key != SYNC_META_KEY}, self.machine_id, self.account_id_resolver(mapped[0]))
+            if not str(meta.get("accountId") or "").startswith("v3:"):
+                raise ValueError("Ledger identity requires data migration")
             return row
 
         normalized_quota = [normalized for row in quota if (normalized := normalize_quota(row)) is not None]
         normalized_ledger = [normalized for row in ledger if (normalized := normalize_ledger(row)) is not None]
-        if cache_changed:
-            self._store_cache(cache, packs)
         if normalized_quota != quota:
             self._atomic_write(self.quota_path, self._quota_bytes(normalized_quota))
         if normalized_ledger != ledger:
             from monitor_token_ledger import write_token_ledger
             write_token_ledger(self.token_ledger_path, normalized_ledger)
         local = normalized_quota, normalized_ledger
-        if cache_changed or local != self._local_datasets_cache or self._merged_datasets_cache is None:
-            self._materialize_datasets(local, cache)
+        if local != self._local_datasets_cache or self._merged_datasets_cache is None:
+            self._materialize_datasets(local)
         return local
 
     def normalize_local(self) -> tuple[list[dict], list[dict]]:
@@ -971,9 +768,6 @@ class UsageDataStore:
             with self.index.transaction() as db:
                 db.execute("DELETE FROM processing_files")
                 peers = list(db.execute("SELECT machine_id,day FROM remote_days"))
-                for source, position, kind, data in list(db.execute("SELECT source,position,kind,data FROM processing_facts WHERE source LIKE 'peer:%:legacy'")):
-                    if (row := self._map_account(kind, json.loads(data))) is not None:
-                        self.index.fact(db, source, position, kind, row)
             self._ingest_local()
             for machine_id, day in peers:
                 self.refresh_peer_partition(machine_id, day, force=True)
@@ -982,14 +776,14 @@ class UsageDataStore:
         if self._local_datasets_cache is None or self._merged_datasets_cache is None:
             self._normalize_local()
         elif self.account_revision_resolver is not None and self.account_revision_resolver() != self._account_revision:
-            self._materialize_datasets(self._local_datasets_cache, self._load_cache()[0])
+            self._materialize_datasets(self._local_datasets_cache)
         return self._merged_datasets_cache if view == "merged" else self._local_datasets_cache
 
     def datasets(self, view: str = "local") -> tuple[list[dict], list[dict]]:
         with self.lock:
             self._ingest_local()
             if self._local_datasets_cache is None or self._merged_datasets_cache is None:
-                self._materialize_datasets((self.index.rows(self.quota_path, "quota"), self.index.rows(self.token_ledger_path, "tokenLedger")), self._load_cache()[0])
+                self._materialize_datasets((self.index.rows(self.quota_path, "quota"), self.index.rows(self.token_ledger_path, "tokenLedger")))
             return self._merged_datasets_cache if view == "merged" else self._local_datasets_cache
 
     def snapshot(self, necessary_only: bool = True) -> tuple[dict[str, dict], set[str]]:
@@ -998,92 +792,15 @@ class UsageDataStore:
             local = active_records(quota, ledger, self.machine_id, self.account_id_resolver, necessary_only)
             return local, set(local)
 
-    def pack_hashes(self, machine_id: str) -> dict[str, str]:
-        with self.lock:
-            return self._load_cache()[1].get(machine_id, {}).copy()
-
-    def apply_pack_snapshot(self, machine_id: str, manifest: dict[str, str], downloaded: dict[str, list[dict]], replace_all: bool = False) -> list[dict]:
-        with self.lock:
-            local = self._normalize_local()
-            cache, packs = self._load_cache()
-            cached = packs.get(machine_id, {})
-            changed = set(manifest) if replace_all else {pack_id for pack_id, pack_hash in manifest.items() if cached.get(pack_id) != pack_hash}
-            if set(downloaded) != changed:
-                raise ValueError("Synchronized usage pack download set does not match the manifest changes")
-            replace = changed | (set(cached) - set(manifest))
-            if replace_all or not cached:
-                cache = {key: entry for key, entry in cache.items() if key[0] != machine_id}
-            elif replace:
-                cache = {key: entry for key, entry in cache.items() if key[0] != machine_id or entry.get("sourcePackId") not in replace}
-            for pack_id, entries in downloaded.items():
-                for item in entries:
-                    operation = {"action": "upsert", **item}
-                    if (operation.get("record") or {}).get("kind") in {"cost", "token"}:
-                        continue
-                    if (operation.get("record") or {}).get("kind") == "tokenLedger":
-                        if (row := canonical_ledger_row(operation["record"]["row"])) is None:
-                            continue
-                        operation["record"] = operation["record"] | {"row": row}
-                    validate_sync_operation(operation)
-                    if sync_meta(operation["record"]["row"]).get("originMachineId") != machine_id:
-                        raise ValueError("Synchronized usage pack origin does not match its record")
-                    cache[(machine_id, operation["key"])] = {
-                        "sourceMachineId": machine_id, "sourcePackId": pack_id, "sourcePackHash": manifest[pack_id], "key": operation["key"], "record": operation["record"],
-                    }
-            if manifest:
-                packs[machine_id] = manifest.copy()
-            else:
-                packs.pop(machine_id, None)
-            self._store_cache(cache, packs)
-            self._materialize_datasets(local, cache)
-            return self.conflicts
-
-    def apply(self, operations: list[dict], checkpoint_origin: str | None = None, operation_origin: str | None = None) -> list[dict]:
-        with self.lock:
-            local = self._normalize_local()
-            cache, packs = self._load_cache()
-            previous = cache.copy()
-            if checkpoint_origin:
-                cache = {key: value for key, value in cache.items() if key[0] != checkpoint_origin}
-                packs.pop(checkpoint_origin, None)
-            for operation in operations:
-                if operation.get("action") == "upsert" and (operation.get("record") or {}).get("kind") in {"cost", "token"}:
-                    continue
-                if operation.get("action") == "upsert" and (operation.get("record") or {}).get("kind") == "tokenLedger":
-                    if (row := canonical_ledger_row(operation["record"]["row"])) is None:
-                        continue
-                    operation = operation | {"record": operation["record"] | {"row": row}}
-                validate_sync_operation(operation)
-                if operation["action"] == "upsert":
-                    source = operation_origin or sync_meta(operation["record"]["row"]).get("originMachineId")
-                    if not source or sync_meta(operation["record"]["row"]).get("originMachineId") != source:
-                        raise ValueError("Synchronized usage operation origin does not match its record")
-                    cache[(source, operation["key"])] = {"sourceMachineId": source, "key": operation["key"], "record": operation["record"]}
-                    packs.pop(source, None)
-                else:
-                    if not operation_origin:
-                        raise ValueError("Synchronized usage deletion is missing its origin")
-                    cache.pop((operation_origin, operation["key"]), None)
-                    packs.pop(operation_origin, None)
-            if cache != previous:
-                self._store_cache(cache, packs)
-                self._materialize_datasets(local, cache)
-            return self.conflicts
-
     def remove_origins_not_in(self, authoritative_machine_ids) -> int:
-        authoritative = set(authoritative_machine_ids)
-        if not all(isinstance(machine_id, str) and machine_id for machine_id in authoritative):
-            raise ValueError("Invalid authoritative machine inventory")
-        with self.lock:
-            local = self._normalize_local()
-            cache, packs = self._load_cache()
-            retained = {key: entry for key, entry in cache.items() if key[0] in authoritative}
-            retained_packs = {machine_id: inventory for machine_id, inventory in packs.items() if machine_id in authoritative}
-            removed = len(({key[0] for key in cache} | set(packs)) - authoritative)
-            if retained != cache or retained_packs != packs:
-                self._store_cache(retained, retained_packs)
-                self._materialize_datasets(local, retained)
-            return removed
+        with self.index.transaction() as db:
+            removed = [row[0] for row in db.execute("SELECT machine_id FROM remote_origins") if row[0] not in set(authoritative_machine_ids)]
+        for machine in removed:
+            self.v4_remove_days(machine, set(self.v4_cached_days(machine)))
+        with self.index.transaction() as db:
+            db.executemany("DELETE FROM remote_origins WHERE machine_id=?", ((machine,) for machine in removed))
+        self._local_datasets_cache = self._merged_datasets_cache = None
+        return len(removed)
 
     def _v4_remote_cache(self) -> tuple[list[dict], set[str]]:
         initialize_v4_cache(self.v4_cache_path)

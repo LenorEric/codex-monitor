@@ -33,8 +33,8 @@ import monitor_tokens
 import monitor_usage_sync
 from monitor_accounts import AccountError, AccountManager, api_identity_id, atomic_write_json, auth_fingerprint, auth_identity, normalize_session_refresh, normalize_session_refresh_windows, parse_auth_bytes
 from monitor_cloud import (
-    AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS, USAGE_FULL_VERIFY_INTERVAL_SECONDS, USAGE_PACK_BUCKET_BITS, USAGE_PACK_MAX_BYTES,
-    USAGE_REGULAR_VERIFY_PACKS, USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
+    AUTO_FETCH_INTERVAL_SECONDS, AUTO_PUSH_RETRY_SECONDS, AUTO_PUSH_STABLE_SECONDS,
+    USAGE_SYNC_INTERVAL_SECONDS, CloudError, CloudManager, CryptoBox, WebDavClient,
     WEBDAV_MKCOL_RETRY_SECONDS, control_password_matches, hash_control_password, load_server_config, new_control_password_salt, normalized_webdav_identity, passphrase_hash, valid_passphrase_hash, webdav_passphrase_salt,
 )
 from monitor_skills import MANIFEST_FULL_REHASH_SECONDS, SkillError, SkillManager, _safe_name
@@ -79,6 +79,18 @@ from monitor_codex_usage import (
     UsageError,
     write_history,
 )
+
+
+def session_baselines_from_sessions(sessions):
+    return [{"schemaVersion": 2, "recordType": "sessionBaseline", "session": session} for session in sessions]
+
+
+def migrate_test_data(root, codex_home=None):
+    from monitor_migrations import DATA_MIGRATION_STATE_FILENAME, migrate_history_data
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    (root / DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":14}', encoding="utf-8")
+    migrate_history_data(root, *(root / name for name in ("history.jsonl", "quota.jsonl", "sessions.jsonl", "ledger.jsonl", "samples.jsonl")), target_version=15, codex_home=codex_home)
 
 
 class MonitorCodexUsageTests(unittest.TestCase):
@@ -191,7 +203,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path = directory / "auth.json"
             original = json.dumps(self.account_auth("acct-a", "refresh-a", unknown={"kept": True}), separators=(",", ":")).encode()
             auth_path.write_bytes(original)
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             self.assertEqual(auth_path.read_bytes(), original)
             self.assertEqual((manager.root / "ppl-pro" / "auth.json").read_bytes(), original)
             self.assertEqual(manager.status()["items"][0]["label"], "Current account")
@@ -202,7 +214,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_account_manager_bootstraps_without_an_account_when_auth_is_missing(self):
         with self.account_directory() as directory:
-            manager = AccountManager(directory / "auth.json")
+            manager = AccountManager(directory / "auth.json", root=Path(directory / "auth.json").parent / "accounts")
             self.assertTrue(manager.status()["awaitingLogin"])
             self.assertIsNone(manager.status()["activeAccountId"])
             self.assertEqual(manager.status()["items"], [])
@@ -211,14 +223,15 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            legacy_manager = AccountManager(auth_path)
+            legacy_manager = AccountManager(auth_path, directory / "usage-monitor-accounts")
             legacy_root = legacy_manager.root
             target_root = directory / ".codex-switch" / "accounts"
 
-            manager = AccountManager(auth_path, target_root, legacy_root)
+            migrate_test_data(target_root.parent, directory)
+            manager = AccountManager(auth_path, target_root)
 
             self.assertEqual(manager.root, target_root)
-            self.assertFalse(legacy_root.exists())
+            self.assertFalse((legacy_root / "accounts.json").exists())
             self.assertTrue((target_root / "accounts.json").exists())
             self.assertEqual((target_root / "ppl-pro" / "auth.json").read_bytes(), auth_path.read_bytes())
 
@@ -236,7 +249,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             for name, data in expected.items():
                 (legacy_home / name).write_bytes(data)
 
-            moved = monitor_history.migrate_default_monitor_data(legacy_home, data_home)
+            moved = __import__("monitor_migrations").migrate_default_monitor_data(legacy_home, data_home)
 
             self.assertEqual(moved, list(expected))
             self.assertEqual(monitor_history.default_history_path(data_home), data_home / "usage_monitor_history.jsonl")
@@ -252,7 +265,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-original")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-rotated", unknown="preserved")), encoding="utf-8")
             manager.sync_active_from_live()
             manager.create_account("Second")
@@ -268,7 +281,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             api_id = manager.create_account("API")["activeAccountId"]
             auth_path.write_text(json.dumps({"OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
             self.assertFalse(manager.status()["awaitingLogin"])
@@ -277,14 +290,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             expected = ["ppl-pro", api_id, "ppl-pro", api_id]
             self.assertEqual([row["accountSlotId"] for row in manager.attribution_timeline()], expected)
-            self.assertEqual([row["accountSlotId"] for row in AccountManager(auth_path).attribution_timeline()], expected)
+            self.assertEqual([row["accountSlotId"] for row in AccountManager(auth_path, root=Path(auth_path).parent / "accounts").attribution_timeline()], expected)
 
     def test_normal_account_config_changes_remain_common_without_changing_headers(self):
         with self.account_directory() as directory:
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model = "old"\n\n[settings]\nlevel = 1\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.status()
 
             config_path.write_text('model = "new"\nadded = true\n\n[settings]\nlevel = 2\nextra = [1, 2]\n', encoding="utf-8")
@@ -298,7 +311,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model = "old"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.status()
             manager.update_common_account_header('registered = "old"\ncascade.key = "old"\narray = ["old"]\nremoved = true\n\n[provider]\nurl = "old"\n')
 
@@ -314,7 +327,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps({"OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
             config_path.write_text('model = "old"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.status()
 
             config_path.write_text('model = "new"\nnew_free = true\n\n[new_table]\nenabled = true\n', encoding="utf-8")
@@ -343,7 +356,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model = "old"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.update_common_config('model = "new"\n\n\n\n[settings]\nlevel = 1\n\n\n')
             saved = config_path.read_text(encoding="utf-8")
             self.assertNotIn("\n\n\n", saved)
@@ -354,7 +367,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model = "gpt-5"\nmodel_reasoning_effort = "high"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
 
             for _ in range(3):
                 common_toml, header_toml = manager._config_editor_parts()
@@ -379,7 +392,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps({"OPENAI_API_KEY": "sk-api-a"}), encoding="utf-8")
             config_path.write_text('model = "common"\napi_a = "a"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.status()
             manager.update_api_config("ppl-pro", 'api_a = "a"\n')
             api_header = manager.active_account()["configHeaderToml"]
@@ -396,7 +409,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model = "gpt-5"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             api_id = manager.create_account("API", "api", "sk-api")["activeAccountId"]
             manager.update_api_config(api_id, 'model_provider = "custom-provider"\n')
             manager.switch("ppl-pro")
@@ -431,7 +444,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             (directory / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.update_common_account_header('model_provider = "custom-provider"\n')
             session_ids = [str(uuid.UUID(int=index + 1)) for index in range(2)]
             paths = [directory / "sessions" / "live.jsonl", directory / "archived_sessions" / "archived.jsonl"]
@@ -454,7 +467,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             (directory / "config.toml").write_text('model = "gpt-5"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             api_id = manager.create_account("API", "api", "sk-api")["activeAccountId"]
             manager.update_api_config(api_id, 'model_provider = "custom-provider"\n')
             manager.switch("ppl-pro")
@@ -480,7 +493,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model = "gpt-5"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             api_id = manager.create_account("API", "api", "sk-api")["activeAccountId"]
             manager.update_api_config(api_id, 'model_provider = "custom-provider"\n')
             sessions_dir = directory / "sessions"
@@ -497,7 +510,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model_provider = "custom-provider"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.create_account("Second")
 
             with mock.patch.object(manager, "_rewrite_recent_session_model_providers", wraps=manager._rewrite_recent_session_model_providers) as rewrite:
@@ -510,7 +523,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps({"OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
             config_path.write_text('model = "common-old"\n\n[settings]\nlevel = 1\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.status()
             manager.update_api_config("ppl-pro", 'api_key = "old"\ncascade.key = "old"\narray = ["old"]\n\n[provider]\nurl = "old"\n\n[[provider.models]]\nname = "old"\n')
 
@@ -528,7 +541,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth = self.account_auth("acct-a", "refresh-original")
             auth["tokens"]["access_token"] = "x.eyJleHAiOjB9.x"
             auth_path.write_text(json.dumps(auth), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             with mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-a", "access_token": "access-rotated", "refresh_token": "refresh-rotated", "id_token": "id-rotated"})):
                 refresh_access_token(auth, object(), auth_path, 10)
             manager.sync_active_from_live()
@@ -542,7 +555,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth = self.account_auth("acct-a", "refresh-original")
             auth["tokens"]["access_token"] = "x.eyJleHAiOjB9.x"
             auth_path.write_text(json.dumps(auth), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             contender_acquired = []
 
             def refresh_response(*_args, **_kwargs):
@@ -663,7 +676,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "access_token": "access-a"}}), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             self.assertTrue(manager.status()["awaitingLogin"])
             self.assertIn("refresh token", manager.status()["error"])
             self.assertFalse(manager._account_path("ppl-pro").exists())
@@ -672,7 +685,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "access_token": "partial-access"}}), encoding="utf-8")
             self.assertFalse(manager.sync_active_from_live())
             saved = json.loads(manager._account_path("ppl-pro").read_text(encoding="utf-8"))
@@ -683,7 +696,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps(self.account_auth("acct-unknown", "refresh-unknown")), encoding="utf-8")
             with mock.patch("builtins.print") as output:
                 changed, external_update = manager.reconcile_active_from_live()
@@ -722,7 +735,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-recorded")), encoding="utf-8")
-            AccountManager(auth_path)
+            AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-external")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
@@ -737,7 +750,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-recorded")), encoding="utf-8")
-            AccountManager(auth_path)
+            AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "access_token": "partial-access"}}), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
@@ -931,7 +944,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertIsNone(state.last_sample)
             self.assertEqual(cached_status["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
             self.assertEqual(cached_status["lastSample"]["windows"]["5h"]["resetAt"], "2030-01-01T00:00:00Z")
-            self.assertEqual(state.series_response()["status"]["lastSample"]["windows"]["7d"]["usedPercent"], 34.0)
+            self.assertEqual(state.status_payload()["lastSample"]["windows"]["7d"]["usedPercent"], 34.0)
             self.assertTrue(state.wake_event.is_set())
             self.assertFalse(any(state.accounts.root.glob(".inactive-usage-*.json")))
 
@@ -941,7 +954,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 with self.subTest(operation=operation, outcome=outcome), self.account_directory() as directory:
                     auth_path = directory / "auth.json"
                     auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-                    manager = AccountManager(auth_path)
+                    manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
                     second_id = manager.create_account("Second")["activeAccountId"]
                     auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
                     manager.status()
@@ -1020,7 +1033,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             config = {"fiveHour": {"enabled": True, "windowsUtc": [{"start": "05:00", "end": "06:00"}]}, "sevenDay": {"enabled": False}}
             status = manager.set_session_refresh("ppl-pro", config)
             self.assertEqual(status["items"][0]["sessionRefresh"], config)
@@ -1031,7 +1044,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
             manifest["accounts"][0].pop("sessionRefresh")
             manifest["accounts"][0]["sessionRefreshEnabled"] = True
             manager.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            migrated = AccountManager(auth_path)
+            from monitor_migrations import migrate_manifest
+            migrate_manifest(manager.manifest_path)
+            migrated = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             self.assertEqual(migrated.manifest["version"], 3)
             self.assertEqual(migrated.active_account()["sessionRefresh"], {"fiveHour": {"enabled": True, "windowsUtc": []}, "sevenDay": {"enabled": True}})
             self.assertNotIn("sessionRefreshEnabled", migrated.active_account())
@@ -1374,7 +1389,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -1473,7 +1488,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             history = directory / "history.jsonl"
             history.write_text('{"accountSlotId":"ppl-pro","accountLabel":"Current account"}\n', encoding="utf-8")
             original = history.read_bytes()
@@ -1489,7 +1504,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             history, invalid_log = directory / "history.jsonl", directory / "samples.jsonl"
             history.write_text('{"accountSlotId":"ppl-pro","accountLabel":"Current account"}\n', encoding="utf-8")
             invalid_log.write_text('{invalid json\n', encoding="utf-8")
@@ -1505,7 +1520,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             self.assertFalse(manager.sync_active_from_live())
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
@@ -1514,7 +1529,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             changed = self.account_auth("acct-a", "refresh-new")
             changed["tokens"]["id_token"] = "id-another-login"
             auth_path.write_text(json.dumps(changed), encoding="utf-8")
@@ -1529,7 +1544,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -1549,7 +1564,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             live = self.account_auth("acct-a", "refresh-a")
             del live["tokens"]["account_id"]
             auth_path.write_text(json.dumps(live), encoding="utf-8")
@@ -1563,7 +1578,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -1582,7 +1597,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.manifest["cloudBindingEnabled"] = True
             manager._find("ppl-pro")["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine"}
             manager._save_manifest()
@@ -1602,7 +1617,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_new_empty_accounts_support_create_switch_rename_and_delete(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             first_id = manager.create_account("First")["activeAccountId"]
             second_id = manager.create_account("Second")["activeAccountId"]
             manager.manifest["cloudBindingEnabled"] = True
@@ -1623,7 +1638,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             empty_id = manager.create_account("Empty")["activeAccountId"]
             manager.manifest["cloudBindingEnabled"] = True
             manager._find("ppl-pro")["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine"}
@@ -1643,7 +1658,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             empty_id = manager.create_account("Empty")["activeAccountId"]
             manager.manifest["cloudBindingEnabled"] = True
             manager._save_manifest()
@@ -1661,13 +1676,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
             cloud.new_account_key.assert_called_once_with()
             cloud.begin_account_transition.assert_called_once_with("release", accountId=empty_id, accountKey="placeholder-key", revisionId=hashlib.sha256(b"{}").hexdigest())
-            cloud.release_account.assert_called_once_with("placeholder-key", b"{}", {"accountId": None, "email": None}, "Empty", ready=False, key_type="opaque", config_header={}, account_type="account", config_header_toml="")
+            cloud.release_account.assert_called_once_with("placeholder-key", b"{}", {"accountId": None, "email": None}, "Empty", ready=False, key_type="opaque", account_type="account", config_header_toml="")
 
     def test_duplicate_openai_profiles_release_to_distinct_opaque_cloud_keys(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second A")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -1688,7 +1703,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_empty_cloud_account_binds_as_login_placeholder(self):
         with self.account_directory() as directory:
-            manager = AccountManager(directory / "auth.json")
+            manager = AccountManager(directory / "auth.json", root=Path(directory / "auth.json").parent / "accounts")
             cloud = SimpleNamespace(
                 begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), machine_id="machine", delete_account_payloads=mock.Mock(),
                 bind_account=mock.Mock(return_value=({"accountKey": "placeholder-key", "keyType": "opaque", "accountId": None, "label": "Empty", "ready": False}, b"{}", '"etag"')),
@@ -1719,7 +1734,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model = "gpt-5"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.unlink()
 
             status = manager.create_account("Second")
@@ -1730,14 +1745,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(config_path.read_text(encoding="utf-8"), 'model = "gpt-5"\n')
             self.assertEqual(json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
             self.assertEqual(manager._find("ppl-pro")["identity"]["accountId"], "acct-a")
-            self.assertEqual(AccountManager(auth_path)._find("ppl-pro")["identity"]["accountId"], "acct-a")
+            self.assertEqual(AccountManager(auth_path, root=Path(auth_path).parent / "accounts")._find("ppl-pro")["identity"]["accountId"], "acct-a")
 
     def test_account_change_recovers_empty_live_auth_before_switching(self):
         with self.account_directory() as directory:
             auth_path, config_path = directory / "auth.json", directory / "config.toml"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             config_path.write_text('model = "gpt-5"\n', encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text("{}\n", encoding="utf-8")
 
             status = manager.create_account("Second")
@@ -1752,7 +1767,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-b", "access_token": "access-b"}}), encoding="utf-8")
 
             status = manager.create_account("Second")
@@ -1765,7 +1780,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             with self.subTest(empty_auth=empty_auth), self.account_directory() as directory:
                 auth_path = directory / "auth.json"
                 auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-                manager = AccountManager(auth_path)
+                manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
                 second_id = manager.create_account("Second")["activeAccountId"]
                 auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
                 manager.status()
@@ -1786,13 +1801,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text("{}\n", encoding="utf-8")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
             manager.switch("ppl-pro")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-other", "access_token": "access-other"}}), encoding="utf-8")
 
             status = manager.switch(second_id)
@@ -1804,7 +1819,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.rename("ppl-pro", "Recorded Account")
             self.assertEqual(manager.attribution_for_auth(self.account_auth("acct-a", "another-refresh")), {"accountSlotId": "ppl-pro", "accountLabel": "Recorded Account"})
             self.assertEqual(manager.attribution_for_auth(self.account_auth("not-registered", "refresh-x")), {"accountSlotId": "unknown", "accountLabel": "Unknown"})
@@ -1813,7 +1828,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             pending_id = manager.create_account("Duplicate")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-new")), encoding="utf-8")
             status = manager.status()
@@ -1835,7 +1850,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -1850,7 +1865,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
 
             with self.assertRaises(AccountError) as raised:
                 manager.create_account("Duplicate API", "api", "sk-api")
@@ -1870,7 +1885,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             original = self.account_auth("acct-a", "refresh-a")
             original["tokens"]["id_token"] = "stable-id-token"
             auth_path.write_text(json.dumps(original), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             pending_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps({"tokens": {"access_token": "access-new", "id_token": "stable-id-token", "refresh_token": "refresh-new"}}), encoding="utf-8")
 
@@ -1886,10 +1901,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             pending_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-b", "access_token": "access-b"}}), encoding="utf-8")
-            reloaded = AccountManager(auth_path)
+            reloaded = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             self.assertEqual(reloaded.status()["activeAccountId"], pending_id)
             self.assertTrue(reloaded.status()["awaitingLogin"])
             self.assertIn("refresh token", reloaded.status()["error"])
@@ -1898,7 +1913,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -1922,7 +1937,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             config_path.write_bytes(b'model = "universal"\n')
             session_path.write_bytes(b'{"conversation":"shared"}\n')
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -1935,7 +1950,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path = directory / "auth.json"
             original = json.dumps(self.account_auth("acct-a", "refresh-a"), separators=(",", ":")).encode()
             auth_path.write_bytes(original)
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             status = manager.rename("ppl-pro", "Renamed Pro")
             self.assertEqual(status["items"][0]["label"], "Renamed Pro")
             self.assertEqual(auth_path.read_bytes(), original)
@@ -1945,7 +1960,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.manifest["cloudBindingEnabled"] = True
             manager.active_account()["cloud"] = {"state": "bound-local", "accountKey": "key-a", "boundMachineId": "machine", "etag": '"old"'}
             manager._save_manifest()
@@ -1967,7 +1982,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             config_path.write_bytes(b'model = "universal"\n')
             session_path.write_bytes(b'{"conversation":"shared"}\n')
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -1985,7 +2000,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             with self.assertRaises(AccountError) as raised:
                 manager.delete("ppl-pro")
             self.assertEqual(raised.exception.status, 409)
@@ -1995,7 +2010,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             cloud = SimpleNamespace(begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), release_account=mock.Mock())
 
             with self.assertRaises(AccountError) as raised:
@@ -2009,7 +2024,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -2027,7 +2042,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -2044,7 +2059,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -2066,7 +2081,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -2492,8 +2507,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"eventId": "historical:2", "sessionId": "historical", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-terra", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
             ]
 
-            rows = monitor_token_ledger.sync_token_ledger(path, [legacy], events, "account", "Account")
-            repeated = monitor_token_ledger.sync_token_ledger(path, rows, events, "account", "Account")
+            monitor_token_ledger.write_token_ledger(path, [{"schemaVersion": 2, "recordType": "sessionBaseline", "session": legacy}])
+            rows = monitor_token_ledger.sync_token_ledger(path, events, "account", "Account")
+            repeated = monitor_token_ledger.sync_token_ledger(path, events, "account", "Account")
             ledger = monitor_token_ledger.load_token_ledger(path)
             with mock.patch.dict(monitor_tokens.MODEL_PRICES_PER_MILLION, {"gpt-5.6-terra": {"input": 99.0, "cachedInput": 99.0, "cacheWriteInput": 99.0, "output": 99.0}}):
                 reloaded = monitor_token_ledger.token_sessions_from_ledger(ledger)
@@ -2501,7 +2517,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(rows[0]["cost"]["totalCostUsd"], 4.5)
         self.assertEqual(repeated[0]["cost"]["totalCostUsd"], 4.5)
         self.assertEqual(reloaded[0]["cost"]["totalCostUsd"], 4.5)
-        self.assertEqual([row["recordType"] for row in ledger], ["legacyBaseline", "usage"])
+        self.assertEqual([row["recordType"] for row in ledger], ["sessionBaseline", "usage"])
         self.assertEqual(ledger[1]["cost"]["totalCostUsd"], 2.0)
         self.assertNotIn("pricingId", ledger[1])
 
@@ -2513,7 +2529,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"eventId": "session:2", "sessionId": "session", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
             ]
 
-            sessions = monitor_token_ledger.sync_token_ledger(path, [], events, "account", "Account")
+            sessions = monitor_token_ledger.sync_token_ledger(path, events, "account", "Account")
             ledger = monitor_token_ledger.load_token_ledger(path)
 
         self.assertEqual(sessions[0]["cost"]["totalCostUsd"], 1.2)
@@ -2531,7 +2547,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "API"},
             ]
 
-            sessions = monitor_token_ledger.sync_token_ledger(directory / "token-ledger.jsonl", [], events, "api", "API", timeline)
+            sessions = monitor_token_ledger.sync_token_ledger(directory / "token-ledger.jsonl", events, "api", "API", timeline)
             usage_rows = [row for row in monitor_token_ledger.load_token_ledger(directory / "token-ledger.jsonl") if row["recordType"] == "usage"]
 
         self.assertEqual([(row["accountSlotId"], row["tokens"]["freshInputTokens"]) for row in sessions], [("normal", 70), ("api", 140)])
@@ -2542,7 +2558,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             event = {"eventId": "session:1", "sessionId": "session", "checkedAt": "2030-01-01T01:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 100, "cachedInput": 0, "cacheWriteInput": 0, "output": 10}}
             activation_timeline = [{"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "UU API Pro"}]
 
-            monitor_token_ledger.sync_token_ledger(directory / "token-ledger.jsonl", [], [event], "api", "UU API Pro", activation_timeline)
+            monitor_token_ledger.sync_token_ledger(directory / "token-ledger.jsonl", [event], "api", "UU API Pro", activation_timeline)
             usage_row = next(row for row in monitor_token_ledger.load_token_ledger(directory / "token-ledger.jsonl") if row["recordType"] == "usage")
 
         self.assertEqual((usage_row["accountSlotId"], usage_row["accountLabel"]), ("api", "UU API Pro"))
@@ -2881,7 +2897,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_token_session_history_migrates_legacy_cached_output_to_cache_write(self):
         legacy_tokens = {"inputTokens": 100, "freshInputTokens": 80, "cachedInputTokens": 20, "outputTokens": 10, "freshOutputTokens": 0, "cachedOutputTokens": 30, "totalTokens": 110, "requests": 1}
-        row = monitor_history.normalize_token_session_row({"sessionId": "legacy", "tokens": legacy_tokens, "byModel": {"gpt-5.6-sol": {"tokens": legacy_tokens, "cost": {}}}})
+        row = __import__("monitor_migration_history").normalize_token_session_row({"sessionId": "legacy", "tokens": legacy_tokens, "byModel": {"gpt-5.6-sol": {"tokens": legacy_tokens, "cost": {}}}})
 
         self.assertEqual(row["tokens"], {"inputTokens": 100, "freshInputTokens": 50, "cachedInputTokens": 20, "cacheWriteInputTokens": 30, "outputTokens": 10, "totalTokens": 110, "requests": 1})
         self.assertEqual(row["byModel"]["gpt-5.6-sol"]["tokens"], row["tokens"])
@@ -3789,7 +3805,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             "tokens": {"inputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}, "byModel": {"gpt-5.5": {"tokens": {"inputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}}},
         }
         accounts = {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "Account A"}]}
-        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard._dashboard_display_data([], monitor_token_ledger.legacy_baselines_from_sessions([monitor_history.normalize_token_session_row(session)]), monitor_dashboard.dashboard_account_status(accounts)))
+        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard._dashboard_display_data([], session_baselines_from_sessions([monitor_history.normalize_token_session_row(session)]), monitor_dashboard.dashboard_account_status(accounts)))
 
         model = payload["tokenSessions"][0]["byModel"]["gpt-5.5"]
         self.assertEqual(model["usageTokens"], {"inputTokens": 123, "freshInputTokens": 123, "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 45, "totalTokens": 168, "requests": 0})
@@ -3814,105 +3830,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(payload["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
         self.assertEqual(payload["lastSample"]["cost"]["totalCostUsd"], 1.5)
         self.assertEqual(len(payload["revision"]), 20)
-        self.assertEqual(len(payload["streamId"]), 20)
-        self.assertEqual(payload["newestIndex"], 0)
-        self.assertEqual(len(payload["mergedRevision"]), 20)
 
-    def test_dashboard_series_stream_indexes_semantic_local_changes_only(self):
-        with self.account_directory() as directory:
-            args = SimpleNamespace(
-                history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", token_session_history=directory / "tokens.jsonl", token_ledger=directory / "ledger.jsonl",
-                state=directory / "state.json", dashboard_cache=directory / "dashboard-cache.json", usage_sync_cache=directory / "sync.json",
-            )
-            for path, contents in ((args.history, ""), (args.quota_history, ""), (args.token_session_history, ""), (args.token_ledger, ""), (args.state, "{}"), (args.usage_sync_cache, "{}")):
-                path.write_text(contents, encoding="utf-8")
-            quota = []
-            state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
-            state.args = args
-            state.lock = threading.RLock()
-            state._series_build_lock = threading.Lock()
-            state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
-            state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
-            state.usage_data = SimpleNamespace(datasets=lambda _view: (quota, []))
-            state.last_sample = state.last_error = None
-            state.runtime_state = {}
-            state.wake_event = threading.Event()
 
-            snapshot = state.series_response()
-            quota.append({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": 12}}})
-            args.quota_history.write_text("changed\n", encoding="utf-8")
-            update = state.series_response(snapshot["streamId"], snapshot["includedIndex"], snapshot["mergedRevision"])
-            args.quota_history.write_text("rewritten without a semantic change\n", encoding="utf-8")
-            unchanged = state.series_response(update["streamId"], update["includedIndex"], update["mergedRevision"])
 
-            self.assertEqual(snapshot["mode"], "snapshot")
-            self.assertEqual(update["mode"], "update")
-            self.assertEqual([batch["index"] for batch in update["batches"]], [1])
-            self.assertEqual(len(update["batches"][0]["local"]["quotaPoints"]["upsert"]), 1)
-            self.assertEqual(update["batches"][0]["local"], update["batches"][0]["merged"])
-            self.assertEqual(unchanged["includedIndex"], 1)
-            self.assertEqual(unchanged["batches"], [])
-
-    def test_dashboard_series_replaces_complete_merged_view_after_cloud_history_change(self):
-        with self.account_directory() as directory:
-            args = SimpleNamespace(
-                history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", token_session_history=directory / "tokens.jsonl", token_ledger=directory / "ledger.jsonl",
-                state=directory / "state.json", dashboard_cache=directory / "dashboard-cache.json", usage_sync_cache=directory / "sync.json",
-            )
-            for path, contents in ((args.history, ""), (args.quota_history, ""), (args.token_session_history, ""), (args.token_ledger, ""), (args.state, "{}"), (args.usage_sync_cache, "{}")):
-                path.write_text(contents, encoding="utf-8")
-            local_quota = [{"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": 12}}}]
-            supplemental_quota = []
-            state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
-            state.args = args
-            state.lock = threading.RLock()
-            state._series_build_lock = threading.Lock()
-            state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
-            state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
-            state.usage_data = SimpleNamespace(datasets=lambda view: (local_quota + supplemental_quota if view == "merged" else local_quota, []))
-            state.last_sample = state.last_error = None
-            state.runtime_state = {}
-            state.wake_event = threading.Event()
-
-            snapshot = state.series_response()
-            previous = snapshot
-            for revision, rows, expected in (
-                ("insert", [{"checkedAt": "2029-12-31T00:00:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": 5}}}], [5.0, 12.0]),
-                ("overwrite", [{"checkedAt": "2029-12-31T00:00:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": 8}}}], [8.0, 12.0]),
-                ("delete", [], [12.0]),
-            ):
-                supplemental_quota[:] = rows
-                args.usage_sync_cache.write_text(json.dumps({"cloud": revision}), encoding="utf-8")
-                state._signal_dashboard_cache("cloud")
-                update = state.series_response(previous["streamId"], previous["includedIndex"], previous["mergedRevision"])
-                self.assertEqual(update["mode"], "update")
-                self.assertEqual(update["includedIndex"], snapshot["includedIndex"])
-                self.assertEqual(update["batches"], [])
-                self.assertNotEqual(update["mergedRevision"], previous["mergedRevision"])
-                self.assertEqual([point["fiveHour"]["raw"] for point in update["mergedSnapshot"]["quotaPoints"]], expected)
-                self.assertEqual([point["fiveHour"]["raw"] for point in state._series_views["local"]["quotaPoints"]], [12.0])
-                previous = update
-
-    def test_dashboard_series_falls_back_to_snapshot_for_stream_mismatch_or_journal_gap(self):
-        state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
-        state.lock = threading.RLock()
-        state._series_stream_id = "current-stream"
-        state._series_index = 2
-        state._series_journal = monitor_dashboard.deque([{"index": 2, "createdAt": monitor_dashboard.time.time(), "local": {}, "merged": {}, "bytes": 1}])
-        state._series_journal_bytes = 1
-        state._series_views = {"local": monitor_dashboard.dashboard_transfer_view(None), "merged": monitor_dashboard.dashboard_transfer_view(None)}
-        state._series_initialized = True
-        state._merged_revision = "merged-current"
-        state._dashboard_cache_reasons = set()
-        status = {"revision": "status"}
-
-        with mock.patch.object(state, "refresh_dashboard_cache"), mock.patch.object(state, "status_payload", return_value=status):
-            wrong_stream = state.series_response("old-stream", 2, "merged-current")
-            journal_gap = state.series_response("current-stream", 0, "merged-current")
-
-        self.assertEqual(wrong_stream["mode"], "snapshot")
-        self.assertEqual(journal_gap["mode"], "snapshot")
-        self.assertEqual(journal_gap["includedIndex"], 2)
 
     def test_dashboard_display_tiers_keep_recent_points_and_compact_older_points(self):
         now = 100 * 24 * 60 * 60
@@ -3963,48 +3883,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(next_maintenance % hour, 0)
         self.assertGreater(next_maintenance, now)
 
-    def test_dashboard_display_cache_round_trips_and_expires_at_next_tier(self):
-        with self.account_directory() as directory:
-            path = directory / "dashboard-cache.json"
-            cache = monitor_dashboard.DashboardDisplayCache(path)
-            entry = {"quotaPoints": [], "tokenSessions": [], "costUsage": {"fiveHour": [], "sevenDay": []}, "historyStats": {"rows": 0}}
-            cache.replace({
-                "version": monitor_dashboard.DASHBOARD_DISPLAY_CACHE_VERSION, "sourceRevision": "source", "builtAt": 100.0, "nextMaintenanceAt": 200.0,
-                "displayRevision": "display", "views": {"local": entry, "merged": entry},
-            })
-            reloaded = monitor_dashboard.DashboardDisplayCache(path)
 
-            self.assertEqual(reloaded.entry("local", "source", 199.0)["historyStats"], {"rows": 0})
-            self.assertIsNone(reloaded.entry("local", "source", 200.0))
-            self.assertEqual(reloaded.revision("source", 200.0), "stale")
-
-    def test_dashboard_series_uses_persistent_display_cache_without_reloading_datasets(self):
-        with self.account_directory() as directory:
-            args = SimpleNamespace(
-                history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", token_session_history=directory / "tokens.jsonl", token_ledger=directory / "ledger.jsonl", state=directory / "state.json",
-                dashboard_cache=directory / "dashboard-cache.json", usage_sync_cache=directory / "sync.json",
-            )
-            for path, contents in ((args.history, ""), (args.quota_history, ""), (args.token_session_history, ""), (args.token_ledger, ""), (args.usage_sync_cache, "{}"), (args.state, "{}")):
-                path.write_text(contents, encoding="utf-8")
-            quota = [{"checkedAt": "2029-12-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 12}}}]
-            state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
-            state.args = args
-            state.lock = threading.RLock()
-            state._series_build_lock = threading.Lock()
-            state._series_cache = {}
-            state.dashboard_cache = monitor_dashboard.DashboardDisplayCache(args.dashboard_cache)
-            state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
-            state.usage_data = SimpleNamespace(datasets=lambda _view: (quota, []))
-            state.last_sample = state.last_error = None
-            state.runtime_state = {}
-            state.wake_event = threading.Event()
-
-            self.assertTrue(state.refresh_dashboard_cache(now=2000000000.0))
-            with mock.patch.object(state.usage_data, "datasets", side_effect=AssertionError("persistent cache should avoid dataset loading")):
-                payload = state.series_response()
-
-            self.assertEqual(payload["views"]["local"]["quotaPoints"][0]["fiveHour"]["raw"], 12.0)
-            self.assertTrue(args.dashboard_cache.exists())
 
     def test_dashboard_exposes_independent_local_and_merged_data_views(self):
         html = dashboard_html()
@@ -4015,16 +3894,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('`/api/dashboard?${new URLSearchParams(scope)}`', html)
         self.assertIn('vscode.postMessage({type:"getCodexDashboard",requestId,scope,etag})', html)
         self.assertIn('button.classList.toggle("active",button.dataset.dataView===dataView)', html)
-        self.assertIn('async getSeries(cursor = {})', extension)
-        self.assertIn('["streamId", "includedIndex", "mergedRevision"]', extension)
-        self.assertIn('target.webview.postMessage({ type: "codexUsageSeries", payload: await monitor.getSeries(message.cursor || {}) })', extension)
-        self.assertNotIn('searchParams.set("view"', extension)
+        self.assertIn('async getDashboard(scope, etag)', extension)
+        self.assertNotIn("getCodexUsageSeries", extension)
 
     def test_dashboard_local_view_uses_only_local_quota_tokens_and_cost(self):
         local_quota = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}
         merged_quota = {"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 2}}}
         local_session = {"sessionId": "local", "tokens": {}, "byModel": {}}
-        payload = monitor_dashboard._dashboard_display_data([local_quota], monitor_token_ledger.legacy_baselines_from_sessions([monitor_history.normalize_token_session_row(local_session)]), {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]})
+        payload = monitor_dashboard._dashboard_display_data([local_quota], session_baselines_from_sessions([monitor_history.normalize_token_session_row(local_session)]), {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]})
 
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 1)
         self.assertEqual(payload["tokenSessions"][0]["sessionId"], "local")
@@ -4517,7 +4394,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("sync_token_ledger(", poll)
         self.assertIn("append_quota_history_sample(self.args.quota_history, sample)", poll)
 
-    def test_dashboard_series_returns_quota_points_for_all_accounts(self):
+    def test_dashboard_projection_returns_quota_points_for_all_accounts(self):
         accounts = {"awaitingLogin": False, "activeAccountId": "account-a", "items": [{"id": "account-a", "label": "Account A"}, {"id": "account-b", "label": "Account B"}]}
         quota_history = [
                 {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 12, "resetAt": None, "plan": "plus"}}},
@@ -5056,6 +4933,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         try:
             path.write_text('{"window":"5h","events":[{"checkedAt":"2030-01-01T00:00:00Z","deltaPercent":1,"deltaCostUsd":2}]}\n', encoding="utf-8")
 
+            from monitor_migrations import convert_saved_fields
+            path.write_text(json.dumps(convert_saved_fields(json.loads(path.read_text()))), encoding="utf-8")
             rows = load_history(path)
 
             self.assertEqual(rows, [{"checkedAt": "2030-01-01T00:00:00Z", "deltaPercent": 1, "deltaCostUsd": 2, "window": "5h", "accountSlotId": "unknown", "accountLabel": "Unknown"}])
@@ -5231,7 +5110,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual((codex_home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "managed")
 
     def test_python_version_requirement_is_documented_and_checked_before_monitor_imports(self):
-        for name, first_import in (("codex_monitor_daemon.py", "from monitor_accounts import"), ("monitor_codex_usage.py", "from codex_monitor_daemon import")):
+        for name, first_import in (("codex_monitor_daemon.py", "from monitor_auto_update import"), ("monitor_codex_usage.py", "from codex_monitor_daemon import")):
             source = Path(name).read_text(encoding="utf-8")
             self.assertIn("if sys.version_info < (3, 12):", source)
             self.assertLess(source.index("if sys.version_info < (3, 12):"), source.index(first_import))
@@ -5243,6 +5122,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             private.mkdir()
             (private / "skills.json").write_text(json.dumps({"version": 1, "skills": {}}), encoding="utf-8")
 
+            migrate_test_data(private)
             manager = SkillManager(directory / "codex", private, directory / "gemini")
 
             self.assertEqual(manager.state["deletions"], {})
@@ -5254,6 +5134,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             private.mkdir()
             (private / "skills.json").write_text(json.dumps({"version": 1, "skills": {"demo": {"codex": True, "gemini": False}}, "deletions": {}}), encoding="utf-8")
 
+            migrate_test_data(private)
             manager = SkillManager(directory / "codex", private, directory / "gemini")
 
             self.assertTrue(manager.state["skills"]["demo"]["shared"])
@@ -6058,7 +5939,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             local = json.loads(cloud.state_path.read_text(encoding="utf-8"))
             local["remote"] = {
                 "accounts": {"same": {"etag": '"same"', "state": {"version": 1, "accountKey": "same", "label": "Unchanged"}}, "removed": {"etag": '"removed"', "state": {"version": 1, "accountKey": "removed"}}},
-                "skills": {"pointerEtag": '"old-pointer"', "snapshotId": "old"}
+                "skills": {"version": 2, "indexEtag": '"old-pointer"', "indexId": "old", "packages": {}}
             }
             cloud.state_path.write_text(json.dumps(local), encoding="utf-8")
             cloud._state = local
@@ -6080,25 +5961,25 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                     return json.dumps({"version": 1, "accountKey": "changed", "label": "Changed", "boundMachineId": None}).encode(), '"changed"'
 
                 def get_if_changed(self, path, etag):
-                    return json.dumps({"version": 1, "snapshotId": "new", "updatedAt": "now"}).encode(), '"new-pointer"'
+                    return json.dumps({"version": 2, "packages": {"new-skill": {"packageId": "a" * 64, "contentSha256": "a" * 64}}, "updatedAt": "now"}).encode(), '"new-pointer"'
 
             client = Client()
             box = SimpleNamespace(decrypt=lambda _purpose, payload, *_args: payload)
             usage = {"machinesChanged": 1, "payloadsDownloaded": 2, "conflicts": 0, "fetchedAt": "now"}
             with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "_fetch_usage_data", return_value=usage) as fetch_usage, mock.patch.object(
                 skills, "merge", return_value={"added": ["new-skill"], "updated": ["updated-skill"], "projectionErrors": []}
-            ), mock.patch.object(skills, "snapshot_content_hash", return_value="remote-hash"), mock.patch.object(skills, "content_hash", return_value="merged-hash"):
+            ), mock.patch.object(cloud, "_download_skill_snapshot", side_effect=lambda client, box, index, names: (client.downloads.append("skills/packages/" + "a" * 64 + ".enc") or b"snapshot")), mock.patch.object(skills, "snapshot_content_hash", return_value="remote-hash"), mock.patch.object(skills, "content_hash", return_value="merged-hash"):
                 result = cloud.fetch()
 
             saved = json.loads(cloud.state_path.read_text(encoding="utf-8"))["remote"]
-            self.assertEqual(client.downloads, ["accounts/states/changed.enc", "skills/snapshots/new.enc"])
+            self.assertEqual(client.downloads, ["accounts/states/changed.enc", "skills/packages/" + "a" * 64 + ".enc"])
             self.assertEqual(result, {
                 "accountsChanged": 1, "accountsRemoved": 1, "skillsChanged": True, "skillsAdded": ["new-skill"], "skillsUpdated": ["updated-skill"], "skillsDeleted": [],
                 "accountsUpdated": 0, "usage": usage, "projectionErrors": [], "fetchedAt": saved["fetchedAt"]
             })
             fetch_usage.assert_called_once_with(client, box)
             self.assertEqual(set(saved["accounts"]), {"same", "changed"})
-            self.assertEqual(saved["skills"]["indexId"], "new")
+            self.assertEqual(saved["skills"]["indexEtag"], '"new-pointer"')
             self.assertEqual(cloud._state["skills"]["localSha256"], {})
 
     def test_cloud_fetch_skips_unchanged_version_two_packages(self):
@@ -6218,7 +6099,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
             cloud = CloudManager(directory / "private", skills, None)
-            cloud._state["remote"]["skills"] = {"version": 1, "indexEtag": '"current"', "indexId": "snapshot", "legacySnapshotId": "snapshot", "updatedAt": "then"}
+            cloud._state["remote"]["skills"] = {"version": 2, "indexEtag": '"current"', "indexId": "snapshot", "packages": {"demo": {"packageId": "a" * 64, "contentSha256": "base"}}, "updatedAt": "then"}
             cloud._state["skills"] = {"indexEtag": '"current"', "indexId": "snapshot", "localSha256": {"demo": "base"}}
 
             class Client:
@@ -6239,11 +6120,10 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             box = SimpleNamespace(decrypt=lambda _purpose, payload, *_args: payload)
             with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(
                 skills, "merge", return_value={"added": [], "updated": ["demo"], "projectionErrors": []}
-            ) as merge, mock.patch.object(skills, "content_hashes", side_effect=({"demo": "modified"}, {"demo": "base"}, {"demo": "base"})):
+            ) as merge, mock.patch.object(cloud, "_download_skill_snapshot", return_value=b"snapshot"), mock.patch.object(skills, "content_hashes", side_effect=({"demo": "modified"}, {"demo": "base"}, {"demo": "base"})):
                 result = cloud.fetch()
 
             merge.assert_called_once_with(b"snapshot")
-            self.assertEqual(client.path, "skills/snapshots/snapshot.enc")
             self.assertTrue(result["skillsChanged"])
             self.assertEqual(result["skillsUpdated"], ["demo"])
 
@@ -6329,10 +6209,10 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             remote_snapshot = remote.snapshot()
             remote_snapshot_id = hashlib.sha256(remote_snapshot).hexdigest()
             cloud = CloudManager(directory / "private", skills, None)
-            stored = {
-                "skills/current.enc": json.dumps({"version": 1, "snapshotId": remote_snapshot_id}).encode(),
-                f"skills/snapshots/{remote_snapshot_id}.enc": remote_snapshot
-            }
+            remote_packages = remote.skill_snapshots()
+            packages = {name: {"packageId": remote.skill_package_hash(data), "contentSha256": remote.skill_package_hash(data)} for name, data in remote_packages.items()}
+            stored = {"skills/current.enc": json.dumps({"version": 2, "packages": packages}).encode(),
+                **{f"skills/packages/{packages[name]['packageId']}.enc": data for name, data in remote_packages.items()}}
 
             def put(path, data, **_kwargs):
                 stored[path] = data
@@ -6481,6 +6361,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             private.mkdir()
             (private / "config.json").write_text(json.dumps({"version": 1, "machineName": "Legacy name", "webdav": {"enabled": False}}), encoding="utf-8")
 
+            migrate_test_data(private)
             CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
 
             control = json.loads((private / "config.json").read_text(encoding="utf-8"))["control"]
@@ -6516,6 +6397,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "webdav": {"enabled": True, "baseUrl": "https://example.test", "username": "user", "password": "webdav-secret", "remoteRoot": "root", "encryptionPassphraseHash": encryption_hash},
             }), encoding="utf-8")
 
+            migrate_test_data(private)
             cloud = CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
 
             saved = json.loads(cloud.config_path.read_text(encoding="utf-8"))
@@ -6603,6 +6485,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "server": {"host": "127.0.0.1"}, "webdav": {"enabled": False},
             }), encoding="utf-8")
 
+            migrate_test_data(private)
             cloud = CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
 
             self.assertNotEqual(cloud.config()["control"]["passwordHash"], "")
@@ -6628,6 +6511,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             legacy_key = hashlib.scrypt(b"old passphrase", salt=legacy_salt, n=1 << 15, r=8, p=1, dklen=32, maxmem=128 * 1024 * 1024)
             old_hash = f"scrypt-key-v1$32768$8$1${base64.b64encode(legacy_salt).decode()}${base64.b64encode(legacy_key).decode()}"
             new_hash = passphrase_hash("new passphrase", "https://new.example.test", "new-user")
+            from monitor_migrations import convert_verifier
+            old_hash = convert_verifier(old_hash, {"baseUrl": "https://old.example.test", "username": "old-user"})
             old_box = CryptoBox(old_hash, CryptoBox.descriptor(old_hash))
             stored = {
                 "crypto.json": json.dumps(CryptoBox.descriptor(old_hash), separators=(",", ":")).encode(),
@@ -6678,6 +6563,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
             old_hash = passphrase_hash("old passphrase", "https://example.test", "user")
+            from monitor_migrations import convert_verifier
+            old_hash = convert_verifier(old_hash, {"baseUrl": "https://old.example.test", "username": "old-user"})
             old_box = CryptoBox(old_hash, CryptoBox.descriptor(old_hash))
             stored = {"crypto.json": json.dumps(CryptoBox.descriptor(old_hash), separators=(",", ":")).encode()}
             for name in ("first", "second"):
@@ -6841,10 +6728,11 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "pendingAccountOperation": None, "conditionalWritesVerified": False
             }), encoding="utf-8")
 
+            migrate_test_data(private)
             cloud = CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
 
-            self.assertEqual(cloud._state["skills"], {"indexEtag": '"pointer"', "indexId": "legacy", "localSha256": {}})
-            self.assertEqual(cloud._state["remote"]["skills"], {"version": 1, "indexEtag": '"pointer"', "indexId": "legacy", "legacySnapshotId": "legacy", "updatedAt": "then"})
+            self.assertEqual(cloud._state["skills"], {"indexEtag": None, "indexId": None, "localSha256": {}})
+            self.assertEqual(cloud._state["remote"]["skills"], {})
 
     def test_skill_scan_is_cached_until_explicit_refresh(self):
         with self.account_directory() as directory:
@@ -6983,7 +6871,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             auth_path = directory / "auth.json"
             data = json.dumps(self.account_auth("acct-a", "remote-refresh")).encode()
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "local-refresh")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             local_data = auth_path.read_bytes()
             cloud = SimpleNamespace(
                 begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), machine_id="machine", delete_account_payloads=mock.Mock(),
@@ -7006,7 +6894,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             cloud = SimpleNamespace(
                 begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), machine_id="machine", delete_account_payloads=mock.Mock(),
                 bind_account=mock.Mock(return_value=({"accountKey": "key-api", "accountType": "api", "label": "API"}, auth_path.read_bytes(), '"etag"')),
@@ -7025,7 +6913,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             auth_path = directory / "auth.json"
             data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
             auth_path.write_bytes(data)
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.active_account()["label"] = "API profile"
             manager.active_account()["configHeaderToml"] = 'model_provider = "custom"\n'
             identity = auth_identity(parse_auth_bytes(data))
@@ -7048,7 +6936,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             cloud = SimpleNamespace(find_remote_api_accounts=mock.Mock(return_value=[{"accountKey": "legacy-key"}]), release_account=mock.Mock())
 
             with self.assertRaises(AccountError) as raised:
@@ -7062,7 +6950,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
             state = {"accountKey": "api-key", "keyType": "api-identity", "accountType": "api", "label": "Remote API", "configHeaderToml": 'model_provider = "custom"\n'}
             cloud = SimpleNamespace(bind_account=mock.Mock(return_value=(state, data, '"etag"')), cache_remote_account=mock.Mock(), delete_account_payloads=mock.Mock())
@@ -7080,7 +6968,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
             state = {"accountKey": "legacy-api", "accountType": "api", "label": "API"}
             cloud = SimpleNamespace(bind_account=mock.Mock(return_value=(state, data, '"etag"')), cache_remote_account=mock.Mock(), begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), delete_account_payloads=mock.Mock())
@@ -7095,7 +6983,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             data = auth_path.read_bytes()
             cloud = SimpleNamespace(bind_account=mock.Mock(return_value=({"accountKey": "legacy-api", "accountType": "api", "label": "API"}, data, '"etag"')), cache_remote_account=mock.Mock(), delete_account_payloads=mock.Mock())
 
@@ -7111,7 +6999,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.active_account()["cloud"] = {"state": "bound-local", "accountKey": "key-a"}
             cloud = SimpleNamespace(bind_account=mock.Mock())
 
@@ -7125,7 +7013,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "local-refresh")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             data = json.dumps(self.account_auth("acct-a", "remote-refresh")).encode()
             cloud = SimpleNamespace(
                 begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), machine_id="machine",
@@ -7148,7 +7036,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             auth_path = directory / "auth.json"
             data = json.dumps(self.account_auth("acct-a", "refresh-a")).encode()
             auth_path.write_bytes(data)
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.active_account()["cloud"] = {"state": "bound-local", "accountKey": "profile-key", "keyType": "opaque", "boundMachineId": "machine"}
             manager._save_manifest()
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
@@ -7165,7 +7053,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             auth_path = directory / "auth.json"
             data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
             auth_path.write_bytes(data)
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.active_account()["cloud"] = {"accountKey": "legacy-api", "keyType": "opaque"}
             manager._save_manifest()
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
@@ -7185,7 +7073,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             auth_path = directory / "auth.json"
             data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
             auth_path.write_bytes(data)
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manager.active_account()["cloud"] = {"accountKey": "legacy-api", "keyType": "opaque"}
             manager._save_manifest()
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
@@ -7214,7 +7102,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps({"tokens": {"id_token": "stable-id-token", "refresh_token": "refresh-a"}}), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
             first = cloud.usage_account_id("ppl-pro")
             manager.active_account()["label"] = "A completely different label"
@@ -7381,7 +7269,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             second_id = manager.create_account("Second")["activeAccountId"]
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
             manager.status()
@@ -7406,7 +7294,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             auth_path = directory / "auth.json"
             auth = json.dumps(self.account_auth("acct-a", "secret-refresh")).encode()
             auth_path.write_bytes(auth)
-            manager = AccountManager(auth_path)
+            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             manifest = json.loads(manager.manifest_path.read_text(encoding="utf-8"))
             manifest["version"] = 1
             manifest.pop("cloudBindingEnabled", None)
@@ -7414,7 +7302,9 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 account.pop("cloud")
             manager.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
 
-            migrated = AccountManager(auth_path)
+            from monitor_migrations import migrate_manifest
+            migrate_manifest(manager.manifest_path)
+            migrated = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
 
             self.assertEqual(migrated.manifest["version"], 3)
             self.assertNotIn("cloudBindingEnabled", migrated.manifest)
@@ -7431,10 +7321,10 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             rows = [{
                 "checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "Managed name",
                 "windows": {"5h": {"usedPercent": 5 if index < 5 else 6, "resetAt": "2030-01-01T05:00:00Z"}, "7d": {"usedPercent": 20, "resetAt": "2030-01-08T00:00:00Z"}},
-                "sync": {"version": 1, "originMachineId": "machine-a", "accountId": "usage-a", "recordId": f"quota-{index}"},
+                "sync": {"version": 1, "originMachineId": "machine-a", "accountId": "v3:usage-a", "recordId": f"quota-{index}"},
             } for index in range(6)]
             quota.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
-            store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "usage-a", threading.Lock())
+            store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
 
             records, present = store.snapshot()
             full_records, full_present = store.snapshot(necessary_only=False)
@@ -7454,7 +7344,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             tokens.write_text("", encoding="utf-8")
             make_row = lambda index: {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 5, "resetAt": "2030-01-01T05:00:00Z"}}}
             monitor_history.write_quota_history(quota, [make_row(index) for index in range(3)])
-            store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "usage-a", threading.Lock())
+            store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
             first, _ = store.snapshot()
             monitor_history.write_quota_history(quota, monitor_history.load_quota_history(quota) + [make_row(3), make_row(4)])
 
@@ -7478,60 +7368,18 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "windows": {"5h": {"usedPercent": 5, "plan": "plus", "resetAt": "2030-01-01T05:00:00Z"}},
             } for index in range(3)]
             monitor_history.write_quota_history(quota, rows)
-            store = UsageDataStore(quota, tokens, "machine-a", lambda slot: "usage-a" if slot == "account-a" else "usage-b", threading.Lock())
+            store = UsageDataStore(quota, tokens, "machine-a", lambda slot: "v3:usage-a" if slot == "account-a" else "v3:usage-b", threading.Lock())
 
             records, _ = store.snapshot()
             selected = [(record["row"]["sync"]["accountId"], record["row"]["checkedAt"]) for record in records.values()]
 
-            self.assertEqual(selected, [("usage-a", "2030-01-01T00:00:00Z"), ("usage-a", "2030-01-01T00:02:00Z"), ("usage-a", "2030-01-01T00:03:00Z"), ("usage-a", "2030-01-01T00:04:00Z"), ("usage-b", "2030-01-01T00:00:30Z"), ("usage-b", "2030-01-01T00:02:30Z")])
+            self.assertEqual(selected, [("v3:usage-a", "2030-01-01T00:00:00Z"), ("v3:usage-a", "2030-01-01T00:02:00Z"), ("v3:usage-a", "2030-01-01T00:03:00Z"), ("v3:usage-a", "2030-01-01T00:04:00Z"), ("v3:usage-b", "2030-01-01T00:00:30Z"), ("v3:usage-b", "2030-01-01T00:02:30Z")])
 
 
-    def test_usage_cache_namespaces_same_record_key_by_remote_machine(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = directory / "history.jsonl", directory / "quota.jsonl", directory / "tokens.jsonl"
-            for path in (history, quota, tokens):
-                path.write_text("", encoding="utf-8")
-            store = UsageDataStore(quota, tokens, "machine-a", lambda _: "usage-a", threading.Lock())
-            for machine in ("machine-b", "machine-c"):
-                row = {"checkedAt": "2030-01-01T00:00:00Z", "windows": {"5h": {"usedPercent": 1, "resetAt": None, "plan": "unknown"}}, "sync": {"version": 1, "originMachineId": machine, "accountId": "usage-a", "recordId": "shared"}}
-                store.apply([{"action": "upsert", "key": record_key("quota", row), "record": {"kind": "quota", "row": row}}], operation_origin=machine)
-
-            self.assertEqual(len(store._load_cache()[0]), 2)
-            store.apply([{"action": "delete", "key": "quota:shared"}], operation_origin="machine-b")
-            self.assertEqual(next(iter(store._load_cache()[0].values()))["sourceMachineId"], "machine-c")
 
 
-    def test_usage_packs_are_stable_hash_buckets_split_by_compressed_length(self):
-        keys, candidate = [], 0
-        while len(keys) < 80:
-            key = f"quota:bucket-test-{candidate}"
-            if hashlib.sha256(key.encode()).digest()[0] >> (8 - USAGE_PACK_BUCKET_BITS) == 0xA0 >> (8 - USAGE_PACK_BUCKET_BITS):
-                keys.append(key)
-            candidate += 1
-        records = {key: {"kind": "quota", "row": {"blob": "".join(hashlib.sha256(f"{key}:{index}".encode()).hexdigest() for index in range(48))}} for key in keys}
 
-        packs = CloudManager._usage_record_packs("machine-a", records)
 
-        self.assertGreater(len(packs), 1)
-        self.assertTrue(all(pack_id.startswith("a0-") for pack_id in packs))
-        self.assertTrue(all(pack["bytes"] <= USAGE_PACK_MAX_BYTES for pack in packs.values()))
-        self.assertEqual(sum(pack["records"] for pack in packs.values()), len(records))
-
-    def test_usage_pack_and_verification_limits_reduce_incremental_transfer(self):
-        self.assertEqual(USAGE_PACK_BUCKET_BITS, 6)
-        self.assertEqual(USAGE_PACK_MAX_BYTES, 16 * 1024)
-        self.assertEqual(USAGE_REGULAR_VERIFY_PACKS, 2)
-        self.assertEqual(USAGE_FULL_VERIFY_INTERVAL_SECONDS, 30 * 24 * 60 * 60)
-
-    def test_old_v2_usage_pointer_remains_readable_and_requests_format_migration(self):
-        box = SimpleNamespace(decrypt=lambda _purpose, payload, _limit: payload)
-        pointer = {"version": 2, "machineId": "machine-a", "packs": {"a-0000": "a" * 64}, "recordCount": 1}
-
-        self.assertEqual(CloudManager._parse_usage_pointer(box, "machine-a", json.dumps(pointer).encode()), pointer)
-        self.assertTrue(CloudManager._usage_full_verification_due(pointer))
-        pointer["verification"] = {"mode": "sampled", "verifiedPacks": [{}], "fullVerifiedAt": None}
-        with self.assertRaises(CloudError):
-            CloudManager._parse_usage_pointer(box, "machine-a", json.dumps(pointer).encode())
 
     def test_automatic_usage_period_is_thirty_minutes(self):
         self.assertEqual(AUTO_FETCH_INTERVAL_SECONDS, 60 * 60)
@@ -7578,7 +7426,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         first = event_sample("2030-01-01T00:00:00Z", five_hour=0, cost=0, plan="plus", five_hour_reset="2030-01-01T05:00:00Z")
         second = event_sample("2030-01-01T00:01:30Z", five_hour=1, cost=2, plan="plus", five_hour_reset="2030-01-01T05:00:00Z")
         for row in (first, second):
-            row.update({"originMachineId": "machine-a", "usageAccountId": "usage-a"})
+            row.update({"originMachineId": "machine-a", "usageAccountId": "v3:usage-a"})
 
         process_sample_delta_events(state, first, [])
         events = process_sample_delta_events(state, second, [])
@@ -7589,194 +7437,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertEqual((intervals[0]["startedAt"], intervals[0]["startPercent"], intervals[0]["endPercent"]), ("2030-01-01T00:00:00Z", 0, 1))
         self.assertEqual((intervals[0]["modelCostsUsd"]["gpt-5.5"], intervals[0]["deltaCostUsd"]), (2, 2))
 
-    @unittest.skip("Legacy hash-pack integration is replaced by test_usage_v4")
-    def test_usage_cloud_pack_manifest_fetches_each_missing_hash_and_updates_only_changed_buckets(self):
-        class Client:
-            def __init__(self):
-                self.files, self.revision, self.get_paths, self.list_paths = {}, 0, [], []
-                self.fail_pointer_put_once = False
-
-            def ensure_directories(self, path):
-                pass
-
-            def put(self, path, data, etag=None, create=False):
-                if self.fail_pointer_put_once and path.startswith("usage/machines/"):
-                    self.fail_pointer_put_once = False
-                    raise CloudError("simulated pointer write failure", 502)
-                if create and path in self.files or etag is not None and (path not in self.files or self.files[path][1] != etag):
-                    raise CloudError("HTTP 412", 409)
-                self.revision += 1
-                current = f'"{self.revision}"'
-                self.files[path] = (data, current)
-                return current
-
-            def get(self, path):
-                self.get_paths.append(path)
-                if path not in self.files:
-                    raise CloudError("HTTP 404", 502)
-                return self.files[path]
-
-            def list_details(self, path):
-                self.list_paths.append(path)
-                prefix = path.rstrip("/") + "/"
-                return [{"name": name[len(prefix):], "etag": value[1]} for name, value in self.files.items() if name.startswith(prefix) and "/" not in name[len(prefix):]]
-
-            def list(self, path):
-                return [item["name"] for item in self.list_details(path)]
-
-            def delete(self, path, etag=None):
-                self.files.pop(path, None)
-
-        class Store:
-            def __init__(self, records):
-                self.records, self.received, self.packs = records, [], {}
-
-            def snapshot(self, necessary_only=True):
-                self.necessary_only = necessary_only
-                return self.records, set(self.records)
-
-            def apply(self, operations, checkpoint_origin=None, operation_origin=None):
-                self.received.extend(operations)
-                return []
-
-            def pack_hashes(self, machine_id):
-                return self.packs.get(machine_id, {}).copy()
-
-            def apply_pack_snapshot(self, machine_id, manifest, downloaded, replace_all=False):
-                self.received.extend({"action": "upsert", **entry} for entries in downloaded.values() for entry in entries)
-                self.packs[machine_id] = manifest.copy()
-                return []
-
-            def remove_origins_not_in(self, machine_ids):
-                removed = set(self.packs) - set(machine_ids)
-                for machine_id in removed:
-                    self.packs.pop(machine_id)
-                return len(removed)
-
-        with self.account_directory() as directory:
-            encryption_hash = passphrase_hash("passphrase", "https://example.test", "user")
-            client, box, clouds = Client(), CryptoBox(encryption_hash, CryptoBox.descriptor(encryption_hash)), []
-            for name in ("a", "b"):
-                root = directory / name
-                cloud = CloudManager(root / "private", SkillManager(root / "codex", root / "private", root / "gemini"), None)
-                cloud._config["webdav"]["enabled"] = True
-                cloud._state["conditionalWritesVerified"] = True
-                cloud._connection = lambda initialize=False: (client, box)
-                clouds.append(cloud)
-            records = {
-                f"quota:quota-{index}": {"kind": "quota", "row": {
-                    "checkedAt": f"2030-01-01T00:{index:02}:00Z", "windows": {"5h": {"usedPercent": index}},
-                    "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": f"quota-{index}"},
-                }}
-                for index in range(32)
-            }
-            first_store, second_store = Store(records), Store({})
-            clouds[0].configure_usage_sync(first_store)
-            clouds[1].configure_usage_sync(second_store)
-
-            first = clouds[0].sync_usage_data()
-            second = clouds[1].sync_usage_data()
-            files_after_snapshot = set(client.files)
-            unchanged = clouds[0].sync_usage_data()
-            manifest = clouds[0]._usage_pointer(client, box, clouds[0].machine_id)[0]["packs"]
-            client.get_paths.clear()
-            quiet_fetch = clouds[1]._fetch_usage_data(client, box)
-            self.assertEqual(quiet_fetch["payloadsDownloaded"], 0)
-            self.assertNotIn(clouds[0]._usage_pointer_path(clouds[0].machine_id), client.get_paths)
-            clouds[1]._state["usage"]["remote"][clouds[0].machine_id]["lastFullVerificationAt"] = "2000-01-01T00:00:00Z"
-            periodic_full_fetch = clouds[1]._fetch_usage_data(client, box)
-            self.assertEqual(periodic_full_fetch["payloadsDownloaded"], len(manifest))
-            retained_pack = sorted(manifest)[-1]
-            second_store.packs[clouds[0].machine_id] = {retained_pack: manifest[retained_pack]}
-            second_store.received.clear()
-            repair = clouds[1]._fetch_usage_data(client, box)
-            self.assertEqual(repair["payloadsDownloaded"], len(manifest) - 1)
-            self.assertEqual(second_store.packs[clouds[0].machine_id], manifest)
-            first_store.records["quota:quota-new"] = {"kind": "quota", "row": {"checkedAt": "2030-01-01T01:00:00Z", "windows": {"5h": {"usedPercent": 33}}, "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": "quota-new"}}}
-            incremental = clouds[0].sync_usage_data()
-
-            self.assertTrue(first["published"]["fullSnapshot"])
-            self.assertGreater(first["published"]["packs"], 1)
-            self.assertGreater(len(second_store.received), 0)
-            self.assertEqual(unchanged["published"]["uploaded"], 0)
-            self.assertEqual(unchanged["published"]["packsUploaded"], 0)
-            self.assertNotEqual(files_after_snapshot, set(client.files))
-            self.assertEqual(incremental["published"]["uploaded"], 1)
-            self.assertEqual(incremental["published"]["packsUploaded"], 1)
-            client.get_paths.clear()
-            client.list_paths.clear()
-            bucket_keys, candidate = {}, 0
-            while len(bucket_keys) < 5:
-                key = f"quota:sampled-{candidate}"
-                bucket = hashlib.sha256(key.encode()).digest()[0] >> (8 - USAGE_PACK_BUCKET_BITS)
-                bucket_keys.setdefault(bucket, key)
-                candidate += 1
-            for index, key in enumerate(bucket_keys.values()):
-                first_store.records[key] = {"kind": "quota", "row": {
-                    "checkedAt": f"2030-01-01T02:{index:02}:00Z", "windows": {"5h": {"usedPercent": 40 + index}},
-                    "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": key},
-                }}
-            sampled = clouds[0].sync_usage_data()
-            pack_gets = [path for path in client.get_paths if path.startswith(f"usage/packs/{clouds[0].machine_id}/")]
-            self.assertGreaterEqual(sampled["published"]["packsUploaded"], 5)
-            self.assertEqual(sampled["published"]["packsVerified"], USAGE_REGULAR_VERIFY_PACKS)
-            self.assertFalse(sampled["published"]["fullVerification"])
-            self.assertEqual(len(pack_gets), USAGE_REGULAR_VERIFY_PACKS)
-            self.assertEqual(client.get_paths.count(clouds[0]._usage_pointer_path(clouds[0].machine_id)), 1)
-            self.assertNotIn(f"usage/packs/{clouds[0].machine_id}", client.list_paths)
-            pointer_path = clouds[0]._usage_pointer_path(clouds[0].machine_id)
-            pointer_before_failure = client.files[pointer_path]
-            first_store.records["quota:failure-retry"] = {"kind": "quota", "row": {
-                "checkedAt": "2030-01-01T03:00:00Z", "windows": {"5h": {"usedPercent": 50}},
-                "sync": {"originMachineId": clouds[0].machine_id, "accountId": "usage-a", "recordId": "failure-retry"},
-            }}
-            client.fail_pointer_put_once = True
-            with self.assertRaises(CloudError):
-                clouds[0].sync_usage_data()
-            self.assertEqual(client.files[pointer_path], pointer_before_failure)
-            recovered = clouds[0].sync_usage_data()
-            self.assertEqual(recovered["published"]["uploaded"], 1)
-            with mock.patch.object(clouds[0], "_usage_full_verification_due", return_value=True):
-                verified = clouds[0].sync_usage_data()
-            self.assertTrue(verified["published"]["fullVerification"])
-            self.assertEqual(verified["published"]["packsUploaded"], 0)
-            self.assertEqual(verified["published"]["packsVerified"], verified["published"]["packs"])
-            full = clouds[0]._push_usage_data(True)
-            self.assertFalse(full["fullSnapshot"])
-            self.assertEqual(full["uploaded"], len(first_store.records))
-            self.assertEqual(full["packsUploaded"], full["packs"])
-            self.assertTrue(first_store.necessary_only)
-            received_before_full_fetch = len(second_store.received)
-            full_fetch = clouds[1]._fetch_usage_data(client, box, True)
-            self.assertEqual(full_fetch["payloadsDownloaded"], full["packs"])
-            self.assertEqual(len(second_store.received), received_before_full_fetch + len(first_store.records))
-
-            legacy_machine = "legacy-machine"
-            legacy_records = [{
-                "key": "quota:legacy-a", "record": {"kind": "quota", "row": {
-                    "checkedAt": "2029-12-31T23:58:00Z", "windows": {"5h": {"usedPercent": 1, "plan": "plus"}},
-                    "sync": {"version": 1, "originMachineId": legacy_machine, "accountId": "usage-legacy", "recordId": "legacy-a"},
-                }},
-            }]
-            checkpoint_id, _ = clouds[0]._put_usage_payload(client, box, "checkpoints", legacy_machine, {"version": 1, "machineId": legacy_machine, "sequence": 0, "records": legacy_records})
-            chunk_id, _ = clouds[0]._put_usage_payload(client, box, "chunks", legacy_machine, {
-                "version": 1, "machineId": legacy_machine, "sequence": 1, "parentChunkId": None,
-                "operations": [{"action": "upsert", "key": "quota:legacy-b", "record": {"kind": "quota", "row": {
-                    "checkedAt": "2029-12-31T23:59:00Z", "windows": {"5h": {"usedPercent": 2, "plan": "plus"}},
-                    "sync": {"version": 1, "originMachineId": legacy_machine, "accountId": "usage-legacy", "recordId": "legacy-b"},
-                }}}],
-            })
-            legacy_pointer = {"version": 1, "machineId": legacy_machine, "sequence": 1, "checkpointId": checkpoint_id, "headChunkId": chunk_id}
-            client.put(clouds[0]._usage_pointer_path(legacy_machine), box.encrypt(f"usage-pointer:{legacy_machine}", json.dumps(legacy_pointer, separators=(",", ":")).encode()), create=True)
-
-            migration = clouds[1]._fetch_usage_data(client, box)
-            migrated_pointer = clouds[1]._usage_pointer(client, box, legacy_machine)[0]
-
-            self.assertEqual(migration["machinesMigrated"], 1)
-            self.assertEqual(migrated_pointer["version"], 2)
-            self.assertEqual(migrated_pointer["recordCount"], 2)
-            self.assertEqual(second_store.packs[legacy_machine], migrated_pointer["packs"])
-            self.assertFalse(any(f"/{kind}/{legacy_machine}/" in path for path in client.files for kind in ("chunks", "checkpoints")))
 
 
 def sample(checked_at, five_hour=None, seven_day=None, five_hour_reset=None, seven_day_reset=None):
@@ -7824,7 +7484,7 @@ class RawCostUsageTests(unittest.TestCase):
             {"schemaVersion": 1, "recordType": "usage", "eventId": f"s:{index}", "sessionId": "s", "occurredAt": timestamp, "rawModel": model, "billingModel": model, "accountSlotId": "a", "tokens": {}, "cost": {"totalCostUsd": cost}}
             for index, (timestamp, model, cost) in enumerate((("2030-01-01T00:11:00Z", "a", 2), ("2030-01-01T00:13:00Z", "b", 3), ("2030-01-01T00:15:00Z", "a", 100)), 1)
         ]
-        result = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "usage-a"}), ledger, {"a": "usage-a"})["fiveHour"]
+        result = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "v3:usage-a"}), ledger, {"a": "v3:usage-a"})["fiveHour"]
         self.assertEqual(len(result), 2)
         self.assertEqual([(row["startedAt"], row["endedAt"], row["checkedAt"]) for row in result], [
             ("2030-01-01T00:10:00Z", "2030-01-01T00:12:00Z", "2030-01-01T00:12:00Z"),
@@ -7846,9 +7506,9 @@ class RawCostUsageTests(unittest.TestCase):
             self.assertEqual([row["checkedAt"] for row in result[label]], [quota[1]["checkedAt"], quota[2]["checkedAt"]])
 
     def test_raw_ledger_deduplicates_same_logical_event(self):
-        base = {"schemaVersion": 1, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z", "rawModel": "m", "billingModel": "m", "serviceTier": "default", "tokens": monitor_common.empty_token_totals(), "cost": monitor_common.empty_cost_totals() | {"totalCostUsd": 1}}
-        first = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "a"}, "machine-a", "usage-a")
-        second = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "b"}, "machine-b", "usage-a")
+        base = {"schemaVersion": 2, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z", "rawModel": "m", "billingModel": "m", "serviceTier": "default", "tokens": monitor_common.empty_token_totals(), "cost": monitor_common.empty_cost_totals() | {"totalCostUsd": 1}}
+        first = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "a"}, "machine-a", "v3:usage-a")
+        second = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "b"}, "machine-b", "v3:usage-a")
         merged, conflicts = monitor_usage_sync.merge_token_ledger_rows([first, second])
         self.assertEqual((len(merged), conflicts), (1, []))
         operation = {"action": "upsert", "key": monitor_usage_sync.record_key("tokenLedger", first), "record": {"kind": "tokenLedger", "row": first}}
@@ -7865,32 +7525,11 @@ class RawCostUsageTests(unittest.TestCase):
                 (10, 1, "2030-01-01T10:00:00Z", "plus"), (12, 2, "2030-01-01T10:00:00Z", "plus"),
             )
         ]
-        points = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "usage-a"}), [], {"a": "usage-a"})["fiveHour"]
+        points = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "v3:usage-a"}), [], {"a": "v3:usage-a"})["fiveHour"]
         self.assertEqual(len(points), 3)
         self.assertEqual((points[0]["startUsagePercent"], points[0]["endUsagePercent"], points[0]["deltaPercent"]), (20.0, 40.0, 20.0))
         self.assertEqual(points[0]["costPer100PercentUsd"], 0.0)
 
-    def test_store_syncs_each_ledger_record_and_ignores_old_derived_records(self):
-        with MonitorCodexUsageTests().account_directory() as directory:
-            quota, ledger = directory / "quota.jsonl", directory / "ledger.jsonl"
-            monitor_history.write_quota_history(quota, [{"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}])
-            rows = [
-                {"schemaVersion": 1, "recordType": "priceEpoch", "pricingId": "p", "rates": {}},
-                {"schemaVersion": 1, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:30Z", "rawModel": "m", "billingModel": "m", "accountSlotId": "a", "tokens": {}, "cost": {"totalCostUsd": 1}},
-                {"schemaVersion": 1, "recordType": "legacyBaseline", "session": {"sessionId": "old", "accountSlotId": "a", "tokens": {}, "byModel": {}, "cost": {}}},
-            ]
-            ledger.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-            store = UsageDataStore(quota, ledger, "machine-a", lambda _slot: "usage-a", threading.Lock(), lambda _account, _slot, _label: ("a", "A"))
-            records, _ = store.snapshot(necessary_only=False)
-            self.assertEqual(sorted(record["row"]["recordType"] for record in records.values() if record["kind"] == "tokenLedger"), ["legacyBaseline", "usage"])
-            old = {"action": "upsert", "key": "cost:old", "record": {"kind": "cost", "row": {"sync": {"originMachineId": "machine-b"}}}}
-            store.apply([old], operation_origin="machine-b")
-            local_rows = store.datasets("local")[1]
-            self.assertEqual([row["recordType"] for row in local_rows], ["usage", "legacyBaseline"])
-            self.assertTrue(all(row["schemaVersion"] == 2 and row["sync"]["accountId"] == "usage-a" for row in local_rows))
-            self.assertEqual(local_rows[0]["cost"], rows[1]["cost"])
-            self.assertEqual(monitor_token_ledger.load_token_ledger(ledger), local_rows)
-            self.assertEqual([row["recordType"] for row in store.datasets("merged")[1]], ["legacyBaseline", "usage"])
 
     def test_dashboard_uses_weighted_model_attribution_and_average_dense_points(self):
         html = dashboard_html()

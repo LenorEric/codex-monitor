@@ -1,4 +1,5 @@
 import json
+import gc
 import tempfile
 import shutil
 import uuid
@@ -18,7 +19,7 @@ class ProcessingTests(unittest.TestCase):
         self.root = Path.cwd() / f".test-processing-{uuid.uuid4().hex}"
         self.root.mkdir()
         self.addCleanup(self.cleanup)
-        self.store = UsageDataStore(self.root / "quota.jsonl", self.root / "ledger.jsonl", "machine", lambda _: "account", threading.RLock())
+        self.store = UsageDataStore(self.root / "quota.jsonl", self.root / "ledger.jsonl", "machine", lambda _: "v3:account", threading.RLock())
         self.log = self.root / "sessions" / "2030" / "01" / "01" / "rollout.jsonl"
         self.log.parent.mkdir(parents=True)
         self.write([
@@ -30,6 +31,8 @@ class ProcessingTests(unittest.TestCase):
     def cleanup(self):
         if not self.root.resolve().is_relative_to(Path.cwd().resolve()) or not self.root.name.startswith(".test-processing-"):
             raise ValueError("Unexpected test directory")
+        # Failure-injection tracebacks can retain SQLite cursors until cyclic collection.
+        gc.collect()
         shutil.rmtree(self.root)
 
     @staticmethod
@@ -46,7 +49,7 @@ class ProcessingTests(unittest.TestCase):
         store = store or self.store
         store.index.scan(self.root)
         return store.index.sync_ledger(store.token_ledger_path, "slot", "Account", [],
-            lambda row: add_record_provenance("tokenLedger", row, "machine", "account"), store.normalize_new_ledger, "machine")
+            lambda row: add_record_provenance("tokenLedger", row, "machine", "v3:account"), store.normalize_new_ledger, "machine")
 
     def test_restart_and_idle_do_not_read_or_hash_history(self):
         expected = monitor_tokens.scan_codex_token_usage(self.root)
@@ -57,7 +60,7 @@ class ProcessingTests(unittest.TestCase):
         self.sync()
         self.assertEqual(self.store.index.metrics["sourceBytesRead"], first["sourceBytesRead"])
         self.assertEqual(self.store.index.metrics["eventsHashed"], first["eventsHashed"])
-        restarted = UsageDataStore(self.store.quota_path, self.store.token_ledger_path, "machine", lambda _: "account", threading.RLock())
+        restarted = UsageDataStore(self.store.quota_path, self.store.token_ledger_path, "machine", lambda _: "v3:account", threading.RLock())
         with mock.patch.object(monitor_token_ledger, "load_token_ledger", side_effect=AssertionError("history reload")):
             self.assertEqual(self.sync(restarted), self.store.index.ledger_cost(self.store.token_ledger_path))
         self.assertEqual(restarted.index.metrics["sourceBytesRead"], 0)
@@ -112,7 +115,7 @@ class ProcessingTests(unittest.TestCase):
 
         with mock.patch.object(monitor_token_ledger, "append_token_ledger", side_effect=interrupted), self.assertRaises(RuntimeError):
             self.sync()
-        restarted = UsageDataStore(self.store.quota_path, self.store.token_ledger_path, "machine", lambda _: "account", threading.RLock())
+        restarted = UsageDataStore(self.store.quota_path, self.store.token_ledger_path, "machine", lambda _: "v3:account", threading.RLock())
         self.sync(restarted)
         self.assertEqual(len(monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)), 1)
 
@@ -153,7 +156,7 @@ class ProcessingTests(unittest.TestCase):
         import monitor_dashboard
         from monitor_projection import DashboardProjector
         projector = DashboardProjector(self.store)
-        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "account"}]}
+        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
         self.sync()
         initial_rebuilds = None
         for minute in range(5):
@@ -177,7 +180,7 @@ class ProcessingTests(unittest.TestCase):
         from monitor_projection import DashboardProjector
         from datetime import datetime, timezone
         projector = DashboardProjector(self.store)
-        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "account"}]}
+        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
         values = [12, 13, 12.8, 12.9, 13, 14, 60, None, 15, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 100, 16]
         for minute, value in enumerate(values):
             now = 1893456000 + minute * 60
@@ -227,7 +230,7 @@ class ProcessingTests(unittest.TestCase):
         self.store.account_mapper = lambda *_: ("slot", "Account")
         self.sync()
         row = monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)[0]
-        row = row | {"eventId": "remote-event", "sessionId": "remote-session", "sync": {"version": 1, "originMachineId": "remote", "accountId": "account"}}
+        row = row | {"eventId": "remote-event", "sessionId": "remote-session", "sync": {"version": 1, "originMachineId": "remote", "accountId": "v3:account"}}
         record = {"kind": "tokenLedger", "row": row}
         entry = v4_record_envelope("remote", record_key("tokenLedger", row), record, "2030-01-01T00:00Z")
         self.store.v4_apply_day("remote", {"day": "2030-01-01", "parts": {"bulk": "hash"}, "logicalHash": v4_logical_hash([entry])}, {"bulk": [entry]})
@@ -261,7 +264,7 @@ class ProcessingTests(unittest.TestCase):
         from monitor_streaming import json_chunks
         self.sync()
         projector = DashboardProjector(self.store)
-        projector.refresh({"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "account"}]}, 1893456000)
+        projector.refresh({"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}, 1893456000)
         for view in ("local", "merged"):
             streamed = projector.snapshot(view, True)
             try:
@@ -277,7 +280,7 @@ class ProcessingTests(unittest.TestCase):
         from monitor_streaming import json_chunks, close_records
         self.sync()
         projector = DashboardProjector(self.store)
-        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "account"}]}
+        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
         projector.refresh(accounts, 1893456000)
         expected = projector.snapshot("local")
         snapshot = projector.snapshot("local", True)
@@ -294,7 +297,7 @@ class ProcessingTests(unittest.TestCase):
         self.store.account_mapper = lambda *_: ("slot", "Account")
         self.sync()
         row = monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)[0] | {"eventId": "remote-one", "sessionId": "remote-session",
-            "sync": {"version": 1, "originMachineId": "remote", "accountId": "account"}}
+            "sync": {"version": 1, "originMachineId": "remote", "accountId": "v3:account"}}
         def envelope(row):
             return v4_record_envelope("remote", record_key("tokenLedger", row), {"kind": "tokenLedger", "row": row}, "2030-01-01T00:00Z")
         entries = [envelope(row)]

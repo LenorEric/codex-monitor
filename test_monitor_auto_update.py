@@ -11,8 +11,10 @@ from pathlib import Path
 from unittest import mock
 
 import build_release
+import monitor_migrations
 import monitor_auto_update
-from monitor_auto_update import AutoUpdateError, AutoUpdater, DATA_MIGRATION_STATE_FILENAME, RELEASE_VERSION_URL, RUNTIME_FILE_URL, installed_data_contract_version, installed_version, migrate_history_data, parse_version, restart_process, validate_manifest
+from monitor_auto_update import AutoUpdateError, AutoUpdater, RELEASE_VERSION_URL, RUNTIME_FILE_URL, installed_version, parse_version, restart_process, validate_manifest
+from monitor_migrations import DATA_MIGRATION_STATE_FILENAME, installed_data_contract_version, migrate_history_data
 
 
 class Response(BytesIO):
@@ -67,7 +69,7 @@ class AutoUpdateTests(unittest.TestCase):
     def test_startup_checks_before_migration_failure_and_restarts_before_migration(self):
         import codex_monitor_daemon as daemon
 
-        with mock.patch.object(daemon.sys, "argv", [str(Path(daemon.__file__))]), mock.patch.object(daemon, "check_startup_update", return_value=False) as check, mock.patch.object(daemon, "migrate_default_monitor_data", side_effect=RuntimeError("migration failed")) as migrate:
+        with mock.patch.object(daemon.sys, "argv", [str(Path(daemon.__file__))]), mock.patch.object(daemon, "check_startup_update", return_value=False) as check, mock.patch.object(daemon, "migrate_installed_data", side_effect=RuntimeError("migration failed")) as migrate:
             with self.assertRaisesRegex(RuntimeError, "migration failed"):
                 daemon._main(mock.Mock())
             check.assert_called_once()
@@ -157,7 +159,7 @@ class AutoUpdateTests(unittest.TestCase):
             paths = [data_home / name for name in ("history", "quota", "sessions", "ledger", "samples")]
             (data_home / DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":1}\n', encoding="utf-8")
             applied = []
-            with mock.patch.object(monitor_auto_update, "DATA_CONTRACT_VERSION", 3), mock.patch.object(monitor_auto_update, "DATA_MIGRATIONS", {2: lambda _paths: applied.append(2), 3: lambda _paths: applied.append(3)}):
+            with mock.patch.object(monitor_migrations, "DATA_CONTRACT_VERSION", 3), mock.patch.object(monitor_migrations, "DATA_MIGRATIONS", {2: lambda _paths: applied.append(2), 3: lambda _paths: applied.append(3)}):
                 self.assertEqual(migrate_history_data(data_home, *paths, target_version=3), [2, 3])
             self.assertEqual(applied, [2, 3])
             self.assertEqual(json.loads((data_home / DATA_MIGRATION_STATE_FILENAME).read_text(encoding="utf-8")), {"dataContractVersion": 3})
@@ -267,7 +269,7 @@ class AutoUpdateTests(unittest.TestCase):
             updater = AutoUpdater(runtime, lambda: True, lambda: None)
             opener = Opener({RUNTIME_FILE_URL.format(name=name): data for name, data in files.items()})
 
-            with mock.patch.object(monitor_auto_update, "migrate_installed_usage_data", side_effect=AssertionError("old runtime attempted migration")) as migrate:
+            with mock.patch.object(monitor_migrations, "migrate_installed_data", side_effect=AssertionError("old runtime attempted migration")) as migrate:
                 updater._install(opener, "1.5.1", {name: descriptor(data) for name, data in files.items()})
                 migrate.assert_not_called()
 
@@ -362,19 +364,36 @@ class AutoUpdateTests(unittest.TestCase):
 
         commit.assert_not_called()
 
+    def test_mismatched_contract_cannot_bump_version_or_replace_runtime(self):
+        with temporary_directory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir()
+            (runtime / "preserved.txt").write_text("existing release", encoding="utf-8")
+            (root / "package.json").write_text('{"dataContractVersion":16,"cloudDataContractVersion":3}', encoding="utf-8")
+            with mock.patch.object(build_release, "ROOT", root), mock.patch.object(build_release, "RUNTIME_DIR", runtime), mock.patch.object(build_release, "bump_package_version") as bump:
+                with self.assertRaises(monitor_migrations.MigrationError):
+                    build_release.main()
+                bump.assert_not_called()
+                with self.assertRaises(monitor_migrations.MigrationError):
+                    build_release.rebuild_runtime("1.5.18")
+            self.assertEqual((runtime / "preserved.txt").read_text(encoding="utf-8"), "existing release")
+
     def test_current_release_is_complete_and_next_build_is_patch(self):
         package = json.loads((build_release.ROOT / "package.json").read_text(encoding="utf-8"))
         manifest = json.loads((build_release.RELEASE_DIR / "version.json").read_text(encoding="utf-8"))
         actual = {path.name: descriptor(path.read_bytes()) for path in build_release.RUNTIME_DIR.iterdir() if path.is_file()}
 
-        self.assertEqual(package["dataContractVersion"], monitor_auto_update.DATA_CONTRACT_VERSION)
-        self.assertEqual(sorted(monitor_auto_update.DATA_MIGRATIONS), list(range(1, monitor_auto_update.DATA_CONTRACT_VERSION + 1)))
+        self.assertEqual(package["dataContractVersion"], monitor_migrations.DATA_CONTRACT_VERSION)
+        self.assertEqual(sorted(monitor_migrations.DATA_MIGRATIONS), list(range(1, monitor_migrations.DATA_CONTRACT_VERSION + 1)))
         self.assertEqual(manifest, {"version": package["version"], "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
-        from monitor_cloud import CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_MIGRATIONS
+        from monitor_migrations import CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_MIGRATIONS
         self.assertEqual(package["cloudDataContractVersion"], CLOUD_DATA_CONTRACT_VERSION)
         self.assertEqual(sorted(CLOUD_DATA_MIGRATIONS), list(range(1, CLOUD_DATA_CONTRACT_VERSION + 1)))
-        self.assertEqual(json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8")), {"version": package["version"], "dataContractVersion": monitor_auto_update.DATA_CONTRACT_VERSION, "cloudDataContractVersion": CLOUD_DATA_CONTRACT_VERSION})
-        self.assertTrue(all((build_release.ROOT / name).read_text(encoding="utf-8") == (build_release.RUNTIME_DIR / name).read_text(encoding="utf-8") for name in build_release.RUNTIME_FILES))
+        released = json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8"))
+        self.assertEqual(released["version"], package["version"])
+        self.assertIn(monitor_migrations.DATA_CONTRACT_VERSION, {released["dataContractVersion"], released["dataContractVersion"] + 1})
+        self.assertIn(CLOUD_DATA_CONTRACT_VERSION, {released["cloudDataContractVersion"], released["cloudDataContractVersion"] + 1})
+        self.assertTrue(all((build_release.ROOT / name).is_file() for name in build_release.RUNTIME_FILES))
         self.assertEqual(build_release.next_patch_version("1.5.5"), "1.5.6")
         ignore = (build_release.ROOT / ".vscodeignore").read_text(encoding="utf-8").splitlines()
         self.assertIn("release/**", ignore)

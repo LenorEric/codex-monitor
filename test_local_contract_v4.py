@@ -7,7 +7,7 @@ import sqlite3
 from contextlib import closing, contextmanager
 from pathlib import Path
 
-import monitor_auto_update
+import monitor_migrations
 import monitor_history
 import monitor_token_ledger
 
@@ -26,7 +26,7 @@ class LocalContractV4Tests(unittest.TestCase):
     def test_v9_preserves_history_and_bootstraps_retryable_delivery_indexes(self):
         from monitor_processing import ProcessingIndex
         with workspace_directory() as root:
-            (root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":8}\n', encoding="utf-8")
+            (root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":8}\n', encoding="utf-8")
             quota, ledger, cache = root / "quota.jsonl", root / "ledger.jsonl", root / "cache.json"
             quota.write_bytes(b'{"original":"quota"}\n')
             ledger.write_bytes(b'{"original":"ledger"}\n')
@@ -34,19 +34,19 @@ class LocalContractV4Tests(unittest.TestCase):
             with index.transaction() as db:
                 db.execute("INSERT INTO processing_display VALUES('local','a','tokenSessions','s',NULL,?)", (json.dumps({"startedAt": "2030-01-01T00:00:00Z"}),))
             args = (root, root / "history.jsonl", quota, root / "sessions.jsonl", ledger, root / "samples.jsonl")
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [9])
+            self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [9])
             with index.transaction() as db:
                 self.assertEqual(db.execute("SELECT event_at FROM processing_display").fetchone()[0], 1893456000)
                 self.assertTrue(db.execute("SELECT dirty FROM dashboard_days WHERE day=?", (1893456000 // 86400,)).fetchone()[0])
             self.assertEqual(quota.read_bytes(), b'{"original":"quota"}\n')
             self.assertEqual(ledger.read_bytes(), b'{"original":"ledger"}\n')
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [])
+            self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [])
 
     def test_v12_rebuilds_projections_preserves_canonical_data_and_rolls_back_for_retry(self):
         from monitor_processing import ProcessingIndex
         from monitor_delivery import DashboardDelivery
         with workspace_directory() as root:
-            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state = root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
             state.write_text('{"dataContractVersion":11}', encoding="utf-8")
             cache = root / "cache.json"
             index = ProcessingIndex(root / "cache-v4.sqlite3")
@@ -61,15 +61,15 @@ class LocalContractV4Tests(unittest.TestCase):
             quota.write_bytes(b'{"original":"quota"}\n')
             ledger.write_bytes(b'{"original":"ledger"}\n')
             args = (root, root / "history", quota, root / "sessions", ledger, root / "samples")
-            migration = monitor_auto_update.DATA_MIGRATIONS[12]
+            migration = monitor_migrations.DATA_MIGRATIONS[12]
             def fail(paths):
                 migration(paths)
                 raise RuntimeError("interrupted")
-            with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {12: fail}), self.assertRaisesRegex(RuntimeError, "interrupted"):
-                monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12)
+            with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {12: fail}), self.assertRaisesRegex(RuntimeError, "interrupted"):
+                monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12)
             self.assertEqual(delivery.manifest("local", "All"), old)
             self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12), [12])
+            self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12), [12])
             with index.transaction() as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_quota_points").fetchone()[0], 0)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM dashboard_blobs").fetchone()[0], 0)
@@ -78,12 +78,12 @@ class LocalContractV4Tests(unittest.TestCase):
             self.assertIsNotNone(delivery.manifest("local", "All"))
             self.assertEqual(quota.read_bytes(), b'{"original":"quota"}\n')
             self.assertEqual(ledger.read_bytes(), b'{"original":"ledger"}\n')
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12), [])
+            self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12), [])
 
     def test_v8_preserves_canonical_files_and_durable_v4_database(self):
         from monitor_usage_sync import initialize_v4_cache
         with workspace_directory() as root:
-            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state = root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
             state.write_text('{"dataContractVersion":7}\n', encoding="utf-8")
             quota, ledger, cache = root / "quota.jsonl", root / "ledger.jsonl", root / "cache.json"
             quota.write_bytes(b'{"raw":"quota"}\n')
@@ -94,13 +94,13 @@ class LocalContractV4Tests(unittest.TestCase):
                 db.execute("CREATE TABLE local_records(record_key TEXT PRIMARY KEY,period TEXT,content_hash TEXT,record_json TEXT)")
                 db.execute("INSERT INTO local_records VALUES('key','2030-01-01T00:00Z','digest','{}')")
             args = (root, root / "history.jsonl", quota, root / "sessions.jsonl", ledger, root / "samples.jsonl")
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [8, 9])
+            self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [8, 9])
             with closing(sqlite3.connect(database)) as db, db:
                 self.assertEqual(db.execute("SELECT * FROM local_records").fetchall(), [('key', '2030-01-01T00:00Z', 'digest', '{}')])
                 self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_scan_sources'").fetchone())
             self.assertEqual(quota.read_bytes(), b'{"raw":"quota"}\n')
             self.assertEqual(ledger.read_bytes(), b'{"raw":"ledger"}\n')
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [])
+            self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [])
 
     def test_sqlite_migration_backup_and_rollback_include_wal(self):
         with workspace_directory() as root:
@@ -116,7 +116,7 @@ class LocalContractV4Tests(unittest.TestCase):
                     db.commit()
                     raise RuntimeError("interrupted")
                 with self.assertRaisesRegex(RuntimeError, "interrupted"):
-                    monitor_auto_update._run_data_migration(fail, {"processing_index": path}, 8, state, journal)
+                    monitor_migrations._run_data_migration(fail, {"processing_index": path}, 8, state, journal)
                 self.assertEqual(db.execute("SELECT value FROM durable").fetchone()[0], "original")
                 self.assertFalse(state.exists())
                 self.assertFalse(journal.exists())
@@ -124,7 +124,7 @@ class LocalContractV4Tests(unittest.TestCase):
                 db.close()
     def test_v7_rebuilds_derived_dashboard_without_changing_raw_history(self):
         with workspace_directory() as root:
-            (root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":6}\n', encoding="utf-8")
+            (root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":6}\n', encoding="utf-8")
             history = monitor_history.default_history_path(root)
             quota = monitor_history.default_quota_history_path(history)
             ledger = monitor_token_ledger.default_token_ledger_path(history)
@@ -133,11 +133,11 @@ class LocalContractV4Tests(unittest.TestCase):
             cache = root / "usage_monitor_dashboard_cache.json"
             cache.write_text('{"version":3}\n', encoding="utf-8")
             args = (root, history, quota, root / "usage_monitor_token_sessions.jsonl", ledger, monitor_history.default_sample_log_path(history))
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, target_version=7), [7])
+            self.assertEqual(monitor_migrations.migrate_history_data(*args, target_version=7), [7])
             self.assertFalse(cache.exists())
             self.assertEqual(quota.read_text(encoding="utf-8"), '{"raw":"quota"}\n')
             self.assertEqual(ledger.read_text(encoding="utf-8"), '{"raw":"tokens"}\n')
-            self.assertEqual(monitor_auto_update.migrate_history_data(*args, target_version=7), [])
+            self.assertEqual(monitor_migrations.migrate_history_data(*args, target_version=7), [])
 
     def test_default_recorders_are_named_for_their_data(self):
         with workspace_directory() as root:
@@ -149,7 +149,7 @@ class LocalContractV4Tests(unittest.TestCase):
 
     def test_v4_renames_default_files_and_merges_existing_destinations(self):
         with workspace_directory() as root:
-            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state = root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
             state.write_text('{"dataContractVersion":3}\n', encoding="utf-8")
             legacy = {
                 "usage_monitor_quota_history.jsonl": [{"source": "old-quota"}],
@@ -161,7 +161,7 @@ class LocalContractV4Tests(unittest.TestCase):
             (root / "usage_monitor_quota_readings.jsonl").write_text('{"source":"new-quota"}\n', encoding="utf-8")
 
             history = monitor_history.default_history_path(root)
-            completed = monitor_auto_update.migrate_history_data(
+            completed = monitor_migrations.migrate_history_data(
                 root, history, monitor_history.default_quota_history_path(history), root / "usage_monitor_token_sessions.jsonl",
                 monitor_token_ledger.default_token_ledger_path(history), monitor_history.default_sample_log_path(history), target_version=4,
             )
@@ -179,7 +179,7 @@ class LocalContractV4Tests(unittest.TestCase):
             old_quota.write_text('{"checkedAt":"2026-01-01T00:00:00Z","windows":{"5h":{"used_percent":4,"usedPercent":4}}}\n', encoding="utf-8")
             history = monitor_history.default_history_path(root)
 
-            completed = monitor_auto_update.migrate_history_data(
+            completed = monitor_migrations.migrate_history_data(
                 root, history, monitor_history.default_quota_history_path(history), root / "usage_monitor_token_sessions.jsonl",
                 monitor_token_ledger.default_token_ledger_path(history), monitor_history.default_sample_log_path(history), target_version=4,
             )
@@ -192,7 +192,7 @@ class LocalContractV4Tests(unittest.TestCase):
 
     def test_v4_failure_restores_every_old_and_new_file_for_retry(self):
         with workspace_directory() as root:
-            state = root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+            state = root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
             state.write_text('{"dataContractVersion":3}\n', encoding="utf-8")
             old_quota, new_quota = root / "usage_monitor_quota_history.jsonl", root / "usage_monitor_quota_readings.jsonl"
             old_token = root / "usage_monitor_token_ledger.jsonl"
@@ -203,14 +203,14 @@ class LocalContractV4Tests(unittest.TestCase):
             history = monitor_history.default_history_path(root)
 
             with self.assertRaises(json.JSONDecodeError):
-                monitor_auto_update.migrate_history_data(
+                monitor_migrations.migrate_history_data(
                     root, history, monitor_history.default_quota_history_path(history), root / "usage_monitor_token_sessions.jsonl",
                     monitor_token_ledger.default_token_ledger_path(history), monitor_history.default_sample_log_path(history), target_version=4,
                 )
 
             self.assertEqual({path: path.read_bytes() for path in originals}, originals)
             self.assertFalse((root / "usage_monitor_token_events.jsonl").exists())
-            self.assertFalse((root / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).exists())
+            self.assertFalse((root / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).exists())
 
     def test_interrupted_old_contract_recovers_legacy_path_before_continuing(self):
         with workspace_directory() as root:
@@ -227,12 +227,12 @@ class LocalContractV4Tests(unittest.TestCase):
                 "sample_log": samples, "runtime_state": root / "usage_monitor_state.json", "dashboard_cache": root / "usage_monitor_dashboard_cache.json",
                 "usage_sync_cache": root / "usage_monitor_sync_cache.json", "cloud_state": root / "cloud-state.json",
             }
-            (root / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).write_text(json.dumps({
+            (root / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).write_text(json.dumps({
                 "version": 1, "existing": ["quota_history"], "backups": {"quota_history": str(backup.resolve())},
                 "targets": {name: str(path.resolve()) for name, path in targets.items()},
             }), encoding="utf-8")
 
-            completed = monitor_auto_update.migrate_history_data(root, history, quota, root / "usage_monitor_token_sessions.jsonl", ledger, samples, target_version=4)
+            completed = monitor_migrations.migrate_history_data(root, history, quota, root / "usage_monitor_token_sessions.jsonl", ledger, samples, target_version=4)
 
             self.assertEqual(completed, [1, 2, 3, 4])
             self.assertFalse(old_quota.exists())
@@ -240,13 +240,13 @@ class LocalContractV4Tests(unittest.TestCase):
 
     def test_v4_leaves_custom_paths_and_legacy_defaults_independent(self):
         with workspace_directory() as root:
-            (root / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":3}\n', encoding="utf-8")
+            (root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":3}\n', encoding="utf-8")
             legacy = root / "usage_monitor_quota_history.jsonl"
             custom = root / "custom-quota.jsonl"
             legacy.write_text('{"legacy":true}\n', encoding="utf-8")
             custom.write_text('{"custom":true}\n', encoding="utf-8")
 
-            monitor_auto_update.migrate_history_data(root, root / "custom-history.jsonl", custom, root / "custom-sessions.jsonl", root / "custom-token.jsonl", root / "custom-samples.jsonl", target_version=4)
+            monitor_migrations.migrate_history_data(root, root / "custom-history.jsonl", custom, root / "custom-sessions.jsonl", root / "custom-token.jsonl", root / "custom-samples.jsonl", target_version=4)
 
             self.assertEqual(legacy.read_text(encoding="utf-8"), '{"legacy":true}\n')
             self.assertEqual(custom.read_text(encoding="utf-8"), '{"custom":true}\n')

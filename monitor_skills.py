@@ -198,18 +198,8 @@ class SkillManager:
             raise SkillError("Unsupported skill assignment state", 500)
         if not isinstance(state.get("deletions", {}), dict):
             raise SkillError("Unsupported skill deletion state", 500)
-        changed = False
-        if "deletions" not in state:
-            state["deletions"] = {}
-            changed = True
-        for record in state["skills"].values():
-            if not isinstance(record, dict):
-                raise SkillError("Unsupported skill assignment state", 500)
-            if "shared" not in record:
-                record["shared"] = True
-                changed = True
-        if changed:
-            atomic_write_json(self.state_path, state)
+        if "deletions" not in state or any(not isinstance(record, dict) or "shared" not in record for record in state["skills"].values()):
+            raise SkillError("Skill assignment state requires data migration", 500)
         return state
 
     def _save(self) -> None:

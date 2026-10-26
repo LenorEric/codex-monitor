@@ -6,6 +6,7 @@ import subprocess
 import zipfile
 from pathlib import Path
 
+from monitor_migrations import validate_contract_metadata
 
 ROOT = Path(__file__).resolve().parent
 RELEASE_DIR = ROOT / "release"
@@ -19,6 +20,10 @@ RUNTIME_FILES = (
     "management.html",
     "codex_monitor_daemon.py",
     "monitor_accounts.py",
+    "monitor_migrations.py",
+    "monitor_migration_ledger.py",
+    "monitor_migration_history.py",
+    "monitor_migration_samples.py",
     "monitor_auto_update.py",
     "monitor_cloud.py",
     "monitor_cloud_queue.py",
@@ -78,13 +83,14 @@ def write_text_lf(path: Path, text: str) -> None:
 
 
 def rebuild_runtime(version: str) -> None:
+    metadata = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
+    validate_contract_metadata(metadata)
     if RUNTIME_DIR.exists():
         shutil.rmtree(RUNTIME_DIR)
     RUNTIME_DIR.mkdir(parents=True)
     for name in RUNTIME_FILES:
         write_text_lf(RUNTIME_DIR / name, (ROOT / name).read_text(encoding="utf-8"))
     write_text_lf(RUNTIME_DIR / "README.md", (ROOT / "release-runtime.md").read_text(encoding="utf-8"))
-    metadata = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
     write_text_lf(RUNTIME_DIR / "version.json", json.dumps({"version": version, "dataContractVersion": metadata["dataContractVersion"], "cloudDataContractVersion": metadata["cloudDataContractVersion"]}, indent=2) + "\n")
     write_text_lf(RELEASE_DIR / "README.md", (ROOT / "release-package.md").read_text(encoding="utf-8").replace("{{VERSION}}", version))
 
@@ -153,6 +159,7 @@ def commit_release(version: str) -> None:
 
 
 def main() -> None:
+    validate_contract_metadata(json.loads((ROOT / "package.json").read_text(encoding="utf-8")))
     version = bump_package_version()
     build_release(version)
     commit_release(version)

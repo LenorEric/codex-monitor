@@ -8,7 +8,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from monitor_auto_update import AutoUpdateError, migrate_history_data
+from monitor_migrations import MigrationError, migrate_history_data
 from monitor_cloud import CloudError, CloudManager, CryptoBox, passphrase_hash
 from monitor_usage_sync import UsageDataStore, content_hash, v4_logical_hash
 
@@ -47,7 +47,9 @@ class MemoryWebDav:
         return [item["name"] for item in self.list_details(path)]
 
     def delete(self, path, etag=None):
-        self.files.pop(path, None)
+        for name in list(self.files):
+            if name == path or name.startswith(path.rstrip("/") + "/"):
+                self.files.pop(name)
 
 
 class UsageV4Tests(unittest.TestCase):
@@ -66,14 +68,14 @@ class UsageV4Tests(unittest.TestCase):
         cloud._state["conditionalWritesVerified"] = True
         cloud._connection = lambda initialize=False: (self.client, self.box)
         quota, ledger = root / "quota.jsonl", root / "ledger.jsonl"
-        store = UsageDataStore(quota, ledger, cloud.machine_id, lambda _slot: "account-a", threading.RLock())
+        store = UsageDataStore(quota, ledger, cloud.machine_id, lambda _slot: "v3:account-a", threading.RLock())
         cloud.configure_usage_sync(store)
         return cloud, quota
 
     @staticmethod
     def append(quota, machine_id, key, checked_at, used=1):
         quota.parent.mkdir(parents=True, exist_ok=True)
-        row = {"checkedAt": checked_at, "windows": {"5h": {"usedPercent": used, "plan": "plus"}}, "sync": {"version": 1, "originMachineId": machine_id, "accountId": "account-a", "recordId": key}}
+        row = {"checkedAt": checked_at, "windows": {"5h": {"usedPercent": used, "plan": "plus"}}, "sync": {"version": 1, "originMachineId": machine_id, "accountId": "v3:account-a", "recordId": key}}
         with quota.open("a", encoding="utf-8") as output:
             output.write(json.dumps(row) + "\n")
 
@@ -210,7 +212,7 @@ class UsageV4Tests(unittest.TestCase):
         cloud_state.write_text("[]", encoding="utf-8")
         contract_state.write_text('{"dataContractVersion":5}\n', encoding="utf-8")
         kwargs = {"data_home": data, "history_path": history, "quota_history_path": data / "quota.jsonl", "token_session_history_path": data / "sessions.jsonl", "token_ledger_path": data / "ledger.jsonl", "sample_log_path": data / "samples.jsonl", "target_version": 6, "cloud_state_path": cloud_state}
-        with self.assertRaises((AutoUpdateError, ValueError)):
+        with self.assertRaises((MigrationError, ValueError)):
             migrate_history_data(**kwargs)
         self.assertEqual(history.read_text(encoding="utf-8"), '{"original":true}\n')
         self.assertEqual(json.loads(contract_state.read_text(encoding="utf-8"))["dataContractVersion"], 5)

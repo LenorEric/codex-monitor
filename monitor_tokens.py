@@ -226,7 +226,7 @@ def normalize_saved_token_totals(value: dict | None) -> dict:
     value = value if isinstance(value, dict) else {}
     input_tokens = max(0, int(value.get("inputTokens") or 0))
     cached_input_tokens = min(input_tokens, max(0, int(value.get("cachedInputTokens") or 0)))
-    cache_write_input_tokens = min(input_tokens - cached_input_tokens, max(0, int(value.get("cacheWriteInputTokens") or value.get("cachedOutputTokens") or 0)))
+    cache_write_input_tokens = min(input_tokens - cached_input_tokens, max(0, int(value.get("cacheWriteInputTokens") or 0)))
     output_tokens = max(0, int(value.get("outputTokens") or 0))
     return {
         "inputTokens": input_tokens,
@@ -424,7 +424,7 @@ def _scan_codex_token_events_unlocked(home: Path) -> tuple[list[dict], int, floa
     usage_events = []
     seen_event_ids = set()
     latest_timestamp = None
-    complete_sessions, incomplete_sessions, source_files, legacy_event_ids = set(), set(), set(), set()
+    complete_sessions, incomplete_sessions, source_files = set(), set(), set()
     for _, key in file_keys:
         state = cache.get(key)
         if state is None:
@@ -436,7 +436,6 @@ def _scan_codex_token_events_unlocked(home: Path) -> tuple[list[dict], int, floa
         source_files.add(source_file)
         complete_sessions.add(state["sessionId"])
         for cached_event in state["events"]:
-            legacy_event_ids.add(f'{state["sessionId"]}:{cached_event["index"]}')
             identity = [state["sessionId"], cached_event["checkedAt"], cached_event["cumulative"] or cached_event["tokens"]]
             event_id = f'{state["sessionId"]}:{hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]}'
             if event_id in seen_event_ids:
@@ -447,7 +446,7 @@ def _scan_codex_token_events_unlocked(home: Path) -> tuple[list[dict], int, floa
             latest_timestamp = max(latest_timestamp or 0, event.get("timestamp") or 0) or latest_timestamp
     return usage_events, len(files), latest_timestamp, {
         "completeSessionIds": sorted(complete_sessions - incomplete_sessions), "incompleteSessionIds": sorted(incomplete_sessions),
-        "sourceFiles": sorted(source_files), "legacyEventIds": sorted(legacy_event_ids),
+        "sourceFiles": sorted(source_files),
     }
 
 def _scan_codex_token_events(home: Path) -> tuple[list[dict], int, float | None, dict]:

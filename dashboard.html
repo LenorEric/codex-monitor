@@ -641,7 +641,6 @@ async function load(force=false){
     if(sequence!==seriesLoadSequence)return;
     if(!manifest||manifest.protocolVersion!==4||manifest.view!==scope.view||manifest.range!==scope.range||!Array.isArray(manifest.chunks))throw new Error("Incompatible dashboard scope response");
     if(historyGeneration===manifest.generation)return;
-    document.getElementById("historyStatus").textContent="Loading selected charts…";
     const frames=new Array(manifest.chunks.length);let next=0;
     await Promise.all(Array.from({length:Math.min(4,frames.length)},async()=>{
       while(next<frames.length){const index=next++, id=manifest.chunks[index];let entry=chunkCache.get(id);

@@ -60,7 +60,7 @@ class UsageAccountPollingTests(unittest.TestCase):
         directory.mkdir()
         self.addCleanup(shutil.rmtree, directory)
         manager = AccountManager(Path(directory) / "auth.json", Path(directory) / "accounts")
-        manager.manifest.update({"activeAccountId": "a", "accounts": [{"id": slot, "label": slot.upper(), "ready": False} for slot in ("a", "b", "c")],
+        manager.manifest.update({"activeAccountId": "a", "accounts": [{"id": slot, "label": slot.upper(), "ready": False, "sessionRefresh": {"fiveHour": {"enabled": False, "windowsUtc": []}, "sevenDay": {"enabled": False}}} for slot in ("a", "b", "c")],
             "activationHistory": [{"accountSlotId": slot, "accountLabel": slot.upper(), "checkedAt": f"2030-01-01T00:00:0{i}Z"} for i, slot in enumerate(("b", "c", "a"))]})
         manager._save_manifest()
         manager.cloud = SimpleNamespace(usage_account_id=lambda slot: "u", ensure_no_pending_account_operation=lambda: None, account_transition_targets=lambda *args: [])
@@ -92,7 +92,7 @@ class UsageAccountPollingTests(unittest.TestCase):
         directory.mkdir()
         self.addCleanup(shutil.rmtree, directory)
         manager = AccountManager(directory / "auth.json", directory / "accounts")
-        manager.manifest.update({"activeAccountId": "b", "accounts": [{"id": slot, "label": slot.upper(), "ready": False} for slot in ("a", "b", "c")]})
+        manager.manifest.update({"activeAccountId": "b", "accounts": [{"id": slot, "label": slot.upper(), "ready": False, "sessionRefresh": {"fiveHour": {"enabled": False, "windowsUtc": []}, "sevenDay": {"enabled": False}}} for slot in ("a", "b", "c")]})
         manager.cloud = SimpleNamespace(usage_account_id=lambda slot: "u", ensure_no_pending_account_operation=lambda: None, account_transition_targets=lambda *args: [])
         manager._save_manifest()
         self.assertEqual(manager.manifest["slotOrder"], ["a", "b", "c"])
@@ -115,7 +115,7 @@ class UsageAccountPollingTests(unittest.TestCase):
         self.assertTrue(manager.promote_active_slot_on_cost(cost | {"accountSlotId": "c", "cost": {"totalCostUsd": 0}}))
         manager.delete("b")
         self.assertEqual(manager.manifest["slotOrder"], ["c", "a"])
-        manager.manifest["accounts"].append({"id": "d", "label": "D", "ready": False})
+        manager.manifest["accounts"].append({"id": "d", "label": "D", "ready": False, "sessionRefresh": {"fiveHour": {"enabled": False, "windowsUtc": []}, "sevenDay": {"enabled": False}}})
         manager._save_manifest()
         self.assertEqual(manager.manifest["slotOrder"], ["c", "a", "d"])
         self.assertEqual(AccountManager(manager.auth_path, manager.root).manifest["slotOrder"], ["c", "a", "d"])

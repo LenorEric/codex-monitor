@@ -12,6 +12,7 @@ from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 
+import monitor_migrations
 from monitor_delivery import DAY, DashboardDelivery, cost_groups, reduce_cost, reduce_quota, session_groups
 from monitor_processing import ProcessingIndex
 
@@ -49,7 +50,7 @@ class DeliveryTests(unittest.TestCase):
         return [json.loads(self.delivery.blob(digest, False)) for digest in manifest["chunks"]]
 
     def test_compact_account_records_rebuild_after_v12(self):
-        from monitor_auto_update import _migrate_history_to_v12
+        from monitor_migrations import _migrate_history_to_v12
         self.quota(self.start)
         self.token(self.start)
         self.delivery.prepare(self.start + 100)
@@ -74,13 +75,12 @@ class DeliveryTests(unittest.TestCase):
     def test_contract_12_failure_and_crash_roll_back_and_retry_automatically(self):
         import sqlite3
         from contextlib import closing
-        import monitor_auto_update
         self.quota(self.start)
         self.delivery.prepare(self.start + 100)
         database = self.directory / "cache-v4.sqlite3"
         with closing(sqlite3.connect(self.index.path)) as source, closing(sqlite3.connect(database)) as target:
             source.backup(target)
-        state = self.directory / monitor_auto_update.DATA_MIGRATION_STATE_FILENAME
+        state = self.directory / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
         state.write_text('{"dataContractVersion":11}', encoding="utf-8")
         history = self.directory / "quota.jsonl"
         history.write_text('{"original":"preserved"}\n', encoding="utf-8")
@@ -93,12 +93,12 @@ class DeliveryTests(unittest.TestCase):
         original_manifest = account_manifest.read_bytes()
         original_legacy = legacy_manifest.read_bytes()
         def migrate():
-            return monitor_auto_update.migrate_history_data(self.directory, self.directory / "history", history, self.directory / "sessions", self.directory / "ledger",
+            return monitor_migrations.migrate_history_data(self.directory, self.directory / "history", history, self.directory / "sessions", self.directory / "ledger",
                 self.directory / "samples", target_version=12, usage_sync_cache_path=self.directory / "cache.json", codex_home=self.directory / "codex")
         def interrupted(paths):
-            monitor_auto_update._migrate_history_to_v12(paths)
+            monitor_migrations._migrate_history_to_v12(paths)
             raise RuntimeError("interrupted migration")
-        with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {12: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted migration"):
+        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {12: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted migration"):
             migrate()
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
         self.assertEqual(account_manifest.read_bytes(), original_manifest)
@@ -107,26 +107,26 @@ class DeliveryTests(unittest.TestCase):
             self.assertGreater(db.execute("SELECT count(*) FROM dashboard_blobs").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 1)
         def crashed(paths):
-            monitor_auto_update._migrate_history_to_v12(paths)
+            monitor_migrations._migrate_history_to_v12(paths)
             raise KeyboardInterrupt("simulated process interruption")
-        with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {12: crashed}), self.assertRaises(KeyboardInterrupt):
+        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {12: crashed}), self.assertRaises(KeyboardInterrupt):
             migrate()
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
-        self.assertTrue((self.directory / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).exists())
+        self.assertTrue((self.directory / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).exists())
         # Recovery must restore both manifests before the next migration attempt.
         def verify_recovery(paths):
             self.assertEqual(account_manifest.read_bytes(), original_manifest)
             self.assertEqual(legacy_manifest.read_bytes(), original_legacy)
             with closing(sqlite3.connect(database)) as db:
                 self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 1)
-            monitor_auto_update._migrate_history_to_v12(paths)
-        with mock.patch.dict(monitor_auto_update.DATA_MIGRATIONS, {12: verify_recovery}):
+            monitor_migrations._migrate_history_to_v12(paths)
+        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {12: verify_recovery}):
             self.assertEqual(migrate(), [12])
         self.assertEqual(migrate(), [])
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 12)
         self.assertEqual(json.loads(account_manifest.read_text())["slotOrder"], ["a", "b"])
         self.assertEqual(json.loads(legacy_manifest.read_text())["slotOrder"], ["y", "x"])
-        self.assertFalse((self.directory / monitor_auto_update.DATA_MIGRATION_JOURNAL_FILENAME).exists())
+        self.assertFalse((self.directory / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).exists())
         with closing(sqlite3.connect(database)) as db:
             self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM dashboard_blobs").fetchone()[0], 0)
@@ -299,6 +299,11 @@ class DeliveryTests(unittest.TestCase):
         worker.start()
         try:
             base = f"http://127.0.0.1:{server.server_port}"
+            with self.assertRaises(urllib.error.HTTPError) as retired:
+                urllib.request.urlopen(base + "/api/series", timeout=3)
+            self.assertEqual(retired.exception.code, 410)
+            self.assertIn("/api/dashboard", json.load(retired.exception)["error"])
+            retired.exception.close()
             with self.assertRaises(urllib.error.HTTPError) as preparing:
                 urllib.request.urlopen(base + "/api/dashboard?view=local&range=All", timeout=3)
             self.assertEqual(preparing.exception.code, 503)

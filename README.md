@@ -43,7 +43,7 @@ flowchart LR
     M <--> W[Optional encrypted WebDAV]
 ```
 
-The monitor is authoritative. The dashboard loads scoped `/api/dashboard` manifests and immutable chunks for the selected view and time range, then polls `/api/status` every five seconds with an ETag. Unchanged manifests reuse downloaded chunks; local and synchronized changes prepare updated views in the backend. The legacy `/api/series` snapshot/patch API remains available for compatibility.
+The monitor is authoritative. The dashboard loads scoped `/api/dashboard` manifests and immutable chunks for the selected view and time range, then polls `/api/status` every five seconds with an ETag. Unchanged manifests reuse downloaded chunks; local and synchronized changes prepare updated views in the backend. The retired `/api/series` endpoint returns 410.
 
 ## Requirements
 
@@ -229,19 +229,12 @@ Automatic usage synchronization supplements the directional manual Push and Fetc
 - Local quota history keeps every accepted poll. Cloud synchronization removes only redundant interior samples from unchanged quota plateaus and marks the retained endpoint with the covered range;
   gaps over four hours remain separate and unmarked so charts can distinguish compaction from a real monitoring outage.
 - It excludes credentials, skill contents, detailed sample logs, and runtime state.
-- Each machine publishes an encrypted manifest containing every logical usage-pack ID and content hash. Fetch compares that complete inventory with `usage_monitor_sync_cache.json`, so one known pack can never cause earlier or missing packs to be skipped.
-- Records are assigned to 64 key-hash buckets and subdivided by additional hash bits when a pack exceeds 16 KiB compressed; an indivisible oversized record stays in its own pack. Changes remain within the affected hash branch; full Push keeps the same compacted quota dataset and forces upload and verification.
-- Ordinary publishing verifies at most two deterministically rotated changed packs and commits the manifest with a strong conditional ETag. It does not list the pack directory.
-  A full verification reads every referenced pack and verifies the committed pointer every 30 days, on format migration, and for an explicit full Push.
-- A failed upload cannot expose a partial manifest: immutable content-addressed packs are uploaded first, and the pointer is committed last with `If-Match`/`If-None-Match`.
-  A later attempt can reuse packs left by a failure before retrying the pointer commit.
-- Fetch reads legacy checkpoint/chunk streams while retaining quota records and ignoring obsolete derived cost/session records. Current packs are published through a conditional manifest commit.
-- Downloaded records are stored in immutable pack shards under `usage_monitor_sync_cache.json.d/`; `usage_monitor_sync_cache.json` is the small manifest committed after its shards are durable. Fetch reconciles removed machine origins after reading the complete remote inventory.
-- Usage account IDs are domain-separated hashes of account identity and stay unchanged when the encryption passphrase changes. Compatible legacy aliases keep older synchronized records associated with their account.
-- The dashboard maintains `usage_monitor_dashboard_cache.json` as a display-only cache of complete local and merged chart datasets. It keeps the newest three days lossless and progressively groups older chart points; raw recorder files and token/session totals are not changed. Cache build timestamps and hourly maintenance deadlines do not publish an API update unless the visible data changes.
+- Each machine publishes a v4 encrypted head pointing to month catalogs, day manifests and immutable data partitions. Changed days are uploaded and verified before the head commits with a conditional ETag.
+- Fetch compares remote day hashes with the SQLite cache and downloads missing or changed partitions. Removed machine origins are reconciled after reading the complete inventory.
+- Usage account IDs are domain-separated hashes of account identity and stay unchanged when the encryption passphrase changes. Ordered migration converts old IDs before normal loading; runtime account matching uses current IDs only.
+- Dashboard projections and scoped delivery chunks share the typed SQLite store. Raw recorder files and token/session totals remain authoritative; obsolete JSON display caches are removed during migration.
 
-Every 60 minutes, periodic Fetch also checks the authoritative skill index and refreshes the remote-account list. Strong pointer ETags skip unchanged usage manifests, while missing local pack hashes still force repair.
-Every 30 days a full fetch verifies all active remote packs. The first periodic Fetch runs immediately when no previous attempt is recorded or when the recorded attempt is at least one hour old.
+Every 60 minutes, periodic Fetch also checks the authoritative skill index and refreshes the remote-account list. Strong head ETags skip unchanged usage inventories. Every 30 days a full fetch verifies active remote partitions. The first periodic Fetch runs immediately when no previous attempt is recorded or when that attempt is at least one hour old.
 
 ## Data and privacy
 
@@ -253,13 +246,12 @@ The canonical data root is `~/.codex-switch`:
 | `accounts/` | Sensitive Codex account vault and manifest | Explicit API Share/Link or OpenAI Release/Bind only |
 | `skills/` | Private managed skill source | Optional encrypted packages |
 | `usage_monitor_quota_readings.jsonl` | Complete local accepted quota readings | Compacted derived records only |
-| `usage_monitor_token_events.jsonl` | Append-only usage events with recorded costs and preserved legacy token baselines; authoritative for token and cost totals | Every record, encrypted |
+| `usage_monitor_token_events.jsonl` | Append-only usage events with recorded costs and preserved session baselines; authoritative for token and cost totals | Every record, encrypted |
 | `usage_monitor_diagnostic_samples.jsonl` | Detailed local diagnostic samples | Never |
 | `usage_monitor_state.json` | Runtime baselines and cursors | Never |
-| `usage_monitor_sync_cache.json` / `usage_monitor_sync_cache.json.d/` | Atomic cache manifest and immutable downloaded pack shards | Never uploaded as recorder files |
-| `usage_monitor_dashboard_cache.json` | Backend-maintained complete local/merged display snapshots with tiered chart points | Never |
+| `usage_monitor_sync_cache-v4.sqlite3` | Typed local/remote facts, incremental processing, dashboard projections and delivery chunks | Never uploaded as a database |
 
-Each token event stores its cost calculated using the price effective at the event time. Stored costs remain authoritative after pricing changes; redundant price-epoch records and references are removed by the ordered data-contract migration after verifying totals. Existing session-only totals are preserved as legacy baselines, which contribute to token summaries but not Cost vs Usage charts. Legacy source high-water totals are retained when they cannot be derived equivalently from the baseline.
+Each token event stores its cost calculated using the price effective at the event time. Stored costs remain authoritative after pricing changes; redundant price-epoch records and references are removed by the ordered data-contract migration after verifying totals. Existing session-only totals are preserved as schema 2 `sessionBaseline` records, which contribute to token summaries but not Cost vs Usage charts. Source high-water totals are retained to prevent historical usage from being replayed.
 
 Derived charts are rebuilt from retained quota history and token-ledger events; obsolete cost-chart records are not converted. Local quota and ledger entries are appended and flushed to disk, runtime state is atomically replaced, and interrupted migrations recover before affected data is loaded.
 
@@ -313,7 +305,7 @@ python codex_monitor_daemon.py --help
 
 ### A control password is reported as compromised
 
-A legacy nonempty `passwordHash` without its separate valid `passwordSalt` is rejected. Stop the monitor, remove only `control.passwordHash` from `~/.codex-switch/config.json`, restart, and create a new password locally. Do not reuse `123456`.
+A nonempty `passwordHash` without its separate valid `passwordSalt` is rejected. Stop the monitor, remove only `control.passwordHash` from `~/.codex-switch/config.json`, restart, and create a new password locally. Do not reuse `123456`.
 
 ### WebDAV authentication works but encrypted data does not open
 
@@ -360,12 +352,13 @@ Credentials, local history, caches, tests, reference sources, and development-on
 | `codex_monitor_daemon.py` | Canonical CLI entry point, monitor startup, automatic update coordination, and restart. |
 | `monitor_codex_usage.py` | Compatibility wrapper for the former entry command. |
 | `monitor_auto_update.py` | Verified background runtime updater. |
+| `monitor_migrations.py` | Local/cloud contract targets, ordered migrations, rollback recovery and old-format conversion. |
 | `monitor_dashboard.py` | Polling loops, dashboard/API server, response caches, control authorization, and UI datasets. |
 | `monitor_accounts.py` | Local credential vault, identity-safe switching, API copy transfer, and OpenAI move transfer. |
 | `monitor_cloud.py` | Configuration, WebDAV, encryption, serialized cloud operations, packages, and usage journal. |
 | `monitor_skills.py` | Skill discovery, managed storage, validation, assignments, and projections. |
 | `monitor_tokens.py` | Incremental session-log parsing, token aggregation, Fast attribution, and cost calculation. |
-| `monitor_token_ledger.py` | Append-only token/cost ledger, compact legacy baseline migration, and derived session totals. |
+| `monitor_token_ledger.py` | Current token/cost ledger and derived session totals; historical readers live in migration-only modules. |
 | `monitor_events.py` / `monitor_quota.py` | Remote usage interpretation, reset handling, and delta validation. |
 | `monitor_history.py` / `monitor_usage_sync.py` | Local persistence, compaction, provenance, synchronized cache, and merged datasets. |
 | `extension.js` / `package.json` | Thin VS Code extension host and manifest. |

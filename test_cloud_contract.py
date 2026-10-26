@@ -8,8 +8,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
+import monitor_migrations
 import monitor_cloud
-from monitor_cloud import CLOUD_DATA_CONTRACT_PATH, CLOUD_LOCK_PATH, CloudError, CloudManager, WebDavClient
+from monitor_cloud import CLOUD_LOCK_PATH, CloudError, CloudManager, WebDavClient
+from monitor_migrations import CLOUD_DATA_CONTRACT_PATH
 
 
 def lock_response(token="opaquelocktoken:test", timeout="Second-300", depth="infinity"):
@@ -60,6 +62,8 @@ class CloudContractTests(unittest.TestCase):
                             owner.token = f"opaquelocktoken:{uuid.uuid4().hex}" if owner.reentrant else owner.token or f"opaquelocktoken:{uuid.uuid4().hex}"
                             owner.tokens.add(owner.token)
                             result = lock_response(owner.token, timeout=owner.timeout, depth="0")
+                    elif self.command == "PROPFIND":
+                        status, result = 207, b'<D:multistatus xmlns:D="DAV:"></D:multistatus>'
                     elif self.command == "UNLOCK":
                         token = self.headers.get("Lock-Token", "").strip("<>")
                         if token not in owner.tokens:
@@ -101,6 +105,7 @@ class CloudContractTests(unittest.TestCase):
 
             do_GET = do_PUT = do_DELETE = do_MKCOL = do_LOCK = do_UNLOCK = handle_request
 
+        Handler.do_PROPFIND = Handler.handle_request
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
         self.thread = threading.Thread(target=self.server.serve_forever)
         self.thread.start()
@@ -130,7 +135,7 @@ class CloudContractTests(unittest.TestCase):
         self.files["payload"] = b"old", '"payload"'
         manager = self.manager()
         self.assertEqual(self.run_operation(manager)[0], b"old")
-        self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0]), {"dataContractVersion": 2})
+        self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0]), {"dataContractVersion": 3})
         self.assertEqual(self.files["payload"][0], b"old")
         self.assertIsNone(self.token)
         events = manager.operation_queue.snapshot()["events"]
@@ -138,14 +143,14 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(events[-1]["operation"]["status"], "succeeded")
 
     def test_equal_version_does_not_run_migration(self):
-        self.mark_version(2)
+        self.mark_version(3)
         self.files["payload"] = b"old", '"payload"'
-        with mock.patch.dict(monitor_cloud.CLOUD_DATA_MIGRATIONS, {1: mock.Mock(side_effect=AssertionError("unexpected migration"))}):
+        with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {1: mock.Mock(side_effect=AssertionError("unexpected migration"))}):
             self.run_operation(self.manager())
         self.assertFalse(any(method == "PUT" and path != CLOUD_LOCK_PATH for method, path, _ in self.calls))
 
     def test_newer_contract_blocks_reads_writes_and_overwrite_before_locking(self):
-        self.mark_version(3)
+        self.mark_version(4)
         manager = self.manager()
         for action in ("read_payload", "write_payload", "overwrite_cloud_from_local"):
             with self.subTest(action=action), self.assertRaisesRegex(CloudError, "local script is updated"):
@@ -154,11 +159,11 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(len(manager.operation_queue.snapshot()["events"]), 6)
 
     def test_recheck_under_lock_blocks_upgrade_race(self):
-        self.mark_version(2)
+        self.mark_version(3)
         original = WebDavClient.acquire_file_lock
         def racing_acquire(client):
             original(client)
-            self.mark_version(3)
+            self.mark_version(4)
         with mock.patch.object(WebDavClient, "acquire_file_lock", racing_acquire), self.assertRaisesRegex(CloudError, "newer"):
             self.run_operation(self.manager())
         self.assertIsNone(self.token)
@@ -168,7 +173,7 @@ class CloudContractTests(unittest.TestCase):
         self.mark_version(0)
         self.files["payload"] = b"old", '"payload"'
         manager = self.manager()
-        with mock.patch.dict(monitor_cloud.CLOUD_DATA_MIGRATIONS, {1: mock.Mock(side_effect=RuntimeError("interrupted"))}), self.assertRaisesRegex(RuntimeError, "interrupted"):
+        with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {1: mock.Mock(side_effect=RuntimeError("interrupted"))}), self.assertRaisesRegex(RuntimeError, "interrupted"):
             self.run_operation(manager)
         self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0])["dataContractVersion"], 0)
         self.assertEqual(self.files["payload"][0], b"old")
@@ -183,11 +188,11 @@ class CloudContractTests(unittest.TestCase):
             applied.append(3)
             raise RuntimeError("interrupted")
         manager = self.manager()
-        with mock.patch.object(monitor_cloud, "CLOUD_DATA_CONTRACT_VERSION", 3), mock.patch.dict(monitor_cloud.CLOUD_DATA_MIGRATIONS, {2: lambda client: applied.append(2), 3: fail}):
+        with mock.patch.object(monitor_migrations, "CLOUD_DATA_CONTRACT_VERSION", 3), mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {2: lambda client: applied.append(2), 3: fail}):
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
                 self.run_operation(manager)
             self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0])["dataContractVersion"], 2)
-            with mock.patch.dict(monitor_cloud.CLOUD_DATA_MIGRATIONS, {3: lambda client: applied.append(3)}):
+            with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {3: lambda client: applied.append(3)}):
                 self.run_operation(manager)
         self.assertEqual(applied, [2, 3, 3])
 
@@ -198,12 +203,12 @@ class CloudContractTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaisesRegex(CloudError, "Invalid cloud"):
                 self.run_operation(manager)
         self.mark_version(0)
-        with mock.patch.dict(monitor_cloud.CLOUD_DATA_MIGRATIONS, {}, clear=True), self.assertRaisesRegex(CloudError, "Missing cloud"):
+        with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {}, clear=True), self.assertRaisesRegex(CloudError, "Missing cloud"):
             self.run_operation(manager)
         self.assertIsNone(self.token)
 
     def test_other_client_cannot_migrate_or_write_during_operation(self):
-        self.mark_version(2)
+        self.mark_version(3)
         manager = self.manager()
         def held_operation():
             manager._connection()
@@ -247,7 +252,7 @@ class CloudContractTests(unittest.TestCase):
                 client._accept_file_lock(response, 0)
 
     def test_read_only_operation_claims_owner_without_busy_status(self):
-        self.mark_version(2)
+        self.mark_version(3)
         self.files["payload"] = b"old", '"payload"'
         self.run_operation(self.manager())
         self.assertFalse(any(method == "PUT" and path != CLOUD_LOCK_PATH for method, path, _ in self.calls))
@@ -257,7 +262,7 @@ class CloudContractTests(unittest.TestCase):
         self.assertIn("/root/sync-lock.json>", payload_headers["If"])
 
     def test_write_status_wraps_all_nested_writes_once(self):
-        self.mark_version(2)
+        self.mark_version(3)
         manager = self.manager()
         observed = []
         def write_twice():
@@ -275,7 +280,7 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual([e["phase"] for e in manager.operation_queue.snapshot()["events"]], ["start", "end"])
 
     def test_writer_excludes_both_readers_and_writers_until_cleanup(self):
-        self.mark_version(2)
+        self.mark_version(3)
         manager = self.manager()
         other = self.manager("other")
         def held_write():
@@ -290,7 +295,7 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(self.run_operation(other)[0], b"published")
 
     def test_exception_clears_status_and_unlocks(self):
-        self.mark_version(2)
+        self.mark_version(3)
         manager = self.manager()
         def interrupted():
             manager._connection()[0].put("payload", b"published")
@@ -303,14 +308,14 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(manager.operation_queue.snapshot()["events"][-1]["operation"]["status"], "failed")
 
     def test_infinite_file_lock_is_accepted_and_released(self):
-        self.mark_version(2)
+        self.mark_version(3)
         self.timeout = "Infinite"
         self.run_operation(self.manager(), "write_payload")
         self.assertIsNone(self.token)
         self.assertEqual(json.loads(self.files[CLOUD_LOCK_PATH][0]), {"writing": 0})
 
     def test_bootstrap_missing_lock_file_for_both_server_behaviors(self):
-        self.mark_version(2)
+        self.mark_version(3)
         self.files["payload"] = b"retained", '"payload"'
         for reject in (False, True):
             self.files.pop(CLOUD_LOCK_PATH, None)
@@ -320,7 +325,7 @@ class CloudContractTests(unittest.TestCase):
             self.assertIsNone(self.token)
 
     def test_interrupted_or_invalid_status_blocks_payload_access(self):
-        self.mark_version(2)
+        self.mark_version(3)
         for state in (b'{"writing":1}', b'{"writing":false}', b'{}', b'broken', b''):
             self.files[CLOUD_LOCK_PATH] = state, '"state"'
             with self.subTest(state=state), self.assertRaisesRegex(CloudError, "lock (file|status)"):
@@ -330,7 +335,7 @@ class CloudContractTests(unittest.TestCase):
             self.assertIsNone(self.token)
 
     def test_status_reset_failure_unlocks_and_reports_failure(self):
-        self.mark_version(2)
+        self.mark_version(3)
         self.fail_idle_status = True
         manager = self.manager()
         with self.assertRaises(CloudError):
@@ -365,7 +370,7 @@ class CloudContractTests(unittest.TestCase):
                 client.release_file_lock()
 
     def test_overwrite_preserves_lock_file_and_contract(self):
-        self.mark_version(2)
+        self.mark_version(3)
         manager = self.manager()
         manager.upload_skills = lambda: {}
         self.files["payload"] = b"old", '"payload"'
@@ -408,7 +413,7 @@ class CloudContractTests(unittest.TestCase):
         self.mark_version(1)
         self.files["payload"] = b"retained", '"payload"'
         self.assertEqual(self.run_operation(self.manager())[0], b"retained")
-        self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0]), {"dataContractVersion": 2})
+        self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0]), {"dataContractVersion": 3})
         self.assertEqual(self.files["payload"][0], b"retained")
 
     def test_automatic_fetch_retries_contention_without_waiting_an_hour(self):

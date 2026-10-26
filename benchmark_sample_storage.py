@@ -13,6 +13,7 @@ import time
 from contextlib import closing
 from pathlib import Path
 
+from monitor_migrations import migrate_sample_store
 import monitor_sample_store as samples
 
 
@@ -74,7 +75,7 @@ def run(source, target):
     parameters = (*source_position, account, session, *remote)
     before = {"allocation": allocation(target, False), "queries": timings(target, parameters), "fingerprints": fingerprints(target)}
     started = time.perf_counter()
-    samples.migrate(target)
+    migrate_sample_store(target)
     duration = time.perf_counter() - started
     after = {"allocation": allocation(target, True), "queries": timings(target, parameters), "fingerprints": fingerprints(target)}
     if before["fingerprints"] != after["fingerprints"]:
