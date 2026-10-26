@@ -1,5 +1,5 @@
 {
-  "version": "1.5.14",
+  "version": "1.5.15",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 6157,
@@ -22,8 +22,8 @@
       "sha256": "52d2ddf675fe3eb9a39eeee84951c048a04d88438b74d9b8608177891ea88ec3"
     },
     "monitor_auto_update.py": {
-      "size": 42526,
-      "sha256": "8f53d539ef71bc180bce2bad94e151707d40d88c42de1710cf77d7bdb99e7778"
+      "size": 43200,
+      "sha256": "5cbc49248732fbb7fd535545f66303ffd682d187a3508f6a7317a9f810409727"
     },
     "monitor_cloud.py": {
       "size": 162037,
@@ -42,8 +42,8 @@
       "sha256": "4511b61639a6c05a3bb1b8ece38acc7b931c3286cb47ca7371863bd2c3fcf77e"
     },
     "monitor_dashboard.py": {
-      "size": 139375,
-      "sha256": "057f594b5cb318b4b2e5cbcda776fe53036b3e932621e36d5e4f853aa7b826ce"
+      "size": 139439,
+      "sha256": "672945e9302a10bd052245cfbe50a14891ff3887619365e5b3a5aafcdf284872"
     },
     "monitor_delivery.py": {
       "size": 32767,
@@ -62,8 +62,8 @@
       "sha256": "7d2a76210ce645fa07d9c61b4a5be486915af6bdb793882f7da0dc30ec269950"
     },
     "monitor_processing.py": {
-      "size": 55886,
-      "sha256": "566b015be42c44f1c1f07640c55f14024c6cb0a6107886011c153dc9cb0bd73e"
+      "size": 57740,
+      "sha256": "60e2f4fee01bd6b600bc49e3e03195dc2e415a186be79335ac84c093a7d9863e"
     },
     "monitor_projection.py": {
       "size": 25814,
@@ -94,8 +94,8 @@
       "sha256": "855b1ae15fda33cf9522137b61c3647a3897139029c388b2d0b29c205693c008"
     },
     "monitor_usage_sync.py": {
-      "size": 75104,
-      "sha256": "52105c54b01a87b3430a98599153dbeb26b43845388dad7acb18e4ce22b865e3"
+      "size": 75157,
+      "sha256": "ffbe92eeb93aed2b0df7b065e8e5365f14c498a4b6f58d355811a73851806b73"
     },
     "README.md": {
       "size": 2844,
@@ -107,7 +107,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "7f339068fc837586ac3a7710b0ec6da43b93257b5682888830c84f69cd42ec3c"
+      "sha256": "fc191af34b67423786a12da076600154b1575eb2e233dadad23811b6b3c5eb12"
     }
   }
 }

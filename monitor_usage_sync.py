@@ -405,6 +405,7 @@ def initialize_v4_cache(path: Path) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(sqlite3.connect(path)) as db, db:
+        db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         db.execute("CREATE TABLE IF NOT EXISTS local_records (record_key TEXT PRIMARY KEY, period TEXT NOT NULL, content_hash TEXT NOT NULL, record_json TEXT NOT NULL)")
         db.execute("CREATE INDEX IF NOT EXISTS local_records_period ON local_records(period)")
         db.execute("CREATE TABLE IF NOT EXISTS remote_days (machine_id TEXT NOT NULL, day TEXT NOT NULL, logical_hash TEXT NOT NULL, layout_json TEXT NOT NULL, PRIMARY KEY(machine_id, day))")

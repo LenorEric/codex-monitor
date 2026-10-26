@@ -25,7 +25,7 @@ MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_RUNTIME_FILE_BYTES = 32 * 1024 * 1024
 MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 AUTO_UPDATE_RESTART = 75
-DATA_CONTRACT_VERSION = 12
+DATA_CONTRACT_VERSION = 13
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 
@@ -415,7 +415,20 @@ def _migrate_history_to_v12(paths: dict[str, Path]) -> None:
             _atomic_write(paths[name], (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode("utf-8"))
 
 
-DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8, 9: _migrate_history_to_v9, 10: _migrate_history_to_v10, 11: _migrate_history_to_v11, 12: _migrate_history_to_v12}
+def _migrate_history_to_v13(paths: dict[str, Path]) -> None:
+    import sqlite3
+    from contextlib import closing
+    from monitor_processing import initialize_processing_index
+    initialize_processing_index(paths["processing_index"])
+    # Outside a transaction and before workers start. SQLite and the migration backup
+    # preserve the original data if conversion/compaction fails or is interrupted.
+    with closing(sqlite3.connect(paths["processing_index"], isolation_level=None)) as db:
+        db.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        db.execute("VACUUM")
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+
+
+DATA_MIGRATIONS = {1: _migrate_history_to_v1, 2: _migrate_history_to_v2, 3: _migrate_history_to_v3, 4: _migrate_history_to_v4, 5: _migrate_history_to_v5, 6: _migrate_history_to_v6, 7: _migrate_history_to_v7, 8: _migrate_history_to_v8, 9: _migrate_history_to_v9, 10: _migrate_history_to_v10, 11: _migrate_history_to_v11, 12: _migrate_history_to_v12, 13: _migrate_history_to_v13}
 
 
 def _restore_data_backup(backup: Path, path: Path) -> None:

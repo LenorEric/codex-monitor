@@ -1203,6 +1203,7 @@ class UsageDashboardState:
                 self.refresh_dashboard_cache()
                 if hasattr(self, "delivery"):
                     self.delivery.prepare()
+                    self.usage_data.index.maintain_disk_space()
             except Exception as exc:
                 print(f"Dashboard display cache maintenance failed: {exc}", file=sys.stderr, flush=True)
 
