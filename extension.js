@@ -142,7 +142,7 @@ function secondsAgo(value) {
 }
 
 function remainingTime(value) {
-    const seconds = Math.max(0, Math.floor((Date.parse(value || "") - Date.now()) / 1000));
+    const seconds = Math.max(0, Math.floor(((value == null ? NaN : value * 1000) - Date.now()) / 1000));
     if (!Number.isFinite(seconds)) return "-";
     const days = Math.floor(seconds / 86400), hours = Math.floor(seconds % 86400 / 3600), minutes = Math.floor(seconds % 3600 / 60);
     return days ? `${days}d ${hours}h` : hours ? `${hours}h ${minutes}m` : `${minutes}m`;
@@ -152,7 +152,7 @@ function stableTooltip(status) {
     const display = status.display || {};
     const windows = display.windows || {};
     const sampleWindows = status.lastSample?.windows || {};
-    const resetText = label => sampleWindows[label]?.resetAt ? `${new Date(sampleWindows[label].resetAt).toLocaleString()} (${remainingTime(sampleWindows[label].resetAt)} remaining)` : windows[label]?.resetText || "-";
+    const resetText = label => sampleWindows[label]?.resetAt ? `${new Date(sampleWindows[label].resetAt * 1000).toLocaleString()} (${remainingTime(sampleWindows[label].resetAt)} remaining)` : windows[label]?.resetText || "-";
     return [
         "Codex Usage",
         `5h: ${windows["5h"]?.usageText || "-"} used, resets ${resetText("5h")}`,

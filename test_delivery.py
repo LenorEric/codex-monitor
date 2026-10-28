@@ -229,46 +229,25 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(grouped["usageByModel"], {"m": 20, "n": 10})
         self.assertEqual(cost_groups([grouped])[0], grouped)
 
-    def test_quota_buckets_average_instead_of_retaining_extrema(self):
+    def test_quota_delivery_preserves_raw_values_and_rejection_boundaries(self):
         rows = [self.quota(self.start + i, value=value) | {"_key": str(i)} for i, value in enumerate([10, 11, 99, 12, 13, 14])]
-        for i, row in enumerate(rows):
-            for label in ("fiveHour", "sevenDay"):
-                row[label]["continuous"] = 10 + i
-        reduced = reduce_quota(rows, 300)
-        self.assertEqual(len(reduced), 1)
-        self.assertEqual(reduced[0]["fiveHour"]["raw"], 26.5)
-        self.assertEqual(reduced[0]["fiveHour"]["continuous"], 12.5)
-        self.assertEqual(reduced[0]["overviewBucket"]["count"], 6)
-        self.assertEqual(reduce_quota(rows, 0), rows)
-        self.assertEqual(rows[2]["fiveHour"]["raw"], 99)
-        for row in rows[3:]:
-            row["fiveHour"]["resetAt"] = "2030-02-02T00:00:00Z"
-        reduced = reduce_quota(rows, 300)
-        self.assertEqual(len(reduced), 2)
-        self.assertEqual([row["fiveHour"]["raw"] for row in reduced], [40, 13])
+        rows[3]["fiveHour"]["continuous"] = None
+        for seconds in (0, 300, 3600, DAY):
+            self.assertEqual(reduce_quota(rows, seconds), rows)
+            self.assertIsNone(reduce_quota(rows, seconds)[3]["fiveHour"]["continuous"])
 
-    def test_quota_rollups_weight_original_observations_and_keep_accounts_separate(self):
+    def test_quota_rollups_keep_every_account_observation(self):
         rows = [self.quota(self.start + offset, value=value) | {"_key": str(i)}
             for i, (offset, value) in enumerate([(0, 10), (1, 20), (2, 30), (301, 40)])]
-        self.assertEqual(len(reduce_quota(rows, 300)), 2)
-        self.assertEqual(reduce_quota(reduce_quota(rows, 300), 3600)[0]["fiveHour"]["raw"], 25)
-        self.assertEqual(reduce_quota(reduce_quota(rows, 300), 3600)[0]["overviewBucket"]["count"], 4)
         other = rows[0] | {"usageAccountId": "b", "_key": "other"}
-        reduced = reduce_quota(rows + [other], 3600)
-        self.assertEqual(len(reduced), 2)
-        self.assertEqual([row["fiveHour"]["raw"] for row in reduced], [25, 10])
-        for row in rows:
-            row["sevenDay"]["raw"] = None
-            row["sevenDay"]["continuous"] = None
-        self.assertIsNone(reduce_quota(rows, 3600)[0]["sevenDay"]["raw"])
+        self.assertEqual(reduce_quota(reduce_quota(rows + [other], 300), 3600), rows + [other])
 
-    def test_prepared_overview_averages_while_selected_day_retains_observations(self):
+    def test_prepared_overview_and_selected_day_retain_exact_observations(self):
         for minute, value in enumerate([10, 11, 12, 13]):
             self.quota(self.start + minute * 60, value=value)
         self.delivery.prepare(self.start + 4 * DAY)
         overview = [row for part in self.materialize(self.delivery.manifest("local", "All")) for row in part["quotaPoints"]]
-        self.assertEqual(len(overview), 1)
-        self.assertEqual(overview[0]["fiveHour"]["raw"], 11.5)
+        self.assertEqual([row["fiveHour"]["raw"] for row in overview], [10, 11, 12, 13])
         detail = [row for part in self.materialize(self.delivery.manifest("local", "Date", self.start, self.start + DAY)) for row in part["quotaPoints"]]
         self.assertEqual([row["fiveHour"]["raw"] for row in detail], [10, 11, 12, 13])
 

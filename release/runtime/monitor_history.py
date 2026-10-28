@@ -5,14 +5,13 @@ import os
 import shutil
 import tempfile
 import time
-from datetime import datetime, timezone
 from pathlib import Path
 import urllib.request
 
 from monitor_common import atomic_write_bytes as _write_atomic_bytes
 from monitor_common import (
     DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, TARGET_WINDOWS, UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
-    first_value, load_json, now_iso, parse_timestamp,
+    load_json, now_iso, parse_timestamp,
 )
 from monitor_accounts import is_api_auth
 from monitor_quota import fetch_usage
@@ -21,7 +20,6 @@ from monitor_tokens import (
     scan_codex_token_usage, sum_cost_totals, token_progress,
 )
 
-MAX_PERCENT_ARBITRATION_RESPONSES = 5
 SAMPLE_LOG_COMPACT_RATIO = 0.8
 QUOTA_HISTORY_DISCONTINUITY_SECONDS = 4 * 60 * 60
 JSONL_COPY_CHUNK_BYTES = 1024 * 1024
@@ -72,25 +70,11 @@ def normalize_token_session_row(row: dict) -> dict | None:
 
 
 def quota_used_percent(values: dict) -> float | None:
-    used = coerce_float(first_value(values, "used_percent", "usedPercent", "utilization"))
-    if used is not None:
-        return max(0.0, used)
-    remaining = coerce_float(first_value(values, "remaining_percent", "remainingPercent"))
-    if remaining is not None:
-        return max(0.0, 100.0 - remaining)
-    used_value = coerce_float(first_value(values, "used", "usage"))
-    limit_value = coerce_float(first_value(values, "limit", "individualLimit", "individual_limit"))
-    if used_value is not None and limit_value and limit_value > 0:
-        return max(0.0, used_value / limit_value * 100.0)
-    return None
+    return values.get("used_percent")
 
-def quota_reset_at(values: dict) -> str | None:
-    reset = first_value(values, "reset_at", "resetAt", "resets_at", "resetsAt")
-    if isinstance(reset, (int, float)):
-        return datetime.fromtimestamp(reset, timezone.utc).isoformat().replace("+00:00", "Z")
-    if isinstance(reset, str) and reset:
-        return reset
-    return None
+def quota_reset_at(values: dict) -> int | None:
+    return values.get("reset_at")
+
 
 def normalize_plan_type(value) -> str:
     if value is None:
@@ -107,12 +91,12 @@ def normalize_plan_type(value) -> str:
     return "unknown"
 
 def quota_plan(values: dict) -> dict:
-    plan = normalize_plan_type(first_value(values, "planType", "plan_type", "plan", "accountType", "account_type", "subscriptionPlan", "subscription_plan"))
+    plan = normalize_plan_type(values.get("plan_type"))
     return {"type": plan, "multiplier": PLAN_MULTIPLIERS[plan]}
 
 def output_plan(output: dict) -> dict:
     usage = output.get("usage") or {}
-    for item in list((usage.get("windows") or {}).values()) + list(usage.get("matches") or []):
+    for item in list((usage.get("windows") or {}).values()):
         plan = quota_plan(item.get("values") or {})
         if plan["type"] != "unknown":
             return plan
@@ -126,109 +110,16 @@ def quota_history_windows(output: dict) -> dict:
         plan = quota_plan(values)
         if plan["type"] == "unknown":
             plan = fallback_plan
+        used = quota_used_percent(values)
         windows[label] = {
-            "usedPercent": quota_used_percent(values),
+            "usedPercent": used,
             "resetAt": quota_reset_at(values),
             "path": item.get("path"),
             "plan": plan["type"],
             "planMultiplier": plan["multiplier"],
-            "unavailable": bool(item.get("unavailable")),
+            "unavailable": bool(item.get("unavailable")) or used is None,
         }
     return windows
-
-def remote_output_identity(output: dict) -> dict | None:
-    raw = ((output.get("remoteUsage") or {}).get("rawResponse") or {})
-    auth_identity = ((output.get("remoteUsage") or {}).get("authIdentity") or {})
-    identity = {key: raw.get(key) if raw.get(key) is not None else auth_identity.get(key) for key in ("user_id", "account_id", "email", "plan_type")}
-    return identity if any(value is not None for value in identity.values()) else None
-
-def normalized_output_percent(output: dict, label: str) -> float | None:
-    window = quota_history_windows(output).get(label) or {}
-    percent = coerce_float(window.get("usedPercent"))
-    return None if percent is None else percent * (coerce_float(window.get("planMultiplier")) or PLAN_MULTIPLIERS["unknown"])
-
-def percent_arbitration_threshold(label: str, multiplier: float | None) -> float:
-    return max(25.0 if label == "5h" else 10.0, 2.0 * (multiplier or PLAN_MULTIPLIERS["unknown"]))
-
-def output_percent_diff(output: dict, baseline: dict, label: str) -> float | None:
-    current = normalized_output_percent(output, label)
-    previous = coerce_float(((baseline.get("windows") or {}).get(label) or {}).get("baselinePercent"))
-    return None if current is None or previous is None else current - previous
-
-def output_consecutive_percent_diff(newer: dict, older: dict, label: str) -> float | None:
-    current = normalized_output_percent(newer, label)
-    previous = normalized_output_percent(older, label)
-    return None if current is None or previous is None else current - previous
-
-def output_window_multiplier(output: dict, label: str) -> float:
-    return coerce_float((quota_history_windows(output).get(label) or {}).get("planMultiplier")) or PLAN_MULTIPLIERS["unknown"]
-
-def output_identity_or_plan_switched(output: dict, state: dict | None) -> bool:
-    if not state:
-        return False
-    identity = remote_output_identity(output)
-    if state.get("remoteUsageIdentity") and identity and identity != state["remoteUsageIdentity"]:
-        return True
-    for label, window in quota_history_windows(output).items():
-        window_state = ((state.get("windows") or {}).get(label) or {})
-        if window_state.get("baselinePlan") is not None and window.get("plan") != window_state.get("baselinePlan"):
-            return True
-        if window_state.get("baselineMultiplier") is not None and window.get("planMultiplier") != window_state.get("baselineMultiplier"):
-            return True
-    return False
-
-def weird_percent_response(output: dict, state: dict | None) -> list[dict]:
-    if not state or output_identity_or_plan_switched(output, state):
-        return []
-    weird = []
-    for label in TARGET_WINDOWS:
-        diff = output_percent_diff(output, state, label)
-        if diff is not None and diff > percent_arbitration_threshold(label, output_window_multiplier(output, label)):
-            weird.append({"window": label, "deltaPercent": round(diff, 8), "thresholdPercent": percent_arbitration_threshold(label, output_window_multiplier(output, label))})
-    return weird
-
-def consecutive_percent_stable(newer: dict, older: dict) -> bool:
-    for label in TARGET_WINDOWS:
-        diff = output_consecutive_percent_diff(newer, older, label)
-        if diff is not None and diff > percent_arbitration_threshold(label, output_window_multiplier(newer, label)):
-            return False
-    return True
-
-def fetch_usage_with_percent_arbitration(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path | None, timeout: int, debug: dict, retries: int, state: dict | None = None, auth_lock=None, refreshed_callback=None, allow_token_refresh: bool = True) -> dict:
-    output = fetch_usage(auth, opener, auth_path, timeout, debug, retries, auth_lock, refreshed_callback, allow_token_refresh)
-    output["remoteUsage"] = debug
-    weird = weird_percent_response(output, state)
-    if not weird:
-        return output
-    debug.setdefault("percentArbitration", {"maxResponses": MAX_PERCENT_ARBITRATION_RESPONSES, "attempts": []})["attempts"].append({"response": 1, "weird": weird})
-    previous = output
-    for response_index in range(2, MAX_PERCENT_ARBITRATION_RESPONSES + 1):
-        attempt_debug = {}
-        output = fetch_usage(auth, opener, auth_path, timeout, attempt_debug, retries, auth_lock, refreshed_callback, allow_token_refresh)
-        output["remoteUsage"] = attempt_debug
-        stable = consecutive_percent_stable(output, previous)
-        debug["percentArbitration"]["attempts"].append({
-            "response": response_index,
-            "stableWithPrevious": stable,
-            "consecutiveDiffs": {
-                label: None if output_consecutive_percent_diff(output, previous, label) is None else round(output_consecutive_percent_diff(output, previous, label), 8)
-                for label in TARGET_WINDOWS
-            },
-            "debug": compact_remote_debug(attempt_debug),
-        })
-        if stable:
-            arbitration = debug["percentArbitration"]
-            arbitration["acceptedResponse"] = response_index
-            debug.clear()
-            debug.update(attempt_debug)
-            debug["percentArbitration"] = arbitration
-            output["remoteUsage"] = debug
-            return output
-        previous = output
-    raise UsageError(f"weird percent data stayed unstable after {MAX_PERCENT_ARBITRATION_RESPONSES} API responses")
-
-def compact_remote_debug(debug: dict) -> dict:
-    return {key: value for key, value in debug.items() if key != "rawResponse"}
 
 def load_history(path: Path) -> list[dict]:
     rows = []
@@ -295,49 +186,6 @@ def load_quota_history(path: Path) -> list[dict]:
             raise
         rows = parse_history_rows(content[:content.rfind(b"\n") + 1].decode("utf-8"))
     return [normalized for row in rows if (normalized := normalize_quota_history_row(row)) is not None]
-
-def same_quota_history_state(left: dict, right: dict) -> bool:
-    left_windows, right_windows = left.get("windows") or {}, right.get("windows") or {}
-    if set(left_windows) != set(right_windows):
-        return False
-    for label in left_windows:
-        left_window, right_window = left_windows[label] or {}, right_windows[label] or {}
-        if coerce_float(left_window.get("usedPercent")) != coerce_float(right_window.get("usedPercent")) or normalize_plan_type(left_window.get("plan")) != normalize_plan_type(right_window.get("plan")):
-            return False
-        left_reset, right_reset = parse_timestamp(left_window.get("resetAt")), parse_timestamp(right_window.get("resetAt"))
-        if left_reset is not None or right_reset is not None:
-            if left_reset is None or right_reset is None or abs(left_reset - right_reset) > RESET_TIME_JITTER_SECONDS:
-                return False
-        elif left_window.get("resetAt") != right_window.get("resetAt"):
-            return False
-    return True
-
-def quota_history_samples_are_continuous(left: dict, right: dict) -> bool:
-    left_at, right_at = parse_timestamp(left.get("checkedAt")), parse_timestamp(right.get("checkedAt"))
-    return left_at is not None and right_at is not None and 0 <= right_at - left_at <= QUOTA_HISTORY_DISCONTINUITY_SECONDS
-
-def compact_quota_history_rows(rows: list[dict]) -> list[dict]:
-    normalized = [value for row in rows if (value := normalize_quota_history_row(row)) is not None]
-    normalized.sort(key=lambda row: (parse_timestamp(row["checkedAt"]) is None, parse_timestamp(row["checkedAt"]) or 0, row["checkedAt"], row["accountSlotId"]))
-    by_account = {}
-    for row in normalized:
-        account_key = (row.get("sync") or {}).get("accountId") or f"local:{row['accountSlotId']}"
-        by_account.setdefault(account_key, []).append(row)
-    compacted = []
-    for account_rows in by_account.values():
-        start = 0
-        while start < len(account_rows):
-            end = start + 1
-            while end < len(account_rows) and same_quota_history_state(account_rows[start], account_rows[end]) and quota_history_samples_are_continuous(account_rows[end - 1], account_rows[end]):
-                end += 1
-            compacted.append(account_rows[start])
-            if end - start > 1:
-                last = account_rows[end - 1]
-                if end - start > 2:
-                    last = last | {"compaction": {"continuousFrom": account_rows[start]["checkedAt"], "omittedSamples": end - start - 2}}
-                compacted.append(last)
-            start = end
-    return sorted(compacted, key=lambda row: (parse_timestamp(row["checkedAt"]) is None, parse_timestamp(row["checkedAt"]) or 0, row["checkedAt"], row["accountSlotId"]))
 
 def write_quota_history(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -763,7 +611,7 @@ def make_history_sample(output: dict, previous_token_usage: dict | None, previou
         "endpoint": output.get("endpoint"),
         "status": output.get("status"),
         "windows": quota_history_windows(output),
-        "errors": {},
+        "errors": {"quotaWindows": (output.get("usage") or {}).get("errors")} if (output.get("usage") or {}).get("errors") else {},
     }
     if output.get("accountSlotId"):
         sample["accountSlotId"] = output["accountSlotId"]
@@ -812,14 +660,6 @@ def compact_history(path: Path, retain_days: int | None) -> None:
     kept = [row for row in load_history(path) if parse_timestamp(row.get("checkedAt")) is None or parse_timestamp(row.get("checkedAt")) >= cutoff]
     write_history(path, kept)
 
-def compact_quota_history(path: Path, retain_days: int | None) -> None:
-    if retain_days is None or retain_days <= 0:
-        return
-    rows = load_quota_history(path)
-    cutoff = time.time() - retain_days * 24 * 60 * 60
-    rows = [row for row in rows if parse_timestamp(row.get("checkedAt")) is None or parse_timestamp(row.get("checkedAt")) >= cutoff]
-    write_quota_history(path, rows)
-
 def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, previous_token_usage: dict | None, previous_cost: dict | None = None, runtime_state: dict | None = None, skip_remote: bool = False) -> dict:
     output = {}
     auth = load_json(args.auth) if not args.local_only and not skip_remote else None
@@ -829,12 +669,12 @@ def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, pre
             raise UsageError("no HTTP opener is available")
         if getattr(args, "account_attribution_callback", None):
             output.update(args.account_attribution_callback(auth))
-        output.update(fetch_usage_with_percent_arbitration(
-            auth, opener, args.auth, max(args.timeout, 1), output["remoteUsage"], getattr(args, "retry_limit", DEFAULT_RETRY_LIMIT), runtime_state,
+        output.update(fetch_usage(
+            auth, opener, args.auth, max(args.timeout, 1), output["remoteUsage"], getattr(args, "retry_limit", DEFAULT_RETRY_LIMIT),
             getattr(args, "auth_lock", None), getattr(args, "auth_refreshed_callback", None), False,
         ))
     if not args.no_token_scan:
         output["tokenUsage"] = getattr(args, "token_capture_snapshot", None) if getattr(args, "background_token_capture", False) else (
             args.processing_index.scan(args.codex_home) if getattr(args, "processing_index", None) is not None else scan_codex_token_usage(args.codex_home))
-    output["checkedAt"] = now_iso()
+    output["checkedAt"] = (output.get("remoteUsage") or {}).get("completedAt") or now_iso()
     return make_history_sample(output, previous_token_usage, previous_cost, previous_cost_by_model=(runtime_state or {}).get("costByModel"))

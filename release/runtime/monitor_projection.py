@@ -10,78 +10,6 @@ from monitor_common import parse_timestamp
 from monitor_processing import encode
 
 
-class RankIndex:
-    """A counted deterministic treap: exact percentile selection visits O(log n) nodes."""
-    def __init__(self, db, index, scope):
-        self.db, self.index, self.scope = db, index, scope
-        self.root = index.get(db, f"rankRoot:{scope}")
-
-    def node(self, value):
-        return self.db.execute("SELECT priority,frequency,size,left_value,right_value FROM processing_rank_nodes WHERE scope=? AND value=?", (self.scope, value)).fetchone() if value is not None else None
-
-    def size(self, value):
-        return self.node(value)[2] if value is not None else 0
-
-    def save(self, value, priority, frequency, left, right):
-        self.db.execute("INSERT OR REPLACE INTO processing_rank_nodes VALUES(?,?,?,?,?,?,?)", (
-            self.scope, value, priority, frequency, frequency + self.size(left) + self.size(right), left, right))
-
-    def insert(self, root, value):
-        if root is None:
-            self.save(value, int.from_bytes(hashlib.sha256(f"{self.scope}:{value!r}".encode()).digest()[:8], "big") & ((1 << 63) - 1), 1, None, None)
-            return value
-        priority, frequency, _, left, right = self.node(root)
-        if root == value:
-            self.save(root, priority, frequency + 1, left, right)
-        elif value < root:
-            left = self.insert(left, value)
-            child = self.node(left)
-            if child[0] < priority:
-                self.save(root, priority, frequency, child[4], right)
-                self.save(left, child[0], child[1], child[3], root)
-                return left
-            self.save(root, priority, frequency, left, right)
-        else:
-            right = self.insert(right, value)
-            child = self.node(right)
-            if child[0] < priority:
-                self.save(root, priority, frequency, left, child[3])
-                self.save(right, child[0], child[1], root, child[4])
-                return right
-            self.save(root, priority, frequency, left, right)
-        return root
-
-    def add(self, value):
-        self.root = self.insert(self.root, value)
-        self.index.put(self.db, f"rankRoot:{self.scope}", self.root)
-
-    def percentile(self, label):
-        from monitor_dashboard import USAGE_TIME_RATE_FLOORS
-        floor = USAGE_TIME_RATE_FLOORS[label]
-        count = self.size(self.root)
-        if count < 10:
-            return floor
-        rank, root = int((count - 1) * .9), self.root
-        while root is not None:
-            node = self.node(root)
-            left = self.size(node[3])
-            if rank < left:
-                root = node[3]
-            elif rank < left + node[1]:
-                return max(floor, min(floor * 3, root * 2.5))
-            else:
-                rank -= left + node[1]
-                root = node[4]
-        raise ValueError("Invalid quota rate rank index")
-
-    def clear(self):
-        self.db.execute("DELETE FROM processing_rank_nodes WHERE scope=?", (self.scope,))
-        self.root = None
-        self.index.put(self.db, f"rankRoot:{self.scope}", None)
-
-
-
-
 class DashboardProjector:
     def __init__(self, store):
         self.store, self.index = store, store.index
@@ -126,34 +54,17 @@ class DashboardProjector:
         for row in rows:
             self._row(db, view, account, kind, row, patches)
 
-    def _rate(self, rank, previous, current, label):
-        from monitor_dashboard import USAGE_TIME_ROUNDING_ALLOWANCE
-        left, right = previous[label]["raw"], current[label]["raw"]
-        if left is not None and right is not None and current["timestamp"] > previous["timestamp"] and right > left:
-            rank.add(max(0.0, right - left - USAGE_TIME_ROUNDING_ALLOWANCE) / ((current["timestamp"] - previous["timestamp"]) / 60))
-
-    def _rebuild(self, db, view, account, accounts, now, patches, reason="quota continuity, rate, or ordering change"):
-        from monitor_dashboard import _dashboard_display_data, dashboard_quota_points, _usage_time_continuous_values, _same_cost_usage_cycle
+    def _rebuild(self, db, view, account, accounts, now, patches, reason="quota ordering or source change"):
+        from monitor_dashboard import _dashboard_display_data
+        from monitor_sampling import stored_points
         rows, ledger = self._datasets(db, view, account)
-        frame = _dashboard_display_data(rows, ledger, accounts, now)
-        slots = {str(row["id"]): str(row["usageAccountId"]) for row in accounts.get("items", []) if row.get("usageAccountId")}
-        points = sorted(dashboard_quota_points(rows, slots), key=lambda row: (row["timestamp"] is None, row["timestamp"] or 0, row["checkedAt"] or ""))
+        points = stored_points(db, view, account)
+        frame = _dashboard_display_data(rows, ledger, accounts, now, processed_quota=points)
         db.execute("DELETE FROM processing_quota_points WHERE view=? AND account=?", (view, account))
         for point in points:
             if point["timestamp"] is not None:
                 db.execute("INSERT INTO processing_quota_points VALUES(?,?,?,?,?)", (view, account, point["timestamp"], point["checkedAt"], encode(point)))
-        state = {"last": points[-1] if points else None, "windows": {}}
-        for label in ("fiveHour", "sevenDay"):
-            rank = RankIndex(db, self.index, f"{view}:{account}:{label}")
-            rank.clear()
-            for previous, current in zip(points, points[1:]):
-                if previous["timestamp"] is not None and current["timestamp"] is not None:
-                    self._rate(rank, previous, current, label)
-            records = [{"timestamp": point["timestamp"], "raw": point[label]["raw"], "resetAt": parse_timestamp(point[label].get("resetAt")), "window": point[label]}
-                for point in points if point["timestamp"] is not None]
-            state["windows"][label] = _usage_time_continuous_values(records, label, rank.percentile(label))
-            if records and all(record["raw"] is None for record in records):
-                state["windows"][label]["safe"] = True
+        state = {"last": points[-1] if points else None}
         self.index.put(db, f"quotaState:{view}:{account}", state)
         for kind in ("quotaPoints", "tokenSessions", "costTime"):
             self._replace(db, view, account, kind, frame[kind], patches)
@@ -166,7 +77,7 @@ class DashboardProjector:
             "quotaRows": len(points), "tokenLedgerRows": len(ledger), "at": now}
 
     def _fast_quota(self, db, view, account, changes, accounts, now, patches):
-        from monitor_dashboard import dashboard_quota_point, _dashboard_key_rows, USAGE_TIME_ROUNDING_ALLOWANCE, dashboard_display_factor, _same_cost_usage_cycle
+        from monitor_dashboard import _dashboard_key_rows
         state = self.index.get(db, f"quotaState:{view}:{account}")
         if not any(row[0] == "quota" for row in changes):
             return True
@@ -179,37 +90,19 @@ class DashboardProjector:
         for kind, key, stamp, session, action in changes:
             if kind != "quota":
                 continue
-            if action != "append" or stamp is None or stamp <= state["last"]["timestamp"] or dashboard_display_factor(stamp, now) != 1:
+            if action != "append" or stamp is None or stamp <= state["last"]["timestamp"]:
                 return False
             candidates = [json.loads(row[1]) for row in db.execute("SELECT source,data FROM processing_facts WHERE account=? AND kind='quota' AND record_key=? ORDER BY source,position", (account, key))
                 if row[0] == str(self.store.quota_path.resolve()) or view == "merged" and row[0].startswith("peer:")]
             if len(candidates) != 1:
                 return False
-            points.append(dashboard_quota_point(candidates[0]))
+            sampled = db.execute("SELECT data FROM processing_sampled_quota WHERE view=? AND account=? AND record_key=?", (view, account, candidates[0]["checkedAt"])).fetchone()
+            if sampled is None:
+                return False
+            points.append(json.loads(sampled[0]))
         points.sort(key=lambda row: row["timestamp"])
         if not points:
             return True
-        previous = state["last"]
-        for point in points:
-            for label in ("fiveHour", "sevenDay"):
-                left, right = previous[label]["raw"], point[label]["raw"]
-                if right is None:
-                    point[label]["continuous"] = None
-                    if left is not None:
-                        state["windows"][label]["safe"] = False
-                    continue
-                if not state["windows"][label].get("safe") or not 0 <= right <= 100 or left is not None and right < left:
-                    return False
-                if left is None:
-                    continue
-                rank = RankIndex(db, self.index, f"{view}:{account}:{label}")
-                self._rate(rank, previous, point, label)
-                if rank.percentile(label) != state["windows"][label]["rate"]:
-                    return False
-                same_plan = point[label].get("plan") == previous[label].get("plan")
-                if same_plan and right - left > USAGE_TIME_ROUNDING_ALLOWANCE + state["windows"][label]["rate"] * ((point["timestamp"] - previous["timestamp"]) / 60):
-                    return False
-            previous = point
         # Eligibility is established before writing display rows. A failed fast-path is rebuilt in this transaction.
         previous = state["last"]
         for point in points:
@@ -310,7 +203,7 @@ class DashboardProjector:
             for view, account, reason in dirty:
                 rows = list(db.execute("SELECT kind,record_key,event_at,session,action FROM processing_changes WHERE view=? AND account=? ORDER BY event_at,record_key", (view, account)))
                 if reason != "records" or not db.execute("SELECT 1 FROM processing_projections WHERE view=? AND account=?", (view, account)).fetchone() or any(row[0] == "tokenLedger" and row[4] != "append" for row in rows) or not self._fast_quota(db, view, account, rows, accounts, now, changes[view]):
-                    self._rebuild(db, view, account, accounts, now, changes[view], reason if reason != "records" else "quota continuity, rate, ordering, or initial projection")
+                    self._rebuild(db, view, account, accounts, now, changes[view], reason if reason != "records" else "quota ordering, source change, or initial projection")
                 else:
                     self._refresh_cost_intervals(db, view, account, rows, changes[view])
                     self._sessions(db, view, account, rows, accounts, changes[view])

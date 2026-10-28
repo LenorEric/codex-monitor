@@ -55,7 +55,7 @@ test("status renders while history and password setup are still pending", async 
     const history = h.run("load(true)");
     await h.run("pollStatus(true)");
     assert.equal(h.context.statusRendered, true);
-    assert.equal(h.elements.get("historyStatus").textContent, "Loading selected history…");
+    assert.equal(h.elements.get("historyStatus").textContent, "");
     finishHistory({ payload: manifest("Date", "day"), etag: "day" });
     await history;
     assert.equal(h.context.drawCount, 1);
@@ -381,6 +381,20 @@ test("combined legend series reuse scope accounts and respect selected account f
     assert.equal(h.run("costTimeUsageSeries(0,36000).every(item=>item.accountId==='outside-scope')"), true);
     h.run("selectedAccounts.clear();updateAccountControls(payload.quotaPoints.filter(point=>point.usageAccountId==='a'))");
     assert.equal(h.run("costTimeUsageSeries(0,36000).every(item=>item.accountId==='a')"), true);
+});
+
+test("chart accounts sort by current slot names and retain data order for duplicate names", () => {
+    const h = combinedCostHarness();
+    h.run(`payload.accounts={usageGroups:[{id:'z',label:'Slot 2'},{id:'a',label:'slot 2'},{id:'b',label:'Slot 10'}]};
+        payload.accountLabels={z:'Old Z',a:'Old A',b:'Old B'};
+        payload.quotaPoints=['b','z','a'].map(usageAccountId=>({timestamp:1,usageAccountId,accountLabel:'Historical',fiveHour:{continuous:1},sevenDay:{continuous:1}}));
+        updateAccountControls(payload.quotaPoints)`);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(costTimeUsageSeries(0,2).filter(item=>item.label==='fiveHour').map(item=>item.accountId))")), ["z", "a", "b"]);
+    h.run("payload.accounts.usageGroups[2].label='Slot 1'");
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(costTimeUsageSeries(0,2).filter(item=>item.label==='fiveHour').map(item=>item.accountId))")), ["b", "z", "a"]);
+    h.context.chart = (_id, series) => { h.context.scatterNames = series.map(item => item.name); };
+    h.run("drawDeltaChart('scatter5h','',null,payload.quotaPoints.map(point=>({...point,deltaPercent:1,deltaCostUsd:1,costPer100PercentUsd:100})))");
+    assert.deepEqual(Array.from(h.context.scatterNames), ["Slot 1", "Slot 2", "slot 2"]);
 });
 
 test("each account uses the same chart color for dashed 5h and solid 7d usage", () => {

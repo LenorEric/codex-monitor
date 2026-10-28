@@ -1,6 +1,6 @@
-# Sampled storage, local contract 14
+# Sampled storage, pending local contract 16
 
-`monitor_sample_store.py` owns sampled payload insertion, reconstruction and release. JSONL remains the authoritative local history. Existing projection, scan, delivery and chart caches keep their representations. This change joins the pending local migration 14; released migrations 1–13 remain available for sequential upgrades. The existing pending cloud coordination change remains separate; normalization introduces no cloud or client format change.
+`monitor_sample_store.py` owns normalized raw payload insertion and reconstruction. Quota JSONL remains a complete append-only raw archive, including repeats and rejected readings; cloud synchronization preserves these records. `monitor_sampling.py` owns deterministic backend decisions. SQLite commits processed points, per-window accepted/protection state, and raw ingestion checkpoints together. Released local contract 15 / cloud contract 3 is the baseline; pending local contract 16 combines Unix reset-timestamp conversion with rebuilding processed sampling and display data. Pending cloud contract 4 retains the raw record shape with Unix reset timestamps.
 
 | Stored table | Contents |
 | --- | --- |
@@ -8,6 +8,8 @@
 | `sample_accounts`, `sample_devices`, `sample_sources`, `sample_sessions`, `sample_models`, `sample_plans`, `sample_tiers` | Shared identifier dictionaries with integer foreign keys |
 | `sample_sync` | Original provenance, record identity and local-only flag |
 | `quota_samples`, `quota_windows` | Compaction boundary/count and separate 5h/7d readings, reset timestamps and historical plans; no derived continuous chart values |
+| `processing_sampled_quota` | Exact raw/continuous decisions for each account, timestamp and local/merged view; rejected values remain null in continuous |
+| `processing_sampling_changes`, `processing_meta` | Transactional replay work, per-window accepted sample timestamp/reset/plan, decrease protection, and runtime snapshots |
 | `token_samples` | Seven token counters and five cost totals; event/session/model/source identity comes from `sample_records` |
 | `baseline_sessions`, `baseline_models`, `baseline_totals`, `baseline_tiers` | Legacy session totals, model breakdowns, fast tokens and source high-water values |
 | `processing_fact_refs` | Sample reference, integer source/account/session references, source position, lookup identity and source-specific slot/label attribution |

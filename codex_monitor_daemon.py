@@ -6,6 +6,12 @@ from pathlib import Path
 if sys.version_info < (3, 12):
     raise SystemExit("Codex Usage Monitor requires Python 3.12 or newer.")
 
+from monitor_dependencies import validate_dependencies
+
+print("Startup: validating Python libraries...", flush=True)
+if not validate_dependencies(Path(__file__).resolve().parent):
+    raise SystemExit(1)
+
 from monitor_auto_update import AUTO_UPDATE_RESTART, check_startup_update, installed_version, restart_process
 from monitor_migrations import migrate_installed_data
 from monitor_cloud import CloudManager
@@ -33,18 +39,19 @@ def _main(instance_lock) -> int:
     parser.add_argument("--sample-log-max-bytes", type=int, default=DEFAULT_SAMPLE_LOG_MAX_BYTES, help="Maximum detailed sample debug log size before oldest rows are trimmed. Defaults to 50 MiB.")
     parser.add_argument("--dashboard", action="store_true", help="Open the local dashboard in the default browser after starting the server.")
     parser.add_argument("--reencrypt-cloud", action="store_true", help="Re-encrypt and verify every encrypted WebDAV payload with the configured hash key, then exit.")
-    parser.add_argument("--compact-history-days", type=int, help="Rewrite quota history to keep only samples newer than this many days.")
     parser.add_argument("--local-only", action="store_true", help="Only scan local Codex session logs; do not call ChatGPT usage endpoints.")
     parser.add_argument("--no-token-scan", action="store_true", help="Disable local Codex session token usage scanning.")
     parser.add_argument("--repair-processing", action="store_true", help="Rebuild derived processing checkpoints and dashboard rows; preserve canonical histories and v4 collection periods.")
     parser.add_argument("--retry-limit", type=int, default=DEFAULT_RETRY_LIMIT, help="Retries for HTTP and dashboard polling failures before raising; network errors retry indefinitely. Defaults to 3.")
     args = parser.parse_args()
+    print("Startup: acquiring the single-instance lock...", flush=True)
     if not instance_lock.acquire():
         print("Cannot start dashboard: another monitor instance is already running.", file=sys.stderr, flush=True)
         return 1
     args.instance_lock = instance_lock
 
     args.data_home = codex_switch_home()
+    print("Startup: checking for runtime updates...", flush=True)
     if check_startup_update(Path(__file__).resolve().parent, args.data_home, lambda: opener_for(args.auth.parent), args.timeout):
         instance_lock.release()
         restart_process(Path(sys.argv[0]).resolve())
@@ -57,6 +64,7 @@ def _main(instance_lock) -> int:
     args.usage_sync_cache = default_usage_sync_cache_path(args.quota_history)
     args.state = args.data_home / "usage_monitor_state.json"
     args.dashboard_cache = default_dashboard_cache_path(args.quota_history)
+    print("Startup: checking and applying pending data migrations...", flush=True)
     migrate_installed_data(
         Path(__file__).resolve().parent, args.data_home, args.quota_history, args.token_ledger, args.sample_log,
         runtime_state_path=args.state, dashboard_cache_path=args.dashboard_cache, usage_sync_cache_path=args.usage_sync_cache,
@@ -64,8 +72,10 @@ def _main(instance_lock) -> int:
     )
     args.account_root = args.data_home / "accounts"
     from monitor_processing import ProcessingIndex
+    print("Startup: initializing the processing index and diagnostic backfill...", flush=True)
     index = ProcessingIndex(args.usage_sync_cache.with_name(f"{args.usage_sync_cache.stem}-v4.sqlite3"))
     if args.repair_processing:
+        print("Startup: repairing derived processing data...", flush=True)
         index.repair()
     with index.transaction() as db:
         backfilled = index.get(db, "diagnosticBackfillComplete", False)

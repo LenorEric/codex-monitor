@@ -52,7 +52,6 @@ from monitor_codex_usage import (
     compact_monitor_state,
     compact_quota,
     compact_quota_for_debug,
-    collect_with_bad_remote_usage_retry,
     collect_usage_sample,
     dashboard_html,
     dashboard_display,
@@ -100,7 +99,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         version = json.loads((root / "package.json").read_text(encoding="utf-8"))["version"]
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.splitlines()[0], f"Codex Usage Monitor v{version}")
+        self.assertEqual(completed.stdout.splitlines()[0], "Startup: validating Python libraries...")
+        self.assertIn(f"Codex Usage Monitor v{version}", completed.stdout.splitlines())
 
     @classmethod
     def setUpClass(cls):
@@ -658,10 +658,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth = self.account_auth("acct-a", "refresh-a")
             auth["tokens"]["access_token"] = f"x.{payload}.x"
             auth_path.write_text(json.dumps(auth), encoding="utf-8")
-            usage_response = {"rate_limit": {
-                "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
-                "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
-            }}
+            usage_response = {
+                'rate_limit': {
+                    'primary_window': {
+                        'limit_window_seconds': 18000,
+                        'used_percent': 12,
+                        'reset_at': 1893456000,
+                        'reset_after_seconds': 1893456000 - int(monitor_common.time.time()),
+                    },
+                    'secondary_window': {
+                        'limit_window_seconds': 604800,
+                        'used_percent': 34,
+                        'reset_at': 1893888000,
+                        'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                    },
+                },
+                'plan_type': 'plus',
+            }
             with (
                 mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-a", "access_token": "access-new", "refresh_token": "refresh-new"})) as refresh_request,
                 mock.patch.object(monitor_quota, "request_json", side_effect=(monitor_common.UsageHttpError("GET", monitor_common.USAGE_ENDPOINT, 401, '{"code":"token_expired"}'), (200, usage_response))) as usage_request,
@@ -721,10 +734,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
             with mock.patch("builtins.print"):
                 state.switch_account("ppl-pro")
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-external")), encoding="utf-8")
-            usage_response = {"rate_limit": {
-                "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
-                "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
-            }}
+            usage_response = {
+                'rate_limit': {
+                    'primary_window': {
+                        'limit_window_seconds': 18000,
+                        'used_percent': 12,
+                        'reset_at': 1893456000,
+                        'reset_after_seconds': 1893456000 - int(monitor_common.time.time()),
+                    },
+                    'secondary_window': {
+                        'limit_window_seconds': 604800,
+                        'used_percent': 34,
+                        'reset_at': 1893888000,
+                        'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                    },
+                },
+                'plan_type': 'plus',
+            }
             with mock.patch.object(monitor_common, "token_expired", return_value=False), mock.patch.object(monitor_quota, "request_json", return_value=(200, usage_response)), mock.patch("builtins.print"):
                 state.sync_active_account_from_live()
                 state.wait_for_external_auth_validations(2)
@@ -772,10 +798,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
 
-            usage_response = {"rate_limit": {
-                "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
-                "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
-            }}
+            usage_response = {
+                'rate_limit': {
+                    'primary_window': {
+                        'limit_window_seconds': 18000,
+                        'used_percent': 12,
+                        'reset_at': 1893456000,
+                        'reset_after_seconds': 1893456000 - int(monitor_common.time.time()),
+                    },
+                    'secondary_window': {
+                        'limit_window_seconds': 604800,
+                        'used_percent': 34,
+                        'reset_at': 1893888000,
+                        'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                    },
+                },
+                'plan_type': 'plus',
+            }
             with (
                 mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-a", "access_token": "access-rotated", "refresh_token": "refresh-rotated"})) as refresh_request,
                 mock.patch.object(monitor_quota, "request_json", return_value=(200, usage_response)) as usage_request,
@@ -839,7 +878,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 self.assertEqual(acquired, [True])
                 raise UsageError("stop after lock check")
 
-            with mock.patch.object(monitor_dashboard, "collect_with_bad_remote_usage_retry", side_effect=verify_unlocked):
+            with mock.patch.object(monitor_dashboard, "collect_usage_sample", side_effect=verify_unlocked):
                 with self.assertRaises(UsageError):
                     state.poll_once()
 
@@ -864,7 +903,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     state.switch_account(second_id)
                 return {"checkedAt": "2030-01-01T00:00:00Z", "windows": {}, "errors": {}}
 
-            with mock.patch.object(monitor_dashboard, "collect_with_bad_remote_usage_retry", side_effect=switch_while_request_is_in_flight):
+            with mock.patch.object(monitor_dashboard, "collect_usage_sample", side_effect=switch_while_request_is_in_flight):
                 self.assertEqual(state.poll_once(), {})
             self.assertEqual(state.accounts.status()["activeAccountId"], second_id)
             self.assertIsNone(state.last_sample)
@@ -923,7 +962,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     "7d": {"path": "$.rate_limit.secondary", "values": {"used_percent": 34, "reset_at": 1893888000}},
                 }}}
 
-            with mock.patch.object(monitor_dashboard, "fetch_usage_with_percent_arbitration", side_effect=usage):
+            with mock.patch.object(monitor_dashboard, "fetch_usage", side_effect=usage):
                 self.assertEqual(state.poll_due_inactive_accounts(now=100), 1)
                 self.assertEqual(state.inactive_account_poll_wait_seconds(now=100), 600)
                 self.assertEqual(state.poll_due_inactive_accounts(now=699), 0)
@@ -943,7 +982,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             cached_status = state.status_payload()
             self.assertIsNone(state.last_sample)
             self.assertEqual(cached_status["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
-            self.assertEqual(cached_status["lastSample"]["windows"]["5h"]["resetAt"], "2030-01-01T00:00:00Z")
+            self.assertEqual(cached_status["lastSample"]["windows"]["5h"]["resetAt"], 1893456000)
             self.assertEqual(state.status_payload()["lastSample"]["windows"]["7d"]["usedPercent"], 34.0)
             self.assertTrue(state.wake_event.is_set())
             self.assertFalse(any(state.accounts.root.glob(".inactive-usage-*.json")))
@@ -967,6 +1006,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     state.opener = object()
                     state.lock = threading.RLock()
                     state.cloud = SimpleNamespace(machine_id="machine", usage_account_id=lambda account_id: account_id)
+                    state._record_quota_sample_locked = mock.Mock()
                     state._update_account_status_locked = mock.Mock()
                     state._signal_dashboard_cache = mock.Mock()
                     state.external_auth_validation_fingerprints = set()
@@ -978,10 +1018,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
                             manager._account_path(second_id).write_bytes(changed)
                         return 200, {"account_id": "acct-b", "access_token": "access-rotated", "refresh_token": "refresh-rotated"}
 
-                    usage_response = {"rate_limit": {
-                        "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
-                        "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
-                    }}
+                    usage_response = {
+                        'rate_limit': {
+                            'primary_window': {
+                                'limit_window_seconds': 18000,
+                                'used_percent': 12,
+                                'reset_at': 1893456000,
+                                'reset_after_seconds': 1893456000 - int(monitor_common.time.time()),
+                            },
+                            'secondary_window': {
+                                'limit_window_seconds': 604800,
+                                'used_percent': 34,
+                                'reset_at': 1893888000,
+                                'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                            },
+                        },
+                        'plan_type': 'plus',
+                    }
                     with (
                         mock.patch.object(monitor_common, "token_expired", return_value=True),
                         mock.patch.object(monitor_common, "request_json", side_effect=rotate),
@@ -1419,10 +1472,23 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 empty_id = state.create_account("Empty")["activeAccountId"]
                 state.switch_account("ppl-pro")
 
-            usage_response = {"rate_limit": {
-                "primary": {"window_minutes": 300, "used_percent": 12, "reset_at": 1893456000},
-                "secondary": {"window_minutes": 10080, "used_percent": 34, "reset_at": 1893888000},
-            }}
+            usage_response = {
+                'rate_limit': {
+                    'primary_window': {
+                        'limit_window_seconds': 18000,
+                        'used_percent': 12,
+                        'reset_at': 1893456000,
+                        'reset_after_seconds': 1893456000 - int(monitor_common.time.time()),
+                    },
+                    'secondary_window': {
+                        'limit_window_seconds': 604800,
+                        'used_percent': 34,
+                        'reset_at': 1893888000,
+                        'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                    },
+                },
+                'plan_type': 'plus',
+            }
             with mock.patch.object(monitor_common, "token_expired", return_value=True), mock.patch.object(
                 monitor_common, "request_json", return_value=(200, {"account_id": "acct-b", "access_token": "access-rotated", "refresh_token": "refresh-rotated"}),
             ) as refresh_request, mock.patch.object(monitor_quota, "request_json", return_value=(200, usage_response)):
@@ -2117,20 +2183,21 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_quota_extraction_finds_5h_and_7d_windows(self):
         compact = compact_quota({
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 42.5,
-                    "limit_window_seconds": 18000,
-                    "reset_at": 1893456000,
-                    "planType": "plus",
+            'rate_limit': {
+                'primary_window': {
+                    'used_percent': 42.5,
+                    'limit_window_seconds': 18000,
+                    'reset_at': 1893456000,
+                    'reset_after_seconds': 1893456000 - int(monitor_common.time.time()),
                 },
-                "secondary_window": {
-                    "used_percent": 61,
-                    "limit_window_seconds": 604800,
-                    "reset_at": 1893888000,
-                    "planType": "pro_lite",
+                'secondary_window': {
+                    'used_percent': 61,
+                    'limit_window_seconds': 604800,
+                    'reset_at': 1893888000,
+                    'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
                 },
             },
+            'plan_type': 'plus',
         })
 
         windows = quota_history_windows({"usage": compact})
@@ -2138,24 +2205,28 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertTrue(compact["complete"])
         self.assertEqual(windows["5h"]["usedPercent"], 42.5)
         self.assertEqual(windows["7d"]["usedPercent"], 61)
-        self.assertEqual(windows["5h"]["resetAt"], "2030-01-01T00:00:00Z")
+        self.assertEqual(windows["5h"]["resetAt"], 1893456000)
         self.assertEqual(windows["5h"]["plan"], "plus")
-        self.assertEqual(windows["7d"]["plan"], "pro_lite")
-        self.assertEqual(windows["7d"]["planMultiplier"], 5.0)
+        self.assertEqual(windows["7d"]["plan"], "plus")
+        self.assertEqual(windows["7d"]["planMultiplier"], 1.0)
 
     def test_quota_extraction_uses_parent_plan_as_window_fallback(self):
         compact = compact_quota({
-            "planType": "pro",
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 3,
-                    "limit_window_seconds": 18000,
+            'rate_limit': {
+                'primary_window': {
+                    'used_percent': 3,
+                    'limit_window_seconds': 18000,
+                    'reset_at': 1893888000,
+                    'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
                 },
-                "secondary_window": {
-                    "used_percent": 4,
-                    "limit_window_seconds": 604800,
+                'secondary_window': {
+                    'used_percent': 4,
+                    'limit_window_seconds': 604800,
+                    'reset_at': 1893888000,
+                    'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
                 },
             },
+            'plan_type': 'pro',
         })
 
         windows = quota_history_windows({"usage": compact})
@@ -2165,43 +2236,64 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(windows["7d"]["plan"], "pro")
         self.assertEqual(windows["7d"]["planMultiplier"], 20.0)
 
-    def test_quota_extraction_treats_missing_5h_as_unavailable_zero(self):
+    def test_quota_extraction_treats_missing_5h_as_unavailable(self):
         compact = compact_quota({
-            "rate_limit": {
-                "secondary_window": {
-                    "used_percent": 61,
-                    "limit_window_seconds": 604800,
-                    "planType": "plus",
+            'rate_limit': {
+                'secondary_window': {
+                    'used_percent': 61,
+                    'limit_window_seconds': 604800,
+                    'reset_at': 1893888000,
+                    'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
                 },
+                'primary_window': None,
             },
+            'plan_type': 'plus',
         })
 
         windows = quota_history_windows({"usage": compact})
 
         self.assertTrue(compact["complete"])
         self.assertEqual(compact["missingWindows"], [])
-        self.assertEqual(windows["5h"]["usedPercent"], 0)
+        self.assertIsNone(windows["5h"]["usedPercent"])
         self.assertTrue(windows["5h"]["unavailable"])
         self.assertFalse(windows["7d"]["unavailable"])
 
-    def test_quota_extraction_treats_missing_7d_as_unavailable_zero(self):
+    def test_quota_extraction_treats_missing_7d_as_unavailable(self):
         compact = compact_quota({
-            "rate_limit": {
-                "primary_window": {
-                    "used_percent": 42,
-                    "limit_window_seconds": 18000,
-                    "planType": "plus",
+            'rate_limit': {
+                'primary_window': {
+                    'used_percent': 42,
+                    'limit_window_seconds': 18000,
+                    'reset_at': 1893888000,
+                    'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
                 },
+                'secondary_window': None,
             },
+            'plan_type': 'plus',
         })
 
         windows = quota_history_windows({"usage": compact})
 
         self.assertTrue(compact["complete"])
         self.assertEqual(compact["missingWindows"], [])
-        self.assertEqual(windows["7d"]["usedPercent"], 0)
+        self.assertIsNone(windows["7d"]["usedPercent"])
         self.assertTrue(windows["7d"]["unavailable"])
         self.assertFalse(windows["5h"]["unavailable"])
+
+    def test_quota_extraction_reports_missing_used_percent(self):
+        with self.assertRaisesRegex(UsageError, "Incompatible usage API response.*used_percent"):
+            compact_quota({
+                'plan_type': 'plus',
+                'rate_limit': {
+                    'primary_window': {
+                        'limit_window_seconds': 18000,
+                        'remaining_percent': 30,
+                        'reset_at': 1893456000,
+                        'reset_after_seconds': 1893456000 - int(monitor_common.time.time()),
+                    },
+                    'secondary_window': None,
+                },
+            })
 
     def test_collect_usage_sample_loads_auth_for_remote_usage(self):
         original_load_json = monitor_history.load_json
@@ -2212,10 +2304,21 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 "endpoint": "test",
                 "status": 200,
                 "usage": compact_quota({
-                    "rate_limit": {
-                        "primary_window": {"used_percent": 12, "limit_window_seconds": 18000},
-                        "secondary_window": {"used_percent": 34, "limit_window_seconds": 604800},
+                    'rate_limit': {
+                        'primary_window': {
+                            'used_percent': 12,
+                            'limit_window_seconds': 18000,
+                            'reset_at': 1893888000,
+                            'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                        },
+                        'secondary_window': {
+                            'used_percent': 34,
+                            'limit_window_seconds': 604800,
+                            'reset_at': 1893888000,
+                            'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                        },
                     },
+                    'plan_type': 'plus',
                 }),
             }
 
@@ -2228,7 +2331,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             monitor_history.load_json = original_load_json
             monitor_history.fetch_usage = original_fetch_usage
 
-    def test_collect_usage_sample_arbitrates_weird_percent_and_accepts_stable_retry(self):
+    def test_collect_usage_sample_accepts_large_increase_without_retry(self):
         original_load_json = monitor_history.load_json
         original_fetch_usage = monitor_history.fetch_usage
         calls = []
@@ -2243,10 +2346,21 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     "endpoint": "test",
                     "status": 200,
                     "usage": compact_quota({
-                        "rate_limit": {
-                            "primary_window": {"used_percent": percent, "limit_window_seconds": 18000, "planType": "plus"},
-                            "secondary_window": {"used_percent": 10, "limit_window_seconds": 604800, "planType": "plus"},
+                        'rate_limit': {
+                            'primary_window': {
+                                'used_percent': percent,
+                                'limit_window_seconds': 18000,
+                                'reset_at': 1893888000,
+                                'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                            },
+                            'secondary_window': {
+                                'used_percent': 10,
+                                'limit_window_seconds': 604800,
+                                'reset_at': 1893888000,
+                                'reset_after_seconds': 1893888000 - int(monitor_common.time.time()),
+                            },
                         },
+                        'plan_type': 'plus',
                     }),
                 }
 
@@ -2265,89 +2379,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 },
             )
 
-            self.assertEqual(len(calls), 2)
-            self.assertEqual(sample["windows"]["5h"]["usedPercent"], 71)
-            self.assertEqual(sample["remoteUsage"]["rawResponse"]["sample"], 2)
-            self.assertEqual(sample["remoteUsage"]["percentArbitration"]["acceptedResponse"], 2)
-        finally:
-            monitor_history.load_json = original_load_json
-            monitor_history.fetch_usage = original_fetch_usage
-
-    def test_collect_usage_sample_accepts_weird_percent_on_account_switch(self):
-        original_load_json = monitor_history.load_json
-        original_fetch_usage = monitor_history.fetch_usage
-        calls = []
-        try:
-            monitor_history.load_json = lambda path: {"authPath": str(path)}
-
-            def fake_fetch_usage(auth, opener, auth_path, timeout, debug, retries=3, *args):
-                calls.append(1)
-                debug.update({"rawResponse": remote_identity("user-new")})
-                return {
-                    "endpoint": "test",
-                    "status": 200,
-                    "usage": compact_quota({
-                        "rate_limit": {
-                            "primary_window": {"used_percent": 80, "limit_window_seconds": 18000, "planType": "plus"},
-                            "secondary_window": {"used_percent": 10, "limit_window_seconds": 604800, "planType": "plus"},
-                        },
-                    }),
-                }
-
-            monitor_history.fetch_usage = fake_fetch_usage
-
-            sample = collect_usage_sample(
-                SimpleNamespace(local_only=False, no_token_scan=True, auth=Path("auth.json"), timeout=10),
-                object(),
-                None,
-                runtime_state={
-                    "remoteUsageIdentity": remote_identity("user-old"),
-                    "windows": {"5h": {"baselinePercent": 10, "baselinePlan": "plus", "baselineMultiplier": 1.0}},
-                },
-            )
-
             self.assertEqual(len(calls), 1)
-            self.assertEqual(sample["windows"]["5h"]["usedPercent"], 80)
-            self.assertNotIn("percentArbitration", sample["remoteUsage"])
-        finally:
-            monitor_history.load_json = original_load_json
-            monitor_history.fetch_usage = original_fetch_usage
-
-    def test_collect_usage_sample_raises_when_percent_arbitration_never_stabilizes(self):
-        original_load_json = monitor_history.load_json
-        original_fetch_usage = monitor_history.fetch_usage
-        calls = []
-        try:
-            monitor_history.load_json = lambda path: {"authPath": str(path)}
-
-            def fake_fetch_usage(auth, opener, auth_path, timeout, debug, retries=3, *args):
-                calls.append(1)
-                debug.update({"rawResponse": remote_identity("user-old")})
-                return {
-                    "endpoint": "test",
-                    "status": 200,
-                    "usage": compact_quota({
-                        "rate_limit": {
-                            "primary_window": {"used_percent": 10 + len(calls) * 50, "limit_window_seconds": 18000, "planType": "plus"},
-                            "secondary_window": {"used_percent": 10, "limit_window_seconds": 604800, "planType": "plus"},
-                        },
-                    }),
-                }
-
-            monitor_history.fetch_usage = fake_fetch_usage
-
-            with self.assertRaises(UsageError):
-                collect_usage_sample(
-                    SimpleNamespace(local_only=False, no_token_scan=True, auth=Path("auth.json"), timeout=10),
-                    object(),
-                    None,
-                    runtime_state={
-                        "remoteUsageIdentity": remote_identity("user-old"),
-                        "windows": {"5h": {"baselinePercent": 10, "baselinePlan": "plus", "baselineMultiplier": 1.0}},
-                    },
-                )
-
-            self.assertEqual(len(calls), 5)
+            self.assertEqual(sample["windows"]["5h"]["usedPercent"], 70)
+            self.assertEqual(sample["remoteUsage"]["rawResponse"]["sample"], 1)
         finally:
             monitor_history.load_json = original_load_json
             monitor_history.fetch_usage = original_fetch_usage
@@ -2467,14 +2501,16 @@ class MonitorCodexUsageTests(unittest.TestCase):
         costs = calculate_token_costs({"byModel": {"gpt-6": {"freshInputTokens": 1_000_000, "cachedInputTokens": 1_000_000, "cacheWriteInputTokens": 1_000_000, "outputTokens": 1_000_000}}})
         self.assertEqual(costs, {"inputCostUsd": 10.0, "cachedInputCostUsd": 1.0, "cacheWriteInputCostUsd": 12.5, "outputCostUsd": 50.0, "totalCostUsd": 73.5})
 
-    def test_gpt_6_sol_models_and_luna_use_model_specific_prices(self):
+    def test_gpt_6_models_use_model_specific_prices(self):
         for model, prices, total in (
             ("gpt-6.1-sol", {"input": 2.0, "cachedInput": 0.1, "cacheWriteInput": 2.5, "output": 10.0}, 14.6),
+            ("gpt-6.1-terra", {"input": 1.0, "cachedInput": 0.05, "cacheWriteInput": 1.25, "output": 5.0}, 7.3),
             ("gpt-6-sol", {"input": 2.0, "cachedInput": 0.2, "cacheWriteInput": 2.5, "output": 10.0}, 14.7),
             ("gpt-6-luna", {"input": 0.1, "cachedInput": 0.01, "cacheWriteInput": 0.125, "output": 0.5}, 0.735),
         ):
             with self.subTest(model=model):
                 self.assertEqual(pricing_for_model(f"openai/{model}-2026-09-22"), prices)
+                self.assertEqual(pricing_for_model(f"openai/{model}-20261027"), prices)
                 self.assertEqual(pricing_for_model(model.upper()), prices)
                 tokens = {"freshInputTokens": 1_000_000, "cachedInputTokens": 1_000_000, "cacheWriteInputTokens": 1_000_000, "outputTokens": 1_000_000}
                 self.assertEqual(calculate_token_costs({"byModel": {model: tokens}})["totalCostUsd"], total)
@@ -3287,248 +3323,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertEqual([(event["window"], event["deltaPercent"], event["deltaCostUsd"]) for event in events], [("5h", 1, 2), ("7d", 1, 2)])
 
-    def test_live_processing_recovers_from_transient_future_reset_rollback(self):
-        state = {}
-        history = []
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=24, cost=100, five_hour_reset="2030-01-01T06:00:00Z"), history), [])
-
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=6, cost=102, five_hour_reset="2030-01-01T08:00:00Z"), history), [])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "bad-remote-usage-discarded")
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=37, cost=103, five_hour_reset="2030-01-01T06:00:00Z"), history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 13)
-        self.assertEqual(events[0]["deltaCostUsd"], 3)
-
-    def test_live_processing_recovers_from_transient_reset_rollback_with_jitter(self):
-        state = {}
-        history = []
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", seven_day=65, cost=100, seven_day_reset="2030-01-14T05:32:00Z"), history), [])
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", seven_day=3, cost=101, seven_day_reset="2030-01-15T03:18:06Z"), history), [])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "bad-remote-usage-discarded")
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", seven_day=66, cost=101, seven_day_reset="2030-01-14T05:31:59Z"), history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 1)
-
-    def test_live_processing_discards_stale_backward_reset_sample(self):
-        state = {}
-        history = []
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=6, cost=100, five_hour_reset="2030-01-01T11:00:00Z"), history), [])
-
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=16, cost=100.4, five_hour_reset="2030-01-01T08:00:00Z"), history), [])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "reset-time-moved-backward-discarded")
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=8, cost=100.5, five_hour_reset="2030-01-01T11:00:00Z"), history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 2)
-        self.assertEqual(events[0]["deltaCostUsd"], 0.5)
-
-    def test_live_processing_rebases_after_consistent_backward_reset_samples(self):
-        state = {}
-        history = []
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", seven_day=3, cost=100, seven_day_reset="2030-01-15T03:18:06Z"), history), [])
-
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", seven_day=73, cost=107, seven_day_reset="2030-01-14T05:32:00Z"), history), [])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "reset-time-moved-backward-discarded")
-
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", seven_day=73, cost=107, seven_day_reset="2030-01-14T05:31:59Z"), history), [])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "consistent-backward-reset-rebased")
-        self.assertEqual(state["windows"]["7d"]["baselinePercent"], 73)
-        self.assertEqual(state["windows"]["7d"]["baselineCostUsd"], 107)
-        self.assertEqual(state["windows"]["7d"]["baselineResetAt"], "2030-01-14T05:31:59Z")
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T03:00:00Z", seven_day=74, cost=108, seven_day_reset="2030-01-14T05:32:00Z"), history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 1)
-
-    def test_live_processing_requires_consecutive_backward_reset_samples_to_rebase(self):
-        state = {}
-        history = []
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", seven_day=3, cost=100, seven_day_reset="2030-01-15T03:18:06Z"), history), [])
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", seven_day=73, cost=107, seven_day_reset="2030-01-14T05:32:00Z"), history), [])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "reset-time-moved-backward-discarded")
-
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", seven_day=3, cost=107, seven_day_reset="2030-01-15T03:18:06Z"), history), [])
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T03:00:00Z", seven_day=73, cost=108, seven_day_reset="2030-01-14T05:31:59Z"), history), [])
-
-        self.assertEqual(state["_specialEvents"][0]["reason"], "reset-time-moved-backward-discarded")
-        self.assertEqual(state["windows"]["7d"]["baselinePercent"], 3)
-        self.assertEqual(state["windows"]["7d"]["baselineResetAt"], "2030-01-15T03:18:06Z")
-
-    def test_bad_remote_usage_does_not_consume_cost_before_next_good_sample(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=40, cost=100, five_hour_reset="2030-01-01T10:00:00Z"), history)
-
-        bad = event_sample("2030-01-01T01:00:00Z", five_hour=10, cost=105, five_hour_reset="2030-01-01T12:00:00Z")
-        self.assertEqual(process_sample_delta_events(state, bad, history), [])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "bad-remote-usage-discarded")
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 40)
-        self.assertEqual(state["windows"]["5h"]["baselineCostUsd"], 100)
-        self.assertEqual(state["windows"]["5h"]["previousCostUsd"], 100)
-        self.assertEqual(bad["windows"]["5h"]["usedPercent"], 40)
-        self.assertEqual(bad["windows"]["5h"]["resetAt"], "2030-01-01T10:00:00Z")
-        self.assertTrue(bad["usingPreviousWindows"])
-        self.assertIn("remoteUsageRejected", bad["errors"])
-        self.assertEqual(dashboard_display(bad)["statusBarText"], "5h 40.0% · 7d -")
-        self.assertEqual(dashboard_display(bad)["windows"]["5h"]["resetAt"], "2030-01-01T10:00:00Z")
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=42, cost=110, five_hour_reset="2030-01-01T10:00:00Z"), history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 2)
-        self.assertEqual(events[0]["deltaCostUsd"], 10)
-
-    def test_bad_remote_usage_is_retried_immediately_before_processing(self):
-        state = {"remoteUsageIdentity": remote_identity("user-old")}
-        samples = [
-            with_remote_identity(sample("2026-01-01T00:00:00Z"), "user-new"),
-            with_remote_identity(sample("2026-01-01T00:00:01Z", five_hour=10, five_hour_reset="2026-01-01T05:00:00Z"), "user-old"),
-        ]
-
-        recovered = collect_with_bad_remote_usage_retry(lambda: samples.pop(0), state)
-
-        self.assertEqual(recovered["checkedAt"], "2026-01-01T00:00:01Z")
-        self.assertTrue(recovered["remoteUsage"]["badRemoteUsageRetry"]["attempted"])
-        self.assertIn("identity changed without usable quota windows", recovered["remoteUsage"]["badRemoteUsageRetry"]["initialRejectionReasons"])
-        self.assertEqual(samples, [])
-
-    def test_bad_remote_usage_confirms_plus_manual_reset_with_window_specific_limits(self):
-        cases = {
-            "5h": ([10, 15, 20], "2030-01-01T12:00:00Z", 20),
-            "7d": ([10, 11, 12], "2030-01-15T00:00:00Z", 12),
-        }
-        for label, (percents, reset_at, expected) in cases.items():
-            with self.subTest(window=label):
-                state = {}
-                initial = with_remote_identity(event_sample(
-                    "2030-01-01T00:00:00Z", five_hour=40 if label == "5h" else None, seven_day=40 if label == "7d" else None, cost=100, plan="plus",
-                    five_hour_reset="2030-01-01T10:00:00Z" if label == "5h" else None, seven_day_reset="2030-01-14T00:00:00Z" if label == "7d" else None,
-                ), "user-old")
-                process_sample_delta_events(state, initial, [])
-                samples = [
-                    with_remote_identity(event_sample(
-                        f"2030-01-01T01:00:0{index}Z", five_hour=percent if label == "5h" else None, seven_day=percent if label == "7d" else None,
-                        cost=105 + index, plan="plus", five_hour_reset=reset_at if label == "5h" else None, seven_day_reset=reset_at if label == "7d" else None,
-                    ), "user-old")
-                    for index, percent in enumerate(percents)
-                ]
-
-                confirmed = collect_with_bad_remote_usage_retry(lambda: samples.pop(0), state)
-
-                self.assertTrue(confirmed["remoteUsage"]["manualResetConfirmation"]["confirmed"])
-                self.assertEqual(confirmed["remoteUsage"]["manualResetConfirmation"]["confirmedWindows"], [label])
-                self.assertEqual(process_sample_delta_events(state, confirmed, []), [])
-                self.assertEqual(state["_specialEvents"][0]["reason"], "manual-reset-confirmed")
-                self.assertEqual(state["windows"][label]["baselinePercent"], expected)
-                self.assertEqual(state["windows"][label]["baselineCostUsd"], 107)
-                self.assertEqual(samples, [])
-
-    def test_zero_or_missing_windows_accept_manual_reset_without_retry(self):
-        cases = {
-            "both-zero": (0, 0, {"5h", "7d"}),
-            "zero-and-missing": (0, None, {"5h"}),
-        }
-        for name, (five_hour, seven_day, confirmed_windows) in cases.items():
-            with self.subTest(case=name):
-                state = {}
-                process_sample_delta_events(state, with_remote_identity(event_sample(
-                    "2030-01-01T00:00:00Z", five_hour=40, seven_day=40, cost=100, plan="plus",
-                    five_hour_reset="2030-01-01T10:00:00Z", seven_day_reset="2030-01-14T00:00:00Z",
-                ), "user-old"), [])
-                calls = []
-
-                def collect():
-                    calls.append(1)
-                    return with_remote_identity(event_sample(
-                        "2030-01-01T01:00:00Z", five_hour=five_hour, seven_day=seven_day, cost=105, plan="plus",
-                        five_hour_reset="2030-01-01T12:00:00Z", seven_day_reset="2030-01-15T00:00:00Z" if seven_day is not None else None,
-                    ), "user-old")
-
-                confirmed = collect_with_bad_remote_usage_retry(collect, state)
-
-                self.assertEqual(calls, [1])
-                self.assertTrue(confirmed["remoteUsage"]["manualResetConfirmation"]["directZeroOrMissing"])
-                self.assertEqual(set(confirmed["remoteUsage"]["manualResetConfirmation"]["confirmedWindows"]), confirmed_windows)
-                self.assertEqual(process_sample_delta_events(state, confirmed, []), [])
-                for label in confirmed_windows:
-                    self.assertEqual(state["windows"][label]["baselinePercent"], 0)
-                    self.assertEqual(state["windows"][label]["baselineCostUsd"], 105)
-
-    def test_both_missing_windows_are_not_accepted_as_manual_reset(self):
-        state = {}
-        process_sample_delta_events(state, with_remote_identity(event_sample(
-            "2030-01-01T00:00:00Z", five_hour=40, seven_day=40, cost=100, plan="plus",
-            five_hour_reset="2030-01-01T10:00:00Z", seven_day_reset="2030-01-14T00:00:00Z",
-        ), "user-old"), [])
-        samples = [with_remote_identity(event_sample(f"2030-01-01T01:00:0{index}Z", cost=105 + index, plan="plus"), "user-old") for index in range(2)]
-
-        rejected = collect_with_bad_remote_usage_retry(lambda: samples.pop(0), state)
-
-        self.assertNotIn("manualResetConfirmation", rejected["remoteUsage"])
-        self.assertEqual(process_sample_delta_events(state, rejected, []), [])
-        self.assertIn("both quota window percentages are missing", rejected["errors"]["remoteUsageRejected"])
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 40)
-        self.assertEqual(state["windows"]["7d"]["baselinePercent"], 40)
-        self.assertEqual(samples, [])
-
-    def test_bad_remote_usage_confirms_pro_manual_reset_at_one_percent_per_response(self):
-        for plan, multiplier in (("pro_lite", 5), ("pro", 20)):
-            with self.subTest(plan=plan):
-                state = {}
-                process_sample_delta_events(state, with_remote_identity(event_sample(
-                    "2030-01-01T00:00:00Z", five_hour=40, seven_day=40, cost=100, plan=plan,
-                    five_hour_reset="2030-01-01T10:00:00Z", seven_day_reset="2030-01-14T00:00:00Z",
-                ), "user-old"), [])
-                samples = [
-                    with_remote_identity(event_sample(
-                        f"2030-01-01T01:00:0{index}Z", five_hour=percent, seven_day=percent, cost=105 + index, plan=plan,
-                        five_hour_reset="2030-01-01T12:00:00Z", seven_day_reset="2030-01-15T00:00:00Z",
-                    ), "user-old")
-                    for index, percent in enumerate((10, 11, 12))
-                ]
-
-                confirmed = collect_with_bad_remote_usage_retry(lambda: samples.pop(0), state)
-
-                self.assertEqual(set(confirmed["remoteUsage"]["manualResetConfirmation"]["confirmedWindows"]), {"5h", "7d"})
-                self.assertEqual(process_sample_delta_events(state, confirmed, []), [])
-                self.assertEqual(state["windows"]["5h"]["baselinePercent"], 12 * multiplier)
-                self.assertEqual(state["windows"]["7d"]["baselinePercent"], 12 * multiplier)
-                self.assertEqual([event["reason"] for event in state["_specialEvents"]], ["manual-reset-confirmed", "manual-reset-confirmed"])
-
-    def test_bad_remote_usage_does_not_confirm_unstable_manual_reset(self):
-        state = {}
-        process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T00:00:00Z", five_hour=40, cost=100, plan="plus", five_hour_reset="2030-01-01T10:00:00Z"), "user-old"), [])
-        samples = [
-            with_remote_identity(event_sample(f"2030-01-01T01:00:0{index}Z", five_hour=percent, cost=105 + index, plan="plus", five_hour_reset="2030-01-01T12:00:00Z"), "user-old")
-            for index, percent in enumerate((10, 16, 22, 28, 34))
-        ]
-
-        rejected = collect_with_bad_remote_usage_retry(lambda: samples.pop(0), state)
-
-        self.assertFalse(rejected["remoteUsage"]["manualResetConfirmation"]["confirmed"])
-        self.assertEqual(process_sample_delta_events(state, rejected, []), [])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "bad-remote-usage-discarded")
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 40)
-        self.assertEqual(samples, [])
-
-    def test_repeated_bad_remote_usage_suppresses_duplicate_console_event(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=40, cost=100, five_hour_reset="2030-01-01T10:00:00Z"), history)
-
-        process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=10, cost=105, five_hour_reset="2030-01-01T12:00:00Z"), history)
-        self.assertFalse(state["_specialEvents"][0]["extra"]["suppressConsole"])
-
-        process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=10, cost=106, five_hour_reset="2030-01-01T12:00:00Z"), history)
-        self.assertTrue(state["_specialEvents"][0]["extra"]["suppressConsole"])
 
     def test_consecutive_reset_time_moved_forward_events_are_suppressed_per_window(self):
         state = {}
@@ -3626,16 +3420,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(events[0]["deltaPercent"], 1)
         self.assertEqual(events[0]["deltaCostUsd"], 3)
 
-    def test_remote_identity_switch_without_quota_windows_is_discarded(self):
-        state = {"remoteUsageIdentity": remote_identity("user-old")}
-        sample_row = with_remote_identity(event_sample("2030-01-01T00:00:00Z", cost=100), "user-new")
-
-        self.assertEqual(process_sample_delta_events(state, sample_row, []), [])
-
-        self.assertFalse(sample_row["remoteUsage"]["accepted"])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "bad-remote-usage-discarded")
-        self.assertIn("identity changed without usable quota windows", sample_row["errors"]["remoteUsageRejected"])
-        self.assertEqual(state["remoteUsageIdentity"]["user_id"], "user-old")
 
     def test_live_processing_reports_account_switch_baseline_update(self):
         state = {}
@@ -3832,9 +3616,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(len(payload["revision"]), 20)
 
 
-
-
-    def test_dashboard_display_tiers_keep_recent_points_and_compact_older_points(self):
+    def test_dashboard_display_keeps_exact_points_at_every_age(self):
         now = 100 * 24 * 60 * 60
 
         def point(age_days, index):
@@ -3847,10 +3629,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
         points = [point(2, index) for index in range(5)] + [point(4, index) for index in range(9)] + [point(10, index) for index in range(17)] + [point(40, index) for index in range(33)]
         compacted = monitor_dashboard.dashboard_compact_quota_points(points, now)
 
-        self.assertEqual(len(compacted), 14)
+        self.assertEqual(len(compacted), len(points))
         self.assertEqual(len([item for item in compacted if item["timestamp"] >= now - 3 * 24 * 60 * 60]), 5)
         self.assertTrue(all(item.get("compactedFrom") is None for item in compacted[-5:]))
-        self.assertTrue(any(item.get("compactedFrom") is not None for item in compacted[:-5]))
+        self.assertTrue(all(item.get("compactedFrom") is None for item in compacted))
 
     def test_dashboard_display_compaction_does_not_bridge_a_real_gap(self):
         now = 100 * 24 * 60 * 60
@@ -3865,24 +3647,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         compacted = monitor_dashboard.dashboard_compact_quota_points(points, now)
 
-        self.assertEqual(len(compacted), 2)
-        self.assertEqual(compacted[0]["compactedFrom"], timestamps[0])
-        self.assertEqual(compacted[1]["compactedFrom"], timestamps[6])
-        self.assertGreater(compacted[1]["timestamp"] - compacted[0]["timestamp"], monitor_dashboard.DASHBOARD_DISPLAY_CACHE_GAP_SECONDS)
+        self.assertEqual(len(compacted), len(points))
+        self.assertIsNone(compacted[0]["compactedFrom"])
+        self.assertIsNone(compacted[1]["compactedFrom"])
+        self.assertGreater(compacted[6]["timestamp"] - compacted[5]["timestamp"], monitor_dashboard.DASHBOARD_DISPLAY_CACHE_GAP_SECONDS)
 
 
-    def test_dashboard_next_maintenance_at_uses_hour_resolution(self):
-        hour = monitor_dashboard.HOUR_MULTIPLIER
-        now = 100 * hour + 30 * 60 + 12
-        timestamp = now - monitor_dashboard.QUOTA_HISTORY_DISPLAY_FULL_SECONDS + 15 * 60
-        next_maintenance = monitor_dashboard._dashboard_display_next_maintenance_at(
-            [{"timestamp": timestamp}], {"fiveHour": [], "sevenDay": []}, now,
-        )
-
-        self.assertEqual(next_maintenance, (int(now / hour) + 1) * hour)
-        self.assertEqual(next_maintenance % hour, 0)
-        self.assertGreater(next_maintenance, now)
-
+    def test_exact_quota_points_need_no_ageing_maintenance(self):
+        self.assertIsNone(monitor_dashboard._dashboard_display_next_maintenance_at([], {"fiveHour": [], "sevenDay": []}, 0))
 
 
     def test_dashboard_exposes_independent_local_and_merged_data_views(self):
@@ -4340,36 +4112,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             self.assertEqual([row["checkedAt"] for row in monitor_history.load_quota_history(path)], [f"2030-01-01T00:0{index}:00Z" for index in range(6)])
 
-    def test_quota_history_compaction_tracks_interleaved_accounts_independently(self):
-        rows = []
-        for index in range(3):
-            rows.extend({
-                "checkedAt": f"2030-01-01T00:0{index}:0{offset}Z", "accountSlotId": account, "accountLabel": account,
-                "windows": {"5h": {"usedPercent": 5, "resetAt": "2030-01-01T05:00:00Z", "plan": "plus"}},
-            } for offset, account in enumerate(("account-a", "account-b")))
-
-        compacted = monitor_history.compact_quota_history_rows(rows)
-
-        self.assertEqual([(row["accountSlotId"], row["checkedAt"]) for row in compacted], [
-            ("account-a", "2030-01-01T00:00:00Z"), ("account-b", "2030-01-01T00:00:01Z"),
-            ("account-a", "2030-01-01T00:02:00Z"), ("account-b", "2030-01-01T00:02:01Z"),
-        ])
-        self.assertEqual([row["compaction"] for row in compacted if row.get("compaction")], [
-            {"continuousFrom": "2030-01-01T00:00:00Z", "omittedSamples": 1},
-            {"continuousFrom": "2030-01-01T00:00:01Z", "omittedSamples": 1},
-        ])
-
-    def test_quota_history_compaction_keeps_real_long_gap_discontinuous(self):
-        rows = [{
-            "checkedAt": checked_at, "accountSlotId": "account-a", "accountLabel": "Account A",
-            "windows": {"5h": {"usedPercent": 5, "resetAt": "2030-01-02T05:00:00Z", "plan": "plus"}},
-        } for checked_at in ("2030-01-01T00:00:00Z", "2030-01-01T00:10:00Z", "2030-01-01T00:20:00Z", "2030-01-01T08:00:00Z", "2030-01-01T08:10:00Z", "2030-01-01T08:20:00Z")]
-
-        compacted = monitor_history.compact_quota_history_rows(rows)
-
-        self.assertEqual([row["checkedAt"] for row in compacted], ["2030-01-01T00:00:00Z", "2030-01-01T00:20:00Z", "2030-01-01T08:00:00Z", "2030-01-01T08:20:00Z"])
-        self.assertNotIn("compaction", compacted[2])
-        self.assertEqual([row["compaction"]["continuousFrom"] for row in (compacted[1], compacted[3])], ["2030-01-01T00:00:00Z", "2030-01-01T08:00:00Z"])
 
     def test_quota_history_sample_does_not_require_cost_or_trusted_delta_baseline(self):
         sample = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 42}, "7d": {"usedPercent": 61}}}
@@ -4392,7 +4134,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         source = Path(monitor_dashboard.__file__).read_text(encoding="utf-8")
         poll = source[source.index("    def poll_once(self)"):source.index("    def _poll_inactive_account", source.index("    def poll_once(self)"))]
         self.assertIn("sync_token_ledger(", poll)
-        self.assertIn("append_quota_history_sample(self.args.quota_history, sample)", poll)
+        self.assertIn("self._record_quota_sample_locked(sample)", poll)
 
     def test_dashboard_projection_returns_quota_points_for_all_accounts(self):
         accounts = {"awaitingLogin": False, "activeAccountId": "account-a", "items": [{"id": "account-a", "label": "Account A"}, {"id": "account-b", "label": "Account B"}]}
@@ -4410,42 +4152,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["plan"], "plus")
         self.assertEqual(payload["quotaPoints"][1]["compactedFrom"], monitor_common.parse_timestamp("2029-12-31T12:00:00Z"))
 
-    def test_usage_time_filter_removes_isolated_and_consecutive_false_drops_without_changing_raw_history(self):
-        rows = [
-            {"checkedAt": checked_at, "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
-            for checked_at, percent in (
-                ("2030-01-01T00:00:00Z", 38), ("2030-01-01T00:01:30Z", 3), ("2030-01-01T00:03:00Z", 3), ("2030-01-01T00:04:30Z", 38),
-                ("2030-01-01T00:06:00Z", 13), ("2030-01-01T00:07:30Z", 13), ("2030-01-01T00:09:00Z", 39),
-            )
-        ]
-
-        points = monitor_dashboard.dashboard_quota_points(rows)
-
-        self.assertEqual([point["sevenDay"]["raw"] for point in points], [38, 3, 3, 38, 13, 13, 39])
-        self.assertEqual([point["sevenDay"]["continuous"] for point in points], [38, None, None, 38, None, None, 39])
-
-    def test_usage_time_filter_pins_unconfirmed_downward_rounding_jitter_to_previous_baseline(self):
-        def continuous(values):
-            rows = [
-                {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
-                for index, percent in enumerate(values)
-            ]
-            return [point["sevenDay"]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)]
-
-        self.assertEqual(continuous([98, 96, 96]), [98, 98, 98])
-        self.assertEqual(continuous([98, 96, 97]), [98, 98, 98])
-        self.assertEqual(continuous([98, 96, 96, 97, 98]), [98, 98, 98, 98, 98])
-
-    def test_usage_time_filter_retroactively_accepts_three_consecutive_lower_readings(self):
-        def continuous(values):
-            rows = [
-                {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
-                for index, percent in enumerate(values)
-            ]
-            return [point["sevenDay"]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)]
-
-        self.assertEqual(continuous([98, 96, 96, 96]), [98, 96, 96, 96])
-        self.assertEqual(continuous([98, 96, 97, 97]), [98, 96, 97, 97])
 
     def test_usage_time_filter_rebases_same_account_on_subscription_change(self):
         for label, output in (("5h", "fiveHour"), ("7d", "sevenDay")):
@@ -4456,38 +4162,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     }} for index, value in enumerate(values)]
                     self.assertEqual([point[output]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)], values)
 
-    def test_usage_time_filter_rebases_after_ten_consecutive_large_drops(self):
-        for label, output in (("5h", "fiveHour"), ("7d", "sevenDay")):
-            for lows in ([1] * 10, list(range(10, 0, -1))):
-                with self.subTest(label=label, lows=lows):
-                    values = [80] + lows + [2]
-                    rows = [{"checkedAt": f"2030-01-01T00:{index:02}:00Z", "accountSlotId": "a", "windows": {
-                        label: {"usedPercent": value, "resetAt": "2030-01-05T00:00:00Z", "plan": "plus"},
-                    }} for index, value in enumerate(values)]
-                    self.assertEqual([point[output]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows[:10])], [80] + [None] * 9)
-                    self.assertEqual([point[output]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)], values)
-
-    def test_usage_time_filter_interrupts_ten_drop_recovery(self):
-        for interruption in (80, 90, None, 101):
-            with self.subTest(interruption=interruption):
-                rows = [{"checkedAt": f"2030-01-01T00:{index:02}:00Z", "accountSlotId": "a", "windows": {
-                    "7d": {"usedPercent": value, "resetAt": "2030-01-05T00:00:00Z", "plan": "plus"},
-                }} for index, value in enumerate([80] + [1] * 9 + [interruption] + [1] * 9)]
-                points = monitor_dashboard.dashboard_quota_points(rows)
-                self.assertEqual([point["sevenDay"]["continuous"] for point in points[1:10]], [None] * 9)
-                self.assertEqual([point["sevenDay"]["continuous"] for point in points[-9:]], [None] * 9)
-
-    def test_usage_time_filter_removes_consecutive_upward_spikes_using_historical_rate(self):
-        rows = [
-            {"checkedAt": checked_at, "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": "2030-01-08T00:00:00Z"}}}
-            for checked_at, percent in (
-                ("2030-01-01T00:00:00Z", 20), ("2030-01-01T00:01:30Z", 70), ("2030-01-01T00:03:00Z", 71), ("2030-01-01T00:04:30Z", 21),
-            )
-        ]
-
-        points = monitor_dashboard.dashboard_quota_points(rows)
-
-        self.assertEqual([point["sevenDay"]["continuous"] for point in points], [20, None, None, 21])
 
     def test_usage_time_filter_learns_a_legitimate_fast_rate_from_history(self):
         rows = [
@@ -4499,39 +4173,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertEqual([point["fiveHour"]["continuous"] for point in points], [minute * 8 for minute in range(11)])
 
-    def test_usage_time_filter_keeps_due_and_supported_manual_resets_with_post_reset_consumption(self):
-        due_rows = [
-            {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "due", "windows": {"7d": {"usedPercent": 80, "resetAt": "2030-01-01T00:02:00Z"}}},
-            {"checkedAt": "2030-01-01T00:03:00Z", "accountSlotId": "due", "windows": {"7d": {"usedPercent": 7, "resetAt": "2030-01-08T00:03:00Z"}}},
-            {"checkedAt": "2030-01-01T00:04:30Z", "accountSlotId": "due", "windows": {"7d": {"usedPercent": 8, "resetAt": "2030-01-08T00:03:00Z"}}},
-        ]
-        manual_rows = [
-            {"checkedAt": checked_at, "accountSlotId": "manual", "windows": {"7d": {"usedPercent": percent, "resetAt": reset_at}}}
-            for checked_at, percent, reset_at in (
-                ("2030-01-01T00:00:00Z", 70, "2030-01-05T00:00:00Z"), ("2030-01-01T01:00:00Z", 6, "2030-01-08T01:00:00Z"),
-                ("2030-01-01T01:02:00Z", 7, "2030-01-08T01:00:00Z"), ("2030-01-01T01:04:00Z", 7, "2030-01-08T01:00:00Z"),
-                ("2030-01-01T01:06:00Z", 8, "2030-01-08T01:00:00Z"),
-            )
-        ]
-
-        points = monitor_dashboard.dashboard_quota_points(due_rows + manual_rows)
-
-        self.assertEqual([point["sevenDay"]["continuous"] for point in points[:3]], [80, 7, 8])
-        self.assertEqual([point["sevenDay"]["continuous"] for point in points[3:]], [70, 6, 7, 7, 8])
-
-    def test_usage_time_filter_rejects_consecutive_foreign_reset_responses_when_original_stream_returns(self):
-        rows = [
-            {"checkedAt": checked_at, "accountSlotId": "account-a", "windows": {"7d": {"usedPercent": percent, "resetAt": reset_at}}}
-            for checked_at, percent, reset_at in (
-                ("2030-01-01T00:00:00Z", 40, "2030-01-05T00:00:00Z"), ("2030-01-01T01:00:00Z", 12, "2030-01-08T01:00:00Z"),
-                ("2030-01-01T01:02:00Z", 12, "2030-01-08T01:00:00Z"), ("2030-01-01T01:04:00Z", 13, "2030-01-08T01:00:00Z"),
-                ("2030-01-01T01:06:00Z", 13, "2030-01-08T01:00:00Z"), ("2030-01-01T01:08:00Z", 40, "2030-01-05T00:00:00Z"),
-            )
-        ]
-
-        points = monitor_dashboard.dashboard_quota_points(rows)
-
-        self.assertEqual([point["sevenDay"]["continuous"] for point in points], [40, None, None, None, None, 40])
 
     def test_dashboard_payload_removes_sensitive_account_and_sample_data(self):
         accounts = {"activeAccountId": "local-a", "awaitingLogin": False, "items": [{"id": "local-a", "label": "Account A", "email": "private@example.test", "ready": True, "active": True, "accountKey": "cloud-key"}]}
@@ -4651,8 +4292,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('const start=Math.max(domain[0],point.compactedFrom), end=Math.min(domain[1],timestamp)', html)
         self.assertIn('function drawUsageTimeChart(id,label,points,animate=false)', html)
         self.assertIn('function accountCurveColor(accountId)', html)
-        self.assertIn('.sort((a,b)=>accountDisplayName(a,', html)
-        self.assertIn('{numeric:true})||a.localeCompare(b)', html)
+        self.assertIn('.sort((a,b)=>a[1].localeCompare(b[1]', html)
         self.assertIn('function renderUsageLegend(id,groups)', html)
         self.assertIn('valueOf=point=>windowOf(point)?.continuous', html)
         self.assertNotIn('function usageTimeRenderedValues(points,valueOf)', html)
@@ -7313,7 +6953,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual((migrated.root / "ppl-pro" / "auth.json").read_bytes(), auth)
 
 
-    def test_usage_quota_snapshot_keeps_only_idle_plateau_boundaries(self):
+    def test_usage_quota_snapshot_keeps_every_idle_plateau_reading(self):
         with self.account_directory() as directory:
             history, quota, tokens = (directory / name for name in ("history.jsonl", "quota.jsonl", "tokens.jsonl"))
             history.write_text("", encoding="utf-8")
@@ -7329,15 +6969,15 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             records, present = store.snapshot()
             full_records, full_present = store.snapshot(necessary_only=False)
 
-            self.assertEqual([record["row"]["checkedAt"] for record in records.values()], ["2030-01-01T00:00:00Z", "2030-01-01T00:04:00Z", "2030-01-01T00:05:00Z"])
-            self.assertEqual(next(record["row"]["compaction"] for record in records.values() if record["row"]["checkedAt"] == "2030-01-01T00:04:00Z"), {"continuousFrom": "2030-01-01T00:00:00Z", "omittedSamples": 3})
+            self.assertEqual([record["row"]["checkedAt"] for record in records.values()], [row["checkedAt"] for row in rows])
+            self.assertTrue(all("compaction" not in record["row"] for record in records.values()))
             self.assertEqual(present, set(records))
             self.assertEqual([record["row"]["checkedAt"] for record in full_records.values()], [row["checkedAt"] for row in rows])
             self.assertEqual(full_present, set(full_records))
             self.assertNotIn("Managed name", json.dumps(records))
             self.assertEqual([row["checkedAt"] for row in monitor_history.load_quota_history(quota)], [row["checkedAt"] for row in rows])
 
-    def test_usage_quota_plateau_moves_latest_boundary_without_reuploading_middle_rows(self):
+    def test_usage_quota_plateau_appends_without_removing_middle_rows(self):
         with self.account_directory() as directory:
             history, quota, tokens = (directory / name for name in ("history.jsonl", "quota.jsonl", "tokens.jsonl"))
             history.write_text("", encoding="utf-8")
@@ -7350,10 +6990,10 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
             second, present = store.snapshot()
 
-            self.assertEqual([record["row"]["checkedAt"] for record in first.values()], ["2030-01-01T00:00:00Z", "2030-01-01T00:02:00Z"])
-            self.assertEqual([record["row"]["checkedAt"] for record in second.values()], ["2030-01-01T00:00:00Z", "2030-01-01T00:04:00Z"])
-            self.assertEqual(len(set(first) - present), 1)
-            self.assertEqual(len(present - set(first)), 1)
+            self.assertEqual([record["row"]["checkedAt"] for record in first.values()], [make_row(index)["checkedAt"] for index in range(3)])
+            self.assertEqual([record["row"]["checkedAt"] for record in second.values()], [make_row(index)["checkedAt"] for index in range(5)])
+            self.assertEqual(len(set(first) - present), 0)
+            self.assertEqual(len(present - set(first)), 2)
 
     def test_usage_quota_plateaus_are_isolated_by_account_plan_and_reset_cycle(self):
         with self.account_directory() as directory:
@@ -7373,12 +7013,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             records, _ = store.snapshot()
             selected = [(record["row"]["sync"]["accountId"], record["row"]["checkedAt"]) for record in records.values()]
 
-            self.assertEqual(selected, [("v3:usage-a", "2030-01-01T00:00:00Z"), ("v3:usage-a", "2030-01-01T00:02:00Z"), ("v3:usage-a", "2030-01-01T00:03:00Z"), ("v3:usage-a", "2030-01-01T00:04:00Z"), ("v3:usage-b", "2030-01-01T00:00:30Z"), ("v3:usage-b", "2030-01-01T00:02:30Z")])
-
-
-
-
-
+            self.assertEqual(selected, [("v3:usage-a" if row["accountSlotId"] == "account-a" else "v3:usage-b", row["checkedAt"]) for row in sorted(rows, key=lambda row: row["checkedAt"])])
 
 
     def test_automatic_usage_period_is_thirty_minutes(self):
@@ -7436,7 +7071,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertEqual(len(intervals), 1)
         self.assertEqual((intervals[0]["startedAt"], intervals[0]["startPercent"], intervals[0]["endPercent"]), ("2030-01-01T00:00:00Z", 0, 1))
         self.assertEqual((intervals[0]["modelCostsUsd"]["gpt-5.5"], intervals[0]["deltaCostUsd"]), (2, 2))
-
 
 
 def sample(checked_at, five_hour=None, seven_day=None, five_hour_reset=None, seven_day_reset=None):
@@ -7526,7 +7160,7 @@ class RawCostUsageTests(unittest.TestCase):
             )
         ]
         points = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "v3:usage-a"}), [], {"a": "v3:usage-a"})["fiveHour"]
-        self.assertEqual(len(points), 3)
+        self.assertEqual(len(points), 4)
         self.assertEqual((points[0]["startUsagePercent"], points[0]["endUsagePercent"], points[0]["deltaPercent"]), (20.0, 40.0, 20.0))
         self.assertEqual(points[0]["costPer100PercentUsd"], 0.0)
 

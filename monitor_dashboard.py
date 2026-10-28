@@ -30,12 +30,13 @@ from monitor_cloud_queue import OperationSkipped
 from monitor_common import DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_device_auth import DeviceAuthManager
 from monitor_events import (
-    allocate_model_delta_events, collect_with_bad_remote_usage_retry, compact_delta_event, hydrate_delta_state_from_events,
-    print_ratio_warnings, print_special_events, process_sample_delta_events, valid_delta_cost_rate, delta_state_needs_hydration,
+    allocate_model_delta_events, compact_delta_event, hydrate_delta_state_from_events,
+    print_special_events, process_sample_delta_events, valid_delta_cost_rate, delta_state_needs_hydration,
 )
+from monitor_quota import fetch_usage
 from monitor_history import (
-    append_capped_jsonl, append_quota_history_sample, collect_usage_sample, compact_quota_history, default_dashboard_cache_path, normalize_plan_type,
-    fetch_usage_with_percent_arbitration, load_quota_history, load_state, make_history_sample, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, rewrite_account_labels, write_state,
+    append_capped_jsonl, append_quota_history_sample, collect_usage_sample, default_dashboard_cache_path,
+    load_quota_history, load_state, make_history_sample, normalize_quota_history_row, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, rewrite_account_labels, write_state,
 )
 from monitor_skills import SkillError, SkillManager
 from monitor_session_refresh import refresh_session
@@ -54,16 +55,6 @@ SESSION_REFRESH_SUCCESS_TOLERANCE_SECONDS = 10
 SESSION_REFRESH_WINDOW_SECONDS = {"5h": 5 * 60 * 60, "7d": 7 * 24 * 60 * 60}
 CONTROL_COOKIE_NAME = "codex_monitor_control"
 CONTROL_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
-USAGE_TIME_WINDOWS = {"fiveHour": 5 * 60 * 60, "sevenDay": 7 * 24 * 60 * 60}
-USAGE_TIME_RATE_FLOORS = {"fiveHour": 5.0, "sevenDay": 1.0}
-USAGE_TIME_ROUNDING_ALLOWANCE = 2.0
-USAGE_TIME_RESET_JITTER_SECONDS = 2 * 60
-USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS = 30 * 60
-QUOTA_HISTORY_DISPLAY_FULL_SECONDS = 3 * 24 * 60 * 60
-# The x4/x8/x16 tiers mean 4/8/16 source points per display point.
-QUOTA_HISTORY_DISPLAY_X4_SECONDS = 7 * 24 * 60 * 60
-QUOTA_HISTORY_DISPLAY_X8_SECONDS = 30 * 24 * 60 * 60
-HOUR_MULTIPLIER = 60 * 60
 DASHBOARD_DISPLAY_CACHE_GAP_SECONDS = 4 * 60 * 60
 DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS = 60
 DASHBOARD_GZIP_MIN_BYTES = 1024
@@ -179,11 +170,6 @@ def dashboard_safe_json(value):
         return [dashboard_safe_json(item) for item in value]
     return value
 
-def window_point(sample: dict, label: str) -> dict:
-    window = (sample.get("windows") or {}).get(label) or {}
-    raw = coerce_float(window.get("usedPercent"))
-    return {"raw": raw, "continuous": raw, "resetAt": window.get("resetAt"), "plan": window.get("plan") or "plus"}
-
 def dashboard_sample(sample: dict | None) -> dict | None:
     if not isinstance(sample, dict):
         return None
@@ -280,142 +266,14 @@ def dashboard_usage_account_id(row: dict, slot_usage_accounts: dict[str, str] | 
     return str(row.get("usageAccountId") or (row.get("sync") or {}).get("accountId") or (slot_usage_accounts or {}).get(str(row.get("accountSlotId") or "")) or row.get("accountSlotId") or row.get("accountLabel") or "unknown")
 
 def dashboard_quota_point(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> dict:
-    compaction = row.get("compaction") or {}
-    return {
-        "checkedAt": row.get("checkedAt"),
-        "timestamp": parse_timestamp(row.get("checkedAt")),
-        "compactedFrom": parse_timestamp(compaction.get("continuousFrom")),
-        "accountSlotId": row.get("accountSlotId"),
-        "accountLabel": row.get("accountLabel"),
-        "usageAccountId": dashboard_usage_account_id(row, slot_usage_accounts),
-        "fiveHour": window_point(row, "5h"),
-        "sevenDay": window_point(row, "7d"),
-    }
+    from monitor_sampling import quota_point
+    return quota_point(row, slot_usage_accounts)
 
-def _usage_time_rate_limit(records: list[dict], label: str) -> float:
-    rates = sorted(
-        max(0.0, current["raw"] - previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE) / ((current["timestamp"] - previous["timestamp"]) / 60)
-        for previous, current in zip(records, records[1:])
-        if current["raw"] is not None and previous["raw"] is not None and current["timestamp"] > previous["timestamp"] and current["raw"] > previous["raw"]
-    )
-    floor = USAGE_TIME_RATE_FLOORS[label]
-    if len(rates) < 10:
-        return floor
-    return max(floor, min(floor * 3, rates[int((len(rates) - 1) * .9)] * 2.5))
-
-def _usage_time_new_reset_is_supported(records: list[dict], index: int, previous: dict, duration: int) -> bool:
-    current = records[index]
-    if current["resetAt"] is None or not previous["timestamp"] - USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS <= current["resetAt"] - duration <= current["timestamp"] + USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS:
-        return False
-    if previous["resetAt"] is not None and current["resetAt"] <= previous["resetAt"] + USAGE_TIME_RESET_JITTER_SECONDS:
-        return False
-    support = []
-    for candidate in records[index:index + 64]:
-        if candidate["timestamp"] - current["timestamp"] > 2 * 60 * 60:
-            break
-        if candidate["raw"] is None:
-            continue
-        if previous["resetAt"] is not None and candidate["raw"] >= previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE and candidate["resetAt"] is not None and abs(candidate["resetAt"] - previous["resetAt"]) <= USAGE_TIME_RESET_JITTER_SECONDS:
-            return False
-        if (
-            candidate["raw"] < previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE and candidate["resetAt"] is not None
-            and current["resetAt"] - duration - USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS <= candidate["resetAt"] - duration <= candidate["timestamp"] + USAGE_TIME_NEW_RESET_TOLERANCE_SECONDS
-        ):
-            support.append(candidate)
-    return len(support) >= 4
-
-def _usage_time_reset_is_credible(records: list[dict], index: int, previous: dict, duration: int) -> bool:
-    current = records[index]
-    if previous["resetAt"] is not None and current["timestamp"] >= previous["resetAt"] - USAGE_TIME_RESET_JITTER_SECONDS:
-        return True
-    if current["timestamp"] - previous["timestamp"] >= duration:
-        return True
-    return _usage_time_new_reset_is_supported(records, index, previous, duration)
-
-def _usage_time_continuous_values(records: list[dict], label: str, rate_limit: float | None = None) -> dict:
-    if not records:
-        return {"safe": True}
-    rate_limit = _usage_time_rate_limit(records, label) if rate_limit is None else rate_limit
-    previous, lower_anchor, lower_run, rejected_run = None, None, [], []
-    for index, current in enumerate(records):
-        if current["raw"] is None or not 0 <= current["raw"] <= 100:
-            current["window"]["continuous"] = None
-            lower_anchor, lower_run, rejected_run = None, [], []
-            continue
-        if previous is None or normalize_plan_type(current["window"].get("plan")) != normalize_plan_type(previous["window"].get("plan")):
-            previous = current
-            lower_anchor, lower_run, rejected_run = None, [], []
-            continue
-        if current["raw"] >= previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE:
-            rejected_run = []
-        if lower_anchor is not None:
-            if current["raw"] >= lower_anchor["raw"]:
-                for candidate in lower_run:
-                    candidate["window"]["continuous"] = lower_anchor["raw"]
-                previous, lower_anchor, lower_run = lower_anchor, None, []
-            elif current["raw"] >= lower_anchor["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE:
-                current["window"]["continuous"] = lower_anchor["raw"]
-                lower_run.append(current)
-                if len(lower_run) >= 3:
-                    for candidate in lower_run:
-                        candidate["window"]["continuous"] = candidate["raw"]
-                    previous = current
-                continue
-            else:
-                if len(lower_run) < 3:
-                    previous = lower_anchor
-                lower_anchor, lower_run = None, []
-        if current["raw"] < previous["raw"]:
-            if _usage_time_reset_is_credible(records, index, previous, USAGE_TIME_WINDOWS[label]):
-                previous = current
-                rejected_run = []
-            elif current["raw"] >= previous["raw"] - USAGE_TIME_ROUNDING_ALLOWANCE:
-                current["window"]["continuous"] = previous["raw"]
-                lower_anchor, lower_run = previous, [current]
-            else:
-                current["window"]["continuous"] = None
-                rejected_run.append(current)
-                if len(rejected_run) >= 10:
-                    for candidate in rejected_run:
-                        candidate["window"]["continuous"] = candidate["raw"]
-                    previous = current
-                    rejected_run = []
-            continue
-        elapsed_minutes = (current["timestamp"] - previous["timestamp"]) / 60
-        if elapsed_minutes < 0 or current["raw"] - previous["raw"] > USAGE_TIME_ROUNDING_ALLOWANCE + rate_limit * elapsed_minutes:
-            current["window"]["continuous"] = None
-            continue
-        previous = current
-    return {"safe": lower_anchor is None and not rejected_run and previous is records[-1], "rate": rate_limit}
 
 def dashboard_quota_points(rows: list[dict], slot_usage_accounts: dict[str, str] | None = None) -> list[dict]:
-    merged = {}
-    for row in rows:
-        point = dashboard_quota_point(row, slot_usage_accounts)
-        key = point["usageAccountId"], point.get("checkedAt")
-        if key in merged:
-            previous = merged[key]
-            for label in ("fiveHour", "sevenDay"):
-                if point[label]["raw"] is None and previous[label]["raw"] is not None:
-                    point[label] = previous[label]
-            starts = [value for value in (previous.get("compactedFrom"), point.get("compactedFrom")) if value is not None]
-            point["compactedFrom"] = min(starts) if starts else None
-        merged[key] = point
-    points = list(merged.values())
-    for label in USAGE_TIME_WINDOWS:
-        groups = {}
-        for point in points:
-            window = point[label]
-            if point["timestamp"] is None:
-                window["continuous"] = None
-                continue
-            groups.setdefault(point["usageAccountId"], []).append({
-                "timestamp": point["timestamp"], "raw": window["raw"], "resetAt": parse_timestamp(window.get("resetAt")), "window": window,
-            })
-        for records in groups.values():
-            records.sort(key=lambda record: record["timestamp"])
-            _usage_time_continuous_values(records, label)
-    return points
+    from monitor_sampling import sample_rows
+    return sample_rows(rows, slot_usage_accounts)
+
 
 def dashboard_token_session(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> dict:
     return {
@@ -490,15 +348,6 @@ def dashboard_display(sample: dict | None, now: float | None = None) -> dict:
 def _dashboard_revision(value) -> str:
     return hashlib.sha256(json.dumps(dashboard_safe_json(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
 
-def dashboard_display_factor(timestamp: float | None, now: float) -> int:
-    if timestamp is None or now - timestamp <= QUOTA_HISTORY_DISPLAY_FULL_SECONDS:
-        return 1
-    if now - timestamp <= QUOTA_HISTORY_DISPLAY_X4_SECONDS:
-        return 4
-    if now - timestamp <= QUOTA_HISTORY_DISPLAY_X8_SECONDS:
-        return 8
-    return 16
-
 def _dashboard_display_timestamp(value: dict) -> float | None:
     if not isinstance(value, dict):
         return None
@@ -509,78 +358,14 @@ def _dashboard_display_sort_key(value: dict) -> tuple:
     timestamp = _dashboard_display_timestamp(value)
     return timestamp is None, timestamp or 0, str(value.get("usageAccountId") or value.get("accountSlotId") or value.get("accountLabel") or "")
 
-def _dashboard_display_points_are_contiguous(previous: dict | None, current: dict) -> bool:
-    previous_timestamp = _dashboard_display_timestamp(previous or {})
-    current_timestamp = _dashboard_display_timestamp(current)
-    return previous_timestamp is not None and current_timestamp is not None and 0 <= current_timestamp - previous_timestamp <= DASHBOARD_DISPLAY_CACHE_GAP_SECONDS
-
-def _dashboard_display_point_has_discontinuity(point: dict) -> bool:
-    return any(window.get("raw") is not None and window.get("continuous") is None for window in (point.get("fiveHour") or {}, point.get("sevenDay") or {}))
-
-def _dashboard_compact_quota_group(group: list[dict]) -> dict:
-    if len(group) == 1:
-        return group[0]
-    compacted = dict(group[-1])
-    starts = []
-    for point in group:
-        compacted_from = coerce_float(point.get("compactedFrom"))
-        starts.append(compacted_from if compacted_from is not None else _dashboard_display_timestamp(point))
-    starts = [start for start in starts if start is not None]
-    if starts:
-        compacted["compactedFrom"] = min(starts)
-    return compacted
-
-def _dashboard_compact_quota_account_points(points: list[dict], now: float) -> list[dict]:
-    compacted = []
-    pending = []
-    pending_factor = None
-    previous = None
-    for point in sorted(points, key=_dashboard_display_sort_key):
-        timestamp = _dashboard_display_timestamp(point)
-        factor = dashboard_display_factor(timestamp, now)
-        if factor == 1 or timestamp is None or _dashboard_display_point_has_discontinuity(point):
-            if pending:
-                compacted.append(_dashboard_compact_quota_group(pending))
-                pending = []
-                pending_factor = None
-            compacted.append(point)
-        elif not pending or factor != pending_factor or not _dashboard_display_points_are_contiguous(previous, point):
-            if pending:
-                compacted.append(_dashboard_compact_quota_group(pending))
-            pending = [point]
-            pending_factor = factor
-        else:
-            pending.append(point)
-        if pending and len(pending) >= pending_factor:
-            compacted.append(_dashboard_compact_quota_group(pending))
-            pending = []
-            pending_factor = None
-        previous = point
-    if pending:
-        compacted.append(_dashboard_compact_quota_group(pending))
-    return compacted
-
 def dashboard_compact_quota_points(points: list[dict], now: float | None = None) -> list[dict]:
-    now = time.time() if now is None else now
-    by_account = {}
-    for point in points:
-        key = point.get("usageAccountId") or point.get("accountSlotId") or point.get("accountLabel") or "unknown"
-        by_account.setdefault(key, []).append(point)
-    compacted = [point for points_for_account in by_account.values() for point in _dashboard_compact_quota_account_points(points_for_account, now)]
-    return sorted(compacted, key=_dashboard_display_sort_key)
+    # Quota values and rejection boundaries are exact at every display resolution.
+    return sorted(points, key=_dashboard_display_sort_key)
+
 
 def _dashboard_display_next_maintenance_at(quota_points: list[dict], cost_usage: dict[str, list[dict]], now: float) -> float | None:
-    current_hour = math.floor(now / HOUR_MULTIPLIER)
-    timestamps = [_dashboard_display_timestamp(point) for point in quota_points]
-    timestamps.extend(_dashboard_display_timestamp(point) for values in cost_usage.values() for point in values)
-    candidates = []
-    for timestamp in (value for value in timestamps if value is not None):
-        for threshold in (QUOTA_HISTORY_DISPLAY_FULL_SECONDS, QUOTA_HISTORY_DISPLAY_X4_SECONDS, QUOTA_HISTORY_DISPLAY_X8_SECONDS):
-            # Round up so the hour-resolution deadline never falls in the past.
-            candidate_hour = math.ceil((timestamp + threshold + 1) / HOUR_MULTIPLIER)
-            if candidate_hour > current_hour:
-                candidates.append(candidate_hour)
-    return min(candidates, default=None) * HOUR_MULTIPLIER if candidates else None
+    return None
+
 
 def _same_cost_usage_cycle(previous: dict, current: dict, label: str) -> bool:
     left, right = previous[label], current[label]
@@ -670,11 +455,11 @@ def dashboard_cost_time(ledger: list[dict], slot_usage_accounts: dict[str, str] 
     return sorted(rows, key=lambda row: (row["timestamp"], row["_key"]))
 
 
-def _dashboard_display_data(quota_history: list[dict], token_ledger: list[dict], accounts: dict, now: float | None = None) -> dict:
+def _dashboard_display_data(quota_history: list[dict], token_ledger: list[dict], accounts: dict, now: float | None = None, *, processed_quota: list[dict] | None = None) -> dict:
     now = time.time() if now is None else now
     slot_usage_accounts = {str(account.get("id")): str(account.get("usageAccountId")) for account in accounts.get("items", []) if account.get("id") and account.get("usageAccountId")}
     active = next((item for item in accounts.get("items", []) if item.get("id") == accounts.get("activeAccountId")), None)
-    quota_points = [] if active and active.get("isApiAccount") else dashboard_quota_points(quota_history, slot_usage_accounts)
+    quota_points = [] if active and active.get("isApiAccount") else (dashboard_quota_points(quota_history, slot_usage_accounts) if processed_quota is None else processed_quota)
     cost_usage = dashboard_cost_usage(quota_points, token_ledger, slot_usage_accounts)
     token_sessions = token_sessions_from_ledger(token_ledger)
     account_labels = {str(account["id"]): account["label"] for account in accounts.get("items", []) if account.get("id") and account.get("label")}
@@ -747,6 +532,7 @@ class UsageDashboardState:
             self.args.dashboard_cache = default_dashboard_cache_path(self.args.quota_history)
         self.opener = opener
         self.lock = threading.RLock()
+        print("Startup: loading accounts, skills, and cloud configuration...", flush=True)
         self.accounts = AccountManager(args.auth, getattr(args, "account_root", None) or data_home / "accounts")
         self.device_auth = DeviceAuthManager(args.codex_home, args.auth)
         self.skills = SkillManager(args.codex_home, getattr(args, "data_home", None) or args.auth.parent / ".codex-switch", getattr(args, "gemini_skills", None))
@@ -758,6 +544,7 @@ class UsageDashboardState:
         )
         self.args.usage_sync_cache = self.usage_data.cache_path
         self.args.processing_index = self.usage_data.index
+        print("Startup: initializing usage processing and dashboard stores...", flush=True)
         self.usage_data.initialize_processing()
         self.usage_data.initialize_v4_index()
         self.usage_data.index.on_new_cost = self.accounts.promote_active_slot_on_cost
@@ -766,6 +553,7 @@ class UsageDashboardState:
         from monitor_delivery import DashboardDelivery
         self.delivery = DashboardDelivery(self.usage_data.index)
         self.cloud.configure_usage_sync(self.usage_data)
+        print("Startup: recovering account transitions and reconciling managed skills...", flush=True)
         try:
             self.cloud.recover_account_transition()
         except CloudError as exc:
@@ -785,7 +573,6 @@ class UsageDashboardState:
         self.dashboard_cache_event = threading.Event()
         self.token_capture_event = threading.Event()
         self.stop_event = threading.Event()
-        self.last_retention_at = 0
         self.cloud_maintenance_connection_failed = False
         self.running = True
         self.last_sample = None
@@ -804,18 +591,36 @@ class UsageDashboardState:
         self.external_auth_validation_fingerprints = set()
         self._dashboard_build_lock = threading.Lock()
         self.dashboard_cache_event.set()
-        self.runtime_state = reset_runtime_baselines(load_state(args.state))
+        print("Startup: restoring runtime state and reconciling live authentication...", flush=True)
+        with self.usage_data.index.transaction() as db:
+            self.runtime_state = reset_runtime_baselines(self.usage_data.index.get(db, "runtimeState", load_state(args.state)))
         self.restore_console_event_state()
         account_status = self.accounts.status()
         self.account_statuses = {account["id"]: None for account in account_status["items"]}
+        from monitor_sampling import accepted_windows
+        with self.usage_data.index.transaction() as db:
+            for account in account_status["items"]:
+                state = self.usage_data.index.get(db, f"samplingState:local:{self.cloud.usage_account_id(account['id'])}", {"windows": {}})
+                windows = accepted_windows(state["windows"])
+                if windows:
+                    checked_at = max(window["percentCheckedAt"] for window in windows.values())
+                    self.account_statuses[account["id"]] = {"checkedAt": checked_at, "percentCheckedAt": checked_at, "windows": windows,
+                        "accountSlotId": account["id"], "activeAccountSlotId": account["id"], "accountLabel": account["label"]}
         if not self.runtime_state.get("activeAccountSlotId"):
             active_account_id = account_status["activeAccountId"]
             self.runtime_state["activeAccountSlotId"] = active_account_id
             if isinstance(self.runtime_state.get("lastSample"), dict) and not self.runtime_state["lastSample"].get("activeAccountSlotId"):
                 self.runtime_state["lastSample"]["activeAccountSlotId"] = active_account_id
-            write_state(args.state, self.runtime_state)
+            self._write_runtime_state_locked()
         self.sync_active_account_from_live()
         self.sync_device_auth()
+
+    def _write_runtime_state_locked(self) -> None:
+        from monitor_history import compact_monitor_state
+        with self.usage_data.index.transaction() as db:
+            self.usage_data.index.put(db, "runtimeState", compact_monitor_state(self.runtime_state))
+        # The legacy status file contains no derived quota state.
+        write_state(self.args.state, {key: value for key, value in self.runtime_state.items() if key not in {"windows", "lastSample", "remoteUsageIdentity"}})
 
     def restore_console_event_state(self) -> None:
         with self.usage_data.index.transaction() as db:
@@ -825,10 +630,12 @@ class UsageDashboardState:
         if delta_state_needs_hydration(self.console_event_state):
             windows = self.console_event_state.get("windows") or {}
             self.console_event_state["windows"] = {label: windows.get(label) if isinstance(windows, dict) and isinstance(windows.get(label), dict) else {} for label in ("5h", "7d")}
-            local_quota, local_ledger = self.usage_data.datasets("local")
+            _, local_ledger = self.usage_data.datasets("local")
             console_accounts = dashboard_accounts(self)
             slot_usage_accounts = {str(account["id"]): str(account["usageAccountId"]) for account in console_accounts["items"]}
-            quota_points = dashboard_quota_points(local_quota, slot_usage_accounts)
+            from monitor_sampling import stored_points
+            with self.usage_data.index.transaction() as db:
+                quota_points = stored_points(db, "local")
             historical_cost_usage = dashboard_cost_usage(quota_points, local_ledger, slot_usage_accounts)
             hydrate_delta_state_from_events(self.console_event_state, dashboard_cost_usage_delta_events(historical_cost_usage))
         # Seeding lastSample establishes a baseline; it must not count the previous run's final delta twice.
@@ -855,10 +662,32 @@ class UsageDashboardState:
         self.sync_device_auth(status)
         return self.device_auth.regenerate(active["id"])
 
+    def _record_quota_sample_locked(self, sample: dict) -> None:
+        """Write raw evidence first; only SQLite decisions may update live quota status."""
+        sample["sync"] = sample.get("sync") or {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": self.cloud.usage_account_id(sample.get("accountSlotId"))}
+        sample["sync"] = add_record_provenance("quota", sample, self.cloud.machine_id, sample["sync"]["accountId"])["sync"]
+        raw_windows = copy.deepcopy(sample.get("windows") or {})
+        append_quota_history_sample(self.args.quota_history, sample)
+        if getattr(self.args, "sample_log", None):
+            append_capped_jsonl(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample}, self.args.sample_log_max_bytes)
+        self.usage_data.ingest_local()
+        from monitor_usage_sync import record_account_key
+        from monitor_sampling import WINDOWS, accepted_windows
+        with self.usage_data.index.transaction() as db:
+            state = self.usage_data.index.get(db, f"samplingState:local:{record_account_key(sample)}", {"windows": {}})
+            point = db.execute("SELECT data FROM processing_sampled_quota WHERE view='local' AND account=? AND record_key=?", (record_account_key(sample), sample["checkedAt"])).fetchone()
+        point = json.loads(point[0]) if point else {}
+        sample["windows"], sample["rejectedWindows"] = accepted_windows(state["windows"]), {}
+        for name, (label, _) in WINDOWS.items():
+            if raw_windows.get(label, {}).get("usedPercent") is not None and point.get(name, {}).get("continuous") is None:
+                sample["rejectedWindows"][label] = raw_windows[label]
+        sample["usingPreviousWindows"] = bool(sample["rejectedWindows"])
+        sample["percentCheckedAt"] = max((window["percentCheckedAt"] for window in sample["windows"].values()), default=None)
+        if sample.get("remoteUsage") is not None:
+            sample["remoteUsage"]["accepted"] = not sample["rejectedWindows"]
+
     def _update_account_status_locked(self, account_id: str | None, sample: dict) -> bool:
-        if sample.get("rejectedWindows") or sample.get("usingPreviousWindows") or (sample.get("remoteUsage") or {}).get("accepted") is False:
-            return False
-        row = quota_history_row_from_sample(sample)
+        row = normalize_quota_history_row(sample)
         if not account_id or row is None:
             return False
         previous = self.account_statuses.get(account_id)
@@ -867,11 +696,11 @@ class UsageDashboardState:
         label = sample.get("accountLabel") or row.get("accountLabel") or next((account["label"] for account in self.accounts.status()["items"] if account["id"] == account_id), "Unknown")
         self.account_statuses[account_id] = sample | {
             "checkedAt": sample.get("checkedAt") or row["checkedAt"],
-            "percentCheckedAt": row["checkedAt"],
+            "percentCheckedAt": sample.get("percentCheckedAt") or row["checkedAt"],
             "accountSlotId": account_id,
             "accountLabel": label,
             "activeAccountSlotId": account_id,
-            "windows": ((previous or {}).get("windows") or {}) | row["windows"],
+            "windows": ((previous or {}).get("windows") or {}) | sample["windows"],
         }
         if event := getattr(self, "session_refresh_event", None):
             event.set()
@@ -957,8 +786,7 @@ class UsageDashboardState:
             self.dashboard_cache_event.clear()
             try:
                 with self.lock:
-                    self._maintain_quota_retention()
-                self.refresh_dashboard_cache()
+                        self.refresh_dashboard_cache()
                 if hasattr(self, "delivery"):
                     self.delivery.prepare()
                     self.usage_data.index.maintain_disk_space()
@@ -972,16 +800,15 @@ class UsageDashboardState:
 
     def state(self) -> dict:
         with self.lock:
-            return load_state(self.args.state)
+            return copy.deepcopy(self.runtime_state)
 
     def quota_history(self) -> list[dict]:
         with self.lock:
             return load_quota_history(self.args.quota_history)
 
     def _print_usage_console_events(self, sample: dict) -> None:
-        events = process_sample_delta_events(self.console_event_state, copy.deepcopy(sample), None)
+        process_sample_delta_events(self.console_event_state, copy.deepcopy(sample), None)
         print_special_events(self.console_event_state.get("_specialEvents") or [])
-        print_ratio_warnings(events)
         if hasattr(self, "usage_data") and hasattr(self.usage_data, "index"):
             with self.usage_data.index.transaction() as db:
                 self.usage_data.index.put(db, "consoleState", self.console_event_state)
@@ -1005,14 +832,6 @@ class UsageDashboardState:
             self.token_capture_event.wait(min(max(self.args.interval, 1), 5))
             self.token_capture_event.clear()
 
-    def _maintain_quota_retention(self) -> None:
-        if time.monotonic() - getattr(self, "last_retention_at", 0) >= 24 * 60 * 60:
-            if hasattr(getattr(self, "usage_data", None), "retain_quota"):
-                self.usage_data.retain_quota(self.args.compact_history_days)
-            else:
-                compact_quota_history(self.args.quota_history, self.args.compact_history_days)
-            self.last_retention_at = time.monotonic()
-
     def poll_once(self) -> dict:
         account_status = self.accounts.status()
         if not self.args.local_only and account_status["awaitingLogin"]:
@@ -1028,12 +847,7 @@ class UsageDashboardState:
             previous_token_usage = self.runtime_state.get("tokenUsage")
             if getattr(self.args, "background_token_capture", False):
                 previous_token_usage = (self.runtime_state.get("lastSample") or {}).get("tokenUsage") or previous_token_usage
-        sample = collect_with_bad_remote_usage_retry(
-            lambda: collect_usage_sample(self.args, self.opener, previous_token_usage, None, self.runtime_state),
-            self.runtime_state,
-        )
-        if self.accounts.status()["activeAccountId"] != account_status["activeAccountId"]:
-            return {}
+        sample = collect_usage_sample(self.args, self.opener, previous_token_usage, None, self.runtime_state)
         sample["activeAccountSlotId"] = account_status["activeAccountId"]
         sample["accountSlotId"] = account_status["activeAccountId"]
         sample["accountLabel"] = next((account["label"] for account in account_status["items"] if account["id"] == account_status["activeAccountId"]), "Unknown")
@@ -1041,6 +855,12 @@ class UsageDashboardState:
         sample["originMachineId"] = self.cloud.machine_id
         sample["usageAccountId"] = self.cloud.usage_account_id(account_status["activeAccountId"])
         sample["sync"] = {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": sample["usageAccountId"]}
+        if self.accounts.status()["activeAccountId"] != account_status["activeAccountId"]:
+            if sample.get("windows"):
+                with self.lock:
+                    self._record_quota_sample_locked(sample)
+                    self._signal_dashboard_cache()
+            return {}
         api_account = is_api_auth(json.loads(self.args.auth.read_text(encoding="utf-8")))
         with self.lock:
             token_usage = sample.get("tokenUsage") or {}
@@ -1071,13 +891,13 @@ class UsageDashboardState:
                 token_usage.pop("sourceFiles", None)
             self.runtime_state["activeAccountSlotId"] = account_status["activeAccountId"]
             if not api_account:
-                append_quota_history_sample(self.args.quota_history, sample)
+                self._record_quota_sample_locked(sample)
+            else:
+                append_capped_jsonl(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample}, self.args.sample_log_max_bytes)
             sample.pop("costDelta", None)
             sample.pop("costDeltaByModel", None)
             self.runtime_state.update({"tokenUsage": token_usage or None, "cost": sample.get("cost") or empty_cost_totals(), "costByModel": sample.get("costByModel") or {}, "lastSample": sample, "updatedAt": sample.get("checkedAt")})
-            append_capped_jsonl(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample}, self.args.sample_log_max_bytes)
-            write_state(self.args.state, self.runtime_state)
-            self._maintain_quota_retention()
+            self._write_runtime_state_locked()
             self.usage_data.ingest_local()
             self._signal_dashboard_cache()
             self.last_sample = sample
@@ -1101,7 +921,7 @@ class UsageDashboardState:
             expected_fingerprint = auth_fingerprint(data)
 
         debug = {}
-        output = fetch_usage_with_percent_arbitration(
+        output = fetch_usage(
             auth, self.opener, None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials,
         )
         usage_account_id = self.cloud.usage_account_id(credential["id"])
@@ -1109,7 +929,7 @@ class UsageDashboardState:
             "remoteUsage": debug, "sync": {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": usage_account_id}})
         sample = make_history_sample(output, None)
         with self.lock:
-            append_quota_history_sample(self.args.quota_history, sample)
+            self._record_quota_sample_locked(sample)
             self._update_account_status_locked(credential["id"], sample)
 
     def _inactive_usage_credentials(self) -> list[dict]:
@@ -1154,7 +974,6 @@ class UsageDashboardState:
                 print(f"Inactive account usage polling failed for {credential['label']!r}: {exc}", file=sys.stderr, flush=True)
         if polled:
             with self.lock:
-                self._maintain_quota_retention()
                 self.usage_data.ingest_local()
                 self._signal_dashboard_cache()
         return polled
@@ -1224,13 +1043,15 @@ class UsageDashboardState:
                 raise UsageError("recorded credentials changed during token refresh")
             expected_fingerprint = auth_fingerprint(data)
 
-        output = fetch_usage_with_percent_arbitration(
-            auth, self.opener, auth_path if credential["active"] else None, max(self.args.timeout, 1), {}, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT),
+        debug = {}
+        output = fetch_usage(
+            auth, self.opener, auth_path if credential["active"] else None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT),
             auth_lock=self.accounts.lock if credential["active"] else None, refreshed_callback=commit_refreshed_credentials,
         )
-        output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"]})
+        output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"], "remoteUsage": debug})
         sample = make_history_sample(output, None)
         with self.lock:
+            self._record_quota_sample_locked(sample)
             self._update_account_status_locked(credential["id"], sample)
         return parse_timestamp(((sample.get("windows") or {}).get(label) or {}).get("resetAt"))
 
@@ -1464,15 +1285,16 @@ class UsageDashboardState:
                     expected_fingerprint = auth_fingerprint(data)
 
                 auth = json.loads(external_update["data"].decode("utf-8"))
-                output = fetch_usage_with_percent_arbitration(auth, self.opener, None, max(self.args.timeout, 1), {}, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials)
+                debug = {}
+                output = fetch_usage(auth, self.opener, None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials)
                 data = (json.dumps(auth, indent=2) + "\n").encode("utf-8")
                 if not self.accounts.commit_polled_credentials(external_update["id"], expected_fingerprint, data):
                     raise UsageError("recorded credentials changed during external auth validation")
                 usage_account_id = self.cloud.usage_account_id(external_update["id"])
-                output.update({"checkedAt": now_iso(), "accountSlotId": external_update["id"], "accountLabel": external_update["label"], "usageAccountId": usage_account_id, "sync": {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": usage_account_id}})
+                output.update({"checkedAt": now_iso(), "accountSlotId": external_update["id"], "accountLabel": external_update["label"], "usageAccountId": usage_account_id, "remoteUsage": debug, "sync": {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": usage_account_id}})
                 sample = make_history_sample(output, None)
                 with self.lock:
-                    append_quota_history_sample(self.args.quota_history, sample)
+                    self._record_quota_sample_locked(sample)
                     self._update_account_status_locked(external_update["id"], sample)
                     self._signal_dashboard_cache()
                 print(f"External credentials for {external_update['label']!r} were validated and saved.", flush=True)
@@ -2017,6 +1839,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
             return
 
     try:
+        print(f"Startup: binding dashboard server to {server_host}:{DASHBOARD_PORT}...", flush=True)
         server = DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)
     except OSError as exc:
         instance_lock.release()
@@ -2035,6 +1858,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         operation()
     token_thread = None
     source_watcher = None
+    print("Startup: starting token capture, quota polling, session refresh, dashboard, cloud, and configuration workers...", flush=True)
     if hasattr(state, "projector") and not getattr(args, "no_token_scan", True):
         from monitor_processing import SourceWatcher
         try:
@@ -2063,7 +1887,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         runtime_dir, lambda: state.cloud.config()["autoUpdate"]["enabled"], update_opener_factory, args.timeout,
     ) if update_opener_factory is not None else None
     state.auto_updater = auto_updater
+    print("Startup: starting device authentication and scheduling automatic updates...", flush=True)
     state.device_auth.start()
+    print("Startup: initialization complete; dashboard ready.", flush=True)
     url = f"http://127.0.0.1:{DASHBOARD_PORT}/"
     print(f"Dashboard: {url}", flush=True)
     if args.dashboard:

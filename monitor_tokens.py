@@ -12,6 +12,7 @@ MODEL_PRICES_PER_MILLION = {
     "gpt-6": {"input": 10.00, "cachedInput": 1.00, "cacheWriteInput": 12.50, "output": 50.00},
     "gpt-6-astra": {"input": 10.00, "cachedInput": 1.00, "cacheWriteInput": 12.50, "output": 50.00},
     "gpt-6.1-sol": {"input": 2.00, "cachedInput": 0.10, "cacheWriteInput": 2.50, "output": 10.00},
+    "gpt-6.1-terra": {"input": 1.00, "cachedInput": 0.05, "cacheWriteInput": 1.25, "output": 5.00},
     "gpt-6-sol": {"input": 2.00, "cachedInput": 0.20, "cacheWriteInput": 2.50, "output": 10.00},
     "gpt-6-luna": {"input": 0.10, "cachedInput": 0.01, "cacheWriteInput": 0.125, "output": 0.50},
     "gpt-5.6": {"input": 4.00, "cachedInput": 0.40, "cacheWriteInput": 5.00, "output": 20.00},

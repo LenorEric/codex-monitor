@@ -3,6 +3,7 @@
 import base64
 import binascii
 import json
+import math
 import os
 import sys
 import tempfile
@@ -255,7 +256,10 @@ def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, h
             raise UsageError("HTTP acquisition cancelled during shutdown")
         try:
             with opener.open(request, timeout=timeout) as response:
-                return response.status, json.loads(response.read().decode("utf-8"))
+                try:
+                    return response.status, json.loads(response.read().decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise UsageError(f"Incompatible API response from {method} {url}: expected UTF-8 JSON") from exc
         except urllib.error.HTTPError as exc:
             error = UsageHttpError(method, url, exc.code, exc.read().decode("utf-8", errors="replace"))
             if error.is_expired_token() or attempt >= retries:
@@ -293,8 +297,10 @@ def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth
         }, timeout, 0, False)
     except UsageError as exc:
         raise UsageError(f"token refresh failed without retry because rotating-token requests are not safely repeatable: {exc}") from exc
-    if status != 200 or not refreshed.get("access_token"):
+    if status != 200 or not isinstance(refreshed, dict) or not isinstance(refreshed.get("access_token"), str) or not refreshed["access_token"]:
         raise UsageError(f"token refresh did not return access_token: HTTP {status}")
+    if any(refreshed.get(key) is not None and (not isinstance(refreshed[key], str) or not refreshed[key]) for key in ("id_token", "refresh_token", "account_id")):
+        raise UsageError("Incompatible token refresh API response: expected nonempty token and account_id strings when present")
     new_account_id = token_account_id(refreshed)
     if not old_account_id or new_account_id != old_account_id:
         print("Token refresh ignored because the refreshed account_id does not match the recorded account_id.", file=sys.stderr, flush=True)
@@ -310,7 +316,10 @@ def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
-def parse_timestamp(value: str | None) -> int | None:
+def parse_timestamp(value: str | int | float | None) -> int | float | None:
+    # Saved history predates numeric reset times; API validation lives at ingress.
+    if type(value) in (int, float):
+        return value if math.isfinite(value) else None
     if not value:
         return None
     try:

@@ -1,13 +1,13 @@
 {
-  "version": "1.5.18",
+  "version": "1.5.19",
   "files": {
     "codex_monitor_daemon.py": {
-      "size": 5957,
-      "sha256": "a5302d31c7d0023e538548b048de8930abbc80452561c81574073be0cf22e523"
+      "size": 6415,
+      "sha256": "1dd2b3c0e29f66d6fb90e790436ef98dcc8ec49cfd13fae3b04fd80b93e0c484"
     },
     "dashboard.html": {
-      "size": 122362,
-      "sha256": "f46c7938740d85b92fa7dceae348a3d79f48f633264bcfa3052c810798ed668f"
+      "size": 122739,
+      "sha256": "a9c59a76362f234f498c5c026e0d2c5adbeea64129b4c8386e81395c3f936aec"
     },
     "LICENSE": {
       "size": 35147,
@@ -22,8 +22,8 @@
       "sha256": "e41cc1418e7123009b98536fb2cb961b35c0383a9f65030851440f1825631183"
     },
     "monitor_auto_update.py": {
-      "size": 11647,
-      "sha256": "bcab0175498954e344a1704356503fd3c74e1ce493fcc8d6c7319d4bc56393c7"
+      "size": 11752,
+      "sha256": "82ab11f58b76441f0e8ab30877ea065880aa051a5e56a918b4d388283b2eda9f"
     },
     "monitor_cloud.py": {
       "size": 135527,
@@ -38,28 +38,32 @@
       "sha256": "4bbbfb790b7309ba029780466b1d549056eb81731e1dc590615792fdf48bc15e"
     },
     "monitor_common.py": {
-      "size": 14848,
-      "sha256": "4511b61639a6c05a3bb1b8ece38acc7b931c3286cb47ca7371863bd2c3fcf77e"
+      "size": 15649,
+      "sha256": "b02e64e863145c1c456665883a739464c0b39a32c4acb6fa5d704b6f97b0fbd1"
     },
     "monitor_dashboard.py": {
-      "size": 123071,
-      "sha256": "0b216c9b4aa7ddd9034ba87171f912d30ef4f38cff5a2aaf76e1d9ba605a778b"
+      "size": 114855,
+      "sha256": "657124ca9d581c6dbe1671be561fc8de1e36bdbc37f873e1cd4d0674880b92ce"
     },
     "monitor_delivery.py": {
-      "size": 32791,
-      "sha256": "2a455c2ca5fbb4232e05e6461251f4cd3966f19f1e549727c847d29422bffc94"
+      "size": 30054,
+      "sha256": "e12392a241664876478090e637002399946e65bc3e896888a3e5b84dcea38659"
+    },
+    "monitor_dependencies.py": {
+      "size": 1888,
+      "sha256": "8974b8705b31299f514f776a26255289e272e834013790ac6fac7412addcf847"
     },
     "monitor_device_auth.py": {
       "size": 11545,
       "sha256": "f5e5af30c4b019eab5e0eb614dd427733fd0ee0651fd4fffc60c226ed16ede7a"
     },
     "monitor_events.py": {
-      "size": 53066,
-      "sha256": "cce0326640b55853fb9b18364f4bf8717c661a578fef41eced5c5feb8c40d657"
+      "size": 34826,
+      "sha256": "557f1429668324decb5ba2a0e72ece662b3ee19f8e3b0e36a77aca1925d29062"
     },
     "monitor_history.py": {
-      "size": 41206,
-      "sha256": "dd47fa2139e31990c0fc95e16f7f23edd9bac440b7d87d4fc1d6d6f3dc78fad7"
+      "size": 31655,
+      "sha256": "489b0cce400fe41dd1ce8c866cc7545dd4f9441eedbabcb3b8b018401d68f0c5"
     },
     "monitor_migration_history.py": {
       "size": 3452,
@@ -74,24 +78,28 @@
       "sha256": "d259b28622d4863887f41b665b7fd86f79dbd06c96bbe93f97925129937bba3e"
     },
     "monitor_migrations.py": {
-      "size": 90706,
-      "sha256": "864ee21c6e5ccea959ec400fb15946c43ecb42082473e5f6ec34e92f9174d756"
+      "size": 101537,
+      "sha256": "822eae32441020fb4e8e6352c69fcdec7427ea8d8973e9c727d1f3318292ea2c"
     },
     "monitor_processing.py": {
-      "size": 56173,
-      "sha256": "3caadd52ae162cf4e74ffc301995316716e12924a639c754f869f37ec16c7b1e"
+      "size": 56873,
+      "sha256": "e76bf6aff7c63c88279f992860e146e2823bbbfbe8eb6da1cce5339d997fd7b6"
     },
     "monitor_projection.py": {
-      "size": 25504,
-      "sha256": "f4809080221ec7c8f2a989c9dc041c10ef94fda43ab46d17165ad3d03b2a8e9c"
+      "size": 19809,
+      "sha256": "acc71944c209225bd92345cbe263a2938e087439e7f3db57b8c78249acbf8474"
     },
     "monitor_quota.py": {
-      "size": 6613,
-      "sha256": "be81a276638a535a2ec91cd8ce599fd9f1233099790b0c914543e86858b3b825"
+      "size": 4435,
+      "sha256": "2bbddf01195f194dbf1db1044f0fa6083f00370804f2802de67929643dd7e0dc"
     },
     "monitor_sample_store.py": {
       "size": 27481,
       "sha256": "7307ba87fc89d501f6820a995270e8350e990a5bdfe3eb18a727a651c3c8b5e3"
+    },
+    "monitor_sampling.py": {
+      "size": 7856,
+      "sha256": "0b51b1881db9d3d1143544159dd033cf0d5daf1f20b788aed78ae8ce7b31aabe"
     },
     "monitor_session_refresh.py": {
       "size": 3446,
@@ -110,16 +118,16 @@
       "sha256": "444a1b21bbf1a8cc496c4a6ab88a95b734bdb7919fbf325af1bb112550ef2057"
     },
     "monitor_tokens.py": {
-      "size": 26192,
-      "sha256": "49d67867939e78e3ab4a8ef35a950550e09631d555a1f3c0cf4a6085d7e0ca84"
+      "size": 26292,
+      "sha256": "632d77ab3e5fc91ae6ef5de4440d5b15ca6b80e82482479a18da2e20908b2eeb"
     },
     "monitor_usage_sync.py": {
-      "size": 55732,
-      "sha256": "3d8dc5f118e0fd5f783bde8b331d631dd496d3a8aa5296fff6217859c8a4cfa2"
+      "size": 54186,
+      "sha256": "ab5b74987ed143797e1ababc1c939bf3b5b1cfc5841fe199cb7c3413f951c30d"
     },
     "README.md": {
-      "size": 2844,
-      "sha256": "75285aa852cc377890b25907d87b72029dec028b3b89b8e797951ec1d12d4504"
+      "size": 3369,
+      "sha256": "0ff8a5754f20adddfc77306990b86b88281bc5150c06deea090b3c23b92d8b89"
     },
     "requirements.txt": {
       "size": 63,
@@ -127,7 +135,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "1cfabe2e084714a10c76a853ab1b117a67ab2673c931712916893c491df42475"
+      "sha256": "0444ecc8e81ed5c3a4cd2983280d3a9a299f74ceab6c77ffc32727fad63389be"
     }
   }
 }

@@ -127,6 +127,7 @@ def initialize_processing_index(path: Path) -> None:
             CREATE INDEX IF NOT EXISTS processing_cost_range_end ON processing_cost_ranges(view,account,end,start);
             CREATE TABLE IF NOT EXISTS processing_quota_points (view TEXT NOT NULL, account TEXT NOT NULL, event_at REAL NOT NULL, record_key TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(view,account,record_key));
             CREATE INDEX IF NOT EXISTS processing_quota_order ON processing_quota_points(view,account,event_at,record_key);
+            -- Kept empty for released migration 15, which still clears this legacy table.
             CREATE TABLE IF NOT EXISTS processing_rank_nodes (scope TEXT NOT NULL, value REAL NOT NULL, priority INTEGER NOT NULL, frequency INTEGER NOT NULL, size INTEGER NOT NULL, left_value REAL, right_value REAL, PRIMARY KEY(scope,value));
             CREATE TABLE IF NOT EXISTS processing_health(source TEXT PRIMARY KEY, error TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS processing_blocks(source TEXT NOT NULL,block INTEGER NOT NULL,size INTEGER NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(source,block));
@@ -160,6 +161,8 @@ def initialize_processing_index(path: Path) -> None:
             raise ValueError("Unsupported processing index schema")
         from monitor_delivery import initialize_delivery
         initialize_delivery(db)
+        from monitor_sampling import initialize
+        initialize(db)
 
 
 class ProcessingIndex:
@@ -170,6 +173,9 @@ class ProcessingIndex:
         import monitor_tokens
         self.parser_rule = hashlib.sha256(Path(monitor_tokens.__file__).read_bytes()).hexdigest()
         initialize_processing_index(self.path)
+        # Finish queued migration/recovery sampling before any consumer can read it.
+        with self.transaction():
+            pass
 
     @contextmanager
     def transaction(self):
@@ -179,6 +185,8 @@ class ProcessingIndex:
             try:
                 with db:
                     yield db
+                    from monitor_sampling import refresh
+                    refresh(db, self)
             finally:
                 db.close()
 
@@ -229,6 +237,9 @@ class ProcessingIndex:
             return None
 
     def dirty(self, db, account, reason="records", views=("local", "merged")):
+        if reason != "records":
+            from monitor_sampling import changed
+            changed(db, account, views)
         for view in views:
             db.execute("INSERT INTO processing_dirty VALUES(?,?,?) ON CONFLICT(view,account) DO UPDATE SET reason=CASE "
                 "WHEN excluded.reason='records' THEN processing_dirty.reason ELSE excluded.reason END", (view, account, reason))
@@ -272,6 +283,9 @@ class ProcessingIndex:
         if kind == "tokenLedger" and previous is None and not source.startswith("peer:"):
             self._ledger_add(db, source, row)
         self.dirty(db, account, views=("merged",) if source.startswith("peer:") else ("local", "merged"))
+        if kind == "quota":
+            from monitor_sampling import changed
+            changed(db, account, ("merged",) if source.startswith("peer:") else ("local", "merged"), record_key(kind, row))
         if kind == "tokenLedger":
             if previous and (old_key := record_key(kind, json.loads(previous[1]))) != record_key(kind, row):
                 self._effective(db, old_key)
@@ -425,7 +439,7 @@ class ProcessingIndex:
         """Invalidate derived checkpoints while retaining facts, prepared batches and v4 ownership."""
         with self.transaction() as db:
             db.execute("DELETE FROM processing_files")
-            for table in ("display", "projections", "quota_points", "rank_nodes", "cost_ranges"):
+            for table in ("display", "projections", "quota_points", "cost_ranges"):
                 db.execute(f"DELETE FROM processing_{table}")
             for (account,) in list(db.execute("SELECT DISTINCT account FROM processing_facts")):
                 self.dirty(db, account, "explicit repair")

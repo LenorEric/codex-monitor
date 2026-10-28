@@ -182,7 +182,7 @@ API 账号采用复制语义：
 
 ## 自动更新运行时
 
-在管理页的配置中启用 **Automatically update Codex Monitor** 后，程序会在启动后及之后每小时于后台检查已发布的 `release/runtime` 清单。发现较新且校验通过的运行时后，只替换发布清单列出的文件，并使用相同入口命令和参数重启；检查失败不会修改当前运行版本。Python 依赖不会自动安装。
+在管理页的配置中启用 **Automatically update Codex Monitor** 后，程序会在启动后及之后每小时于后台检查已发布的 `release/runtime` 清单。发现较新且校验通过的运行时后，只替换发布清单列出的文件，并使用相同入口命令和参数重启；检查失败不会修改当前运行版本。更新器会在重启前使用当前 Python 解释器安装新版 requirements.txt 中的依赖；安装失败时恢复运行时文件并报告失败，但不会回滚 pip 对 Python 环境的修改。启动时先检查所需库，缺失或无法导入时在控制台列出并退出；各启动阶段会在仪表盘 URL 之前输出。
 
 ## WebDAV 与加密同步
 
@@ -273,7 +273,6 @@ python codex_monitor_daemon.py --help
 | `--sample-log-max-bytes N` | 超过该大小后压缩样本日志；默认 50 MiB，压缩目标为 80%。 |
 | `--local-only` | 只扫描本地会话日志，不访问 ChatGPT 使用量接口。 |
 | `--no-token-scan` | 禁用本地会话 Token 扫描。 |
-| `--compact-history-days N` | 只保留最近 N 天的额度历史。 |
 | `--reencrypt-cloud` | 使用当前密钥刷新随机数并验证所有 WebDAV 加密对象后退出。 |
 | `--retry-limit N` | 设置有限的 HTTP/仪表盘重试次数；网络断线仍会持续重试。 |
 
@@ -356,3 +355,9 @@ npm run release
 ## 许可证
 
 Codex Usage Monitor 是基于 <a href="./LICENSE">GNU General Public License version 3</a> 发布的自由软件。
+
+### 额度采样与原始历史
+
+额度 JSONL 仅追加保存提取后的 API 原始读数，包括重复读数和被拒绝的读数。云同步传输完整原始读数，不再压缩平台段或按天数清理。处理结果及每个账号、窗口的下降保护状态保存在 SQLite，可从原始历史重建。额度曲线在所有显示精度下保留后端实际值，不再进行速率过滤、舍入平滑或均值处理。
+
+只使用 `reset_at`，完全忽略 `reset_after_seconds`。下降读数只有在重置时间前移且严格晚于“上次接受读数的采样时间 + 窗口周期（5 小时或 7 天）”时才直接接受；否则拒绝并将当前值设为下降保护基线。后续读数大于等于保护基线就接受并清除保护，小于基线则继续拒绝并更新保护基线。缺失窗口保留状态，套餐变化重新建立基线，两个窗口独立处理，拒绝读数不会事后转为接受。

@@ -14,7 +14,6 @@ from pathlib import Path
 
 from monitor_common import atomic_write_bytes as _write_atomic_bytes
 from monitor_common import MIN_DELTA_COST_PER_PERCENT_USD, RESET_TIME_JITTER_SECONDS, coerce_float, empty_cost_totals, empty_token_totals, parse_timestamp
-from monitor_history import compact_quota_history_rows
 from monitor_tokens import normalize_codex_model
 
 
@@ -262,10 +261,7 @@ def merge_token_ledger_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
 
 
 def quota_sync_boundary_rows(rows: list[dict], machine_id: str) -> list[dict]:
-    syncable = [row for row in rows if syncable_record("quota", row, machine_id)]
-    compacted = compact_quota_history_rows(syncable)
-    account_order = list(dict.fromkeys(record_account_key(row) for row in syncable))
-    return [row for account_id in account_order for row in compacted if record_account_key(row) == account_id]
+    return [row for row in rows if syncable_record("quota", row, machine_id)]
 
 
 def _cycle_key(row: dict) -> tuple:
@@ -472,28 +468,6 @@ class UsageDataStore:
     def ingest_local(self):
         with self.lock:
             return self._ingest_local()
-
-    def retain_quota(self, days):
-        if days is None or days <= 0:
-            return False
-        with self.lock:
-            self._ingest_local()
-            source, cutoff = str(self.quota_path.resolve()), time.time() - days * 86400
-            with self.index.transaction() as db:
-                if not db.execute("SELECT 1 FROM processing_facts WHERE source=? AND kind='quota' AND event_at<? LIMIT 1", (source, cutoff)).fetchone():
-                    return False
-                descriptor, name = tempfile.mkstemp(prefix=f".{self.quota_path.name}.", suffix=".retention", dir=self.quota_path.parent)
-                try:
-                    with os.fdopen(descriptor, "wb") as output:
-                        for (data,) in db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='quota' AND (event_at IS NULL OR event_at>=?) ORDER BY position", (source, cutoff)):
-                            output.write(data.encode() + b"\n")
-                        output.flush()
-                        os.fsync(output.fileno())
-                    os.replace(name, self.quota_path)
-                finally:
-                    Path(name).unlink(missing_ok=True)
-            self._ingest_local()
-            return True
 
     def _ingest_local(self):
         with self.index.transaction() as db:

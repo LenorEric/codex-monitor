@@ -1,6 +1,6 @@
 """Own local/cloud data contracts, ordered upgrades, journal recovery and old-format conversion.
 
-Released steps are immutable. Merge saved-data changes into local 15 / cloud 3 until
+Released steps are immutable. Merge saved-data changes into local 16 / cloud 4 until
 the next successful release. Frozen historical codecs remain separate implementation
 helpers; application modules only invoke the entry points here.
 """
@@ -22,10 +22,10 @@ from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 15
+DATA_CONTRACT_VERSION = 16
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
-CLOUD_DATA_CONTRACT_VERSION = 3
+CLOUD_DATA_CONTRACT_VERSION = 4
 CLOUD_DATA_CONTRACT_PATH = "data-contract.json"
 
 
@@ -419,6 +419,7 @@ DATA_MIGRATIONS = {
     13: _migrate_history_to_v13,
     14: _migrate_history_to_v14,
     15: _migrate_history_to_v15,
+    16: lambda paths: migrate_reset_timestamps(paths),
 }
 
 
@@ -661,7 +662,7 @@ def _migrate_cloud_to_v3(client):
     migrate_cloud_formats(client, getattr(client, "_migration_manager", None))
 
 
-CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3}
+CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3, 4: lambda client: migrate_cloud_reset_timestamps(client)}
 
 
 def read_cloud_contract(client):
@@ -692,9 +693,14 @@ def ensure_cloud_contract(client):
         if version not in CLOUD_DATA_MIGRATIONS:
             raise CloudError(f"Missing cloud data migration {version}; cloud access is blocked", 409)
         CLOUD_DATA_MIGRATIONS[version](client)
-        etag = client.put(CLOUD_DATA_CONTRACT_PATH, canonical_json({"dataContractVersion": version}), etag=etag, create=etag is None)
-        if read_cloud_contract(client)[0] != version:
-            raise CloudError("Cloud migration commit verification failed", 409)
+        try:
+            etag = client.put(CLOUD_DATA_CONTRACT_PATH, canonical_json({"dataContractVersion": version}), etag=etag, create=etag is None)
+            if read_cloud_contract(client)[0] != version:
+                raise CloudError("Cloud migration commit verification failed", 409)
+        except Exception:
+            if version == 4 and read_cloud_contract(client)[0] < version:
+                rollback_cloud_reset_timestamps(client)
+            raise
     if CLOUD_DATA_CONTRACT_VERSION >= 3:
         finish_cloud_format_migration(client)
 
@@ -1555,3 +1561,179 @@ def migrate_sample_store(path, batch_size=256):
         if db.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("Sample ownership foreign key check failed")
 
+
+
+RESET_TIMESTAMP_FIELDS = {"resetAt", "baselineResetAt", "rollbackBaselineResetAt", "backwardResetCandidateAt"}
+
+
+def convert_reset_timestamps(value):
+    """Convert released ISO reset fields only; diagnostic API payloads stay intact."""
+    if isinstance(value, list):
+        return [convert_reset_timestamps(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+    result = {}
+    for key, item in value.items():
+        if key in RESET_TIMESTAMP_FIELDS and isinstance(item, str):
+            item = parse_timestamp(item)
+            if item is None:
+                raise MigrationError(f"Invalid saved {key}; originals preserved")
+        result[key] = item if key == "rawResponse" else convert_reset_timestamps(item)
+    return result
+
+
+def migrate_reset_timestamps(paths):
+    from monitor_usage_sync import content_hash, v4_logical_hash
+    # The outer startup journal backs up every file and the database before writing.
+    for name in ("history", "quota_history", "token_session_history", "token_ledger", "sample_log"):
+        if paths[name].exists():
+            _atomic_write(paths[name], _jsonl_bytes([convert_reset_timestamps(row) for row in _json_records(paths[name])]))
+    for name in ("runtime_state", "account_manifest"):
+        if paths[name].exists():
+            write_json(paths[name], convert_reset_timestamps(read_json(paths[name])))
+    if paths["processing_index"].exists():
+        with closing(samples.connect(paths["processing_index"])) as db, db:
+            # Stage immutable samples before updating references. Peers can be the
+            # only retained source, so they must survive cache invalidation.
+            db.execute("CREATE TEMP TABLE reset_samples AS SELECT id,kind FROM sample_records")
+            for sample_id, kind in db.execute("SELECT id,kind FROM reset_samples"):
+                original = samples.select_sample(db, sample_id)
+                converted = convert_reset_timestamps(original)
+                if converted == original:
+                    continue
+                replacement, _ = samples.insert_sample(db, kind, converted)
+                for table in ("processing_fact_refs", "local_record_refs", "remote_record_refs"):
+                    db.execute(f"UPDATE {table} SET sample_id=? WHERE sample_id=?", (replacement, sample_id))
+            for key, data in db.execute("SELECT record_key,record_json FROM local_records").fetchall():
+                db.execute("UPDATE local_record_refs SET content_hash=? WHERE record_key=?", (content_hash(json.loads(data)), key))
+            for machine, key, data in db.execute("SELECT machine_id,record_key,record_json FROM remote_records").fetchall():
+                db.execute("UPDATE remote_record_refs SET content_hash=? WHERE device_id=(SELECT id FROM sample_devices WHERE value=?) AND record_key=?",
+                    (content_hash(json.loads(data)["record"]), machine, key))
+            for machine, day in db.execute("SELECT DISTINCT machine_id,day FROM remote_records").fetchall():
+                entries = [json.loads(row[0]) for row in db.execute("SELECT record_json FROM remote_records WHERE machine_id=? AND day=?", (machine, day))]
+                db.execute("UPDATE remote_days SET logical_hash=?,layout_json=? WHERE machine_id=? AND day=?", (v4_logical_hash(entries), "{}", machine, day))
+            generation = json.loads(db.execute("SELECT value FROM processing_meta WHERE name='publishGeneration'").fetchone()[0]) if db.execute("SELECT 1 FROM processing_meta WHERE name='publishGeneration'").fetchone() else 0
+            generation += 1
+            db.execute("INSERT OR REPLACE INTO processing_meta VALUES('publishGeneration',?)", (json.dumps(generation),))
+            for (period,) in db.execute("SELECT DISTINCT period FROM local_records").fetchall():
+                db.execute("INSERT OR REPLACE INTO processing_dirty_days VALUES(?,?)", (period[:10], generation))
+            for key, data in db.execute("SELECT record_key,data FROM processing_pending_records WHERE data IS NOT NULL").fetchall():
+                db.execute("UPDATE processing_pending_records SET data=? WHERE record_key=?", (json.dumps(convert_reset_timestamps(json.loads(data))), key))
+            db.execute("DROP TABLE reset_samples")
+        _migrate_history_to_v10(paths)
+        with closing(samples.connect(paths["processing_index"])) as db, db:
+            db.execute("DELETE FROM processing_meta WHERE name IN ('samplingRule','runtimeState','consoleState') OR name LIKE 'samplingState:%' OR name LIKE 'quotaState:%' OR name LIKE 'rankRoot:%'")
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_sampled_quota'").fetchone():
+                db.execute("DELETE FROM processing_sampled_quota")
+        from monitor_processing import initialize_processing_index
+        initialize_processing_index(paths["processing_index"])
+    if paths["runtime_state"].exists():
+        state = read_json(paths["runtime_state"])
+        for key in ("windows", "lastSample", "remoteUsageIdentity"):
+            state.pop(key, None)
+        write_json(paths["runtime_state"], state)
+    paths["dashboard_cache"].unlink(missing_ok=True)
+    if paths["cloud_state"].exists():
+        state = read_json(paths["cloud_state"])
+        state["usageV4"] = {"remote": {}, "localHeadEtag": None, "transferByMonth": state.get("usageV4", {}).get("transferByMonth", {})}
+        write_json(paths["cloud_state"], state)
+
+
+def migrate_cloud_reset_timestamps(client):
+    try:
+        _convert_cloud_reset_timestamps(client)
+    except Exception:
+        rollback_cloud_reset_timestamps(client)
+        raise
+
+
+def rollback_cloud_reset_timestamps(client):
+    from monitor_cloud import CloudError
+    manager = getattr(client, "_migration_manager", None)
+    if manager is None:
+        return
+    for filename in manager._optional_remote_list(client, "migrations/contract-4"):
+        import re
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}\.enc", filename) is None:
+            raise CloudError("Invalid cloud timestamp migration backup", 409)
+        original = client.get(f"migrations/contract-4/{filename}")[0]
+        path = manager._v4_head_path(filename[:-4])
+        current, etag = client.get(path)
+        if current != original:
+            client.put(path, original, etag=etag)
+            if client.get(path)[0] != original:
+                raise CloudError("Cloud timestamp migration rollback verification failed", 409)
+
+
+def _convert_cloud_reset_timestamps(client):
+    """Publish new immutable payloads, committing each head after verification.
+
+    Originals remain reachable through retained heads in the migration journal.
+    Failures restore mutable heads; immutable original payloads remain retained.
+    """
+    from monitor_cloud import CloudError, CryptoBox
+    from monitor_usage_sync import canonical_json, content_hash, v4_logical_hash
+    try:
+        descriptor = client.get("crypto.json")[0]
+    except CloudError as exc:
+        if exc.http_status == 404:
+            return
+        raise
+    manager = getattr(client, "_migration_manager", None)
+    if manager is None:
+        raise CloudError("Cloud timestamp migration requires the configured monitor", 409)
+    box = CryptoBox(manager.config()["webdav"]["encryptionPassphraseHash"], json.loads(descriptor))
+    client.ensure_directories("migrations/contract-4")
+    for filename in manager._optional_remote_list(client, "usage/v4/heads"):
+        if not filename.endswith(".enc"):
+            continue
+        machine = filename[:-4]
+        import re
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", machine) is None:
+            raise CloudError("Invalid cloud timestamp migration machine ID", 409)
+        head, etag = manager._v4_head(client, box, machine)
+        catalog = manager._v4_catalog(client, box, machine, head)
+        updated_catalog = dict(catalog)
+        for day, reference in catalog.items():
+            manifest = manager._v4_day_manifest(client, box, machine, day, reference)
+            records, changed = [], False
+            for part, digest in manifest["parts"].items():
+                entries = manager._v4_data(client, box, machine, day, part, digest)
+                try:
+                    for entry in entries:
+                        record = convert_reset_timestamps(entry["record"])
+                        changed |= record != entry["record"]
+                        records.append(entry | {"record": record, "contentSha256": content_hash(record)})
+                finally:
+                    if hasattr(entries, "close"):
+                        entries.close()
+            if not changed:
+                continue
+            records.sort(key=lambda row: row["recordKey"])
+            digest, _ = manager._put_usage_payload(client, box, "v4/data", machine, {"version": 1, "machineId": machine, "day": day, "partId": "bulk", "records": records})
+            logical = v4_logical_hash(records)
+            manifest = {"version": 1, "machineId": machine, "day": day, "layout": "bulk", "logicalHash": logical, "parts": {"bulk": digest}}
+            digest, _ = manager._put_usage_payload(client, box, "v4/days", machine, manifest)
+            updated_catalog[day] = {"manifestId": digest, "logicalHash": logical, "layout": "bulk"}
+        if updated_catalog == catalog:
+            continue
+        months = {}
+        for month in sorted({day[:7] for day in updated_catalog}):
+            months[month] = manager._put_usage_payload(client, box, "v4/months", machine,
+                {"version": 1, "machineId": machine, "month": month, "days": {day: ref for day, ref in updated_catalog.items() if day[:7] == month}})[0]
+        path = manager._v4_head_path(machine)
+        original = client.get(path)[0]
+        backup = f"migrations/contract-4/{machine}.enc"
+        try:
+            client.get(backup)
+        except CloudError as exc:
+            if exc.http_status != 404:
+                raise
+            client.put(backup, original, create=True)
+            if client.get(backup)[0] != original:
+                raise CloudError("Cloud timestamp migration backup verification failed", 409)
+        updated = head | {"generation": head["generation"] + 1, "months": months, "activeDay": None}
+        data = box.encrypt(f"usage-v4-head:{machine}", canonical_json(updated))
+        client.put(path, data, etag=etag)
+        if client.get(path)[0] != data:
+            raise CloudError("Cloud timestamp migration head verification failed", 409)

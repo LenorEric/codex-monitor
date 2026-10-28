@@ -11,8 +11,6 @@ from monitor_tokens import normalize_codex_model
 
 DEFAULT_EVENT_MODEL = "gpt-5.5"
 COST_INTERVAL_TYPE = "costInterval"
-MAX_MANUAL_RESET_CONFIRMATION_RESPONSES = 5
-REQUIRED_MANUAL_RESET_CONFIRMATION_RESPONSES = 3
 
 def reset_moved_forward(previous_reset: str | None, current_reset: str | None) -> bool:
     previous_ts = parse_timestamp(previous_reset)
@@ -24,25 +22,6 @@ def reset_moved_backward(previous_reset: str | None, current_reset: str | None) 
     current_ts = parse_timestamp(current_reset)
     return previous_ts is not None and current_ts is not None and previous_ts - current_ts > RESET_TIME_JITTER_SECONDS
 
-def reset_same_window(previous_reset: str | None, current_reset: str | None) -> bool:
-    previous_ts = parse_timestamp(previous_reset)
-    current_ts = parse_timestamp(current_reset)
-    return previous_ts is not None and current_ts is not None and abs(previous_ts - current_ts) <= RESET_TIME_JITTER_SECONDS
-
-def clear_backward_reset_candidate(window_state: dict) -> None:
-    for key in ("backwardResetCandidateAt", "backwardResetCandidatePercent", "backwardResetCandidateCostUsd"):
-        window_state.pop(key, None)
-
-def clear_reset_recovery_state(window_state: dict) -> None:
-    for key in ("rollbackBaselinePercent", "rollbackBaselineCostUsd", "rollbackBaselineCostByModelUsd", "rollbackBaselineResetAt"):
-        window_state.pop(key, None)
-    clear_backward_reset_candidate(window_state)
-
-def checked_before_reset(checked_at: str | None, reset_at: str | None) -> bool:
-    checked_ts = parse_timestamp(checked_at)
-    reset_ts = parse_timestamp(reset_at)
-    return checked_ts is not None and reset_ts is not None and checked_ts < reset_ts - RESET_TIME_JITTER_SECONDS
-
 def remote_usage_identity(sample: dict) -> dict | None:
     raw = ((sample.get("remoteUsage") or {}).get("rawResponse") or {})
     auth_identity = ((sample.get("remoteUsage") or {}).get("authIdentity") or {})
@@ -52,216 +31,6 @@ def remote_usage_identity(sample: dict) -> dict | None:
 def remote_usage_identity_changed(state: dict, sample: dict) -> bool:
     identity = remote_usage_identity(sample)
     return bool(state.get("remoteUsageIdentity") and identity and identity != state["remoteUsageIdentity"])
-
-def confirmed_manual_reset_windows(sample: dict) -> set[str]:
-    confirmation = ((sample.get("remoteUsage") or {}).get("manualResetConfirmation") or {})
-    return set(confirmation.get("confirmedWindows") or []) if confirmation.get("confirmed") else set()
-
-def direct_zero_or_missing_manual_reset_windows(state: dict, sample: dict) -> list[str] | None:
-    identity = remote_usage_identity(sample)
-    if state.get("remoteUsageIdentity") and identity != state["remoteUsageIdentity"]:
-        return None
-    confirmed = []
-    for label in ("5h", "7d"):
-        window = (sample.get("windows") or {}).get(label) or {}
-        raw_percent = coerce_float(window.get("usedPercent"))
-        if raw_percent is None:
-            continue
-        window_state = (state.get("windows") or {}).get(label) or {}
-        if (
-            raw_percent != 0
-            or window_state.get("baselinePlan") is not None and window.get("plan") != window_state.get("baselinePlan")
-            or window_state.get("baselineMultiplier") is not None and window.get("planMultiplier") != window_state.get("baselineMultiplier")
-        ):
-            return None
-        if (coerce_float(window_state.get("baselinePercent")) or 0) > 0:
-            confirmed.append(label)
-    return confirmed or None
-
-def confirm_direct_zero_or_missing_manual_reset(sample: dict, windows: list[str]) -> None:
-    sample.setdefault("remoteUsage", {})["manualResetConfirmation"] = {
-        "attempted": False,
-        "confirmed": True,
-        "directZeroOrMissing": True,
-        "requiredConsecutiveResponses": 1,
-        "maxResponses": 1,
-        "confirmedWindows": windows,
-    }
-
-def manual_reset_rejection_windows(state: dict, sample: dict) -> list[str]:
-    labels = []
-    for label in ("5h", "7d"):
-        window = (sample.get("windows") or {}).get(label) or {}
-        window_state = (state.get("windows") or {}).get(label) or {}
-        raw_percent = coerce_float(window.get("usedPercent"))
-        baseline_percent = coerce_float(window_state.get("baselinePercent"))
-        if raw_percent is None or baseline_percent is None or not checked_before_reset(sample.get("checkedAt"), window_state.get("baselineResetAt")):
-            continue
-        normalized = raw_percent * (coerce_float(window.get("planMultiplier")) or PLAN_MULTIPLIERS["unknown"])
-        if normalized < baseline_percent and (
-            reset_moved_forward(window_state.get("baselineResetAt"), window.get("resetAt"))
-            or reset_moved_backward(window_state.get("baselineResetAt"), window.get("resetAt"))
-        ):
-            labels.append(label)
-    return labels
-
-def manual_reset_percent_increase_limit(label: str, plan: str | None) -> float | None:
-    if plan == "plus":
-        return 5.0 if label == "5h" else 1.0
-    if plan in {"pro_lite", "pro"}:
-        return 1.0
-    return None
-
-def manual_reset_sample_consistent(newer: dict, older: dict, labels: list[str]) -> bool:
-    if remote_usage_identity(newer) != remote_usage_identity(older):
-        return False
-    for label in labels:
-        current = (newer.get("windows") or {}).get(label) or {}
-        previous = (older.get("windows") or {}).get(label) or {}
-        limit = manual_reset_percent_increase_limit(label, current.get("plan"))
-        current_percent = coerce_float(current.get("usedPercent"))
-        previous_percent = coerce_float(previous.get("usedPercent"))
-        if (
-            limit is None
-            or current.get("plan") != previous.get("plan")
-            or current.get("planMultiplier") != previous.get("planMultiplier")
-            or not reset_same_window(previous.get("resetAt"), current.get("resetAt"))
-        ):
-            return False
-        if current_percent is None or previous_percent is None or not 0 <= current_percent - previous_percent <= limit:
-            return False
-    return True
-
-def raw_reset_after_inconsistent(sample: dict, label: str, raw_window: dict) -> str | None:
-    reset_at = coerce_float(raw_window.get("reset_at") if "reset_at" in raw_window else raw_window.get("resetAt"))
-    reset_after = coerce_float(raw_window.get("reset_after_seconds"))
-    if reset_at is None or reset_after is None:
-        return None
-    completed_ts = parse_timestamp((sample.get("remoteUsage") or {}).get("completedAt")) or parse_timestamp(sample.get("checkedAt"))
-    if completed_ts is None:
-        return None
-    drift = abs((reset_at - completed_ts) - reset_after)
-    return None if drift <= 300 else f"{label} reset_after_seconds inconsistent with reset_at by {drift:.0f}s"
-
-def remote_usage_rejection_reasons(state: dict, sample: dict) -> list[str]:
-    reasons = []
-    if ((sample.get("remoteUsage") or {}).get("manualResetConfirmation") or {}).get("directZeroOrMissing"):
-        return reasons
-    confirmed_windows = confirmed_manual_reset_windows(sample)
-    identity_changed = remote_usage_identity_changed(state, sample)
-    if identity_changed and not sample.get("windows"):
-        reasons.append("identity changed without usable quota windows")
-    if identity_changed and sample.get("windows"):
-        return reasons
-    if sample.get("remoteUsage") is not None and all(coerce_float(((sample.get("windows") or {}).get(label) or {}).get("usedPercent")) is None for label in ("5h", "7d")):
-        reasons.append("both quota window percentages are missing")
-    rate_limit = (((sample.get("remoteUsage") or {}).get("rawResponse") or {}).get("rate_limit") or {})
-    for label, raw_key in (("5h", "primary_window"), ("7d", "secondary_window")):
-        if isinstance(rate_limit.get(raw_key), dict):
-            reason = raw_reset_after_inconsistent(sample, label, rate_limit[raw_key])
-            if reason:
-                reasons.append(reason)
-        window = (sample.get("windows") or {}).get(label) or {}
-        raw_percent = coerce_float(window.get("usedPercent"))
-        window_state = (state.get("windows") or {}).get(label) or {}
-        baseline_percent = coerce_float(window_state.get("baselinePercent"))
-        if raw_percent is None or baseline_percent is None or not checked_before_reset(sample.get("checkedAt"), window_state.get("baselineResetAt")):
-            continue
-        normalized = raw_percent * (coerce_float(window.get("planMultiplier")) or PLAN_MULTIPLIERS["unknown"])
-        reset_at = window.get("resetAt")
-        if label in confirmed_windows:
-            continue
-        if normalized < baseline_percent and reset_moved_forward(window_state.get("baselineResetAt"), reset_at):
-            reasons.append(f"{label} percent rolled back and reset moved forward before trusted reset time")
-        elif normalized < baseline_percent and reset_moved_backward(window_state.get("baselineResetAt"), reset_at):
-            reasons.append(f"{label} percent rolled back with an older reset time before trusted reset time")
-    return reasons
-
-def record_remote_usage_rejection(state: dict, sample: dict, reasons: list[str]) -> None:
-    signature = tuple(reasons)
-    suppress_console = state.get("_lastRemoteUsageRejectionSignature") == signature
-    state["_lastRemoteUsageRejectionSignature"] = signature
-    state.setdefault("_specialEvents", []).append({
-        "checkedAt": sample["checkedAt"],
-        "window": "remote",
-        "reason": "bad-remote-usage-discarded",
-        "previous": {},
-        "current": {},
-        "extra": {"reasons": reasons, "suppressConsole": suppress_console},
-    })
-
-def collect_with_bad_remote_usage_retry(collector, state: dict) -> dict:
-    sample = collector()
-    direct_reset_windows = direct_zero_or_missing_manual_reset_windows(state, sample)
-    if direct_reset_windows:
-        confirm_direct_zero_or_missing_manual_reset(sample, direct_reset_windows)
-        return sample
-    rejection_reasons = remote_usage_rejection_reasons(state, sample)
-    if not rejection_reasons:
-        return sample
-    initial_rejection_reasons = rejection_reasons
-    initial_checked_at = sample.get("checkedAt")
-    manual_reset_windows = manual_reset_rejection_windows(state, sample)
-    if len(manual_reset_windows) != len(rejection_reasons):
-        retry_sample = collector()
-        direct_reset_windows = direct_zero_or_missing_manual_reset_windows(state, retry_sample)
-        if direct_reset_windows:
-            confirm_direct_zero_or_missing_manual_reset(retry_sample, direct_reset_windows)
-        if retry_sample.get("remoteUsage") is not None:
-            retry_sample["remoteUsage"]["badRemoteUsageRetry"] = {
-                "attempted": True,
-                "initialCheckedAt": initial_checked_at,
-                "initialRejectionReasons": initial_rejection_reasons,
-            }
-        return retry_sample
-    attempts = [{"checkedAt": initial_checked_at, "windows": {label: ((sample.get("windows") or {}).get(label) or {}).get("usedPercent") for label in manual_reset_windows}}]
-    consecutive = 1
-    previous = sample
-    for _ in range(1, MAX_MANUAL_RESET_CONFIRMATION_RESPONSES):
-        sample = collector()
-        direct_reset_windows = direct_zero_or_missing_manual_reset_windows(state, sample)
-        if direct_reset_windows:
-            confirm_direct_zero_or_missing_manual_reset(sample, direct_reset_windows)
-            return sample
-        rejection_reasons = remote_usage_rejection_reasons(state, sample)
-        current_windows = manual_reset_rejection_windows(state, sample)
-        consistent = current_windows == manual_reset_windows and manual_reset_sample_consistent(sample, previous, manual_reset_windows)
-        attempts.append({
-            "checkedAt": sample.get("checkedAt"),
-            "windows": {label: ((sample.get("windows") or {}).get(label) or {}).get("usedPercent") for label in manual_reset_windows},
-            "consistentWithPrevious": consistent,
-        })
-        if sample.get("remoteUsage") is not None:
-            sample["remoteUsage"]["badRemoteUsageRetry"] = {
-                "attempted": True,
-                "initialCheckedAt": initial_checked_at,
-                "initialRejectionReasons": initial_rejection_reasons,
-            }
-        if not rejection_reasons:
-            return sample
-        if len(current_windows) != len(rejection_reasons) or set(current_windows) != set(manual_reset_windows):
-            return sample
-        consecutive = consecutive + 1 if consistent else 1
-        previous = sample
-        if consecutive >= REQUIRED_MANUAL_RESET_CONFIRMATION_RESPONSES:
-            sample.setdefault("remoteUsage", {})["manualResetConfirmation"] = {
-                "attempted": True,
-                "confirmed": True,
-                "requiredConsecutiveResponses": REQUIRED_MANUAL_RESET_CONFIRMATION_RESPONSES,
-                "maxResponses": MAX_MANUAL_RESET_CONFIRMATION_RESPONSES,
-                "confirmedWindows": manual_reset_windows,
-                "attempts": attempts,
-            }
-            return sample
-    if sample.get("remoteUsage") is not None:
-        sample["remoteUsage"]["manualResetConfirmation"] = {
-            "attempted": True,
-            "confirmed": False,
-            "requiredConsecutiveResponses": REQUIRED_MANUAL_RESET_CONFIRMATION_RESPONSES,
-            "maxResponses": MAX_MANUAL_RESET_CONFIRMATION_RESPONSES,
-            "attempts": attempts,
-        }
-    return sample
 
 def valid_delta_cost_rate(delta_percent: float, delta_cost: float) -> bool:
     return delta_percent > 0 and delta_cost / delta_percent >= MIN_DELTA_COST_PER_PERCENT_USD
@@ -650,6 +419,8 @@ def cost_interval_from_sample(sample: dict, label: str, normalized: float, delta
     }
 
 def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list[dict]:
+    if label in (sample.get("rejectedWindows") or {}):
+        return []
     window = (sample.get("windows") or {}).get(label) or {}
     if window.get("unavailable"):
         # Forget the live baseline, retaining historical totals for the incremental (history=None) path.
@@ -675,7 +446,6 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
             "baselineMultiplier": multiplier,
         })
         set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, plan, multiplier, requires_trusted_percent_baseline(label, plan), sample["checkedAt"])
-        clear_reset_recovery_state(window_state)
         return []
 
     if window_state.get("baselinePercent") is None:
@@ -687,7 +457,6 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
             "baselineMultiplier": multiplier,
         })
         set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, plan, multiplier, requires_trusted_percent_baseline(label, plan), sample["checkedAt"])
-        clear_reset_recovery_state(window_state)
         return []
 
     identity_changed = remote_usage_identity_changed(state, sample)
@@ -700,19 +469,6 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
             "baselineMultiplier": multiplier,
         }, {"previousIdentity": state.get("remoteUsageIdentity"), "currentIdentity": remote_usage_identity(sample)} if identity_changed else None)
         set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, plan, multiplier, requires_trusted_percent_baseline(label, plan), sample["checkedAt"])
-        clear_reset_recovery_state(window_state)
-        return []
-
-    if label in confirmed_manual_reset_windows(sample):
-        record_special_event(state, "manual-reset-confirmed", sample, label, window_state, {
-            "baselinePercent": normalized,
-            "baselineCostUsd": total_cost,
-            "baselineResetAt": reset_at,
-            "baselinePlan": plan,
-            "baselineMultiplier": multiplier,
-        })
-        set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, plan, multiplier, observed_at=sample["checkedAt"])
-        clear_reset_recovery_state(window_state)
         return []
 
     if window_state.get("awaitingTrustedPercentBaseline"):
@@ -725,75 +481,20 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
                 "baselineMultiplier": multiplier,
             })
             set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, plan, multiplier, observed_at=sample["checkedAt"])
-            clear_reset_recovery_state(window_state)
         elif normalized < window_state["baselinePercent"] or reset_moved_forward(window_state.get("baselineResetAt"), reset_at) or reset_moved_backward(window_state.get("baselineResetAt"), reset_at):
             set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, plan, multiplier, True, sample["checkedAt"])
-            clear_reset_recovery_state(window_state)
         else:
             window_state["previousCostUsd"] = total_cost
             window_state["previousCostByModelUsd"] = total_cost_by_model
         return []
 
-    if reset_moved_backward(window_state.get("baselineResetAt"), reset_at):
-        if reset_same_window(window_state.get("rollbackBaselineResetAt"), reset_at):
-            record_special_event(state, "transient-reset-rollback", sample, label, window_state, {
-                "baselinePercent": window_state["rollbackBaselinePercent"],
-                "baselineCostUsd": window_state["rollbackBaselineCostUsd"],
-                "baselineResetAt": reset_at,
-            })
-            window_state["baselinePercent"] = window_state.pop("rollbackBaselinePercent")
-            window_state["baselineCostUsd"] = window_state.pop("rollbackBaselineCostUsd")
-            window_state["baselineCostByModelUsd"] = window_state.pop("rollbackBaselineCostByModelUsd")
-            window_state["baselineResetAt"] = window_state.pop("rollbackBaselineResetAt")
-            clear_backward_reset_candidate(window_state)
-        elif reset_same_window(window_state.get("backwardResetCandidateAt"), reset_at):
-            record_special_event(state, "consistent-backward-reset-rebased", sample, label, window_state, {
-                "baselinePercent": normalized,
-                "baselineCostUsd": total_cost,
-                "baselineResetAt": reset_at,
-            }, {
-                "discardedPercent": max(0.0, normalized - (coerce_float(window_state.get("backwardResetCandidatePercent")) or normalized)),
-                "discardedCostUsd": max(0.0, total_cost - (coerce_float(window_state.get("backwardResetCandidateCostUsd")) or total_cost)),
-            })
-            set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, awaiting_trusted=requires_trusted_percent_baseline(label, plan), observed_at=sample["checkedAt"])
-            clear_reset_recovery_state(window_state)
-            return []
-        else:
-            record_special_event(state, "reset-time-moved-backward-discarded", sample, label, window_state, {
-                "baselinePercent": window_state["baselinePercent"],
-                "baselineCostUsd": window_state["baselineCostUsd"],
-                "baselineResetAt": window_state.get("baselineResetAt"),
-            }, {"observedPercent": normalized, "observedResetAt": reset_at})
-            window_state["backwardResetCandidateAt"] = reset_at
-            window_state["backwardResetCandidatePercent"] = normalized
-            window_state["backwardResetCandidateCostUsd"] = total_cost
-            return []
-    else:
-        clear_backward_reset_candidate(window_state)
-
     if normalized < window_state["baselinePercent"]:
-        if reset_moved_forward(window_state.get("baselineResetAt"), reset_at):
-            window_state["rollbackBaselinePercent"] = window_state["baselinePercent"]
-            window_state["rollbackBaselineCostUsd"] = window_state["baselineCostUsd"]
-            window_state["rollbackBaselineCostByModelUsd"] = window_state.get("baselineCostByModelUsd") or {}
-            window_state["rollbackBaselineResetAt"] = window_state.get("baselineResetAt")
+        # Sampling has already accepted this decrease; establish a new cost baseline.
         record_special_event(state, "usage-percent-rollback", sample, label, window_state, {
-            "baselinePercent": normalized if requires_trusted_percent_baseline(label, plan) else 0.0,
-            "baselineCostUsd": total_cost if requires_trusted_percent_baseline(label, plan) else window_state["previousCostUsd"],
-            "baselineResetAt": reset_at,
+            "baselinePercent": normalized, "baselineCostUsd": total_cost, "baselineResetAt": reset_at,
         })
-        if requires_trusted_percent_baseline(label, plan):
-            set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, awaiting_trusted=True, observed_at=sample["checkedAt"])
-            clear_reset_recovery_state(window_state)
-            return []
-        window_state["baselinePercent"] = 0.0
-        window_state["baselineCostUsd"] = window_state["previousCostUsd"]
-        window_state["baselineCostByModelUsd"] = window_state.get("previousCostByModelUsd") or {}
-        window_state["baselineResetAt"] = reset_at
-        if reset_moved_forward(window_state.get("rollbackBaselineResetAt"), reset_at):
-            window_state["previousCostUsd"] = total_cost
-            window_state["previousCostByModelUsd"] = total_cost_by_model
-            return []
+        set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, plan, multiplier, observed_at=sample["checkedAt"])
+        return []
 
     if normalized <= window_state["baselinePercent"]:
         if reset_moved_forward(window_state["baselineResetAt"], reset_at):
@@ -817,7 +518,6 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
             "baselineResetAt": reset_at,
         }, {"deltaPercent": delta_percent, "deltaCostUsd": delta_cost})
         set_percent_baseline(window_state, normalized, total_cost, total_cost_by_model, reset_at, awaiting_trusted=requires_trusted_percent_baseline(label, plan), observed_at=sample["checkedAt"])
-        clear_reset_recovery_state(window_state)
         return []
     window_state["cumulativePercent"] = round(window_state["cumulativePercent"] + delta_percent, 8)
     window_state["cumulativeCostUsd"] = round(window_state["cumulativeCostUsd"] + delta_cost, 8)
@@ -846,7 +546,6 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
         "previousCostByModelUsd": total_cost_by_model,
         "baselineObservedAt": sample["checkedAt"],
     })
-    clear_reset_recovery_state(window_state)
     return events
 
 def process_sample_delta_events(state: dict, sample: dict, existing_events: list[dict] | None) -> list[dict]:
@@ -860,26 +559,9 @@ def process_sample_delta_events(state: dict, sample: dict, existing_events: list
             window.setdefault("cumulativePercent", 0.0)
             window.setdefault("cumulativeCostUsd", 0.0)
             window.setdefault("models", {})
-    rejection_reasons = remote_usage_rejection_reasons(state, sample)
-    if rejection_reasons:
-        sample.setdefault("errors", {})["remoteUsageRejected"] = "; ".join(rejection_reasons)
-        if sample.get("remoteUsage"):
-            sample["remoteUsage"]["accepted"] = False
-            sample["remoteUsage"]["rejectionReasons"] = rejection_reasons
-        sample["percentCheckedAt"] = ((state.get("lastSample") or {}).get("percentCheckedAt") or (state.get("lastSample") or {}).get("checkedAt"))
-        sample["rejectedWindows"] = sample.get("windows") or {}
-        sample["windows"] = ((state.get("lastSample") or {}).get("windows") or {})
-        sample["usingPreviousWindows"] = bool(sample["windows"])
-        record_remote_usage_rejection(state, sample, rejection_reasons)
-        state["tokenUsage"] = compact_token_usage_for_state(sample.get("tokenUsage"))
-        state["cost"] = sample.get("cost")
-        state["costByModel"] = sample.get("costByModel") or {}
-        state["lastSample"] = compact_sample_for_state(sample)
-        state["updatedAt"] = sample["checkedAt"]
-        return []
     if sample.get("remoteUsage"):
-        sample["remoteUsage"]["accepted"] = True
-    sample["percentCheckedAt"] = sample["checkedAt"]
+        sample["remoteUsage"]["accepted"] = not bool(sample.get("rejectedWindows"))
+    sample.setdefault("percentCheckedAt", sample["checkedAt"])
     events = build_delta_event_from_sample(state, sample, "5h") + build_delta_event_from_sample(state, sample, "7d")
     identity = remote_usage_identity(sample)
     if identity:
@@ -983,11 +665,6 @@ def format_special_event(event: dict) -> str:
 
 def format_percent(value: float | None) -> str:
     return "-" if value is None else f"{value:.4g}%"
-
-def print_ratio_warnings(events: list[dict]) -> None:
-    for event in events:
-        if event.get("ratioDeviationWarning"):
-            print(format_ratio_warning(event), flush=True)
 
 def print_special_events(events: list[dict]) -> None:
     for event in events:

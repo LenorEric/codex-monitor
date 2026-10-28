@@ -103,52 +103,8 @@ def session_groups(rows):
 
 
 def reduce_quota(rows, seconds):
-    """Average each account/cycle bucket; retain totals for lossless multiday regrouping."""
-    if not seconds:
-        return rows
-    buckets, previous, segments = {}, {}, defaultdict(int)
-    for row in sorted(rows, key=lambda row: (row["timestamp"], row["usageAccountId"], row["_key"])):
-        account = row["usageAccountId"]
-        if account in previous:
-            left = previous[account]
-            changed = (row.get("overviewBucket") or {}).get("start", row["timestamp"]) - (left.get("overviewBucket") or {}).get("end", left["timestamp"]) > 4 * 3600
-            for label in ("fiveHour", "sevenDay"):
-                a, b = left.get(label) or {}, row.get(label) or {}
-                changed |= any(a.get(field) != b.get(field) for field in ("resetAt", "plan"))
-                for field in ("raw", "continuous"):
-                    changed |= (a.get(field) is None) != (b.get(field) is None)
-                changed |= a.get("continuous") is not None and b.get("continuous") is not None and b["continuous"] < a["continuous"]
-            if changed:
-                segments[account] += 1
-        previous[account] = row
-        key = (account, int(row["timestamp"] // seconds), segments[account])
-        if key not in buckets:
-            buckets[key] = []
-        buckets[key].append(row)
-    result = []
-    for key, points in buckets.items():
-        value = points[0] | {"_key": "quotaBucket:" + hashlib.sha256(encoded([seconds, *key])).hexdigest()}
-        value["overviewBucket"] = {
-            "start": min((row.get("overviewBucket") or {}).get("start", row["timestamp"]) for row in points),
-            "end": max((row.get("overviewBucket") or {}).get("end", row["timestamp"]) for row in points),
-            "count": sum((row.get("overviewBucket") or {}).get("count", 1) for row in points), "totals": {}}
-        for label in ("fiveHour", "sevenDay"):
-            value[label] = dict(points[0].get(label) or {})
-            value["overviewBucket"]["totals"][label] = {}
-            for field in ("raw", "continuous"):
-                total, count = 0, 0
-                for row in points:
-                    saved = (row.get("overviewBucket") or {}).get("totals", {}).get(label, {}).get(field)
-                    if saved is not None:
-                        total += saved["sum"]
-                        count += saved["count"]
-                    elif isinstance((row.get(label) or {}).get(field), (int, float)):
-                        total += row[label][field]
-                        count += 1
-                value[label][field] = round(total / count, 1) if count else None
-                value["overviewBucket"]["totals"][label][field] = {"sum": total, "count": count}
-        result.append(value)
-    return sorted(result, key=lambda row: (row["timestamp"], row["usageAccountId"], row["_key"]))
+    """Quota observations remain exact; only cost/session delivery is aggregated."""
+    return rows
 
 
 def reduce_cost(rows, seconds):

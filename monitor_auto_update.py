@@ -16,6 +16,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from monitor_dependencies import install_dependencies
 
 UPDATE_INTERVAL_SECONDS = 60 * 60
 RELEASE_VERSION_URL = "https://raw.githubusercontent.com/LenorEric/codex-monitor/refs/heads/master/release/version.json"
@@ -223,6 +224,7 @@ class AutoUpdater:
                     shutil.copy2(target, backup / name)
                 os.replace(staging / name, target)
                 replaced.append(name)
+            install_dependencies(self.runtime_dir)
         except Exception:
             rollback_errors = []
             for name in reversed(replaced):

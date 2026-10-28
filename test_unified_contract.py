@@ -26,7 +26,7 @@ from test_usage_v4 import MemoryWebDav
 class UnifiedContractTests(unittest.TestCase):
     def test_contract_metadata_requires_aligned_targets_and_contiguous_registries(self):
         import monitor_migrations
-        metadata = {"dataContractVersion": 15, "cloudDataContractVersion": 3}
+        metadata = {"dataContractVersion": 16, "cloudDataContractVersion": 4}
         monitor_migrations.validate_contract_metadata(metadata)
         for field in metadata:
             with self.subTest(field=field), self.assertRaises(monitor_migrations.MigrationError):
@@ -212,7 +212,7 @@ class UnifiedContractTests(unittest.TestCase):
         client.put("usage/machines/machine-b.enc", box.encrypt("usage-pointer:machine-b", json.dumps({"version": 2, "machineId": "machine-b", "packs": {"pack": digest}}).encode()))
         from monitor_migrations import ensure_cloud_contract
         ensure_cloud_contract(client)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 3)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
         head, _ = cloud._v4_head(client, box, "machine-b")
         catalog = cloud._v4_catalog(client, box, "machine-b", head)
         self.assertEqual(set(catalog), {"2026-07-15"})
@@ -260,7 +260,7 @@ class UnifiedContractTests(unittest.TestCase):
         package = migrated["packages"]["demo"]
         self.assertEqual(skills.inspect_snapshot(cloud._download_skill_package(client, box, "demo", package))[1]["demo"]["SKILL.md"], b"Retain this skill")
         self.assertEqual(json.loads(client.get("crypto.json")[0])["version"], 3)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 3)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
 
 
 if __name__ == "__main__":

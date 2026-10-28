@@ -14,9 +14,11 @@ python -m pip install -r requirements.txt
 python codex_monitor_daemon.py
 ```
 
+Startup checks required Python libraries before loading the application. Missing or unloadable libraries are listed in the console with an installation command, and the program exits. Startup stages are printed before the dashboard URL: instance lock, update check, migrations, processing/backfill, server binding, store initialization/recovery, and background workers.
+
 Use `python codex_monitor_daemon.py --dashboard` to open the dashboard automatically. The default server host is `0.0.0.0` on port 8765. Use `http://127.0.0.1:8765` locally or the machine's LAN/public IP remotely. The former `python monitor_codex_usage.py` command remains compatible.
 
-Automatic updates are disabled by default. Enable them on the management Config page to check the published runtime before data migrations and dashboard startup, then every hour in the background. Startup waits for the initial check; a failed check is reported and startup continues. The console shows check results and download/verification progress. Verified updates replace this directory's packaged files and restart the same command with the same arguments; dependencies from `requirements.txt` are not installed automatically.
+Automatic updates are disabled by default. Enable them on the management Config page to check the published runtime before data migrations and dashboard startup, then every hour in the background. Startup waits for the initial check; a failed check is reported and startup continues. The console shows check results and download/verification progress. Verified updates replace this directory's packaged files and restart the same command with the same arguments; the updater installs `requirements.txt` with the running Python interpreter before restarting. A package-install failure restores runtime files and reports failure; pip changes to the Python environment are not rolled back.
 Password-protected control requests are accepted through public addresses and reverse proxies without an origin restriction. Direct public-IP access uses unencrypted HTTP, so prefer a trusted VPN or an HTTPS reverse proxy.
 Change the host to `127.0.0.1` in the management page and restart when LAN access is unnecessary. Install the matching VSIX from the parent release directory to connect VS Code to it.
 

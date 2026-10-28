@@ -51,7 +51,7 @@ The monitor is authoritative. The dashboard loads scoped `/api/dashboard` manife
 - VS Code 1.96 or newer for the extension.
 - A working Codex login in the normal `CODEX_HOME`.
 - Port `8765` available.
-- Python dependencies from `requirements.txt`—currently `cryptography>=46.0.0,<47` and `tomlkit>=0.13.3,<1`.
+- Python dependencies from `requirements.txt`—currently `cryptography>=46.0.0,<47`, `tomlkit>=0.13.3,<1`, and `watchdog>=6.0.0,<7`.
 - Network/proxy access compatible with the environment variables recognized by Python and `monitor_common.py`.
 
 ## Quick start
@@ -68,6 +68,8 @@ Use the matching artifacts from `release/`:
 python -m pip install -r requirements.txt
 python codex_monitor_daemon.py --dashboard
 ```
+
+Startup checks required Python libraries before loading the application. Missing or unloadable libraries are listed in the console with an installation command, and the program exits. Startup stages are printed before the dashboard URL: instance lock, update check, migrations, processing/backfill, server binding, store initialization/recovery, and background workers.
 
 Without `--dashboard`, the service starts normally but does not open a browser:
 
@@ -186,7 +188,7 @@ The five-second observer hashes incrementally and performs a bounded full verifi
 
 ## Automatic runtime updates
 
-Enable **Automatically update Codex Monitor** on the management Config page to check the published `release/runtime` manifest before data migrations and dashboard startup, then every hour in the background. The initial check finishes before normal startup continues; a failed check is reported and startup continues. Console messages show the check result and download/verification progress. A newer verified runtime replaces only files named by the release manifest and then restarts the same entry command with the same arguments; failed checks leave the running installation unchanged. Python dependencies are not installed automatically.
+Enable **Automatically update Codex Monitor** on the management Config page to check the published `release/runtime` manifest before data migrations and dashboard startup, then every hour in the background. The initial check finishes before normal startup continues; a failed check is reported and startup continues. Console messages show the check result and download/verification progress. A newer verified runtime replaces only files named by the release manifest and then restarts the same entry command with the same arguments; failed checks leave the running installation unchanged. Before restarting, the updater installs the new requirements with the running Python interpreter. If package installation fails, runtime files are restored and the update reports failure; pip changes to the Python environment are not rolled back.
 
 ## WebDAV and encrypted synchronization
 
@@ -284,7 +286,6 @@ python codex_monitor_daemon.py --help
 | `--sample-log-max-bytes N` | Compact the sample log after this size; default is 50 MiB with an 80% target. |
 | `--local-only` | Scan local session logs without calling ChatGPT usage endpoints. |
 | `--no-token-scan` | Disable local session token scanning. |
-| `--compact-history-days N` | Keep only quota history newer than N days. |
 | `--reencrypt-cloud` | Refresh nonces and verify all encrypted WebDAV payloads using the configured key, then exit. |
 | `--retry-limit N` | Set bounded HTTP/dashboard retries; network outages continue retrying. |
 
@@ -368,3 +369,9 @@ Credentials, local history, caches, tests, reference sources, and development-on
 ## License
 
 Codex Usage Monitor is free software licensed under the <a href="./LICENSE">GNU General Public License version 3</a>.
+
+### Quota sampling and raw history
+
+Quota JSONL is an append-only archive of extracted API readings, including repeated and rejected readings. Cloud synchronization transfers this raw history without plateau compaction. Processed quota decisions and per-account/window decrease protection live in SQLite and can be rebuilt from the retained raw history. Quota charts show exact backend values at every resolution, without rate filtering, rounding smoothing, or averaging.
+
+Only `reset_at` determines resets; `reset_after_seconds` is ignored. Every decrease is rejected unless its reset timestamp moves forward and is strictly later than the last accepted sample time plus the window period (5h or 7d). A rejected decrease establishes a protection baseline: the next equal or higher reading is accepted; a lower reading is rejected and replaces the baseline. Accepted readings clear protection. Missing windows retain their state, plans establish fresh baselines, and 5h/7d windows are independent. Rejected points are never accepted retroactively.

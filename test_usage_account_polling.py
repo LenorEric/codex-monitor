@@ -49,7 +49,7 @@ class UsageAccountPollingTests(unittest.TestCase):
         state.inactive_account_poll_errors = {}
         state.usage_data = SimpleNamespace(ingest_local=mock.Mock())
         with mock.patch.object(state, "_poll_inactive_account", side_effect=[RuntimeError("offline"), None]) as poll, \
-                mock.patch.object(state, "_maintain_quota_retention"), mock.patch.object(state, "_signal_dashboard_cache"), mock.patch("builtins.print"):
+                mock.patch.object(state, "_signal_dashboard_cache"), mock.patch("builtins.print"):
             self.assertEqual(state.poll_due_inactive_accounts(100), 1)
             self.assertEqual([call.args[0]["id"] for call in poll.call_args_list], ["b1", "c1"])
             self.assertEqual(set(state.inactive_account_poll_errors), {"b"})
