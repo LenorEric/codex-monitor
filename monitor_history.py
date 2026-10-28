@@ -103,6 +103,7 @@ def output_plan(output: dict) -> dict:
     return {"type": "unknown", "multiplier": PLAN_MULTIPLIERS["unknown"]}
 
 def quota_history_windows(output: dict) -> dict:
+    from monitor_interpretation import multiplier
     windows = {}
     fallback_plan = output_plan(output)
     for label, item in ((output.get("usage") or {}).get("windows") or {}).items():
@@ -116,7 +117,7 @@ def quota_history_windows(output: dict) -> dict:
             "resetAt": quota_reset_at(values),
             "path": item.get("path"),
             "plan": plan["type"],
-            "planMultiplier": plan["multiplier"],
+            "planMultiplier": multiplier(plan["type"], parse_timestamp(output.get("checkedAt")) or time.time()),
             "unavailable": bool(item.get("unavailable")) or used is None,
         }
     return windows

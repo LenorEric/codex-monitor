@@ -37,7 +37,7 @@ class LocalContractV4Tests(unittest.TestCase):
             self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [9])
             with index.transaction() as db:
                 self.assertEqual(db.execute("SELECT event_at FROM processing_display").fetchone()[0], 1893456000)
-                self.assertTrue(db.execute("SELECT dirty FROM dashboard_days WHERE day=?", (1893456000 // 86400,)).fetchone()[0])
+                self.assertIsNotNone(db.execute("SELECT 1 FROM delivery_dirty WHERE view='local' AND account='a'").fetchone())
             self.assertEqual(quota.read_bytes(), b'{"original":"quota"}\n')
             self.assertEqual(ledger.read_bytes(), b'{"original":"ledger"}\n')
             self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [])
@@ -56,7 +56,7 @@ class LocalContractV4Tests(unittest.TestCase):
             with index.transaction() as db:
                 db.execute("INSERT INTO processing_quota_points VALUES('local','a',?,'point',?)", (point["timestamp"], json.dumps(point)))
             delivery.prepare(point["timestamp"])
-            old = delivery.manifest("local", "All")
+            old = json.loads(delivery.bulk(False))
             quota, ledger = root / "quota.jsonl", root / "ledger.jsonl"
             quota.write_bytes(b'{"original":"quota"}\n')
             ledger.write_bytes(b'{"original":"ledger"}\n')
@@ -67,7 +67,7 @@ class LocalContractV4Tests(unittest.TestCase):
                 raise RuntimeError("interrupted")
             with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {12: fail}), self.assertRaisesRegex(RuntimeError, "interrupted"):
                 monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12)
-            self.assertEqual(delivery.manifest("local", "All"), old)
+            self.assertEqual(json.loads(delivery.bulk(False)), old)
             self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
             self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12), [12])
             with index.transaction() as db:
@@ -75,7 +75,7 @@ class LocalContractV4Tests(unittest.TestCase):
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM dashboard_blobs").fetchone()[0], 0)
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM dashboard_days").fetchone()[0], 0)
             delivery.prepare(point["timestamp"] + 10 * 86400)
-            self.assertIsNotNone(delivery.manifest("local", "All"))
+            self.assertIsNotNone(json.loads(delivery.bulk(False)))
             self.assertEqual(quota.read_bytes(), b'{"original":"quota"}\n')
             self.assertEqual(ledger.read_bytes(), b'{"original":"ledger"}\n')
             self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=12), [])

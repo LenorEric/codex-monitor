@@ -106,7 +106,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 </div>
 </section>
 <section class="card wide">
-<div class="card-title"><h2>Token Usage</h2><span class="rate"><span id="tokenTimeSpan" hidden></span><span id="tokenSessionCount">0 sessions</span></span></div>
+<div class="card-title"><h2>Token Usage</h2><span class="rate"><span id="tokenTimeSpan" hidden></span></span></div>
 <div class="token-metrics">
 <div class="token-metric"><div class="token-metric-label">Input</div><div class="token-metric-value" id="tokenInput">0</div></div>
 <div class="token-metric"><div class="token-metric-label">Cached input</div><div class="token-metric-value" id="tokenCachedInput">0</div></div>
@@ -130,13 +130,13 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 </section>
 <section class="card" data-quota-widget>
 <div class="card-title"><h2>5h Cost vs Usage</h2><span class="rate" id="rate5h">Cost / 100%: N/A</span></div>
-<div class="meta"><span>Period midpoint on X axis</span><span>Cost / 100% on Y axis</span></div>
+<div class="meta"><span>Cost-weighted time on X axis</span><span>Cost / 100% on Y axis</span></div>
 <canvas class="chart" id="scatter5h"></canvas>
 <div class="legend" id="scatter5hLegend"></div>
 </section>
 <section class="card" data-quota-widget>
 <div class="card-title"><h2>7d Cost vs Usage</h2><span class="rate" id="rate7d">Cost / 100%: N/A</span></div>
-<div class="meta"><span>Period midpoint on X axis</span><span>Cost / 100% on Y axis</span></div>
+<div class="meta"><span>Cost-weighted time on X axis</span><span>Cost / 100% on Y axis</span></div>
 <canvas class="chart" id="scatter7d"></canvas>
 <div class="legend" id="scatter7dLegend"></div>
 </section>
@@ -178,13 +178,14 @@ const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
 const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections";
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
 let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}};
-let statusGeneration=0;
-let pendingStatusRequest=null, statusEtag=null, currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
-let historyScope=null,displayedScope=null,historyGeneration=null,drawGeneration=0,chunkCacheBytes=0;
+let currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false;
+let historyScope=null,historyGeneration=null,drawGeneration=0;
 let curveColors=new Map();
 let availableScopeAccounts=new Map();
 let costTimeMode="spending", costTimeFrame=null;
-const chunkCache=new Map(),scopeCache=new Map(),historyRequests=new Map();
+let bulkData=null,bulkRequest=null,liveSocket=null,liveRetry=null,liveDelay=1000;
+const transportAccounts=new Map();
+const dateMs=value=>typeof value==="number"?value*1000:Date.parse(value||"");
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
 const DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50, DATE_PICKER_VIRTUAL_WIDTH=280, DATE_PICKER_VIRTUAL_HEIGHT=360, DATE_PICKER_VIRTUAL_PADDING=8;
@@ -198,7 +199,7 @@ const tokenFmt=n=>{
 };
 const usd=n=>n==null?"N/A":`$${new Intl.NumberFormat(undefined,{minimumFractionDigits:0,maximumFractionDigits:2}).format(Number(n))}`;
 const pct=n=>n==null?"N/A":`${Math.round(n)}%`;
-const secondsAgo=value=>{const timestamp=Date.parse(value||"");return Number.isFinite(timestamp)?`${Math.max(0,Math.floor((Date.now()-timestamp)/1000))}s ago`:"N/A"};
+const secondsAgo=value=>{const timestamp=dateMs(value);return Number.isFinite(timestamp)?`${Math.max(0,Math.floor((Date.now()-timestamp)/1000))}s ago`:"N/A"};
 const remainingTime=value=>{const seconds=Math.max(0,Math.floor(((value==null?NaN:value*1000)-Date.now())/1000));if(!Number.isFinite(seconds))return "N/A";const days=Math.floor(seconds/86400),hours=Math.floor(seconds%86400/3600),minutes=Math.floor(seconds%3600/60);return days?`${days}d ${hours}h`:hours?`${hours}h ${minutes}m`:`${minutes}m`};
 const chartEaseInOut=progress=>(1-Math.cos(Math.PI*progress))/2;
 const chartStates={}, usageTimeChartStates={}, NODE_RADIUS=5, CHART_MARGINS={l:48,r:18,t:16,b:34};
@@ -224,14 +225,14 @@ function pointFromSample(sample){
   if(!sample)return null;
   const windowPoint=label=>{
     const window=(sample.windows||{})[label]||{};
-    return {raw:window.usedPercent??null,continuous:window.usedPercent??null,resetAt:window.resetAt,plan:window.plan||"plus"};
+    return {raw:window.usedPercent??null,continuous:window.usedPercent??null,resetAt:window.resetAt,multiplier:window.multiplier??window.planMultiplier??1};
   };
   return {checkedAt:sample.checkedAt,timestamp:eventTimestamp(sample),fiveHour:windowPoint("5h"),sevenDay:windowPoint("7d"),cost:sample.cost||{}};
 }
 function eventTimestamp(p){
   const value=Number(p.timestamp);
   if(Number.isFinite(value))return value;
-  const parsed=Date.parse(p.checkedAt||"")/1000;
+  const parsed=(typeof p.checkedAt==="number"?p.checkedAt*1000:Date.parse(p.checkedAt||""))/1000;
   return Number.isFinite(parsed)?parsed:null;
 }
 function updateWindowTime(id,display,resetAt,durationSeconds){
@@ -418,24 +419,23 @@ function accountFilteredQuotaPoints(list){
   return selectedAccounts.size?list.filter(point=>selectedAccounts.has(usageAccountId(point))):list;
 }
 function filteredTokenSessions(list){
-  if(payload.scopedHistory)return list;
   if(selected==="All"||!list.length)return list;
   if(selected==="Date"){
     const bounds=selectedDateBounds();
     if(!bounds)return [];
-    return list.filter(session=>{const timestamp=Date.parse(session.updatedAt||session.startedAt||"");return Number.isFinite(timestamp)&&timestamp>=bounds.startMs&&timestamp<bounds.endMs});
+    return list.filter(session=>{const timestamp=dateMs(session.updatedAt??session.startedAt);return Number.isFinite(timestamp)&&timestamp>=bounds.startMs&&timestamp<bounds.endMs});
   }
-  const timestamps=list.map(session=>Date.parse(session.updatedAt||session.startedAt||"")/1000).filter(Number.isFinite);
+  const timestamps=list.map(session=>dateMs(session.updatedAt??session.startedAt)/1000).filter(Number.isFinite);
   if(!timestamps.length)return [];
   const max=Math.max(...timestamps), seconds=Object.fromEntries(ranges)[selected];
-  return list.filter(session=>{const timestamp=Date.parse(session.updatedAt||session.startedAt||"")/1000;return Number.isFinite(timestamp)&&timestamp>=max-seconds});
+  return list.filter(session=>{const timestamp=dateMs(session.updatedAt??session.startedAt)/1000;return Number.isFinite(timestamp)&&timestamp>=max-seconds});
 }
 function selectedTokenModelValues(session){
   const values=Object.entries(session.byModel||{});
   return selectedModels.size?values.filter(([model])=>selectedModels.has(model)).map(([,value])=>value):values.map(([,value])=>value);
 }
 function tokenDateSpan(sessions){
-  const starts=sessions.map(session=>Date.parse(session.startedAt||session.updatedAt||"")).filter(Number.isFinite), ends=sessions.map(session=>Date.parse(session.updatedAt||session.startedAt||"")).filter(Number.isFinite);
+  const starts=sessions.map(session=>dateMs(session.startedAt??session.updatedAt)).filter(Number.isFinite), ends=sessions.map(session=>dateMs(session.updatedAt??session.startedAt)).filter(Number.isFinite);
   return starts.length&&ends.length?`From ${new Date(Math.min(...starts)).toLocaleDateString()} To ${new Date(Math.max(...ends)).toLocaleDateString()} · `:"";
 }
 function updateTokenSummary(sessions){
@@ -458,8 +458,6 @@ function updateTokenSummary(sessions){
   document.getElementById("tokenCacheHit").textContent=cacheable?`${(totals.cachedInputTokens/cacheable*100).toFixed(1)}%`:"0%";
   document.getElementById("tokenCost").textContent=usd(totals.cost);
   const timeSpan=document.getElementById("tokenTimeSpan");timeSpan.textContent=tokenDateSpan(included);timeSpan.hidden=selected!=="All"||!timeSpan.textContent;
-  const count=included.reduce((sum,session)=>sum+(session.sessionCount??1),0);
-  document.getElementById("tokenSessionCount").textContent=`${count} session${count===1?"":"s"}`;
 }
 function setupControls(){
   document.getElementById("ranges").replaceChildren(...ranges.map(([range])=>{const button=document.createElement("button");button.dataset.range=range;button.classList.toggle("active",range===selected);button.textContent=range;return button}));
@@ -482,22 +480,6 @@ function setupUsageFoldControls(){
   sync();normalize.onclick=()=>{normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)};
 }
 addEventListener("pointermove",updateDateLeavePointer,{passive:true});
-function requestStatus(){
-  if(pendingStatusRequest)return pendingStatusRequest;
-  const generation=statusGeneration;
-  const request=!vscode?fetch("/api/status",{cache:"no-store",headers:statusEtag?{"If-None-Match":statusEtag}:{}}).then(async response=>{if(response.status===304)return {payload:currentStatus,etag:statusEtag,notModified:true};if(!response.ok)throw new Error(`HTTP ${response.status}`);return {payload:await response.json(),etag:response.headers.get("ETag"),notModified:false}}):new Promise((resolve,reject)=>{
-    const receive=event=>{
-      if(event.data?.type!=="codexUsageStatus")return;
-      removeEventListener("message",receive);clearTimeout(timeout);
-      event.data.error?reject(new Error(event.data.error)):resolve(event.data.response);
-    };
-    const timeout=setTimeout(()=>{removeEventListener("message",receive);reject(new Error("Python monitor did not respond"))},10000);
-    addEventListener("message",receive);
-    vscode.postMessage({type:"getCodexUsageStatus"});
-  });
-  pendingStatusRequest=request.then(response=>({...response,statusGeneration:generation})).finally(()=>pendingStatusRequest=null);
-  return pendingStatusRequest;
-}
 function accountAction(action,body){
   if(!vscode){
     const url={switch:"/api/accounts/switch",rename:"/api/accounts/rename",delete:"/api/accounts/delete",login:"/api/control/login",setup:"/api/control/setup"}[action];
@@ -570,10 +552,10 @@ function renderAccounts(accounts){
 }
 async function performAccountAction(action,body){
   if(actionBusy)return;
-  actionBusy=true;statusGeneration++;if(payload.accounts)payload.accounts={...payload.accounts,error:null};renderAccounts(payload.accounts);
+  actionBusy=true;if(payload.accounts)payload.accounts={...payload.accounts,error:null};renderAccounts(payload.accounts);
   const actionName={switch:"Account Switch",rename:"Account Rename",delete:"Account Delete"}[action],workingDetail={switch:"Saving the outgoing account and activating the selected account.",rename:"Updating the account label and persisted local history.",delete:"Removing the inactive account from this machine."}[action],workingSteps={switch:["Verify and save outgoing credentials","Load selected credentials into auth.json"],rename:["Update the account label","Rewrite matching local history labels"],delete:["Validate that deletion is allowed","Remove local credentials and manifest entry"]}[action],workingMessage=showMessage(`${actionName} Started`,workingDetail,messageDetailReport(actionName,"In progress",workingSteps.map((name,index)=>({name,status:index?"pending":"in progress",detail:index?"Waiting for the preceding step.":"The operation is running."}))),"progress");
   let succeeded=false;
-  try{const result=await authenticatedAccountAction(action,body);applyCurrentStatus({...currentStatus,...result.status,accounts:result.status?.accounts||result.accounts||payload.accounts});statusEtag=null;succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(`${actionName} Completed`,{switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(action,"Completed",steps),"success")}
+  try{const result=await authenticatedAccountAction(action,body);if(bulkData)bulkData.state={...bulkData.state,...result.status,accounts:result.status?.accounts||result.accounts||payload.accounts};applyCurrentStatus({...currentStatus,...result.status,accounts:result.status?.accounts||result.accounts||payload.accounts});succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(`${actionName} Completed`,{switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(action,"Completed",steps),"success")}
   catch(error){payload.accounts={...(payload.accounts||{}),error:error.message||String(error)}}
   finally{workingMessage.dismiss();actionBusy=false;renderAccounts(payload.accounts)}
   if(succeeded)load(true);
@@ -625,87 +607,139 @@ function renderCurrentStatus(status){
     :payload.accounts?.items?.find(account=>account.id===payload.accounts.activeAccountId)?.isApiAccount?"Tracking API token usage from Codex sessions."
     :payload.accounts?.activeAccountId?"Refreshing account usage…":"No valid delta pairs yet. Keep this page open while polling.";
 }
-function updateLastUpdateAge(){if(lastUpdateTimestamp&&!document.hidden)document.getElementById("status").textContent=`Last update ${secondsAgo(lastUpdateTimestamp)}`}
+function updateLastUpdateAge(){if(lastUpdateTimestamp&&!document.hidden){document.getElementById("status").textContent=`Last update ${secondsAgo(lastUpdateTimestamp)}`;for(const [window,id,period] of [["5h","time5h",18000],["7d","time7d",604800]])updateWindowTime(id,{},currentStatus?.lastSample?.windows?.[window]?.resetAt,period)}}
 function showRefreshError(error){
   lastUpdateTimestamp=null;const detail=error.message||String(error);document.getElementById("status").textContent=`Dashboard refresh failed; retrying automatically. ${detail}`;
-  if(!refreshErrorShown){showMessage("Dashboard Refresh Failed",`Usage data could not be refreshed; retrying automatically: ${detail}`,messageDetailReport("Dashboard refresh","Failed",[{name:"Status or series request",status:"failed",detail},{name:"Automatic retry",status:"in progress",detail:"Polling remains active and will retry without user action."}]),"error");refreshErrorShown=true}
+  if(!refreshErrorShown){showMessage("Dashboard Refresh Failed",`Usage data could not be refreshed; retrying automatically: ${detail}`,messageDetailReport("Dashboard refresh","Failed",[{name:"Status or series request",status:"failed",detail},{name:"Automatic retry",status:"in progress",detail:"The connection will reconnect and resume automatically."}]),"error");refreshErrorShown=true}
 }
-function validateView(view){
-  if(!view||!Array.isArray(view.quotaPoints)||!Array.isArray(view.tokenSessions)||!Array.isArray(view.costUsage?.fiveHour)||!Array.isArray(view.costUsage?.sevenDay))throw new Error("Invalid dashboard snapshot");
-  for(const row of [...view.quotaPoints,...view.tokenSessions,...view.costUsage.fiveHour,...view.costUsage.sevenDay])if(typeof row?._key!=="string"||!row._key)throw new Error("Dashboard row is missing its key");
-  if(view.costTime!==undefined&&(!Array.isArray(view.costTime)||view.costTime.some(row=>typeof row?._key!=="string"||!row._key)))throw new Error("Invalid cost time collection");
-  return view;
+function normalizeModels(rows,column,models){
+  for(const row of rows)for(const value of row[column])if(typeof value[0]==="number")value[0]=models[value[0]];
+  return rows;
 }
-async function load(force=false){
-  if(document.hidden&&!force)return;
-  const scope={view:dataView,range:selected}, bounds=selected==="Date"?selectedDateBounds():null;
-  if(bounds){scope.start=String(bounds.startMs/1000);scope.end=String(bounds.endMs/1000)}
-  const key=new URLSearchParams(scope).toString(), sequence=++seriesLoadSequence, cached=scopeCache.get(key);
-  if(historyScope!==key){
-    historyScope=key;historyGeneration=null;
-    if(cached)showScope(key,cached);
-    else{
-      drawGeneration++;hideTip();
-      document.getElementById("historyStatus").textContent="";
+function acceptBulk(value){
+  if(!value||!value.epoch||!Array.isArray(value.accounts)||!value.cursors)throw new Error("Invalid bulk snapshot");
+  const next=new Map();
+  for(const account of value.accounts){
+    const views={};
+    for(const view of ["local","merged"]){
+      const data=account[view];
+      if(!data)continue;
+      const state={quota:data.quota,legacy:data.legacy||[],frame:null};
+      for(const channel of ["tokens","usage:5h","usage:7d","chart:5h","chart:7d"]){
+        const rows=data[channel]||[];
+        if(channel==="tokens")normalizeModels(rows,2,value.models);
+        if(channel.startsWith("chart:"))normalizeModels(rows,6,value.models);
+        state[channel]=new Map(rows.map(row=>[row[0],row]));
+      }
+      for(const row of state.legacy)for(const entry of row[2])if(typeof entry[0]==="number")entry[0]=value.models[entry[0]];
+      views[view]=state;
+    }
+    next.set(account.id,views);
+  }
+  transportAccounts.clear();for(const [key,value] of next)transportAccounts.set(key,value);
+  bulkData=value;historyGeneration=value.epoch;refreshErrorShown=false;
+  showBulkView();ensureControlPassword(value.state||{});connectLive();
+}
+function tokenModelValues(values){
+  const byModel={};
+  for(const [model,tier,fresh,cached,output,write,cost] of values){
+    const value=byModel[model]||(byModel[model]={usageTokens:{freshInputTokens:0,cachedInputTokens:0,outputTokens:0,cacheWriteInputTokens:0},cost:{totalCostUsd:0}});
+    value.usageTokens.freshInputTokens+=fresh;value.usageTokens.cachedInputTokens+=cached;value.usageTokens.outputTokens+=output;value.usageTokens.cacheWriteInputTokens+=write;value.cost.totalCostUsd+=cost/1e8;
+  }
+  return byModel;
+}
+function accountFrame(account,state){
+  if(state.frame)return state.frame;
+  const frame={quotaPoints:[],tokenSessions:[],costTime:[],costUsage:{fiveHour:[],sevenDay:[]}};
+  for(const [window,label] of [["5h","fiveHour"],["7d","sevenDay"]]){
+    for(const [id,first,last,percent,multiplier,flags] of state["usage:"+window].values()){
+      for(const timestamp of first===last?[first]:[first,last])frame.quotaPoints.push({_key:`${window}:${id}:${timestamp}`,timestamp,usageAccountId:account,resetWindow:label,runId:id,breakBefore:timestamp===first?Boolean(flags&1):false,
+        fiveHour:{raw:null,continuous:null},sevenDay:{raw:null,continuous:null},[label]:{raw:percent,continuous:percent,multiplier},...(first<last&&timestamp===last?{compactedFrom:first}:{})});
+    }
+    for(const [id,start,end,stamp,multiplier,delta,models] of state["chart:"+window].values()){
+      const costs=Object.fromEntries(models.map(([model,cost])=>[model,cost/1e8])), usage=Object.fromEntries(models.map(([model,cost,amount])=>[model,amount])),total=models.reduce((sum,row)=>sum+row[1],0)/1e8;
+      frame.costUsage[label].push({_key:id,timestamp:stamp,startedAt:start,endedAt:end,usageAccountId:account,planMultiplier:multiplier,deltaPercent:delta,costByModelUsd:costs,usageByModel:usage,totalCostUsd:total,costPer100PercentUsd:delta?total/delta*100:null});
     }
   }
-  try{
-    const response=await requestDashboard(scope,cached?.etag), manifest=response.notModified?cached?.manifest:response.payload;
-    if(sequence!==seriesLoadSequence)return;
-    if(!manifest||manifest.protocolVersion!==4||manifest.view!==scope.view||manifest.range!==scope.range||!Array.isArray(manifest.chunks))throw new Error("Incompatible dashboard scope response");
-    if(historyGeneration===manifest.generation)return;
-    const frames=new Array(manifest.chunks.length);let next=0;
-    await Promise.all(Array.from({length:Math.min(4,frames.length)},async()=>{
-      while(next<frames.length){const index=next++, id=manifest.chunks[index];let entry=chunkCache.get(id);
-        if(!entry){const result=await requestDashboard({chunkId:id});entry=chunkCache.get(id);if(!entry){entry={value:validateView(result.payload),bytes:JSON.stringify(result.payload).length*2};chunkCache.set(id,entry);chunkCacheBytes+=entry.bytes}
-          while(chunkCacheBytes>24*1024*1024&&chunkCache.size>1){const oldest=chunkCache.keys().next().value;chunkCacheBytes-=chunkCache.get(oldest).bytes;chunkCache.delete(oldest)}}
-        frames[index]=entry.value;
-        if(sequence!==seriesLoadSequence)return;
-      }
-    }));
-    if(sequence!==seriesLoadSequence)return;
-    const value={quotaPoints:[],costTime:[],costTimeBounds:manifest.costTimeBounds,costTimeTotals:manifest.costTimeTotals,costTimeResolution:manifest.costTimeResolution,
-      tokenSessions:manifest.tokenSessions||[],costUsage:{fiveHour:[],sevenDay:[]},historyStats:{},maxima:manifest.maxima,rateRows:manifest.rateRows,accountLabels:manifest.accountLabels,scopedHistory:true};
-    for(const frame of frames){for(const row of frame.quotaPoints)value.quotaPoints.push(row);value.costTime.push(...(frame.costTime||[]));for(const name of ["fiveHour","sevenDay"])for(const row of frame.costUsage[name])value.costUsage[name].push(row)}
-    const entry={manifest,value,etag:response.etag||cached?.etag,bytes:JSON.stringify(value).length*2};
-    scopeCache.delete(key);scopeCache.set(key,entry);
-    while(scopeCache.size>8||[...scopeCache.values()].reduce((sum,item)=>sum+item.bytes,0)>24*1024*1024&&scopeCache.size>1)scopeCache.delete(scopeCache.keys().next().value);
-    showScope(key,entry);
-  }catch(error){if(sequence===seriesLoadSequence){document.getElementById("historyStatus").textContent=error.preparing?"Preparing history in the background…":"History refresh failed; retrying automatically. "+error.message}}
+  for(const [id,timestamp,values] of state.tokens.values()){
+    const byModel=tokenModelValues(values),costs={};
+    for(const [model,value] of Object.entries(byModel))costs[model]=value.cost.totalCostUsd;
+    frame.tokenSessions.push({_key:id,timestamp,startedAt:timestamp,updatedAt:timestamp,usageAccountId:account,byModel});
+    frame.costTime.push({_key:id,timestamp,usageAccountId:account,costByModelUsd:costs,totalCostUsd:Object.values(costs).reduce((sum,value)=>sum+value,0)});
+  }
+  for(const [start,end,values] of state.legacy)frame.tokenSessions.push({timestamp:end,startedAt:start,updatedAt:end,usageAccountId:account,byModel:tokenModelValues(values)});
+  frame.quotaPoints.sort(compareQuotaPoints);frame.costTime.sort((a,b)=>a.timestamp-b.timestamp);
+  state.frame=frame;return frame;
 }
-function requestDashboard(scope,etag){
-  const key=JSON.stringify([scope,etag]);if(historyRequests.has(key))return historyRequests.get(key);
-  const request=!vscode?fetch(scope.chunkId?`/api/dashboard/chunk?id=${encodeURIComponent(scope.chunkId)}`:`/api/dashboard?${new URLSearchParams(scope)}`,{cache:scope.chunkId?"force-cache":"no-cache",headers:etag?{"If-None-Match":etag}:{}}).then(async response=>{
-    if(response.status===304)return {notModified:true,etag};
-    const payload=await response.json();if(!response.ok){const error=new Error(payload.error||`HTTP ${response.status}`);error.preparing=payload.preparing;throw error}return {payload,etag:response.headers.get("ETag")};
-  }):new Promise((resolve,reject)=>{
-    const requestId=`history-${++actionSequence}`,receive=event=>{if(event.data?.type!=="codexDashboardResponse"||event.data.requestId!==requestId)return;removeEventListener("message",receive);clearTimeout(timeout);if(event.data.error){const error=new Error(event.data.error);error.preparing=event.data.preparing;reject(error)}else resolve(event.data.response)};
-    const timeout=setTimeout(()=>{removeEventListener("message",receive);reject(new Error("History request timed out"))},30000);addEventListener("message",receive);vscode.postMessage({type:"getCodexDashboard",requestId,scope,etag});
+function showBulkView(){
+  if(!bulkData)return;
+  const next={quotaPoints:[],tokenSessions:[],costTime:[],costUsage:{fiveHour:[],sevenDay:[]}};
+  next.accountLabels=Object.fromEntries(bulkData.accounts.map(account=>[account.id,account.label]));
+  for(const [account,views] of transportAccounts){
+    const state=views[dataView];if(!state)continue;
+    const frame=accountFrame(account,state);
+    for(const name of ["quotaPoints","tokenSessions","costTime"])for(const row of frame[name])next[name].push(row);
+    for(const label of ["fiveHour","sevenDay"])next.costUsage[label].push(...frame.costUsage[label]);
+  }
+  next.quotaPoints.sort(compareQuotaPoints);next.costTime.sort((a,b)=>a.timestamp-b.timestamp);
+  next.maxima={quotaMax:next.quotaPoints.reduce((max,row)=>Math.max(max,row.timestamp),0),costMax:[...next.costUsage.fiveHour,...next.costUsage.sevenDay].reduce((max,row)=>Math.max(max,row.timestamp),0)};
+  const max=next.costTime.at(-1)?.timestamp,min=next.costTime[0]?.timestamp,bounds=selected==="Date"?selectedDateBounds():null;
+  next.costTimeBounds=bounds?[bounds.startMs/1000,bounds.endMs/1000]:max===undefined?null:[selected==="All"?min:max-Object.fromEntries(ranges)[selected],max];
+  const status={...(bulkData.state||{}),accountStatuses:undefined};
+  const active=status.accounts?.items?.find(item=>item.id===status.accounts.activeAccountId),state=transportAccounts.get(active?.usageAccountId)?.[dataView];
+  if(state&&!active.isApiAccount){
+    const windows={};let checkedAt=0;
+    for(const window of ["5h","7d"]){const rows=[...state["usage:"+window].values()].filter(row=>Number.isFinite(row[3])).sort((a,b)=>a[2]-b[2]),last=rows.at(-1);if(last){windows[window]={usedPercent:last[3],resetAt:state.quota[window],multiplier:last[4]};checkedAt=Math.max(checkedAt,last[2])}}
+    status.lastSample={checkedAt,windows};status.display={};
+  }
+  payload=next;historyScope=`${dataView}:${selected}:${selectedDate}`;applyCurrentStatus(status);document.getElementById("historyStatus").textContent="";drawAll(true);
+}
+function applyLive(packet){
+  if(packet.type==="refresh"){reloadBulk();return}
+  if(!bulkData||packet.epoch!==bulkData.epoch)return;
+  if(packet.seq<=bulkData.cursors[packet.stream])return;
+  if(packet.seq!==bulkData.cursors[packet.stream]+1){reloadBulk();return}
+  if(packet.channel==="state")bulkData.state=packet.data;
+  else{
+    let views=transportAccounts.get(packet.account);
+    if(packet.channel==="account"){
+      if(!views){views={};for(const view of ["local","merged"]){const data={quota:{"5h":null,"7d":null},legacy:[],frame:null};for(const channel of ["tokens","usage:5h","usage:7d","chart:5h","chart:7d"])data[channel]=new Map();views[view]=data}transportAccounts.set(packet.account,views)}
+      if(!bulkData.accounts.some(account=>account.id===packet.account))bulkData.accounts.push({id:packet.account,label:packet.data.label});
+      bulkData.cursors[packet.stream]=packet.seq;showBulkView();return;
+    }
+    if(!views){reloadBulk();return}
+    const state=views[packet.stream];
+    if(packet.channel.startsWith("quota:"))state.quota[packet.channel.slice(6)]=packet.data[0];
+    else if(packet.channel==="tokens")for(const row of packet.data)state.tokens.set(row[0],row);
+    else{for(const key of packet.data.remove)state[packet.channel].delete(key);for(const row of packet.data.set)state[packet.channel].set(row[0],row)}
+    state.frame=null;
+  }
+  bulkData.cursors[packet.stream]=packet.seq;if(packet.stream===dataView||packet.stream==="state")showBulkView();
+}
+function connectLive(){
+  if(vscode){vscode.postMessage({type:"subscribeCodexDashboard",epoch:bulkData.epoch,cursors:bulkData.cursors});return}
+  if(liveSocket)liveSocket.close();clearTimeout(liveRetry);
+  const socket=new WebSocket(`${location.protocol==="https:"?"wss:":"ws:"}//${location.host}/api/dashboard/live`);liveSocket=socket;
+  socket.onopen=()=>{liveDelay=1000;socket.send(JSON.stringify({type:"subscribe",epoch:bulkData.epoch,cursors:bulkData.cursors}))};
+  socket.onmessage=event=>{try{applyLive(JSON.parse(event.data))}catch(error){showRefreshError(error);reloadBulk()}};
+  socket.onclose=()=>{if(liveSocket!==socket)return;liveRetry=setTimeout(connectLive,liveDelay);liveDelay=Math.min(30000,liveDelay*2)};
+}
+addEventListener("message",event=>{if(event.data?.type==="codexDashboardLive")applyLive(event.data.packet)});
+async function reloadBulk(){
+  if(bulkRequest)return bulkRequest;
+  const request=!vscode?fetch("/api/dashboard",{cache:"no-store"}).then(async response=>{if(!response.ok)throw new Error(`HTTP ${response.status}`);return response.json()}):requestDashboard();
+  bulkRequest=request.then(acceptBulk).catch(error=>{showRefreshError(error);clearTimeout(liveRetry);liveRetry=setTimeout(reloadBulk,Math.min(30000,liveDelay));liveDelay=Math.min(30000,liveDelay*2)}).finally(()=>bulkRequest=null);
+  return bulkRequest;
+}
+async function load(){if(bulkData)showBulkView();else await reloadBulk()}
+function requestDashboard(){
+  return new Promise((resolve,reject)=>{
+    const requestId=`bulk-${++actionSequence}`,receive=event=>{if(event.data?.type!=="codexDashboardResponse"||event.data.requestId!==requestId)return;removeEventListener("message",receive);clearTimeout(timeout);event.data.error?reject(new Error(event.data.error)):resolve(event.data.response)};
+    const timeout=setTimeout(()=>{removeEventListener("message",receive);reject(new Error("Bulk request timed out"))},60000);addEventListener("message",receive);vscode.postMessage({type:"getCodexDashboard",requestId});
   });
-  const pending=request.finally(()=>historyRequests.delete(key));historyRequests.set(key,pending);return pending;
-}
-function showScope(key,entry){
-  if(historyScope!==key)return;
-  payload={...entry.value,accounts:currentStatus?.accounts,lastSample:currentStatus?.lastSample,display:currentStatus?.display};historyGeneration=entry.manifest.generation;
-  document.getElementById("historyStatus").textContent="";
-  drawAll(displayedScope!==null&&displayedScope!==key);
-  displayedScope=key;
 }
 function setupDataView(){
   document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();setupDataView();load(true)}});
-}
-async function pollStatus(force=false){
-  if(actionBusy||document.hidden&&!force)return;
-  const generation=statusGeneration;
-  try{
-    const response=await requestStatus(), status=response.payload;
-    if(generation!==statusGeneration||response.statusGeneration!==undefined&&response.statusGeneration!==statusGeneration)return;
-    if(!status)throw new Error("Status response was empty");
-    const namesChanged=JSON.stringify(currentStatus?.accounts?.usageGroups)!==JSON.stringify(status.accounts?.usageGroups);
-    statusEtag=response.etag||statusEtag;
-    refreshErrorShown=false;applyCurrentStatus(status);if(namesChanged&&historyGeneration)drawAll();
-    ensureControlPassword(status);
-  }catch(error){if(generation===statusGeneration)showRefreshError(error)}
 }
 function extent(values){
   const nums=values.filter(Number.isFinite);
@@ -747,7 +781,7 @@ function chart(id, series, opts={}){
   const X=x=>x0===x1?(m.l+w-m.r)/2:m.l+(x-x0)/(x1-x0)*(w-m.l-m.r), Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
   const previous=chartStates[id], previousSeries=previous?.series||[];
   const eventTime=p=>Number.isFinite(p.ref.timestamp)?p.ref.timestamp:Date.parse(p.ref.checkedAt||"")/1000;
-  const parsedTime=s=>Number.isFinite(Date.parse(s||"")/1000)?Date.parse(s)/1000:null;
+  const parsedTime=s=>Number.isFinite(dateMs(s)/1000)?Date.parse(s)/1000:null;
   const pointKey=p=>p.ref.synthetic?"baseline":p.ref.mergedCount>1?`${p.ref.mergedFrom}|${p.ref.mergedTo}`:p.ref._key||String(eventTimestamp(p.ref));
   const preparePoint=p=>{
     const time=eventTime(p), from=parsedTime(p.ref.mergedFrom)??time, to=parsedTime(p.ref.mergedTo)??time;
@@ -848,8 +882,8 @@ function showTip(e,hit){
     `Cost / 100% ${usd(p.costPer100PercentUsd)}`,
   ];
   if(p.usageAccountId)rows.push(`Account ${accountDisplayName(usageAccountId(p),p.accountLabel)}`);
-  if(p.startedAt&&p.endedAt)rows.push(`Period ${new Date(p.startedAt).toLocaleString()} to ${new Date(p.endedAt).toLocaleString()}`);
-  if(p.plan&&p.plan!=="unknown")rows.push(`Plan ${p.plan} (${p.planMultiplier||1}x)`);
+  if(p.startedAt&&p.endedAt)rows.push(`Period ${new Date(dateMs(p.startedAt)).toLocaleString()} to ${new Date(dateMs(p.endedAt)).toLocaleString()}`);
+  if(Number.isFinite(p.planMultiplier))rows.push(`Multiplier ×${p.planMultiplier}`);
   if(p.mergedCount>1)rows.push(`Merged ${p.mergedCount} points from ${new Date(p.mergedFrom).toLocaleString()} to ${new Date(p.mergedTo).toLocaleString()}`);
   renderTip(tip,rows);
   tip.style.display="block";
@@ -898,7 +932,7 @@ function quotaPointsInRange(points,domain){
   if(!domain)return [];
   const visible=new Map(), add=(point,timestamp,boundary)=>{
     if(timestamp<domain[0]||timestamp>domain[1])return;
-    const key=`${usageAccountId(point)}\0${timestamp}`;
+    const key=`${usageAccountId(point)}\0${point.resetWindow||""}\0${timestamp}`;
     if(boundary&&visible.has(key))return;
     visible.set(key,boundary?{...point,checkedAt:new Date(timestamp*1000).toISOString(),timestamp,compactedBoundary:true}:point);
   };
@@ -936,7 +970,7 @@ function axisTickPosition(start,pixels,index,count){return count===1?start+pixel
 function drawXAxisTickLabels(ctx,labels,start,pixels,y){
   labels.forEach((label,index)=>{ctx.textAlign=labels.length===1?"center":index===0?"left":index===labels.length-1?"right":"center";ctx.fillText(label,axisTickPosition(start,pixels,index,labels.length),y)});
 }
-function plusEquivalentUsage(point,label,valueOf){return valueOf(point)*({plus:1,pro_lite:5,pro:10}[point[label]?.plan]||1)}
+function plusEquivalentUsage(point,label,valueOf){return valueOf(point)*(point[label]?.multiplier??1)}
 function compactedUsageRanges(points){
   return points.map(point=>({start:point.overviewBucket?.start??point.compactedFrom,end:point.overviewBucket?.end??eventTimestamp(point)})).filter(range=>Number.isFinite(range.start)&&Number.isFinite(range.end)&&range.start<range.end).sort((a,b)=>a.start-b.start||a.end-b.end).reduce((merged,range)=>{
     const previous=merged.at(-1);
@@ -950,6 +984,7 @@ function compactedUsageGap(previous,current,ranges){
   return Number.isFinite(previousAt)&&Number.isFinite(currentAt)&&ranges.some(range=>range.start<=previousAt&&currentAt<=range.end);
 }
 function breakUsageCurve(previous,current,label,valueOf,compactedRanges=[]){
+  if(typeof current.breakBefore==="boolean")return current.breakBefore;
   if(compactedUsageGap(previous,current,compactedRanges))return false;
   const gap=eventTimestamp(current)-eventTimestamp(previous);
   if((Number.isFinite(previous.compactedFrom)||Number.isFinite(current.compactedFrom))&&gap<=4*3600)return false;
@@ -1115,7 +1150,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
       const point=nearest.point, tip=document.getElementById("tip"), window=point[label]||{};
       renderTip(tip,[
         {text:new Date(eventTimestamp(point)*1000).toLocaleString(),strong:true},`${label==="fiveHour"?"5h":"7d"} ${normalizedUsage?"normalized ":""}usage ${Number(nearest.value).toFixed(1)}%`,
-        normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}% · ${window.plan==="pro_lite"?"Pro Lite":window.plan==="pro"?"Pro":"Plus"} ×${{pro_lite:5,pro:10}[window.plan]||1}`:null,
+        normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}% · ×${window.multiplier??1}`:null,
         `Account ${accountDisplayName(usageAccountId(point),point.accountLabel)}`,window.resetAt?`Reset ${new Date(window.resetAt*1000).toLocaleString()}`:null,
       ]);
       tip.style.display="block";positionTip(event,tip);
@@ -1213,6 +1248,26 @@ function costTimeUsageIndex(points,time,after=false){
   let low=0,high=points.length;
   while(low<high){const middle=(low+high)>>>1,timestamp=eventTimestamp(points[middle]);if(after?timestamp<=time:timestamp<time)low=middle+1;else high=middle}
   return low;
+}
+let costHoverPayload=null,costHoverSelection="",costHoverModels=new Map();
+function costModelHover(start,end,time){
+  const chartStart=payload.costTimeBounds?.[0]??start,selection=JSON.stringify([chartStart,...selectedAccounts,...selectedModels]);
+  if(costHoverPayload!==payload||costHoverSelection!==selection){
+    costHoverPayload=payload;costHoverSelection=selection;costHoverModels=new Map();
+    for(const row of payload.costTime||[]){
+      if(row.timestamp<chartStart||selectedAccounts.size&&!selectedAccounts.has(usageAccountId(row)))continue;
+      for(const [model,cost] of Object.entries(row.costByModelUsd||{})){
+        if(selectedModels.size&&!selectedModels.has(model))continue;
+        if(!costHoverModels.has(model))costHoverModels.set(model,[]);
+        costHoverModels.get(model).push([row.timestamp,Math.round(cost*1e8)]);
+      }
+    }
+    for(const [model,rows] of costHoverModels){rows.sort((a,b)=>a[0]-b[0]);let sum=0;costHoverModels.set(model,{times:rows.map(row=>row[0]),prefix:[0,...rows.map(row=>sum+=row[1])]})}
+  }
+  const search=(times,value,inclusive=false)=>{let low=0,high=times.length;while(low<high){const middle=(low+high)>>>1;if(inclusive?times[middle]<=value:times[middle]<value)low=middle+1;else high=middle}return low};
+  return [...costHoverModels].sort(([a],[b])=>a.localeCompare(b)).map(([model,{times,prefix}])=>({model,
+    spending:(prefix[search(times,end,end===payload.costTimeBounds?.[1]&&selected!=="Date")]-prefix[search(times,start)])/1e8,
+    cumulative:prefix[search(times,time,true)]/1e8}));
 }
 function costTimeUsageSeries(start,end){
   const accounts=[...availableScopeAccounts.keys()].filter(accountId=>!selectedAccounts.size||selectedAccounts.has(accountId)).sort((a,b)=>compareAccountNames(a,b,availableScopeAccounts.get(a),availableScopeAccounts.get(b))), grouped=new Map(accounts.map(accountId=>[accountId,[]]));
@@ -1351,7 +1406,7 @@ function drawCostTimeChart(animate=false){
       if(!bucket&&!visibleUsage.length)return hideTip();
       const tip=document.getElementById("tip");
       renderTip(tip,[{text:bucket?`${new Date(bucket.start*1000).toLocaleString()} to ${new Date(bucket.end*1000).toLocaleString()}`:new Date(time*1000).toLocaleString(),strong:true},
-        `Spending: ${costUsd(bucket?.amount||0)}`,`Cumulative: ${costUsd(bucket?.cumulative||0)}`,...visibleUsage.map(item=>{const value=costTimeUsageAt(item,time);return `${item.name}: ${value===null?"N/A":`${value.toFixed(1)}%`}`})]);
+        `Spending: ${costUsd(bucket?.amount||0)}`,...(bucket?costModelHover(bucket.start,bucket.end,time).map(row=>`${modelDisplayName(row.model)}: ${costUsd(row.spending)} (Cum. ${costUsd(row.cumulative)})`):[]),...visibleUsage.map(item=>{const value=costTimeUsageAt(item,time);return `${item.name}: ${value===null?"N/A":`${value.toFixed(1)}%`}`})]);
       tip.style.display="block";positionTip(event,tip);
     };
   };
@@ -1381,7 +1436,7 @@ function drawAll(animate=false){
     requestAnimationFrame(()=>setTimeout(drawNext,0));
   };requestAnimationFrame(()=>setTimeout(drawNext,0));
 }
-restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();setupCostTimeControls();pollStatus(true);load(true);setInterval(pollStatus,5000);setInterval(load,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true);load(true)}});addEventListener("resize",()=>{cancelAnimationFrame(drawAll.resizeFrame);drawAll.resizeFrame=requestAnimationFrame(()=>drawAll())});
+restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();setupCostTimeControls();load(true);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();if(!bulkData)load(true)}});addEventListener("resize",()=>{cancelAnimationFrame(drawAll.resizeFrame);drawAll.resizeFrame=requestAnimationFrame(()=>drawAll())});
 </script>
 </body>
 </html>

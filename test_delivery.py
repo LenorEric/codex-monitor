@@ -1,20 +1,78 @@
+
 import gzip
-import json
-import unittest
-import shutil
-import uuid
-import io
 import http.server
+import json
+import shutil
+import unittest
+import uuid
+import subprocess
 import threading
-import urllib.request
-import urllib.error
-from types import SimpleNamespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-import monitor_migrations
-from monitor_delivery import DAY, DashboardDelivery, cost_groups, reduce_cost, reduce_quota, session_groups
+from monitor_delivery import DashboardDelivery
+from monitor_interpretation import PRO_CUTOVER, aggregate_tokens, chart_rows, connected, multiplier, nearest, usage_runs, valid_intervals, weighted
 from monitor_processing import ProcessingIndex
+from monitor_common import empty_cost_totals, empty_token_totals
+
+
+def point(stamp, value, reset=100000, plan="plus", weekly=None):
+    return {"timestamp": stamp, "fiveHour": {"continuous": value, "plan": plan, "resetAt": reset},
+        "sevenDay": {"continuous": value if weekly is None else weekly, "plan": plan, "resetAt": reset}}
+
+
+class InterpretationTests(unittest.TestCase):
+    def test_multiplier_boundary(self):
+        self.assertEqual(multiplier("pro", PRO_CUTOVER - 1), 20)
+        self.assertEqual(multiplier("pro", PRO_CUTOVER), 10)
+        self.assertEqual(multiplier("pro_lite", PRO_CUTOVER), 5)
+
+    def test_only_consecutive_identical_values_and_resets_merge(self):
+        rows = usage_runs([point(0, 10), point(90, 10), point(180, 11), point(270, 10), point(360, 10, 200000)], "5h")
+        self.assertEqual([(r[1], r[2], r[3]) for r in rows], [(0, 90, 10), (180, 180, 11), (270, 270, 10), (360, 360, 10)])
+
+    def test_invalid_samples_break_curves(self):
+        rows = usage_runs([point(0, 10), point(90, None), point(180, 11)], "5h")
+        self.assertEqual([row[5] for row in rows], [1, 1, 1])
+        self.assertEqual(valid_intervals(rows), [])
+
+    def test_continuity_boundaries(self):
+        base = ["a", 0, 0, 10, 1]
+        self.assertTrue(connected(base, ["b", 1800, 1800, 0, 1], "5h"))
+        self.assertFalse(connected(base, ["b", 1801, 1801, 7, 1], "5h"))
+        self.assertTrue(connected(base, ["b", 14400, 14400, 11, 1], "5h"))
+        self.assertFalse(connected(base, ["b", 14401, 14401, 11, 1], "5h"))
+        self.assertFalse(connected(base, ["b", 3600, 3600, 16, 1], "7d"))
+
+    def test_union_of_window_boundaries(self):
+        intervals = {"5h": [["a", 0, 3, 1, 1], ["b", 3, 7, 1, 1]], "7d": [["c", 2, 6, 1, 1]]}
+        events = [[str(t), t, "m", "default", 1, 2, 3, 4, 10] for t in (.5, 1, 2.5, 4, 5, 6.5)]
+        rows = aggregate_tokens(events, intervals)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(sum(model[-1] for row in rows for model in row[2]), 60)
+        self.assertEqual(sum(model[2] for row in rows for model in row[2]), 6)
+
+    def test_nearest_ties_choose_earlier_interval(self):
+        intervals = [["a", 0, 10], ["b", 20, 30]]
+        self.assertEqual(nearest(intervals, 15), 0)
+        self.assertEqual(nearest(intervals, 16), 1)
+        self.assertEqual(nearest(intervals, -100), 0)
+        self.assertEqual(nearest(intervals, 100), 1)
+
+    def test_flat_and_outside_costs_are_never_lost(self):
+        events = [[str(t), t, "m", "default", 1, 0, 0, 0, 100] for t in (-10, 5, 15, 25, 50)]
+        intervals = [["a", 0, 10, 1, 1], ["b", 20, 30, 2, 1]]
+        rows = chart_rows(events, intervals)
+        self.assertEqual(sum(m[1] for row in rows for m in row[6]), 500)
+        self.assertEqual([row[6][0][1] for row in rows], [300, 200])
+        self.assertEqual(len(aggregate_tokens(events, {"5h": [], "7d": []})), 5)
+
+    def test_api_minute_groups_and_zero_cost_average(self):
+        events = [[str(t), t, "m", "default", 1, 0, 0, 0, 0] for t in (1, 59, 60)]
+        rows = aggregate_tokens(events, {}, api=True)
+        self.assertEqual([row[1] for row in rows], [30, 60])
+        self.assertEqual(weighted([["a", 10, 1], ["b", 20, 3]]), 18)
 
 
 class DeliveryTests(unittest.TestCase):
@@ -24,333 +82,161 @@ class DeliveryTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.directory)
         self.index = ProcessingIndex(self.directory / "index.sqlite3")
         self.delivery = DashboardDelivery(self.index)
-        self.start = 1893456000
+        self.events = []
+        self.projector = SimpleNamespace(_datasets=lambda *args: ([], self.events), store=SimpleNamespace(token_ledger_path=self.directory / "ledger"))
+
+    def quota(self, stamp, value=10, view="local"):
         with self.index.transaction() as db:
-            self.index.put(db, "displayRevision", 1)
+            db.execute("INSERT OR REPLACE INTO processing_quota_points VALUES(?,?,?,?,?)", (view, "a", stamp, str(stamp), json.dumps(point(stamp, value))))
 
-    def quota(self, stamp, value=10, key=None, view="local", **extra):
-        from datetime import datetime, timezone
-        row = {"timestamp": stamp, "checkedAt": datetime.fromtimestamp(stamp, timezone.utc).isoformat(), "usageAccountId": "a", "accountSlotId": "slot", "accountLabel": "Account",
-            "fiveHour": {"raw": value, "continuous": value, "plan": "plus", "resetAt": "2030-02-01T00:00:00Z"},
-            "sevenDay": {"raw": value, "continuous": value, "plan": "plus", "resetAt": "2030-02-07T00:00:00Z"}, **extra}
-        with self.index.transaction() as db:
-            db.execute("INSERT OR REPLACE INTO processing_quota_points VALUES(?,?,?,?,?)", (view, "a", stamp, key or str(stamp), json.dumps(row)))
-        return row
+    def prepare(self, now=1000, **kwargs):
+        self.delivery.prepare(now, self.projector, {"accounts": {"items": []}}, **kwargs)
+        return json.loads(self.delivery.bulk(False))
 
-    def token(self, stamp, key="s", models=None, view="local"):
-        from datetime import datetime, timezone
-        row = {"_key": key, "usageAccountId": "a", "accountSlotId": "slot", "accountLabel": "Account", "sessionId": key,
-            "updatedAt": datetime.fromtimestamp(stamp, timezone.utc).isoformat(), "startedAt": "2029-12-01T00:00:00Z",
-            "byModel": models or {"m": {"usageTokens": {"freshInputTokens": 10, "outputTokens": 2}, "cost": {"totalCostUsd": 3}}}}
-        with self.index.transaction() as db:
-            db.execute("INSERT OR REPLACE INTO processing_display VALUES(?,?,?,?,?,?)", (view, "a", "tokenSessions", key, stamp, json.dumps(row)))
-        return row
+    def test_bulk_has_both_views_and_no_protocol_number(self):
+        self.quota(10);self.quota(20, view="merged")
+        bulk = self.prepare()
+        self.assertNotIn("protocolVersion", bulk)
+        self.assertEqual(bulk["accounts"][0]["local"]["usage:5h"][0][1], 10)
+        self.assertEqual(bulk["accounts"][0]["merged"]["usage:5h"][0][1], 20)
+        self.assertEqual(gzip.decompress(self.delivery.bulk()), self.delivery.bulk(False))
 
-    def materialize(self, manifest):
-        return [json.loads(self.delivery.blob(digest, False)) for digest in manifest["chunks"]]
+    def test_independent_live_streams_and_restart_replay(self):
+        self.quota(10);bulk = self.prepare()
+        self.quota(100)
+        self.prepare(1002)
+        packets = self.delivery.replay(bulk["epoch"], bulk["cursors"])
+        self.assertTrue(packets)
+        self.assertEqual({row["stream"] for row in packets}, {"local"})
+        restarted = DashboardDelivery(self.index)
+        self.assertEqual(restarted.replay(bulk["epoch"], bulk["cursors"]), packets)
 
-    def test_compact_account_records_rebuild_after_v12(self):
-        from monitor_migrations import _migrate_history_to_v12
-        self.quota(self.start)
-        self.token(self.start)
-        self.delivery.prepare(self.start + 100)
-        paths = {"processing_index": self.index.path, "dashboard_cache": self.directory / "display.json"}
-        for _ in range(2):
-            _migrate_history_to_v12(paths)
-            with self.index.transaction() as db:
-                self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 0)
-                self.assertEqual(db.execute("SELECT count(*) FROM dashboard_blobs").fetchone()[0], 0)
-        self.quota(self.start)
-        self.token(self.start)
-        self.delivery.prepare(self.start + 100)
-        for manifest in (self.delivery.manifest("local", "All"), self.delivery.manifest("local", "Date", self.start, self.start + DAY)):
-            self.assertEqual(manifest["tokenSessions"][0]["usageAccountId"], "a")
-            self.assertNotIn("accountSlotId", manifest["tokenSessions"][0])
-            for frame in self.materialize(manifest):
-                for point in frame["quotaPoints"]:
-                    self.assertEqual(point["timestamp"], self.start)
-                    self.assertEqual(point["usageAccountId"], "a")
-                    self.assertFalse({"checkedAt", "accountSlotId", "accountLabel"} & point.keys())
+    def test_unchanged_cloud_fetch_does_not_reset_epoch(self):
+        self.quota(10);bulk = self.prepare()
+        self.delivery.cloud_pending = True
+        self.assertEqual(self.prepare(1002)["epoch"], bulk["epoch"])
+        self.delivery.cloud_pending = True
+        self.quota(20, 11, "merged")
+        self.assertNotEqual(self.prepare(1004)["epoch"], bulk["epoch"])
+        self.assertIsNone(self.delivery.replay(bulk["epoch"], bulk["cursors"]))
 
-    def test_contract_12_failure_and_crash_roll_back_and_retry_automatically(self):
-        import sqlite3
-        from contextlib import closing
-        self.quota(self.start)
-        self.delivery.prepare(self.start + 100)
-        database = self.directory / "cache-v4.sqlite3"
-        with closing(sqlite3.connect(self.index.path)) as source, closing(sqlite3.connect(database)) as target:
-            source.backup(target)
-        state = self.directory / monitor_migrations.DATA_MIGRATION_STATE_FILENAME
-        state.write_text('{"dataContractVersion":11}', encoding="utf-8")
-        history = self.directory / "quota.jsonl"
-        history.write_text('{"original":"preserved"}\n', encoding="utf-8")
-        account_manifest = self.directory / "accounts" / "accounts.json"
-        account_manifest.parent.mkdir()
-        account_manifest.write_text(json.dumps({"version": 3, "accounts": [{"id": "a"}, {"id": "b"}]}), encoding="utf-8")
-        legacy_manifest = self.directory / "codex" / "usage-monitor-accounts" / "accounts.json"
-        legacy_manifest.parent.mkdir(parents=True)
-        legacy_manifest.write_text(json.dumps({"version": 3, "accounts": [{"id": "x"}, {"id": "y"}], "slotOrder": ["y", "x"]}), encoding="utf-8")
-        original_manifest = account_manifest.read_bytes()
-        original_legacy = legacy_manifest.read_bytes()
-        def migrate():
-            return monitor_migrations.migrate_history_data(self.directory, self.directory / "history", history, self.directory / "sessions", self.directory / "ledger",
-                self.directory / "samples", target_version=12, usage_sync_cache_path=self.directory / "cache.json", codex_home=self.directory / "codex")
+    def test_journal_expiry_requests_bulk(self):
+        self.quota(10);bulk = self.prepare()
+        self.quota(100);self.prepare(1002)
+        self.prepare(100000)
+        self.assertIsNone(self.delivery.replay(bulk["epoch"], bulk["cursors"]))
+
+    def test_idle_and_bulk_requests_do_not_reinterpret_history(self):
+        self.quota(10);self.prepare()
+        with mock.patch.object(self.delivery, "_account", side_effect=AssertionError("replay")):
+            self.assertFalse(self.delivery.prepare(1002, self.projector))
+            self.assertTrue(self.delivery.bulk())
+
+    def test_v18_migration_rolls_back_derived_store_and_keeps_originals(self):
+        import monitor_migrations as migrations
+        self.quota(10);self.prepare()
+        before = self.delivery.bulk(False)
+        quota = self.directory / "quota.jsonl"
+        quota.write_bytes(b'{"original":"retained"}\n')
+        state, journal = self.directory / "contract.json", self.directory / "journal.json"
+        state.write_text('{"dataContractVersion":17}')
+        paths = {"processing_index": self.index.path, "dashboard_cache": self.directory / "cache.json", "quota_history": quota}
         def interrupted(paths):
-            monitor_migrations._migrate_history_to_v12(paths)
-            raise RuntimeError("interrupted migration")
-        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {12: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted migration"):
-            migrate()
-        self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
-        self.assertEqual(account_manifest.read_bytes(), original_manifest)
-        self.assertEqual(legacy_manifest.read_bytes(), original_legacy)
-        with closing(sqlite3.connect(database)) as db:
-            self.assertGreater(db.execute("SELECT count(*) FROM dashboard_blobs").fetchone()[0], 0)
-            self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 1)
-        def crashed(paths):
-            monitor_migrations._migrate_history_to_v12(paths)
-            raise KeyboardInterrupt("simulated process interruption")
-        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {12: crashed}), self.assertRaises(KeyboardInterrupt):
-            migrate()
-        self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 11)
-        self.assertTrue((self.directory / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).exists())
-        # Recovery must restore both manifests before the next migration attempt.
-        def verify_recovery(paths):
-            self.assertEqual(account_manifest.read_bytes(), original_manifest)
-            self.assertEqual(legacy_manifest.read_bytes(), original_legacy)
-            with closing(sqlite3.connect(database)) as db:
-                self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 1)
-            monitor_migrations._migrate_history_to_v12(paths)
-        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {12: verify_recovery}):
-            self.assertEqual(migrate(), [12])
-        self.assertEqual(migrate(), [])
-        self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 12)
-        self.assertEqual(json.loads(account_manifest.read_text())["slotOrder"], ["a", "b"])
-        self.assertEqual(json.loads(legacy_manifest.read_text())["slotOrder"], ["y", "x"])
-        self.assertFalse((self.directory / monitor_migrations.DATA_MIGRATION_JOURNAL_FILENAME).exists())
-        with closing(sqlite3.connect(database)) as db:
-            self.assertEqual(db.execute("SELECT count(*) FROM processing_quota_points").fetchone()[0], 0)
-            self.assertEqual(db.execute("SELECT count(*) FROM dashboard_blobs").fetchone()[0], 0)
-            self.assertIsNone(db.execute("SELECT name FROM sqlite_master WHERE name='processing_slot_cost_activity'").fetchone())
-        self.assertEqual(history.read_text(), '{"original":"preserved"}\n')
+            migrations._migrate_history_to_v18(paths)
+            raise RuntimeError("interrupted")
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            migrations._run_data_migration(interrupted, paths, 18, state, journal)
+        self.assertEqual(DashboardDelivery(self.index).bulk(False), before)
+        self.assertEqual(quota.read_bytes(), b'{"original":"retained"}\n')
 
-    def test_warm_manifest_and_idle_preparation_do_not_reload_or_encode_history(self):
-        self.quota(self.start)
-        self.token(self.start)
-        self.delivery.prepare(self.start + 100)
-        manifest = self.delivery.manifest("local", "All")
-        self.assertEqual(manifest["tokenSessions"][0]["sessionCount"], 1)
-        self.assertEqual(manifest["protocolVersion"], 4)
-        for digest in manifest["chunks"]:
-            self.assertEqual(gzip.decompress(self.delivery.blob(digest, True)), self.delivery.blob(digest, False))
-            self.assertEqual(json.loads(self.delivery.blob(digest, False))["tokenSessions"], [])
-        count = self.delivery.metrics["chunksEncoded"]
-        with mock.patch.object(self.delivery, "_load", side_effect=AssertionError("history reload")), mock.patch("monitor_delivery.gzip.compress", side_effect=AssertionError("recompression")):
-            self.assertEqual(self.delivery.manifest("local", "All"), manifest)
-            self.delivery.prepare(self.start + 101)
-        self.assertEqual(self.delivery.metrics["chunksEncoded"], count)
-        self.assertEqual(DashboardDelivery(self.index).manifest("local", "All"), manifest)
+        migrations._run_data_migration(migrations._migrate_history_to_v18, paths, 18, state, journal)
+        self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 18)
+        self.assertEqual(quota.read_bytes(), b'{"original":"retained"}\n')
 
-    def test_append_replaces_only_affected_day_and_old_chunks_remain_downloadable(self):
-        self.quota(self.start)
-        self.quota(self.start + DAY)
-        self.delivery.prepare(self.start + 2 * DAY)
-        old = self.delivery.manifest("local", "All")
-        self.quota(self.start + DAY + 60, value=11)
-        self.delivery.prepare(self.start + 2 * DAY)
-        new = self.delivery.manifest("local", "All")
-        self.assertNotEqual(old["generation"], new["generation"])
-        self.assertEqual(old["chunks"][0], new["chunks"][0])
-        self.assertNotEqual(old["chunks"][1], new["chunks"][1])
-        self.assertTrue(self.delivery.blob(old["chunks"][1], False))
+    def test_cloud_signal_during_preparation_is_consumed_by_next_projection(self):
+        from monitor_dashboard import UsageDashboardState
+        state = UsageDashboardState.__new__(UsageDashboardState)
+        state.running = True
+        state.lock = threading.RLock()
+        state._dashboard_signal_lock = threading.Lock()
+        state._dashboard_cloud_pending = False
+        state.dashboard_cache_event = threading.Event()
+        state.dashboard_cache_wait_seconds = lambda: 0
+        state.status_payload = lambda: {}
+        state.projector = None
+        state.usage_data = SimpleNamespace(index=SimpleNamespace(maintain_disk_space=lambda: None))
+        observed = []
+        def project():
+            if not observed:
+                state._signal_dashboard_cache("cloud")
+        def prepare(**kwargs):
+            observed.append(state.delivery.cloud_pending)
+            state.delivery.cloud_pending = False
+            state.running = len(observed) < 2
+        state.delivery = SimpleNamespace(cloud_pending=False, prepare=prepare)
+        state.refresh_dashboard_cache = project
+        state.run_dashboard_cache_maintenance()
+        self.assertEqual(observed, [False, True])
 
-    def test_day_has_full_detail_and_uses_explicit_local_midnight_instants(self):
-        for minute in range(20):
-            self.quota(self.start + minute * 60, value=10 + minute)
-        self.quota(self.start - 30, value=9)
-        self.quota(self.start + 2000, value=30)
-        self.token(self.start)
-        self.token(self.start + DAY, key="next-day")
-        self.delivery.prepare(self.start + 100 * DAY)
-        manifest = self.delivery.manifest("local", "Date", self.start, self.start + 1500)
-        points = [row for part in self.materialize(manifest) for row in part["quotaPoints"] if not row.get("contextOnly")]
-        self.assertEqual(len(points), 20)
-        self.assertEqual(manifest["tokenSessions"][0]["sessionCount"], 1)
-        self.assertEqual(manifest["bounds"], [self.start, self.start + 1500])
-        with self.assertRaises(ValueError):
-            self.delivery.manifest("local", "Date", self.start, self.start + 27 * 3600)
-        for hours in (23, 25):
-            self.assertIsNotNone(self.delivery.manifest("local", "Date", self.start, self.start + hours * 3600))
+    def test_token_only_update_updates_closest_chart_and_preserves_totals(self):
+        from monitor_usage_sync import record_key
+        self.events = [{"schemaVersion": 2, "recordType": "usage", "eventId": "first", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z",
+            "rawModel": "gpt-5.5", "tokens": empty_token_totals() | {"freshInputTokens": 10}, "cost": empty_cost_totals() | {"totalCostUsd": 1},
+            "accountSlotId": "slot", "accountLabel": "Account", "sync": {"version": 1, "originMachineId": "m", "accountId": "a"}}]
+        self.quota(1893456000, 10);self.quota(1893456100, 11)
+        bulk = self.prepare()
+        event = self.events[0] | {"eventId": "new", "occurredAt": "2030-01-01T01:00:00Z"}
+        with self.index.transaction() as db:
+            self.index.fact(db, str(self.projector.store.token_ledger_path.resolve()), 0, "tokenLedger", event)
+            db.execute("INSERT INTO delivery_work VALUES('local','a','tokenLedger',?)", (record_key("tokenLedger", event),))
+            db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES('local','a')")
+        self.prepare(1002)
+        packets = self.delivery.replay(bulk["epoch"], bulk["cursors"])
+        self.assertEqual({row["channel"] for row in packets}, {"tokens", "chart:5h", "chart:7d"})
+        with self.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT SUM(cost) FROM delivery_tokens WHERE view='local'").fetchone()[0], 200000000)
+        # New spending outside the increasing interval attaches to the preceding interval.
+        charts = [row for row in packets if row["channel"] == "chart:5h"][0]["data"]["set"]
+        self.assertEqual(charts[0][6][0][1], 200000000)
 
-    def test_moved_session_removes_old_summary_contribution(self):
-        self.token(self.start)
-        self.delivery.prepare(self.start + DAY)
-        self.token(self.start + DAY)
-        self.delivery.prepare(self.start + DAY)
-        old = self.delivery.manifest("local", "Date", self.start, self.start + DAY)
-        new = self.delivery.manifest("local", "Date", self.start + DAY, self.start + 2 * DAY)
-        self.assertEqual(old["tokenSessions"], [])
-        self.assertEqual(new["tokenSessions"][0]["sessionCount"], 1)
-        self.assertEqual(self.delivery.manifest("local", "All")["tokenSessions"][0]["sessionCount"], 1)
-
-    def test_unrelated_day_changes_do_not_invalidate_cached_detail(self):
-        self.quota(self.start)
-        day = self.delivery.manifest("local", "Date", self.start, self.start + DAY)
-        self.token(self.start + 10 * DAY)
-        with mock.patch.object(self.delivery, "_load", side_effect=AssertionError("unrelated day reload")):
-            self.assertEqual(self.delivery.manifest("local", "Date", self.start, self.start + DAY), day)
-
-    def test_projection_committing_during_prepare_cannot_publish_partial_generation(self):
-        self.quota(self.start)
-        self.delivery.prepare(self.start)
-        old = self.delivery.manifest("local", "All")
-        self.quota(self.start + 60)
-        load = self.delivery._load
-        def concurrent(*args):
-            result = load(*args)
-            self.quota(self.start + 120)
-            return result
-        with mock.patch.object(self.delivery, "_load", side_effect=concurrent):
-            self.delivery.prepare(self.start)
-        self.assertEqual(self.delivery.manifest("local", "All"), old)
-        self.delivery.prepare(self.start)
-        new = self.delivery.manifest("local", "All")
-        self.assertEqual(sum(len(part["quotaPoints"]) for part in self.materialize(new)), 3)
-
-    def test_model_set_groups_preserve_arbitrary_filter_counts_and_cost_attribution(self):
-        a = self.token(self.start, "one", {"m": {"usageTokens": {"outputTokens": 2}, "cost": {"totalCostUsd": 1}}})
-        b = self.token(self.start + 1, "two", {"m": {"usageTokens": {"outputTokens": 3}}, "n": {"usageTokens": {"outputTokens": 4}}})
-        c = self.token(self.start + 2, "three", {"n": {"usageTokens": {"outputTokens": 5}}})
-        groups = session_groups([a, b, c])
-        self.assertEqual(sum(row["sessionCount"] for row in groups if set(row["byModel"]) & {"m", "n"}), 3)
-        self.assertEqual(sum(row["sessionCount"] for row in groups if "m" in row["byModel"]), 2)
-        costs = [{"usageAccountId": "a", "deltaPercent": 10, "totalCostUsd": 10, "costByModelUsd": {"m": 10}},
-            {"usageAccountId": "a", "deltaPercent": 20, "totalCostUsd": 100, "costByModelUsd": {"m": 50, "n": 50}}]
-        grouped = cost_groups(costs)[0]
-        self.assertEqual(grouped["usageByModel"], {"m": 20, "n": 10})
-        self.assertEqual(cost_groups([grouped])[0], grouped)
-
-    def test_quota_delivery_preserves_raw_values_and_rejection_boundaries(self):
-        rows = [self.quota(self.start + i, value=value) | {"_key": str(i)} for i, value in enumerate([10, 11, 99, 12, 13, 14])]
-        rows[3]["fiveHour"]["continuous"] = None
-        for seconds in (0, 300, 3600, DAY):
-            self.assertEqual(reduce_quota(rows, seconds), rows)
-            self.assertIsNone(reduce_quota(rows, seconds)[3]["fiveHour"]["continuous"])
-
-    def test_quota_rollups_keep_every_account_observation(self):
-        rows = [self.quota(self.start + offset, value=value) | {"_key": str(i)}
-            for i, (offset, value) in enumerate([(0, 10), (1, 20), (2, 30), (301, 40)])]
-        other = rows[0] | {"usageAccountId": "b", "_key": "other"}
-        self.assertEqual(reduce_quota(reduce_quota(rows + [other], 300), 3600), rows + [other])
-
-    def test_prepared_overview_and_selected_day_retain_exact_observations(self):
-        for minute, value in enumerate([10, 11, 12, 13]):
-            self.quota(self.start + minute * 60, value=value)
-        self.delivery.prepare(self.start + 4 * DAY)
-        overview = [row for part in self.materialize(self.delivery.manifest("local", "All")) for row in part["quotaPoints"]]
-        self.assertEqual([row["fiveHour"]["raw"] for row in overview], [10, 11, 12, 13])
-        detail = [row for part in self.materialize(self.delivery.manifest("local", "Date", self.start, self.start + DAY)) for row in part["quotaPoints"]]
-        self.assertEqual([row["fiveHour"]["raw"] for row in detail], [10, 11, 12, 13])
-
-    def test_cost_buckets_sum_even_noncontiguous_intervals_and_preserve_rates(self):
-        costs = [{"usageAccountId": "a", "plan": "plus", "timestamp": self.start + i, "startedAt": str(i * 2), "endedAt": str(i * 2 + 1),
-            "deltaPercent": i + 1, "totalCostUsd": 2 * (i + 1), "costByModelUsd": {"m": 2 * (i + 1)}} for i in range(3)]
-        reduced = reduce_cost(costs, 300)
-        self.assertEqual(len(reduced), 1)
-        self.assertEqual(reduced[0]["totalCostUsd"], 12)
-        self.assertEqual(reduced[0]["deltaPercent"], 6)
-        self.assertEqual(reduced[0]["costByModelUsd"], {"m": 12})
-        self.assertEqual(reduced[0]["costPer100PercentUsd"], 200)
-        costs[2]["plan"] = "pro"
-        self.assertEqual(len(reduce_cost(costs, 300)), 2)
-
-    def test_http_scope_conditional_requests_and_precompressed_chunks_do_not_refresh_history(self):
-        import monitor_dashboard
-        fake_state = mock.Mock(delivery=self.delivery)
-        fake_state.cloud.config.return_value = {"control": {"passwordHash": "", "cookieSecret": "test"}}
-        fake_state.status_payload.return_value = {"revision": "test", "lastSample": None}
-        fake_server = mock.Mock()
-        fake_server.serve_forever.side_effect = KeyboardInterrupt
-        with mock.patch.object(monitor_dashboard, "DashboardInstanceLock"), mock.patch.object(monitor_dashboard, "DashboardHTTPServer", return_value=fake_server) as factory, \
-                mock.patch.object(monitor_dashboard, "UsageDashboardState", return_value=fake_state), mock.patch.object(monitor_dashboard.threading, "Thread"), mock.patch("sys.stdout", new=io.StringIO()):
-            monitor_dashboard.serve_dashboard(SimpleNamespace(data_home=self.directory, dashboard=False, timeout=1), None)
-        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), factory.call_args.args[1])
-        worker = threading.Thread(target=server.serve_forever)
-        worker.start()
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required")
+    def test_real_http_bulk_and_websocket_replay(self):
+        from monitor_live import send_bulk, serve_live
+        self.quota(10);self.prepare()
+        owner = self
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_args):
+                pass
+            def do_GET(self):
+                if self.path.endswith("/live"):
+                    serve_live(self, owner.delivery)
+                else:
+                    send_bulk(self, owner.delivery)
+            def do_POST(self):
+                owner.quota(100, 11)
+                owner.prepare(1002)
+                self.send_response(200);self.send_header("Content-Length", "0");self.end_headers()
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever)
+        thread.start()
+        script = r'''
+const http=require('http'),zlib=require('zlib'),WebSocket=require('ws'),url=process.argv[1];
+const timeout=setTimeout(()=>{console.error('timeout');process.exit(1)},5000);
+http.get(url+'/api/dashboard',{headers:{'Accept-Encoding':'gzip'}},response=>{const chunks=[];response.on('data',v=>chunks.push(v));response.on('end',()=>{
+const bulk=JSON.parse(zlib.gunzipSync(Buffer.concat(chunks))),ws=new WebSocket(url.replace('http:','ws:')+'/api/dashboard/live');
+const packets=[];ws.on('open',()=>{ws.send(JSON.stringify({type:'subscribe',epoch:bulk.epoch,cursors:bulk.cursors}));const r=http.request(url+'/advance',{method:'POST'},v=>v.resume());r.end()});
+ws.on('message',data=>{packets.push(JSON.parse(data));if(packets.some(p=>p.channel==='chart:7d')){console.log(JSON.stringify(packets));clearTimeout(timeout);ws.close()}});
+ws.on('error',error=>{console.error(error);process.exit(1)});
+})});
+'''
         try:
-            base = f"http://127.0.0.1:{server.server_port}"
-            with self.assertRaises(urllib.error.HTTPError) as retired:
-                urllib.request.urlopen(base + "/api/series", timeout=3)
-            self.assertEqual(retired.exception.code, 410)
-            self.assertIn("/api/dashboard", json.load(retired.exception)["error"])
-            retired.exception.close()
-            with self.assertRaises(urllib.error.HTTPError) as preparing:
-                urllib.request.urlopen(base + "/api/dashboard?view=local&range=All", timeout=3)
-            self.assertEqual(preparing.exception.code, 503)
-            preparing.exception.close()
-            self.quota(self.start)
-            self.delivery.prepare(self.start)
-            with mock.patch.object(self.delivery, "prepare", side_effect=AssertionError("request prepared history")), mock.patch.object(self.delivery, "_load", side_effect=AssertionError("request scanned history")):
-                with urllib.request.urlopen(base + "/api/dashboard?view=local&range=All", timeout=3) as response:
-                    manifest, etag = json.load(response), response.headers["ETag"]
-                with self.assertRaises(urllib.error.HTTPError) as unchanged:
-                    urllib.request.urlopen(urllib.request.Request(base + "/api/dashboard?view=local&range=All", headers={"If-None-Match": etag}), timeout=3)
-                self.assertEqual(unchanged.exception.code, 304)
-                unchanged.exception.close()
-                with urllib.request.urlopen(urllib.request.Request(base + "/api/dashboard/chunk?id=" + manifest["chunks"][0], headers={"Accept-Encoding": "gzip"}), timeout=3) as response:
-                    self.assertEqual(response.headers["Content-Encoding"], "gzip")
-                    self.assertEqual(len(json.loads(gzip.decompress(response.read()))["quotaPoints"]), 1)
-            fake_state.refresh_dashboard_cache.assert_not_called()
+            result = subprocess.run(["node", "-e", script, f"http://127.0.0.1:{server.server_port}"], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            packets = json.loads(result.stdout)
+            self.assertTrue(any(row["channel"] == "usage:5h" for row in packets))
+            self.assertTrue(all(row["stream"] == "local" for row in packets))
         finally:
-            server.shutdown()
-            server.server_close()
-            worker.join(3)
-            self.assertFalse(worker.is_alive())
-
-    def test_long_overview_reuses_rollups_and_keeps_recent_detail(self):
-        sample = self.quota(self.start)
-        with self.index.transaction() as db:
-            for day in range(1, 400):
-                row = sample | {"timestamp": self.start + day * DAY}
-                db.execute("INSERT INTO processing_quota_points VALUES(?,?,?,?,?)", ("local", "a", row["timestamp"], str(day), json.dumps(row)))
-            for minute in range(10):
-                row = sample | {"timestamp": self.start + 399 * DAY + minute * 60}
-                db.execute("INSERT OR REPLACE INTO processing_quota_points VALUES(?,?,?,?,?)", ("local", "a", row["timestamp"], f"recent-{minute}", json.dumps(row)))
-        now = self.start + 399 * DAY + 3600
-        self.delivery.prepare(now)
-        manifest = self.delivery.manifest("local", "All")
-        self.assertLess(len(manifest["chunks"]), 100)
-        points = [row for part in self.materialize(manifest) for row in part["quotaPoints"]]
-        self.assertEqual(len([row for row in points if row["timestamp"] >= self.start + 399 * DAY]), 11)
-        before = self.delivery.metrics["chunksEncoded"]
-        # A correction in one old partition rebuilds its levels and its one rollup, not every month.
-        self.quota(self.start + 10 * DAY, key="10", value=99)
-        self.delivery.prepare(now)
-        self.assertEqual(self.delivery.metrics["chunksEncoded"] - before, 6)
-
-    def test_missing_artifact_is_rebuilt_without_repairing_canonical_history(self):
-        self.quota(self.start)
-        self.delivery.prepare(self.start)
-        manifest = self.delivery.manifest("local", "All")
-        digest = manifest["chunks"][0]
-        with self.index.transaction() as db:
-            db.execute("DELETE FROM dashboard_blobs WHERE digest=?", (digest,))
-        self.assertIsNone(self.delivery.blob(digest, False))
-        self.assertIsNone(self.delivery.manifest("local", "All"))
-        self.delivery.prepare(self.start)
-        self.assertIsNotNone(self.delivery.blob(digest, False))
-        self.assertEqual(self.delivery.manifest("local", "All")["generation"], manifest["generation"])
-
-    def test_preset_requests_union_of_dataset_windows_not_every_day_between_anchors(self):
-        # Quota and token capture can end on very different dates.
-        self.token(self.start)
-        self.quota(self.start + 100 * DAY)
-        self.quota(self.start + 50 * DAY)
-        self.delivery.prepare(self.start + 100 * DAY)
-        manifest = self.delivery.manifest("local", "5h")
-        points = [row for part in self.materialize(manifest) for row in part["quotaPoints"]]
-        self.assertEqual([row["timestamp"] for row in points], [self.start + 100 * DAY])
-        self.assertEqual(manifest["tokenSessions"][0]["sessionCount"], 1)
-        self.assertLessEqual(len(manifest["chunks"]), 2)
+            server.shutdown();server.server_close();thread.join()
 
 
 if __name__ == "__main__":

@@ -1,3 +1,9 @@
+# Sampled storage and dashboard interpretation
+
+Released local contract 17 is preserved. Pending contract 18 backfills observation-time multipliers and rebuilds derived interpretation storage. The cloud remains contract 4. `delivery_runs`, `delivery_tokens`, `delivery_charts`, and `delivery_members` contain typed, account-scoped interpretation state. `delivery_journal` commits sequenced changes with that state; `delivery_snapshot` holds the serialized/gzip bulk. None of these tables replace canonical histories or cloud ownership. SQL and network layouts are independent.
+
+The following describes the original normalized sampled-store implementation; historical migration version references below describe that implementation’s development.
+
 # Sampled storage, pending local contract 16
 
 `monitor_sample_store.py` owns normalized raw payload insertion and reconstruction. Quota JSONL remains a complete append-only raw archive, including repeats and rejected readings; cloud synchronization preserves these records. `monitor_sampling.py` owns deterministic backend decisions. SQLite commits processed points, per-window accepted/protection state, and raw ingestion checkpoints together. Released local contract 15 / cloud contract 3 is the baseline; pending local contract 16 combines Unix reset-timestamp conversion with rebuilding processed sampling and display data. Pending cloud contract 4 retains the raw record shape with Unix reset timestamps.

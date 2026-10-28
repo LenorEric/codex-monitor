@@ -377,6 +377,7 @@ def _same_cost_usage_cycle(previous: dict, current: dict, label: str) -> bool:
     return left_reset is None and right_reset is None or left_reset is not None and right_reset is not None and abs(left_reset - right_reset) <= RESET_TIME_JITTER_SECONDS
 
 def dashboard_cost_usage(quota_points: list[dict], ledger: list[dict], slot_usage_accounts: dict[str, str] | None = None) -> dict[str, list[dict]]:
+    from monitor_interpretation import multiplier as quota_multiplier
     usage_events = {}
     for row in ledger:
         if row.get("recordType") != "usage" or (timestamp := parse_timestamp(row.get("occurredAt"))) is None:
@@ -402,7 +403,7 @@ def dashboard_cost_usage(quota_points: list[dict], ledger: list[dict], slot_usag
             for previous, current in zip(points, points[1:]):
                 if not _same_cost_usage_cycle(previous, current, label):
                     continue
-                multiplier = PLAN_MULTIPLIERS.get(current[label].get("plan") or "plus", 1.0)
+                multiplier = current[label].get("multiplier", quota_multiplier(current[label].get("plan") or "plus", current["timestamp"]))
                 start = {"timestamp": previous["timestamp"], "usage": previous[label]["continuous"] * multiplier}
                 end = {"timestamp": current["timestamp"], "usage": current[label]["continuous"] * multiplier,
                     "accountSlotId": current.get("accountSlotId"), "accountLabel": current.get("accountLabel"), "plan": current[label].get("plan") or "plus", "planMultiplier": multiplier}
@@ -575,6 +576,8 @@ class UsageDashboardState:
         self.cloud_maintenance_event = threading.Event()
         self.config_monitor_event = threading.Event()
         self.dashboard_cache_event = threading.Event()
+        self._dashboard_signal_lock = threading.Lock()
+        self._dashboard_cloud_pending = False
         self.token_capture_event = threading.Event()
         self.stop_event = threading.Event()
         self.cloud_maintenance_connection_failed = False
@@ -787,22 +790,32 @@ class UsageDashboardState:
         now = time.time() if now is None else now
         with self.lock:
             next_maintenance = getattr(self, "_dashboard_next_maintenance", None)
-        return DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS if next_maintenance is None or next_maintenance <= now else min(DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS, max(1, next_maintenance - now))
+        return 1
 
     def run_dashboard_cache_maintenance(self) -> None:
         while self.running:
             self.dashboard_cache_event.wait(self.dashboard_cache_wait_seconds())
             self.dashboard_cache_event.clear()
+            with self._dashboard_signal_lock:
+                cloud_refresh = self._dashboard_cloud_pending
+                self._dashboard_cloud_pending = False
             try:
                 with self.lock:
                         self.refresh_dashboard_cache()
                 if hasattr(self, "delivery"):
-                    self.delivery.prepare()
+                    self.delivery.cloud_pending |= cloud_refresh
+                    self.delivery.prepare(projector=self.projector, status=self.status_payload())
                     self.usage_data.index.maintain_disk_space()
             except Exception as exc:
+                if cloud_refresh:
+                    with self._dashboard_signal_lock:
+                        self._dashboard_cloud_pending = True
                 print(f"Dashboard display cache maintenance failed: {exc}", file=sys.stderr, flush=True)
 
     def _signal_dashboard_cache(self, reason: str = "local") -> None:
+        if reason == "cloud" and hasattr(self, "_dashboard_signal_lock"):
+            with self._dashboard_signal_lock:
+                self._dashboard_cloud_pending = True
         event = getattr(self, "dashboard_cache_event", None)
         if event is not None:
             event.set()
@@ -1663,61 +1676,23 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                 self.wfile.write(management_html().encode("utf-8"))
                 return
             if path == "/api/series":
-                self.send_json(410, {"error": "The series protocol has been removed; use /api/dashboard scoped manifests and chunks"})
+                self.send_json(410, {"error": "The series protocol has been removed; use /api/dashboard bulk snapshots"})
                 return
-            if path == "/api/dashboard":
-                started = time.perf_counter()
-                try:
-                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                    if set(query) - {"view", "range", "start", "end"} or any(len(values) != 1 for values in query.values()):
-                        raise ValueError("Invalid dashboard scope")
-                    manifest = state.delivery.manifest(query.get("view", ["merged"])[0], query.get("range", ["All"])[0],
-                        float(query["start"][0]) if "start" in query else None, float(query["end"][0]) if "end" in query else None)
-                except (ValueError, OverflowError) as exc:
-                    self.send_json(400, {"error": str(exc)})
-                    return
-                if manifest is None:
-                    state.dashboard_cache_event.set()
-                    self.send_json(503, {"error": "History is being prepared", "preparing": True}, {"Retry-After": "1"})
-                    return
-                etag = f'"dashboard-{manifest["generation"]}"'
-                if self.headers.get("If-None-Match") == etag:
-                    self.send_not_modified(etag)
-                else:
-                    self.send_json(200, manifest, {"ETag": etag, "Cache-Control": "no-cache", "Server-Timing": f"scope;dur={(time.perf_counter() - started) * 1000:.2f}"}, cache_key=etag)
+            if path == "/api/dashboard/live":
+                from monitor_live import serve_live
+                serve_live(self, state.delivery, lambda: state.running)
                 return
             if path == "/api/dashboard/chunk":
-                try:
-                    query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
-                    if set(query) != {"id"} or len(query["id"]) != 1:
-                        raise ValueError("Expected one chunk identity")
-                    digest = query["id"][0]
-                    etag = f'"chunk-{digest}"'
-                    compressed = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
-                    body = state.delivery.blob(digest, compressed)
-                except ValueError as exc:
-                    self.send_json(400, {"error": str(exc)})
-                    return
-                if body is None:
+                self.send_json(410, {"error": "Reload the dashboard to obtain a complete bulk snapshot"})
+                return
+            if path == "/api/dashboard":
+                from monitor_live import send_bulk
+                if not send_bulk(self, state.delivery):
                     state.dashboard_cache_event.set()
-                    self.send_json(404, {"error": "Dashboard chunk expired; reload the active scope"})
-                    return
-                if self.headers.get("If-None-Match") == etag:
-                    self.send_not_modified(etag)
-                    return
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json; charset=utf-8")
-                self.send_header("Cache-Control", "private, max-age=86400, immutable")
-                self.send_header("ETag", etag)
-                self.send_header("Vary", "Accept-Encoding")
-                if compressed:
-                    self.send_header("Content-Encoding", "gzip")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                    self.send_json(503, {"error": "History is being prepared", "preparing": True}, {"Retry-After": "1"})
                 return
             if path == "/api/status":
-                payload = dashboard_status_payload(state)
+                payload = getattr(getattr(state, "delivery", None), "state", None) or dashboard_status_payload(state)
                 etag = f'W/"status-{payload["revision"]}"'
                 if self.headers.get("If-None-Match") == etag:
                     self.send_not_modified(etag)

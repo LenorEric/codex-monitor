@@ -41,6 +41,7 @@ usage-monitor-accounts/**
 .codex-monitor-update-*/**
 .tmp*/**
 node_modules/**
+!node_modules/ws/**
 .npm-build-cache/**
 .venv/**
 venv/**

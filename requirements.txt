@@ -1,3 +1,4 @@
 cryptography>=46.0.0,<47
 tomlkit>=0.13.3,<1
 watchdog>=6.0.0,<7
+wsproto>=1.2,<2

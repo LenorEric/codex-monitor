@@ -6,8 +6,6 @@ const { performance } = require("node:perf_hooks");
 
 const script = fs.readFileSync(`${__dirname}/dashboard.html`, "utf8").match(/<script>([\s\S]*?)<\/script>/)[1].split("restoreSelections();setupControls();setupDataView();")[0];
 const flush = () => new Promise(resolve => setImmediate(resolve));
-const frame = point => ({ quotaPoints: point ? [{ _key: point, timestamp: 1, usageAccountId: "a" }] : [], tokenSessions: [], costUsage: { fiveHour: [], sevenDay: [] }, historyStats: {} });
-const manifest = (range, generation, chunks = []) => ({ protocolVersion: 4, view: "merged", range, generation, chunks, tokenSessions: [], rateRows: { fiveHour: [], sevenDay: [] }, builtAt: 1 });
 
 test("reset baselines stay in their window and sort before simultaneous observations", () => {
     const h = harness();
@@ -35,7 +33,7 @@ function harness(overrides = {}) {
         innerHeight: 900, document: { hidden: false, getElementById: element, createElement: () => element(Symbol()), querySelectorAll: () => [] }, ...overrides });
     vm.runInContext(script, context);
     const drawAll = vm.runInContext("drawAll", context);
-    vm.runInContext("selected='Date';selectedDate='2030-01-01';drawAll=()=>{drawCount++};", context);
+    vm.runInContext("selected='Date';selectedDate='2030-01-01';drawAll=()=>{drawCount++};connectLive=()=>{};", context);
     context.drawCount = 0;
     return { context, elements, drawAll, run: source => vm.runInContext(source, context) };
 }
@@ -55,181 +53,11 @@ function offscreenChartHarness() {
     return { ...h, draws, drain: () => { while (scheduled.length) scheduled.shift()(); } };
 }
 
-test("scope switches redraw every offscreen chart including cached scopes", async () => {
-    const h = offscreenChartHarness();
-    h.context.requestDashboard = async scope => ({ payload: manifest(scope.range, scope.range) });
-    for (const [range, animate] of [["Date", false], ["All", true], ["Date", true]]) {
-        h.context.nextRange = range;
-        h.run("selected=nextRange");
-        await h.run("load(true)");
-        h.drain();
-        assert.deepEqual(h.draws.splice(0), ["usageTime5h", "usageTime7d", "scatter5h", "scatter7d", "costTime"].map(id => ({ id, range, animate })));
-    }
-});
-
 test("a newer scope cancels queued chart draws and updates all charts offscreen", () => {
     const h = offscreenChartHarness();
     h.run("drawAll(true);selected='All';drawAll(true)");
     h.drain();
     assert.deepEqual(h.draws, ["usageTime5h", "usageTime7d", "scatter5h", "scatter7d", "costTime"].map(id => ({ id, range: "All", animate: true })));
-});
-
-test("timestamp-only chart records use shared labels and refresh names independently of history", async () => {
-    const h = harness();
-    h.context.requestDashboard = async scope => scope.chunkId ? { payload: frame("point") } : {
-        payload: { ...manifest("Date", "generation", ["chunk"]), accountLabels: { a: "Historical name" } }
-    };
-    await h.run("load(true)");
-    assert.equal(h.run("eventTimestamp(payload.quotaPoints[0])"), 1);
-    assert.equal(h.run("accountDisplayName('a')"), "Historical name");
-    h.context.requestStatus = async () => ({ payload: { accounts: { usageGroups: [{ id: "a", label: "Latest slot" }] } } });
-    h.context.renderCurrentStatus = () => {};
-    h.context.ensureControlPassword = () => {};
-    await h.run("pollStatus(true)");
-    assert.equal(h.run("accountDisplayName('a')"), "Latest slot");
-    assert.equal(h.context.drawCount, 2);
-    await h.run("load(true)");
-    assert.equal(h.context.drawCount, 2);
-});
-
-test("status renders while history and password setup are still pending", async () => {
-    const h = harness();
-    let finishHistory;
-    h.context.requestStatus = async () => ({ payload: { controlPasswordConfigured: false }, etag: "status" });
-    h.context.requestDashboard = () => new Promise(resolve => finishHistory = resolve);
-    h.context.ensureControlPassword = () => new Promise(() => {});
-    h.context.renderCurrentStatus = () => h.context.statusRendered = true;
-    const history = h.run("load(true)");
-    await h.run("pollStatus(true)");
-    assert.equal(h.context.statusRendered, true);
-    assert.equal(h.elements.get("historyStatus").textContent, "");
-    finishHistory({ payload: manifest("Date", "day"), etag: "day" });
-    await history;
-    assert.equal(h.context.drawCount, 1);
-});
-
-test("an obsolete day response cannot overwrite a newer preset selection", async () => {
-    const h = harness();
-    let finishDay;
-    const requests = [];
-    h.context.requestDashboard = scope => {
-        requests.push(scope);
-        if (scope.range === "Date") return new Promise(resolve => finishDay = resolve);
-        return Promise.resolve({ payload: manifest("All", "overview") });
-    };
-    const day = h.run("load(true)");
-    h.run("selected='All'");
-    await h.run("load(true)");
-    finishDay({ payload: manifest("Date", "obsolete", ["never-download"]) });
-    await day;
-    assert.equal(h.run("historyGeneration"), "overview");
-    assert.equal(requests.length, 2);
-    assert.equal(h.context.drawCount, 1);
-});
-
-test("changed scopes download only new chunks and unchanged manifests do not redraw", async () => {
-    const h = harness(), chunks = [];
-    let generation = 1;
-    h.run("selected='All'");
-    h.context.requestDashboard = async (scope, etag) => {
-        if (scope.chunkId) { chunks.push(scope.chunkId); return { payload: frame(scope.chunkId) }; }
-        if (etag === `g${generation}`) return { notModified: true, etag };
-        return { payload: manifest("All", `g${generation}`, generation === 1 ? ["old", "shared"] : ["new", "shared"]), etag: `g${generation}` };
-    };
-    await h.run("load(true)");
-    await h.run("load(true)");
-    assert.equal(h.context.drawCount, 1);
-    generation = 2;
-    await h.run("load(true)");
-    assert.deepEqual(chunks.sort(), ["new", "old", "shared"]);
-    assert.equal(h.context.drawCount, 2);
-    assert.equal(h.run("payload.quotaPoints.length"), 2);
-});
-
-test("scope transitions wait for all chunks and preserve the previous chart state", async () => {
-    const h = harness(), draws = [];
-    let finishChunk;
-    h.context.drawAll = animate => draws.push({ animate, point: h.run("payload.quotaPoints[0]?._key") });
-    h.context.requestDashboard = async scope => ({ payload: scope.chunkId ? frame("old") : manifest("Date", "day", ["old"]) });
-    await h.run("load(true)");
-    h.run("selected='All';chartStates.scatter5h={lineLayer:'previous'};usageTimeChartStates.usageTime5h={labelLayer:'previous'}");
-    h.context.requestDashboard = scope => scope.chunkId ? new Promise(resolve => finishChunk = resolve) :
-        Promise.resolve({ payload: { ...manifest("All", "all", ["new"]), tokenSessions: [{ _key: "new-session" }] } });
-    const pending = h.run("load(true)");
-    await flush();
-    assert.equal(draws.length, 1);
-    assert.equal(h.run("payload.quotaPoints[0]._key"), "old");
-    assert.equal(h.run("payload.tokenSessions.length"), 0);
-    assert.equal(h.run("chartStates.scatter5h.lineLayer"), "previous");
-    assert.equal(h.run("usageTimeChartStates.usageTime5h.labelLayer"), "previous");
-    finishChunk({ payload: frame("new") });
-    await pending;
-    assert.deepEqual(draws, [{ animate: false, point: "old" }, { animate: true, point: "new" }]);
-});
-
-test("cached scope switches animate immediately and unchanged refreshes do not redraw", async () => {
-    const h = harness(), draws = [];
-    h.context.drawAll = animate => draws.push(animate);
-    h.context.requestDashboard = async scope => ({ payload: manifest(scope.range, scope.range) });
-    await h.run("load(true)");
-    h.run("selected='All'");
-    await h.run("load(true)");
-    h.run("selected='Date'");
-    h.context.requestDashboard = async () => ({ notModified: true });
-    await h.run("load(true)");
-    await h.run("load(true)");
-    assert.deepEqual(draws, [false, true, true]);
-});
-
-test("a scope that is still preparing animates on retry once ready", async () => {
-    const h = harness(), draws = [];
-    h.context.drawAll = animate => draws.push(animate);
-    h.context.requestDashboard = async () => ({ payload: manifest("Date", "day") });
-    await h.run("load(true)");
-    h.run("selected='All'");
-    h.context.requestDashboard = async () => { throw Object.assign(new Error("Preparing"), { preparing: true }); };
-    await h.run("load(true)");
-    assert.deepEqual(draws, [false]);
-    assert.equal(h.run("displayedScope"), h.run("new URLSearchParams({view:'merged',range:'Date',start:String(selectedDateBounds().startMs/1000),end:String(selectedDateBounds().endMs/1000)}).toString()"));
-    h.context.requestDashboard = async () => ({ payload: manifest("All", "ready") });
-    await h.run("load(true)");
-    assert.deepEqual(draws, [false, true]);
-});
-
-test("prepared summaries preserve exact model-selected session counts", () => {
-    const h = harness();
-    h.context.sessions = [{ sessionCount: 3, byModel: { m: { usageTokens: { outputTokens: 10 } } } },
-        { sessionCount: 2, byModel: { n: { usageTokens: { outputTokens: 20 } } } },
-        { sessionCount: 4, byModel: { m: { usageTokens: { outputTokens: 30 } }, n: { usageTokens: { outputTokens: 40 } } } }];
-    h.run("selectedModels=new Set(['m']);updateTokenSummary(sessions)");
-    assert.equal(h.elements.get("tokenSessionCount").textContent, "7 sessions");
-    assert.equal(h.elements.get("tokenOutput").textContent, "40");
-    h.run("selectedModels=new Set(['m','n']);updateTokenSummary(sessions)");
-    assert.equal(h.elements.get("tokenSessionCount").textContent, "9 sessions");
-    assert.equal(h.elements.get("tokenOutput").textContent, "100");
-});
-
-test("a preparation error affects history only and the next refresh can recover", async () => {
-    const h = harness();
-    h.context.requestDashboard = async () => { throw Object.assign(new Error("Preparing"), { preparing: true }); };
-    await h.run("load(true)");
-    assert.match(h.elements.get("historyStatus").textContent, /background/);
-    h.context.requestDashboard = async () => ({ payload: manifest("Date", "ready") });
-    await h.run("load(true)");
-    assert.equal(h.run("historyGeneration"), "ready");
-});
-
-test("VS Code bridge deduplicates identical scopes without combining unrelated requests", async () => {
-    const extension = fs.readFileSync(`${__dirname}/extension.js`, "utf8");
-    const source = extension.slice(extension.indexOf("const API_POLL_INTERVAL_MS"), extension.indexOf("function secondsAgo"));
-    const calls = [];
-    const context = vm.createContext({ URL, setInterval() {}, requestJson(url) { calls.push(url.toString()); return new Promise(() => {}); } });
-    vm.runInContext(source + "\nmonitor=new PythonMonitor({});", context);
-    vm.runInContext("monitor.getDashboard({view:'local',range:'All'});monitor.getDashboard({view:'local',range:'All'});monitor.getDashboard({view:'merged',range:'Date',start:0,end:86400});", context);
-    assert.equal(calls.length, 2);
-    assert.match(calls[0], /view=local/);
-    assert.match(calls[1], /view=merged/);
-    await flush();
 });
 
 test("cost time bins preserve hourly sums, gaps, exact filters and independent totals", () => {
@@ -269,17 +97,6 @@ test("cost time retains zero events, uses daily bins and bounds All history", ()
     h.elements.get("costTimeCumulative").onclick();
     assert.equal(h.run("costTimeMode"), "cumulative");
     assert.equal(h.context.drawCount, 1);
-});
-
-test("cost time scoped chunks and exact totals are carried through dashboard loading", async () => {
-    const h = harness();
-    const cost = { _key: "cost", timestamp: 10, usageAccountId: "a", costByModelUsd: { m: 4 }, totalCostUsd: 4 };
-    h.context.requestDashboard = async scope => ({ payload: scope.chunkId ? { ...frame(), costTime: [cost] } :
-        { ...manifest("Date", "cost-day", ["cost-chunk"]), costTimeBounds: [0, 86400], costTimeTotals: [cost] } });
-    await h.run("load(true)");
-    assert.equal(h.run("payload.costTime.length"), 1);
-    assert.equal(h.run("costTimeSeries().total"), 4);
-    assert.throws(() => h.run("validateView({quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]},costTime:[{}]})"), /Invalid cost time/);
 });
 
 test("cost time canvas renders bars, cumulative mode and interval tooltips", () => {
@@ -499,44 +316,79 @@ test("account switch renders cached usage and reset times before another status 
     assert.equal(h.run("currentStatus.accounts.activeAccountId"), "b");
 });
 
-test("switch response status wins over a pending poll and uncached accounts clear old readings", async () => {
-    const h = harness();
-    let finishPoll;
-    h.context.requestStatus = () => new Promise(resolve => finishPoll = resolve);
-    h.context.showMessage = () => ({ dismiss() {} });
-    h.context.load = () => {};
-    h.context.ensureControlPassword = () => {};
-    h.context.authenticatedAccountAction = async () => ({ accounts: { activeAccountId: "b", items: [] }, status: {
-        accounts: { activeAccountId: "b", items: [] }, accountStatuses: { b: { lastSample: null, display: {} } }
-    } });
-    h.run('payload.points=[{fiveHour:{raw:99,resetAt:1893456000}}]');
-    const poll = h.run("pollStatus(true)");
-    await h.run('performAccountAction("switch",{accountId:"b"})');
-    finishPoll({ payload: { accounts: { activeAccountId: "a", items: [] }, lastSample: { windows: { "5h": { usedPercent: 99 } } } } });
-    await poll;
-    assert.equal(h.run("currentStatus.accounts.activeAccountId"), "b");
-    assert.equal(h.elements.get("usage5hValue").textContent, "N/A");
-    assert.equal(h.elements.get("time5hReset").textContent, "Reset: N/A");
-    assert.equal(h.elements.get("status").textContent, "Refreshing account usage…");
+
+
+function bulkFixture(){
+    const view=()=>({quota:{'5h':30000,'7d':70000},tokens:[['b',100,[[0,'default',10,5,2,1,100000000]]]],legacy:[],
+        'usage:5h':[['q',0,100,10,20,1]],'usage:7d':[['w',0,100,20,1,1]],'chart:5h':[],'chart:7d':[]});
+    return {epoch:'e',cursors:{local:0,merged:0,state:0},models:['model-x'],state:{accounts:{activeAccountId:'slot',items:[{id:'slot',usageAccountId:'a',ready:true}],usageGroups:[{id:'a',label:'Nomei'}]}},accounts:[{id:'a',local:view(),merged:view()}]};
+}
+test('bulk decoding preserves both quota windows and numeric times',()=>{
+    const h=harness();h.context.bulkFixture=bulkFixture();h.run('acceptBulk(bulkFixture)');
+    assert.equal(h.run('payload.costTime[0].totalCostUsd'),1);
+    assert.equal(h.run('payload.tokenSessions[0].byModel["model-x"].usageTokens.freshInputTokens'),10);
+    assert.equal(h.run('payload.quotaPoints.filter(p=>p.resetWindow==="fiveHour").length'),2);
+    assert.equal(h.run('payload.quotaPoints.filter(p=>p.resetWindow==="sevenDay").length'),2);
+    assert.equal(h.run('payload.quotaPoints[0].fiveHour.multiplier'),20);
+    assert.equal(h.run('lastUpdateTimestamp'),100);
+});
+test('switching range and view does not fetch history',async()=>{
+    const h=harness({fetch(){throw new Error('unexpected request')}});h.context.bulkFixture=bulkFixture();h.run('acceptBulk(bulkFixture);dataView="local";selected="All"');await h.run('load(true)');
+    assert.equal(h.run('payload.tokenSessions.length'),1);
+});
+test('live token additions are idempotent and independent by view',()=>{
+    const h=harness();h.context.bulkFixture=bulkFixture();h.run('acceptBulk(bulkFixture)');
+    h.context.packet={epoch:'e',stream:'local',seq:1,channel:'tokens',account:'a',data:[['new',200,[['model-x','default',20,0,0,0,200000000]]]]};
+    h.run('applyLive(packet);applyLive(packet)');assert.equal(h.run('payload.costTime.length'),1);
+    h.run('dataView="local";showBulkView()');assert.equal(h.run('payload.costTime.length'),2);
+    assert.equal(h.run('payload.costTime.reduce((sum,row)=>sum+row.totalCostUsd,0)'),3);
+});
+test('chart attribution updates never change token totals',()=>{
+    const h=harness();h.context.bulkFixture=bulkFixture();h.run('acceptBulk(bulkFixture)');
+    h.context.packet={epoch:'e',stream:'merged',seq:1,channel:'chart:5h',account:'a',data:{set:[['i',0,100,50,1,10,[['model-x',100000000,10]]]],remove:[]}};
+    h.run('applyLive(packet)');assert.equal(h.run('payload.costTime[0].totalCostUsd'),1);assert.equal(h.run('payload.costUsage.fiveHour[0].totalCostUsd'),1);
+});
+test('cost popup sums selected accounts and stops cumulative at mouse time',()=>{
+    const h=harness();h.run(`payload={costTimeBounds:[0,100],costTime:[{timestamp:10,usageAccountId:'a',costByModelUsd:{m:1}},{timestamp:40,usageAccountId:'b',costByModelUsd:{m:2}},{timestamp:80,usageAccountId:'a',costByModelUsd:{m:3}}]}`);
+    assert.deepEqual(JSON.parse(h.run('JSON.stringify(costModelHover(50,100,60))')),[{model:'m',spending:3,cumulative:3}]);
+    h.run('selectedAccounts=new Set(["a"])');assert.deepEqual(JSON.parse(h.run('JSON.stringify(costModelHover(50,100,90))')),[{model:'m',spending:3,cumulative:4}]);
 });
 
+test('obsolete epoch packets cannot replace active data',()=>{
+ const h=harness();h.context.bulkFixture=bulkFixture();h.run('acceptBulk(bulkFixture)');
+ h.context.packet={epoch:'old',stream:'state',seq:100,channel:'state',data:{accounts:{activeAccountId:'old'}}};
+ h.run('applyLive(packet)');assert.equal(h.run('currentStatus.accounts.activeAccountId'),'slot');
+});
 
-test("a poll sharing a pre-switch request cannot replace the switch response", async () => {
-    let finishFetch;
-    const h = harness({ fetch: () => new Promise(resolve => finishFetch = resolve) });
-    h.context.showMessage = () => ({ dismiss() {} });
-    h.context.load = () => {};
-    h.context.ensureControlPassword = () => {};
-    h.context.authenticatedAccountAction = async () => ({ status: {
-        accounts: { activeAccountId: "b", items: [] },
-        accountStatuses: { b: { lastSample: { windows: { "5h": { usedPercent: 42, resetAt: 1893456000 } } } } }
-    } });
-    const oldPoll = h.run("pollStatus(true)");
-    await h.run('performAccountAction("switch",{accountId:"b"})');
-    const sharedPoll = h.run("pollStatus(true)");
-    finishFetch({ ok: true, status: 200, headers: { get: () => "old" }, json: async () => ({ accounts: { activeAccountId: "a", items: [] } }) });
-    await Promise.all([oldPoll, sharedPoll]);
-    assert.equal(h.run("currentStatus.accounts.activeAccountId"), "b");
-    assert.equal(h.elements.get("usage5hValue").textContent, "42.0%");
-    assert.equal(h.run("statusEtag"), null);
+function extensionHarness(requestJson,overrides={}){
+ const source=fs.readFileSync(`${__dirname}/extension.js`,'utf8');
+ const context=vm.createContext({URL,requestJson,stableTooltip:()=>'',setTimeout,clearTimeout,...overrides});
+ vm.runInContext(source.slice(source.indexOf('const TOOLTIP_HOVER_DELAY_SECONDS'),source.indexOf('function secondsAgo'))+';monitor=new PythonMonitor({show(){}});',context);
+ return context;
+}
+test('extension shares the initial bulk request',async()=>{
+ let finish,calls=0;const context=extensionHarness(()=>{calls++;return new Promise(resolve=>finish=resolve)});
+ const first=vm.runInContext('monitor.getDashboard()',context),second=vm.runInContext('monitor.getDashboard()',context);
+ assert.equal(calls,1);finish({state:{accounts:{items:[]}}});await Promise.all([first,second]);assert.equal(calls,1);
+});
+test('a delayed HTTP status cannot overwrite newer streamed state',async()=>{
+ let finish;const context=extensionHarness(()=>new Promise(resolve=>finish=resolve));
+ const response=vm.runInContext('monitor.getStatusResponse()',context);
+ vm.runInContext('monitor.cachedStatus={newest:true};monitor.streamStatusReceived=true;',context);
+ finish({payload:{newest:false}});assert.equal((await response).payload.newest,true);
+});
+
+test('a new account initializes before its first token packet',()=>{
+ const h=harness();h.context.bulkFixture=bulkFixture();h.run('acceptBulk(bulkFixture)');
+ h.context.metadata={epoch:'e',stream:'merged',seq:1,channel:'account',account:'new',data:{label:'New account'}};
+ h.context.event={epoch:'e',stream:'merged',seq:2,channel:'tokens',account:'new',data:[['event',200,[['model-y','default',1,0,0,0,1]]]]};
+ h.run('applyLive(metadata);applyLive(event)');assert.equal(h.run('payload.accountLabels.new'),'New account');assert.equal(h.run('payload.costTime.length'),2);
+});
+
+test('extension keeps state-only subscription snapshots out of dashboard replay',()=>{
+ const sockets=[];class Socket{constructor(){this.callbacks={};sockets.push(this)}on(name,callback){this.callbacks[name]=callback}}
+ const context=extensionHarness(()=>{}, {WebSocket:Socket});context.forwarded=0;
+ vm.runInContext('monitor.onDashboardPacket=()=>forwarded++;monitor.connectStream()',context);
+ sockets[0].callbacks.message(Buffer.from(JSON.stringify({type:'state',epoch:'e',cursors:{state:1},data:{}})));
+ assert.equal(context.forwarded,0);
 });

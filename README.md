@@ -24,7 +24,7 @@ A lightweight Python service owns the data, dashboard, account vault, managed sk
 
 | Capability | What you get |
 | --- | --- |
-| Live quota monitoring | Authoritative 5-hour and 7-day percentages, reset times, plan-aware history curves, and lightweight five-second status refreshes. |
+| Live quota monitoring | Authoritative 5-hour and 7-day percentages, reset times, plan-aware history curves, and server-pushed live updates. |
 | Token and cost analytics | Fresh input, cached input, cache writes, output, cache-hit rate, per-model totals, Standard/Fast attribution, and estimated cost. |
 | Multiple Codex accounts | Safe local account switching, login-slot creation, rename/delete controls, identity validation, and per-account history attribution. |
 | Skill management | Discover Codex and Gemini skills, move them into one private managed store, assign them with strict links or managed fallbacks, and synchronize changes. |
@@ -43,7 +43,7 @@ flowchart LR
     M <--> W[Optional encrypted WebDAV]
 ```
 
-The monitor is authoritative. The dashboard loads scoped `/api/dashboard` manifests and immutable chunks for the selected view and time range, then polls `/api/status` every five seconds with an ETag. Unchanged manifests reuse downloaded chunks; local and synchronized changes prepare updated views in the backend. The retired `/api/series` endpoint returns 410.
+The monitor is authoritative. The dashboard downloads one gzip-compressed `/api/dashboard` snapshot containing all retained Local and Merged history, grouped by account. `/api/dashboard/live` pushes sequenced changes over a WebSocket on the same port. Filters and time ranges operate locally. Changed cloud data triggers an atomic full snapshot refresh; reconnects replay retained updates or request a new snapshot. HTTP has no explicit protocol version. The retired `/api/series` and chunk endpoints return 410.
 
 ## Requirements
 
@@ -109,14 +109,14 @@ The top cards show the latest 5-hour and 7-day usage, reset times, plan, and act
 - Account filters shared by quota, token, and cost views.
 - **Local** and **Merged** quota, token, and cost datasets.
 - Separate colored quota curves per selected account.
-- Fresh input, cached input, output, cache write, cache-hit rate, and estimated cost.
-- A full-width Cost vs Time chart with adaptive whole-minute/hour/day spending bars, a cumulative-cost toggle, 5h/7d usage overlays, and exact event-based account/model filters. Joint idle folding preserves intervals containing spending or usage changes. Older session-only cost baselines are excluded from this chart.
+- Fresh input, cached input, output, cache write, cache-hit rate, and estimated cost. Session counts are no longer displayed.
+- A full-width Cost vs Time chart with adaptive whole-minute/hour/day spending bars, a cumulative-cost toggle, 5h/7d usage overlays, and exact event-based account/model filters. Joint idle folding preserves intervals containing spending or usage changes. Older session-only cost baselines are excluded from this chart. Hover shows each model’s bar spending and cumulative cost through the pointer time, summed across selected accounts.
 
 **Local** shows only quota, token, and cost data recorded by this machine. **Merged** extends each local account with synchronized records carrying the same private account identity.
 Synchronized records that do not yet match a local account remain in the sync cache but are temporarily excluded; they are included automatically when the corresponding account is created or bound locally.
 Merged datasets are materialized when local, synchronized, or account-identity data changes, so switching views only selects an existing dataset.
 
-The extension contributes **Codex Usage Monitor: Show Details**. Opening it fetches the current dashboard, and invoking it again refreshes the same view. Webview status and history requests are independently deduplicated.
+The extension contributes **Codex Usage Monitor: Show Details**. Opening it fetches the current dashboard, and invoking it again refreshes the same view. The extension shares one live connection, subscribes only to current state while the dashboard is closed, and relays history updates to its webview.
 
 ## Managing Codex accounts
 
@@ -234,7 +234,7 @@ Automatic usage synchronization supplements the directional manual Push and Fetc
 - Each machine publishes a v4 encrypted head pointing to month catalogs, day manifests and immutable data partitions. Changed days are uploaded and verified before the head commits with a conditional ETag.
 - Fetch compares remote day hashes with the SQLite cache and downloads missing or changed partitions. Removed machine origins are reconciled after reading the complete inventory.
 - Usage account IDs are domain-separated hashes of account identity and stay unchanged when the encryption passphrase changes. Ordered migration converts old IDs before normal loading; runtime account matching uses current IDs only.
-- Dashboard projections and scoped delivery chunks share the typed SQLite store. Raw recorder files and token/session totals remain authoritative; obsolete JSON display caches are removed during migration.
+- Dashboard projections and prepared account snapshots share the typed SQLite store. Raw recorder files and token/session totals remain authoritative; obsolete JSON display caches are removed during migration.
 
 Every 60 minutes, periodic Fetch also checks the authoritative skill index and refreshes the remote-account list. Strong head ETags skip unchanged usage inventories. Every 30 days a full fetch verifies active remote partitions. The first periodic Fetch runs immediately when no previous attempt is recorded or when that attempt is at least one hour old.
 
@@ -251,7 +251,7 @@ The canonical data root is `~/.codex-switch`:
 | `usage_monitor_token_events.jsonl` | Append-only usage events with recorded costs and preserved session baselines; authoritative for token and cost totals | Every record, encrypted |
 | `usage_monitor_diagnostic_samples.jsonl` | Detailed local diagnostic samples | Never |
 | `usage_monitor_state.json` | Runtime baselines and cursors | Never |
-| `usage_monitor_sync_cache-v4.sqlite3` | Typed local/remote facts, incremental processing, dashboard projections and delivery chunks | Never uploaded as a database |
+| `usage_monitor_sync_cache-v4.sqlite3` | Typed local/remote facts, incremental processing, dashboard projections and bulk/live interpretation data | Never uploaded as a database |
 
 Each token event stores its cost calculated using the price effective at the event time. Stored costs remain authoritative after pricing changes; redundant price-epoch records and references are removed by the ordered data-contract migration after verifying totals. Existing session-only totals are preserved as schema 2 `sessionBaseline` records, which contribute to token summaries but not Cost vs Usage charts. Source high-water totals are retained to prevent historical usage from being replayed.
 

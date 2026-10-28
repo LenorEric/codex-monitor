@@ -3,8 +3,8 @@ const http = require("http");
 const path = require("path");
 const zlib = require("zlib");
 const vscode = require("vscode");
+const WebSocket = require("ws");
 
-const API_POLL_INTERVAL_MS = 5000;
 const TOOLTIP_HOVER_DELAY_SECONDS = 3;
 const DASHBOARD_URL = new URL("http://127.0.0.1:8765/");
 const MANAGEMENT_URL = new URL("http://127.0.0.1:8765/manage");
@@ -65,7 +65,13 @@ class PythonMonitor {
         this.pendingDashboardRequests = new Map();
         this.cachedStatus = null;
         this.statusEtag = null;
-        this.pollTimer = null;
+        this.stream = null;
+        this.retryTimer = null;
+        this.retryDelay = 1000;
+        this.subscription = { type: "subscribe", epoch: null, cursors: { state: 0 } };
+        this.disposed = false;
+        this.onDashboardPacket = null;
+        this.streamStatusReceived = false;
         this.lastTooltip = null;
     }
 
@@ -74,12 +80,13 @@ class PythonMonitor {
         this.statusBar.tooltip = "Start the monitor with: python codex_monitor_daemon.py";
         this.statusBar.show();
         this.update();
-        this.pollTimer = setInterval(() => this.update(), API_POLL_INTERVAL_MS);
+        this.connectStream();
     }
 
     async getStatusResponse() {
         if (this.pendingStatusRequest) return this.pendingStatusRequest;
         this.pendingStatusRequest = requestJson(STATUS_API_URL, { etag: this.statusEtag, responseMetadata: true }).then(response => {
+            if (this.streamStatusReceived && this.cachedStatus) return { ...response, payload: this.cachedStatus };
             if (response.notModified) {
                 if (!this.cachedStatus) throw new Error("Python monitor returned 304 before a status snapshot was available");
                 return { ...response, payload: this.cachedStatus };
@@ -97,23 +104,60 @@ class PythonMonitor {
         return (await this.getStatusResponse()).payload;
     }
 
-    async getDashboard(scope, etag) {
-        if (!scope || typeof scope !== "object") throw new Error("Invalid dashboard scope");
-        const url = new URL(scope.chunkId ? `${DASHBOARD_API_URL}/chunk` : DASHBOARD_API_URL);
-        if (scope.chunkId) url.searchParams.set("id", scope.chunkId);
-        else for (const name of ["view", "range", "start", "end"]) if (scope[name] !== undefined) url.searchParams.set(name, scope[name]);
-        const key = `${url}|${etag || ""}`;
-        if (!this.pendingDashboardRequests.has(key)) {
-            this.pendingDashboardRequests.set(key, requestJson(url, { etag, responseMetadata: true, timeoutMs: 30000 }).finally(() => this.pendingDashboardRequests.delete(key)));
-        }
+    async getDashboard() {
+        const key = "bulk";
+        if (!this.pendingDashboardRequests.has(key)) this.pendingDashboardRequests.set(key, requestJson(DASHBOARD_API_URL, { timeoutMs: 60000 }).then(bulk => {
+            if (bulk.state) { this.cachedStatus = bulk.state; this.update(); }
+            return bulk;
+        }).finally(() => this.pendingDashboardRequests.delete(key)));
         return this.pendingDashboardRequests.get(key);
+    }
+
+    subscribeDashboard(epoch, cursors, listener) {
+        this.onDashboardPacket = listener;
+        this.subscription = { type: "subscribe", epoch, cursors: { ...cursors } };
+        if (this.stream?.readyState === WebSocket.OPEN) this.stream.send(JSON.stringify(this.subscription));
+    }
+
+    unsubscribeDashboard() {
+        this.onDashboardPacket = null;
+        this.subscription = { type: "subscribe", epoch: null, cursors: { state: 0 } };
+        if (this.stream?.readyState === WebSocket.OPEN) this.stream.send(JSON.stringify(this.subscription));
+    }
+
+    connectStream() {
+        if (this.disposed) return;
+        const socket = new WebSocket("ws://127.0.0.1:8765/api/dashboard/live", { perMessageDeflate: false, maxPayload: 4 * 1024 * 1024 });
+        this.stream = socket;
+        socket.on("open", () => { this.retryDelay = 1000; socket.send(JSON.stringify(this.subscription)); });
+        socket.on("message", data => {
+            try {
+                const packet = JSON.parse(data.toString());
+                if (packet.type === "state" || packet.channel === "state") {
+                    this.streamStatusReceived = true;
+                    this.cachedStatus = packet.data;
+                    this.update();
+                }
+                if (packet.type === "state") return;
+                if (packet.type === "refresh" && !this.onDashboardPacket) { this.unsubscribeDashboard(); return; }
+                if (packet.seq) this.subscription.cursors[packet.stream] = packet.seq;
+                this.onDashboardPacket?.(packet);
+            } catch { socket.close(); }
+        });
+        socket.on("error", () => {});
+        socket.on("close", () => {
+            if (this.disposed || this.stream !== socket) return;
+            this.statusBar.text = "$(plug) Codex usage unavailable";
+            this.retryTimer = setTimeout(() => this.connectStream(), this.retryDelay);
+            this.retryDelay = Math.min(30000, this.retryDelay * 2);
+        });
     }
 
     async update() {
         try {
-            const status = await this.getStatus();
+            const status = this.cachedStatus || await this.getStatus();
             const display = status.display || {};
-            this.statusBar.text = `$(pulse) ${display.statusBarText || "Codex usage"}`;
+            this.statusBar.text = `$(pulse) ${display.statusBarText || `Codex 5h ${status.lastSample?.windows?.["5h"]?.usedPercent ?? "-"}% · 7d ${status.lastSample?.windows?.["7d"]?.usedPercent ?? "-"}%`}`;
             const tooltip = stableTooltip(status);
             if (tooltip !== this.lastTooltip) {
                 this.lastTooltip = tooltip;
@@ -132,12 +176,14 @@ class PythonMonitor {
     }
 
     dispose() {
-        clearInterval(this.pollTimer);
+        this.disposed = true;
+        clearTimeout(this.retryTimer);
+        this.stream?.close();
     }
 }
 
 function secondsAgo(value) {
-    const timestamp = Date.parse(value || "");
+    const timestamp = typeof value === "number" ? value * 1000 : Date.parse(value || "");
     return Number.isFinite(timestamp) ? `${Math.max(0, Math.floor((Date.now() - timestamp) / 1000) + TOOLTIP_HOVER_DELAY_SECONDS)}s ago` : "-";
 }
 
@@ -155,9 +201,9 @@ function stableTooltip(status) {
     const resetText = label => sampleWindows[label]?.resetAt ? `${new Date(sampleWindows[label].resetAt * 1000).toLocaleString()} (${remainingTime(sampleWindows[label].resetAt)} remaining)` : windows[label]?.resetText || "-";
     return [
         "Codex Usage",
-        `5h: ${windows["5h"]?.usageText || "-"} used, resets ${resetText("5h")}`,
-        `7d: ${windows["7d"]?.usageText || "-"} used, resets ${resetText("7d")}`,
-        `Last update ${secondsAgo(display.percentCheckedAt)}`,
+        `5h: ${windows["5h"]?.usageText || `${sampleWindows["5h"]?.usedPercent ?? "-"}%`} used, resets ${resetText("5h")}`,
+        `7d: ${windows["7d"]?.usageText || `${sampleWindows["7d"]?.usedPercent ?? "-"}%`} used, resets ${resetText("7d")}`,
+        `Last update ${secondsAgo(status.lastSample?.percentCheckedAt ?? status.lastSample?.checkedAt ?? display.percentCheckedAt)}`,
     ].join("\n");
 }
 
@@ -271,9 +317,13 @@ function activate(context) {
             panel.webview.onDidReceiveMessage(async message => {
                 const target = panel;
                 if (!target) return;
+                if (message.type === "subscribeCodexDashboard") {
+                    monitor.subscribeDashboard(message.epoch, message.cursors, packet => panel?.webview.postMessage({ type: "codexDashboardLive", packet }));
+                    return;
+                }
                 if (message.type === "getCodexDashboard") {
                     try {
-                        target.webview.postMessage({ type: "codexDashboardResponse", requestId: message.requestId, response: await monitor.getDashboard(message.scope, message.etag) });
+                        target.webview.postMessage({ type: "codexDashboardResponse", requestId: message.requestId, response: await monitor.getDashboard() });
                     } catch (error) {
                         target.webview.postMessage({ type: "codexDashboardResponse", requestId: message.requestId, error: error.message || String(error), preparing: error.preparing });
                     }
@@ -281,6 +331,7 @@ function activate(context) {
                 }
                 if (message.type === "codexUsageNavigate") {
                     if (!PAGE_ALLOWLIST[message.page]) return;
+                    if (message.page !== "dashboard") monitor.unsubscribeDashboard();
                     currentPage = message.page;
                     target.title = PAGE_ALLOWLIST[currentPage].title;
                     target.webview.html = await detailsHtml(context, target.webview, currentPage);
@@ -308,16 +359,10 @@ function activate(context) {
                     }
                     return;
                 }
-                if (message.type === "getCodexUsageStatus") {
-                    try {
-                        target.webview.postMessage({ type: "codexUsageStatus", response: await monitor.getStatusResponse() });
-                    } catch (error) {
-                        target.webview.postMessage({ type: "codexUsageStatus", error: error.message || String(error) });
-                    }
-                    return;
-                }
+
             });
             panel.onDidDispose(() => {
+                monitor.unsubscribeDashboard();
                 panel = undefined;
             });
             const target = panel;

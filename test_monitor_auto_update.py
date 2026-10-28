@@ -51,6 +51,12 @@ def temporary_directory():
 
 
 class AutoUpdateTests(unittest.TestCase):
+    def setUp(self):
+        # Fixtures do not contain installable requirements; never run real pip.
+        patcher = mock.patch.object(monitor_auto_update, "install_dependencies")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_startup_check_respects_setting_and_does_not_initialize_data(self):
         with temporary_directory() as root, mock.patch.object(monitor_auto_update.AutoUpdater, "check_for_update", return_value=True) as check:
             self.assertFalse(monitor_auto_update.check_startup_update(root, root, lambda: None))

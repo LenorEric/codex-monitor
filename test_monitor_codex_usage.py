@@ -2200,7 +2200,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             'plan_type': 'plus',
         })
 
-        windows = quota_history_windows({"usage": compact})
+        windows = quota_history_windows({"checkedAt": "2030-01-01T00:00:00Z", "usage": compact})
 
         self.assertTrue(compact["complete"])
         self.assertEqual(windows["5h"]["usedPercent"], 42.5)
@@ -2229,7 +2229,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             'plan_type': 'pro',
         })
 
-        windows = quota_history_windows({"usage": compact})
+        windows = quota_history_windows({"checkedAt": "2030-01-01T00:00:00Z", "usage": compact})
 
         self.assertEqual(windows["5h"]["plan"], "pro")
         self.assertEqual(windows["5h"]["planMultiplier"], 10.0)
@@ -2250,7 +2250,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             'plan_type': 'plus',
         })
 
-        windows = quota_history_windows({"usage": compact})
+        windows = quota_history_windows({"checkedAt": "2030-01-01T00:00:00Z", "usage": compact})
 
         self.assertTrue(compact["complete"])
         self.assertEqual(compact["missingWindows"], [])
@@ -2272,7 +2272,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             'plan_type': 'plus',
         })
 
-        windows = quota_history_windows({"usage": compact})
+        windows = quota_history_windows({"checkedAt": "2030-01-01T00:00:00Z", "usage": compact})
 
         self.assertTrue(compact["complete"])
         self.assertEqual(compact["missingWindows"], [])
@@ -3696,10 +3696,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         self.assertIn('<button data-data-view="local">Local</button><button data-data-view="merged">Merged</button>', html)
         self.assertIn('dataView="merged"', html)
-        self.assertIn('`/api/dashboard?${new URLSearchParams(scope)}`', html)
-        self.assertIn('vscode.postMessage({type:"getCodexDashboard",requestId,scope,etag})', html)
+        self.assertIn('fetch("/api/dashboard",{cache:"no-store"})', html)
+        self.assertIn('vscode.postMessage({type:"getCodexDashboard",requestId})', html)
         self.assertIn('button.classList.toggle("active",button.dataset.dataView===dataView)', html)
-        self.assertIn('async getDashboard(scope, etag)', extension)
+        self.assertIn('async getDashboard()', extension)
         self.assertNotIn("getCodexUsageSeries", extension)
 
     def test_dashboard_local_view_uses_only_local_quota_tokens_and_cost(self):
@@ -3732,14 +3732,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('const ACCOUNT_ACTION_TIMEOUT_MS = 300000', extension)
         self.assertIn('timeoutMs: ACCOUNT_ACTION_TIMEOUT_MS', extension)
         self.assertIn('STATUS_API_URL = new URL("http://127.0.0.1:8765/api/status")', extension)
-        self.assertIn("const status = await this.getStatus()", extension)
+        self.assertIn("const status = this.cachedStatus || await this.getStatus()", extension)
         self.assertNotIn("if (error.statusCode === 404) return this.getSeries()", extension)
-        self.assertIn('message.type === "getCodexUsageStatus"', extension)
-        self.assertIn('fetch("/api/status",{cache:"no-store",headers:statusEtag?', html)
-        self.assertIn('if(historyGeneration===manifest.generation)return', html)
-        self.assertIn("setInterval(pollStatus,5000)", html)
-        self.assertIn('addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true);load(true)}})', html)
-        self.assertIn("setInterval(load,5000)", html)
+        self.assertIn('message.type === "subscribeCodexDashboard"', extension)
+        self.assertIn('fetch("/api/dashboard",{cache:"no-store"})', html)
+        self.assertIn('if(packet.seq<=bulkData.cursors[packet.stream])return', html)
+        self.assertNotIn("setInterval(pollStatus,5000)", html)
+        self.assertIn('addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();if(!bulkData)load(true)}})', html)
+        self.assertNotIn("setInterval(load,5000)", html)
 
         self.assertNotIn("RELATIVE_TIME_UPDATE_INTERVAL_MS", extension)
         self.assertNotIn("lastTooltipRevision", extension)
@@ -3747,7 +3747,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("Math.floor((Date.now() - timestamp) / 1000) + TOOLTIP_HOVER_DELAY_SECONDS", extension)
         self.assertIn("const tooltip = stableTooltip(status)", extension)
         self.assertIn("if (tooltip !== this.lastTooltip)", extension)
-        self.assertIn('`Last update ${secondsAgo(display.percentCheckedAt)}`', extension)
+        self.assertIn('`Last update ${secondsAgo(status.lastSample?.percentCheckedAt ?? status.lastSample?.checkedAt ?? display.percentCheckedAt)}`', extension)
 
     def test_dashboard_and_management_pages_expose_stacked_pop_messages(self):
         for html in (dashboard_html(), Path(__file__).with_name("management.html").read_text(encoding="utf-8")):
@@ -4318,7 +4318,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('button.setAttribute("aria-pressed",String(getValue()))', html)
         self.assertIn('normalize.setAttribute("aria-pressed",String(normalizedUsage))', html)
         self.assertIn('normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)', html)
-        self.assertIn('setupAccountControls();setupUsageFoldControls();setupCostTimeControls();pollStatus(true);load(true)', html)
+        self.assertIn('setupAccountControls();setupUsageFoldControls();setupCostTimeControls();load(true)', html)
         self.assertIn('function quotaTimeDomain(points)', html)
         self.assertIn('function quotaPointsInRange(points,domain)', html)
         self.assertIn('compactedBoundary:true', html)
@@ -4390,7 +4390,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('points.length?"Not enough data for the selected scope":"No data for this range"', html)
         self.assertNotIn("Not enough data for the selected accounts", html)
         self.assertIn('function plusEquivalentUsage(point,label,valueOf)', html)
-        self.assertIn('{plus:1,pro_lite:5,pro:10}[point[label]?.plan]||1', html)
+        self.assertIn('point[label]?.multiplier??1', html)
         self.assertIn('function compactedUsageRanges(points)', html)
         self.assertIn('ranges.some(range=>range.start<=previousAt&&currentAt<=range.end)', html)
         self.assertIn('function compactedUsageGap(previous,current,ranges)', html)
@@ -4427,7 +4427,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         html = dashboard_html()
         script = html[html.index("function plusEquivalentUsage"):html.index("function compactedUsageRanges")] + r'''
 const valueOf=point=>point.fiveHour.continuous;
-const point=(plan,continuous)=>({fiveHour:{plan,continuous}});
+const point=(plan,continuous)=>({fiveHour:{multiplier:{plus:1,pro_lite:5,pro:10}[plan],continuous}});
 if(plusEquivalentUsage(point("pro_lite",20),"fiveHour",valueOf)!==100)throw new Error("Pro Lite 20% did not normalize to 100%");
 if(plusEquivalentUsage(point("pro",20),"fiveHour",valueOf)!==200)throw new Error("Pro 20% did not normalize to 200%");
 if(plusEquivalentUsage(point(undefined,20),"fiveHour",valueOf)!==20)throw new Error("Missing plan was not treated as Plus");
@@ -4449,7 +4449,7 @@ if(plusEquivalentUsage(point(undefined,20),"fiveHour",valueOf)!==20)throw new Er
         html = dashboard_html()
         script = html[html.index("function eventTimestamp"):html.index("function updateWindowTime")] + html[html.index("function plusEquivalentUsage"):html.index("function drawUsageTimeChart")] + r'''
 const valueOf=point=>point.fiveHour.continuous;
-const point=(timestamp,continuous,plan="plus")=>({timestamp,fiveHour:{continuous,plan}});
+const point=(timestamp,continuous,plan="plus")=>({timestamp,fiveHour:{continuous,multiplier:{plus:1,pro_lite:5,pro:10}[plan]}});
 const resetPoints=[point(300,5),point(100,10),point(200,20),point(400,15),point(500,2),point(600,12)];
 if(usageTimeAccountTotal(resetPoints,valueOf)!==30)throw new Error(`Reset-aware total was incorrect: ${usageTimeAccountTotal(resetPoints,valueOf)}`);
 const normalizedValueOf=point=>plusEquivalentUsage(point,"fiveHour",valueOf), litePoints=[point(0,10,"pro_lite"),point(1,20,"pro_lite"),point(2,5,"pro_lite"),point(3,8,"pro_lite")];
@@ -6362,7 +6362,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertIn('await requestControlPassword(true)', dashboard)
         self.assertIn('password=await requestControlPassword(setup)', dashboard)
         self.assertNotIn('prompt("Control password")', dashboard)
-        self.assertIn('load(true);setInterval(pollStatus,5000)', dashboard)
+        self.assertIn('connectLive()', dashboard)
 
     def test_initial_control_password_setup_is_loopback_only(self):
         self.assertTrue(monitor_dashboard.client_host_is_loopback("127.0.0.1"))

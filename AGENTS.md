@@ -15,7 +15,7 @@
 
 # Data boundaries
 
-- Keep ingestion and business calculations in the Python backend. Dashboard and extension clients consume prepared scope manifests/chunks; `/api/series` is retired (410).
+- Keep ingestion and business calculations in the Python backend. Dashboard and extension clients consume prepared account-based bulk snapshots and sequenced WebSocket updates; `/api/series` is retired (410).
 - Preserve canonical histories and synchronization ownership when rebuilding derived projections or delivery artifacts. Cloud-downloaded history must not be appended to local recorder files.
 - Use `monitor_sample_store.connect()` when querying compatibility views such as `processing_facts`, `local_records`, and `remote_records`; their JSON columns require registered codec functions. Plain SQLite clients should inspect typed physical tables.
 - Consult `data-pipeline.zh-CN.md` for pipeline semantics, `sampled-storage.md` for typed storage, and `dashboard-delivery.md` for delivery behavior. Verify version claims against code and successful releases; design documents contain historical targets.
@@ -37,3 +37,4 @@
 ## Developing
 
 * The script should be designed to work for both windows and linux.
+* Unix timestamp is preferred than time string.

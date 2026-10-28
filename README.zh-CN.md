@@ -42,7 +42,7 @@ flowchart LR
     M <--> W[可选的加密 WebDAV]
 ```
 
-Python 监控服务是权威数据源。仪表盘通过 `/api/dashboard` 获取所选视图和时间范围的清单及不可变数据块，之后每五秒携带 ETag 轮询 `/api/status`。清单未变化时复用已下载的数据块；本地及同步数据的变化由后端生成更新后的视图。已移除的 `/api/series` 接口返回 410。
+Python 监控服务是权威数据源。仪表盘通过 `/api/dashboard` 一次获取按账号组织、同时包含 Local 和 Merged 全部历史的 gzip 快照，随后通过同一端口上的 `/api/dashboard/live` WebSocket 接收分视图、分通道的增量数据。时间范围和筛选在客户端完成。云端数据发生实际变化后整体刷新快照；断线后按序列补发，超出保留范围时重新下载快照。HTTP 不声明协议版本号。旧 series 和 chunk 接口返回 410。
 
 ## 运行要求
 

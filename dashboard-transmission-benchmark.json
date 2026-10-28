@@ -1,0 +1,39 @@
+{
+  "bulkBytes": 1169826,
+  "jsonBytes": 5891425,
+  "warmHttpMs": 3.878,
+  "accounts": 8,
+  "keyedJsonBytes": 10909855,
+  "keyedGzipBytes": 1281133,
+  "decodeMs": 735.5963,
+  "idleObservationMs": 600,
+  "heartbeatIntervalSeconds": 20,
+  "idleWireBytes": 0,
+  "liveWireBytes": 1967,
+  "packetBytes": {
+    "local:tokens": 292,
+    "local:chart:5h": 309,
+    "local:chart:7d": 369,
+    "merged:tokens": 293,
+    "merged:chart:5h": 310,
+    "merged:chart:7d": 370
+  },
+  "packetCounts": {
+    "local:tokens": 1,
+    "local:chart:5h": 1,
+    "local:chart:7d": 1,
+    "merged:tokens": 1,
+    "merged:chart:5h": 1,
+    "merged:chart:7d": 1
+  },
+  "firstPacketMs": 1723.8503,
+  "liveObserveMs": 5812.5051,
+  "sourceSnapshotMs": 24637.382,
+  "preparationMs": 17957.521,
+  "preparation": {
+    "accountsPrepared": 18,
+    "bulkBytes": 5891431,
+    "gzipBytes": 1169828,
+    "prepareSeconds": 4.675116
+  }
+}

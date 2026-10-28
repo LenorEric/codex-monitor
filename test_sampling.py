@@ -150,7 +150,7 @@ class SamplingStorageTests(unittest.TestCase):
             monitor_migrations.migrate_history_data(*args)
         self.assertEqual(self.store.quota_path.read_bytes(), original)
         self.assertEqual(self.points(), expected)
-        self.assertEqual(monitor_migrations.migrate_history_data(*args), [17])
+        self.assertEqual(monitor_migrations.migrate_history_data(*args), [17, 18])
         self.assertEqual(self.store.quota_path.read_bytes(), original)
         self.store.index = ProcessingIndex(self.store.v4_cache_path)
         self.store.ingest_local()

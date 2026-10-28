@@ -23,7 +23,8 @@ def quota_point(row, slot_usage_accounts=None):
         window = (row.get("windows") or {}).get(label) or {}
         raw = None if window.get("unavailable") else coerce_float(window.get("usedPercent"))
         plan = normalize_plan_type(window.get("plan"))
-        point[name] = {"raw": raw, "continuous": raw, "resetAt": window.get("resetAt"), "plan": "plus" if plan == "unknown" else plan}
+        from monitor_interpretation import multiplier
+        point[name] = {"raw": raw, "continuous": raw, "resetAt": window.get("resetAt"), "plan": "plus" if plan == "unknown" else plan, "multiplier": multiplier(plan, point["timestamp"] or 0)}
     return point
 
 
@@ -55,9 +56,9 @@ def sample_point(point, state, reset_points=None):
 
 
 def accepted_windows(state):
-    from monitor_common import PLAN_MULTIPLIERS
+    from monitor_interpretation import multiplier
     return {label: {"usedPercent": state[name]["raw"], "resetAt": state[name]["resetAt"], "plan": state[name]["plan"],
-        "planMultiplier": PLAN_MULTIPLIERS[state[name]["plan"]], "percentCheckedAt": state[name]["checkedAt"]}
+        "planMultiplier": multiplier(state[name]["plan"], state[name]["timestamp"]), "percentCheckedAt": state[name]["checkedAt"]}
         for name, (label, _) in WINDOWS.items() if name in state}
 
 

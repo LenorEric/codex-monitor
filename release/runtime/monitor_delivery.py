@@ -1,441 +1,354 @@
-"""Incremental, immutable dashboard delivery artifacts. Canonical histories are untouched."""
+
+"""Prepared account snapshots and durable, independently sequenced live channels."""
 
 import gzip
 import hashlib
 import json
-import math
-import monitor_sample_store as samples
 import threading
 import time
-from collections import OrderedDict, defaultdict
-from contextlib import contextmanager
+import uuid
+from contextlib import closing
 
+import monitor_sample_store as samples
 from monitor_common import parse_timestamp
+from monitor_interpretation import WINDOWS, aggregate_tokens, chart_rows, token_row, usage_runs, valid_intervals
 
-PROTOCOL_VERSION = 4
-LEVELS = (0, 300, 1800, 7200, 86400)
-RANGES = {"5h": 18000, "24h": 86400, "7d": 604800, "30d": 2592000, "All": None}
 DAY = 86400
-
-
-def initialize_delivery(db):
-    db.executescript("""
-        CREATE TABLE IF NOT EXISTS dashboard_days(view TEXT,day INTEGER,revision INTEGER NOT NULL,dirty INTEGER NOT NULL,PRIMARY KEY(view,day));
-        CREATE TABLE IF NOT EXISTS dashboard_parts(view TEXT,day INTEGER,level INTEGER,digest TEXT NOT NULL,PRIMARY KEY(view,day,level));
-        CREATE TABLE IF NOT EXISTS dashboard_day_meta(view TEXT,day INTEGER,data TEXT NOT NULL,PRIMARY KEY(view,day));
-        CREATE TABLE IF NOT EXISTS dashboard_blobs(digest TEXT PRIMARY KEY,body BLOB NOT NULL,compressed BLOB NOT NULL,created REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS dashboard_manifests(scope TEXT PRIMARY KEY,signature TEXT NOT NULL,data TEXT NOT NULL,updated REAL NOT NULL);
-        CREATE TABLE IF NOT EXISTS dashboard_rollups(signature TEXT PRIMARY KEY,digest TEXT NOT NULL,created REAL NOT NULL);
-        CREATE INDEX IF NOT EXISTS dashboard_quota_time ON processing_quota_points(view,event_at,account);
-        CREATE INDEX IF NOT EXISTS dashboard_display_time ON processing_display(view,kind,event_at,account);
-    """)
-    for table, condition in (("processing_quota_points", "1"), ("processing_display", "{row}.kind!='quotaPoints'")):
-        for action, rows in (("INSERT", ("NEW",)), ("DELETE", ("OLD",)), ("UPDATE", ("OLD", "NEW"))):
-            body = "".join(f"""
-                INSERT INTO dashboard_days SELECT {row}.view,CAST(COALESCE({row}.event_at,0)/86400 AS INTEGER),1,1 WHERE {condition.format(row=row)}
-                ON CONFLICT(view,day) DO UPDATE SET revision=revision+1,dirty=1;
-            """ for row in rows)
-            db.executescript(f"CREATE TRIGGER IF NOT EXISTS dashboard_{table}_{action.lower()} AFTER {action} ON {table} BEGIN {body} END;")
-    if not db.execute("SELECT 1 FROM processing_meta WHERE name='dashboardDeliveryInitialized'").fetchone():
-        for table, condition in (("processing_quota_points", "1"), ("processing_display", "kind!='quotaPoints'")):
-            db.execute(f"INSERT OR IGNORE INTO dashboard_days SELECT DISTINCT view,CAST(COALESCE(event_at,0)/86400 AS INTEGER),1,1 FROM {table} WHERE {condition}")
-        db.execute("INSERT INTO processing_meta VALUES('dashboardDeliveryInitialized','true')")
+JOURNAL_BYTES = 64 * 1024 * 1024
 
 
 def encoded(value):
-    return json.dumps(transfer_data(value), ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode("utf-8")
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
 
 
-def transfer_data(value):
-    """Keep record identity, but transmit account identity only once and time numerically."""
+def initialize_delivery(db):
+    from monitor_delivery_legacy import initialize_delivery as legacy
+    legacy(db)  # Empty tables required by released sequential migrations.
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS delivery_meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS delivery_dirty(view TEXT,account TEXT,PRIMARY KEY(view,account));
+        CREATE TABLE IF NOT EXISTS delivery_work(view TEXT,account TEXT,kind TEXT,record_key TEXT,PRIMARY KEY(view,account,kind,record_key));
+        CREATE TABLE IF NOT EXISTS delivery_accounts(view TEXT,account TEXT,legacy TEXT NOT NULL,label TEXT NOT NULL DEFAULT 'Unknown',PRIMARY KEY(view,account));
+        CREATE TABLE IF NOT EXISTS delivery_runs(view TEXT,account TEXT,window TEXT,id TEXT,first REAL,last REAL,value REAL,multiplier REAL,flags INTEGER,reset REAL,plan TEXT,PRIMARY KEY(view,account,window,id));
+        CREATE INDEX IF NOT EXISTS delivery_run_time ON delivery_runs(view,account,window,first);
+        CREATE TABLE IF NOT EXISTS delivery_tokens(view TEXT,account TEXT,id TEXT,at REAL,model TEXT,tier TEXT,fresh INTEGER,cached INTEGER,output INTEGER,cache_write INTEGER,cost INTEGER,PRIMARY KEY(view,account,id));
+        CREATE INDEX IF NOT EXISTS delivery_token_time ON delivery_tokens(view,account,at);
+        CREATE TABLE IF NOT EXISTS delivery_charts(view TEXT,account TEXT,window TEXT,id TEXT,start REAL,end REAL,at REAL,multiplier REAL,delta REAL,models TEXT,PRIMARY KEY(view,account,window,id));
+        CREATE TABLE IF NOT EXISTS delivery_members(view TEXT,account TEXT,window TEXT,event TEXT,interval TEXT,PRIMARY KEY(view,account,window,event));
+        CREATE INDEX IF NOT EXISTS delivery_member_interval ON delivery_members(view,account,window,interval);
+        CREATE TABLE IF NOT EXISTS delivery_journal(stream TEXT,seq INTEGER,created REAL,body BLOB,PRIMARY KEY(stream,seq));
+        CREATE TABLE IF NOT EXISTS delivery_snapshot(id INTEGER PRIMARY KEY CHECK(id=1),body BLOB,gzip BLOB,created REAL);
+    """)
+    for table in ("processing_quota_points", "processing_display"):
+        for action, ref in (("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")):
+            db.execute(f"CREATE TRIGGER IF NOT EXISTS delivery_{table}_{action.lower()} AFTER {action} ON {table} BEGIN INSERT OR IGNORE INTO delivery_dirty VALUES({ref}.view,{ref}.account); END")
+    db.execute("INSERT OR IGNORE INTO delivery_meta VALUES('epoch',?)", (uuid.uuid4().hex,))
+    for stream in ("local", "merged", "state"):
+        db.execute("INSERT OR IGNORE INTO delivery_meta VALUES(?, '0')", (stream,))
+    if not db.execute("SELECT 1 FROM delivery_meta WHERE name='initialized'").fetchone():
+        db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT DISTINCT view,account FROM processing_quota_points")
+        db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT DISTINCT view,account FROM processing_display")
+        db.execute("INSERT INTO delivery_meta VALUES('initialized','1')")
+
+
+def numeric_state(value):
     if isinstance(value, list):
-        return [transfer_data(row) for row in value]
+        return [numeric_state(item) for item in value]
     if not isinstance(value, dict):
         return value
-    omitted = {"accountSlotId", "accountLabel"} if value.get("usageAccountId") else set()
-    if value.get("timestamp") is not None:
-        omitted.add("checkedAt")
-    return {key: transfer_data(item) for key, item in value.items() if key not in omitted}
-
-
-def empty_view():
-    return {"quotaPoints": [], "tokenSessions": [], "costTime": [], "costUsage": {"fiveHour": [], "sevenDay": []}, "historyStats": {}}
-
-
-def reduce_cost_time(rows, seconds):
-    """Cost buckets retain sums and model/account identity, never average dollar values."""
-    groups = {}
-    for row in rows:
-        key = (row["usageAccountId"], int(row["timestamp"] // seconds) if seconds else 0)
-        if key not in groups:
-            groups[key] = row | {"costByModelUsd": {}, "totalCostUsd": 0}
-            groups[key]["_key"] = f"costTime:{key[0]}:{key[1]}:{seconds}"
-        value = groups[key]
-        value["timestamp"] = min(value["timestamp"], row["timestamp"])
-        for model, cost in row["costByModelUsd"].items():
-            value["costByModelUsd"][model] = round(value["costByModelUsd"].get(model, 0) + cost, 8)
-        value["totalCostUsd"] = round(sum(value["costByModelUsd"].values()), 8)
-    return sorted(groups.values(), key=lambda row: (row["timestamp"], row["usageAccountId"]))
-
-
-def session_groups(rows):
-    """Group by the complete model set so arbitrary model selection keeps exact session counts."""
-    groups = {}
-    for row in rows:
-        models = tuple(sorted((row.get("byModel") or {}).keys()))
-        key = (row.get("usageAccountId") or row.get("accountSlotId"), models)
-        if key not in groups:
-            groups[key] = {k: row.get(k) for k in ("usageAccountId", "accountSlotId", "accountLabel", "startedAt", "updatedAt")}
-            groups[key].update({"byModel": {}, "sessionCount": 0})
-            groups[key]["_key"] = "summary:" + hashlib.sha256(encoded(key)).hexdigest()
-        group = groups[key]
-        group["sessionCount"] += row.get("sessionCount", 1)
-        for name in ("startedAt", "updatedAt"):
-            values = [value for value in (group.get(name), row.get(name)) if value]
-            group[name] = (min(values) if name == "startedAt" else max(values)) if values else None
-        for model, value in (row.get("byModel") or {}).items():
-            target = group["byModel"].setdefault(model, {"usageTokens": {}, "cost": {}})
-            for field, source in (("usageTokens", value.get("usageTokens") or value.get("tokens") or {}), ("cost", value.get("cost") or {})):
-                for name, amount in source.items():
-                    if isinstance(amount, (float, int)):
-                        target[field][name] = target[field].get(name, 0) + amount
-    return list(groups.values())
-
-
-def reduce_quota(rows, seconds):
-    """Quota observations remain exact; only cost/session delivery is aggregated."""
-    return rows
-
-
-def reduce_cost(rows, seconds):
-    if not seconds:
-        return rows
-    groups = {}
-    for row in rows:
-        key = (row.get("usageAccountId"), row.get("plan"), int(row["timestamp"] // seconds))
-        if key not in groups:
-            groups[key] = row | {"costByModelUsd": dict(row.get("costByModelUsd") or {}), "mergedCount": row.get("mergedCount", 1)}
+    result = {}
+    for key, item in value.items():
+        if key in {"processing", "revision", "plan", "statusBarText", "resetText", "remainingText", "tooltip", "lastUpdateText", "timePercent", "timeText", "configHeaderToml", "cost", "costByModel", "tokenUsage"}:
             continue
-        value = groups[key]
-        value["mergedCount"] += row.get("mergedCount", 1)
-        value["startedAt"] = min(value["startedAt"], row["startedAt"])
-        value["endedAt"] = max(value["endedAt"], row["endedAt"])
-        value["deltaPercent"] += row.get("deltaPercent", 0)
-        value["totalCostUsd"] += row.get("totalCostUsd", 0)
-        for model, amount in (row.get("costByModelUsd") or {}).items():
-            value["costByModelUsd"][model] = value["costByModelUsd"].get(model, 0) + amount
-        value["costPer100PercentUsd"] = value["totalCostUsd"] / value["deltaPercent"] * 100 if value["deltaPercent"] else 0
-    return sorted(groups.values(), key=lambda row: (row["timestamp"], row.get("usageAccountId") or ""))
-
-
-def cost_groups(rows):
-    groups = {}
-    for row in rows:
-        key = row.get("usageAccountId") or row.get("accountSlotId")
-        if key not in groups:
-            groups[key] = {name: row.get(name) for name in ("usageAccountId", "accountSlotId", "accountLabel", "window")}
-            groups[key].update({"deltaPercent": 0, "totalCostUsd": 0, "costByModelUsd": {}, "usageByModel": {}})
-        group = groups[key]
-        group["deltaPercent"] += row.get("deltaPercent", 0)
-        group["totalCostUsd"] += row.get("totalCostUsd", 0)
-        for model, amount in (row.get("costByModelUsd") or {}).items():
-            group["costByModelUsd"][model] = group["costByModelUsd"].get(model, 0) + amount
-            usage = (row.get("usageByModel") or {}).get(model, row.get("deltaPercent", 0) * amount / row["totalCostUsd"] if row.get("totalCostUsd", 0) > 0 else 0)
-            group["usageByModel"][model] = group["usageByModel"].get(model, 0) + usage
-    return list(groups.values())
+        if key in {"checkedAt", "percentCheckedAt", "pollErrorAt", "startedAt", "updatedAt", "resetAt"}:
+            result[key] = parse_timestamp(item)
+        else:
+            result[key] = numeric_state(item)
+    return result
 
 
 class DashboardDelivery:
     def __init__(self, index):
         self.index = index
-        self.prepare_lock = threading.Lock()
-        self.cache_lock = threading.Lock()
-        self.day_access = OrderedDict()
-        self.metrics = {"daysPrepared": 0, "chunksEncoded": 0, "prepareSeconds": 0}
+        self.lock = threading.RLock()
+        self.changed = threading.Condition()
+        self.cloud_pending = False
+        self.last_prepare = 0
+        self.pending_snapshot = False
+        self.resetting = False
+        self.metrics = {"accountsPrepared": 0, "bulkBytes": 0, "gzipBytes": 0, "prepareSeconds": 0}
+        with closing(samples.connect(index.path)) as db:
+            row = db.execute("SELECT body,gzip FROM delivery_snapshot WHERE id=1").fetchone()
+            self.snapshot = tuple(row) if row else None
+            row = db.execute("SELECT value FROM delivery_meta WHERE name='statePayload'").fetchone()
+            self.state = json.loads(row[0]) if row else None
+            self.head = (db.execute("SELECT value FROM delivery_meta WHERE name='epoch'").fetchone()[0], self.cursors(db))
+        if self.snapshot:
+            saved = json.loads(self.snapshot[0])
+            self.pending_snapshot = saved["epoch"] != self.head[0] or saved["cursors"] != self.head[1]
+            if self.pending_snapshot and self.replay(saved["epoch"], saved["cursors"]) is None:
+                self.snapshot = None
 
-    @contextmanager
-    def reader(self):
-        db = samples.connect(self.index.path.resolve().as_uri() + "?mode=ro", uri=True, timeout=10)
-        try:
-            db.execute("BEGIN")
-            yield db
-        finally:
-            db.close()
+    @staticmethod
+    def cursors(db):
+        return {stream: int(value) for stream, value in db.execute("SELECT name,value FROM delivery_meta WHERE name IN ('local','merged','state')")}
 
-    def _load(self, db, view, start, end):
-        result = empty_view()
-        for account, key, data in db.execute("SELECT account,record_key,data FROM processing_quota_points WHERE view=? AND event_at>=? AND event_at<? ORDER BY event_at,account,record_key", (view, start, end)):
-            row = json.loads(data)
-            row["_key"] = f"quota:{account}:{key}"
-            result["quotaPoints"].append(row)
-        for kind in ("tokenSessions", "costTime", "costUsage:fiveHour", "costUsage:sevenDay"):
-            rows = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_display WHERE view=? AND kind=? AND event_at>=? AND event_at<? ORDER BY event_at,account,record_key", (view, kind, start, end))]
-            if kind in {"tokenSessions", "costTime"}:
-                result[kind] = rows
+    def _packet(self, db, stream, channel, account, data, now):
+        sequence = int(db.execute("SELECT value FROM delivery_meta WHERE name=?", (stream,)).fetchone()[0]) + 1
+        db.execute("UPDATE delivery_meta SET value=? WHERE name=?", (str(sequence), stream))
+        packet = {"epoch": db.execute("SELECT value FROM delivery_meta WHERE name='epoch'").fetchone()[0], "stream": stream, "seq": sequence, "channel": channel, "account": account, "data": data}
+        db.execute("INSERT INTO delivery_journal VALUES(?,?,?,?)", (stream, sequence, now, encoded(packet)))
+
+    @staticmethod
+    def _runs(db, view, account, window):
+        return [list(row) for row in db.execute("SELECT id,first,last,value,multiplier,flags,reset,plan FROM delivery_runs WHERE view=? AND account=? AND window=? ORDER BY first,id", (view, account, window))]
+
+    @staticmethod
+    def _tokens(db, view, account):
+        return [list(row) for row in db.execute("SELECT id,at,model,tier,fresh,cached,output,cache_write,cost FROM delivery_tokens WHERE view=? AND account=? ORDER BY at,id", (view, account))]
+
+    def _account(self, db, projector, view, account, now):
+        existing = db.execute("SELECT legacy,label FROM delivery_accounts WHERE view=? AND account=?", (view, account)).fetchone()
+        work = list(db.execute("SELECT kind,record_key FROM delivery_work WHERE view=? AND account=?", (view, account)))
+        legacy = json.loads(existing[0]) if existing else []
+        events = []
+        label = existing[1] if existing else "Unknown"
+        if existing is None or self.cloud_pending:
+            if projector is not None:
+                _, events = projector._datasets(db, view, account)
+            legacy = [row["session"] for row in events if row.get("recordType") == "sessionBaseline" and isinstance(row.get("session"), dict)]
+            label = next((row.get("accountLabel") or (row.get("session") or {}).get("accountLabel") for row in reversed(events) if row.get("accountLabel") or (row.get("session") or {}).get("accountLabel")), label)
+        elif projector is not None:
+            for kind, key in work:
+                if kind != "tokenLedger":
+                    continue
+                if view == "merged":
+                    rows = db.execute("SELECT data FROM processing_effective WHERE account=? AND record_key=?", (account, key))
+                else:
+                    rows = db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' AND account=? AND record_key=?", (str(projector.store.token_ledger_path.resolve()), account, key))
+                events.extend(json.loads(row[0]) for row in rows)
+        if existing is None:
+            point = db.execute("SELECT data FROM processing_quota_points WHERE view=? AND account=? ORDER BY event_at DESC LIMIT 1", (view, account)).fetchone()
+            if point:
+                label = json.loads(point[0]).get("accountLabel") or label
+            self._packet(db, view, "account", account, {"label": label}, now)
+        if existing is not None and self.cloud_pending:
+            desired = {row[0]: row for event in events if (row := token_row(event)) is not None}
+            before = {row[0]: row for row in self._tokens(db, view, account)}
+            if before != desired or json.loads(existing[0]) != legacy:
+                self.force_epoch = True
+                db.execute("DELETE FROM delivery_tokens WHERE view=? AND account=?", (view, account))
+        additions, added_rows = [], []
+        for event in events:
+            row = token_row(event)
+            if row is not None and not db.execute("SELECT 1 FROM delivery_tokens WHERE view=? AND account=? AND id=?", (view, account, row[0])).fetchone():
+                db.execute("INSERT INTO delivery_tokens VALUES(?,?,?,?,?,?,?,?,?,?,?)", (view, account, *row))
+                additions.append([row[0], row[1], [[row[2], row[3], *row[4:]]]])
+                added_rows.append(row)
+        if additions:
+            self._packet(db, view, "tokens", account, additions, now)
+        intervals = {}
+        for window, _ in WINDOWS:
+            old = self._runs(db, view, account, window)
+            if existing is None or not work or any(kind == "quota" for kind, _ in work):
+                points = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_quota_points WHERE view=? AND account=? ORDER BY event_at,record_key", (view, account))]
+                label = next((row["accountLabel"] for row in reversed(points) if row.get("accountLabel")), label)
+                runs = usage_runs(points, window)
             else:
-                result["costUsage"][kind.split(":")[1]] = rows
-        return result
+                runs = old
+            before, after = {row[0]: row for row in old}, {row[0]: row for row in runs}
+            remove = [key for key in before if key not in after]
+            update = [row for key, row in after.items() if before.get(key) != row]
+            for key in remove:
+                db.execute("DELETE FROM delivery_runs WHERE view=? AND account=? AND window=? AND id=?", (view, account, window, key))
+            for row in update:
+                db.execute("INSERT OR REPLACE INTO delivery_runs VALUES(?,?,?,?,?,?,?,?,?,?,?)", (view, account, window, *row))
+            if remove or update:
+                self._packet(db, view, "usage:" + window, account, {"set": [row[:6] for row in update], "remove": remove}, now)
+                latest = next((row for row in reversed(runs) if row[3] is not None), None)
+                previous = next((row for row in reversed(old) if row[3] is not None), None)
+                if (latest[6] if latest else None) != (previous[6] if previous else None):
+                    self._packet(db, view, "quota:" + window, account, [latest[6] if latest else None], now)
+            intervals[window] = valid_intervals(runs)
+        fast_tokens = existing is not None and not self.cloud_pending and work and all(kind == "tokenLedger" for kind, _ in work)
+        tokens = None if fast_tokens else self._tokens(db, view, account)
+        for window, values in intervals.items():
+            from monitor_interpretation import nearest
+            ends = [row[2] for row in values]
+            if fast_tokens:
+                affected = set()
+                for row in added_rows:
+                    index = nearest(values, row[1], ends)
+                    if index is not None:
+                        interval = values[index][0]
+                        affected.add(interval)
+                        db.execute("INSERT OR REPLACE INTO delivery_members VALUES(?,?,?,?,?)", (view, account, window, row[0], interval))
+                rows = []
+                for interval in values:
+                    if interval[0] not in affected:
+                        continue
+                    events = [list(row) for row in db.execute("SELECT t.id,t.at,t.model,t.tier,t.fresh,t.cached,t.output,t.cache_write,t.cost FROM delivery_members m JOIN delivery_tokens t ON t.view=m.view AND t.account=m.account AND t.id=m.event WHERE m.view=? AND m.account=? AND m.window=? AND m.interval=?", (view, account, window, interval[0]))]
+                    rows.extend(chart_rows(events, [interval]))
+            else:
+                db.execute("DELETE FROM delivery_members WHERE view=? AND account=? AND window=?", (view, account, window))
+                members = []
+                for row in tokens:
+                    index = nearest(values, row[1], ends)
+                    if index is not None:
+                        members.append((view, account, window, row[0], values[index][0]))
+                db.executemany("INSERT INTO delivery_members VALUES(?,?,?,?,?)", members)
+                rows = chart_rows(tokens, values)
+            before = {row[0]: list(row[:6]) + [json.loads(row[6])] for row in db.execute("SELECT id,start,end,at,multiplier,delta,models FROM delivery_charts WHERE view=? AND account=? AND window=?", (view, account, window))}
+            after = {row[0]: row for row in rows}
+            remove = [] if fast_tokens else [key for key in before if key not in after]
+            update = [row for key, row in after.items() if before.get(key) != row]
+            for key in remove:
+                db.execute("DELETE FROM delivery_charts WHERE view=? AND account=? AND window=? AND id=?", (view, account, window, key))
+            for row in update:
+                db.execute("INSERT OR REPLACE INTO delivery_charts VALUES(?,?,?,?,?,?,?,?,?,?)", (view, account, window, *row[:6], encoded(row[6]).decode()))
+            if remove or update:
+                self._packet(db, view, "chart:" + window, account, {"set": update, "remove": remove}, now)
+        db.execute("INSERT OR REPLACE INTO delivery_accounts VALUES(?,?,?,?)", (view, account, encoded(legacy).decode(), label))
+        db.execute("DELETE FROM delivery_work WHERE view=? AND account=?", (view, account))
+        db.execute("DELETE FROM delivery_dirty WHERE view=? AND account=?", (view, account))
+        self.metrics["accountsPrepared"] += 1
 
-    def prepare(self, now=None):
+    def prepare(self, now=None, projector=None, status=None, force=False):
+        with self.lock:
+            return self._prepare(now, projector, status, force)
+
+    def _prepare(self, now=None, projector=None, status=None, force=False):
         now = time.time() if now is None else now
         started = time.perf_counter()
-        with self.prepare_lock:
-            with self.reader() as db:
-                dirty = list(db.execute("SELECT view,day,revision FROM dashboard_days WHERE dirty=1 ORDER BY day DESC,view"))
-            for view, day, revision in dirty:
-                with self.reader() as db:
-                    # Capture the source rows and claim from one committed generation.
-                    claim = db.execute("SELECT revision FROM dashboard_days WHERE view=? AND day=?", (view, day)).fetchone()[0]
-                    exact = self._load(db, view, day * DAY, (day + 1) * DAY)
-                meta = {"accountLabels": self._account_labels(exact), "tokens": session_groups(exact["tokenSessions"]), "quotaMax": max((r["timestamp"] for r in exact["quotaPoints"]), default=None),
-                    "costMax": max((r["timestamp"] for values in exact["costUsage"].values() for r in values), default=None),
-                    "tokenMax": max((parse_timestamp(r.get("updatedAt") or r.get("startedAt")) for r in exact["tokenSessions"]), default=None),
-                    "costTimeMax": max((r["timestamp"] for r in exact["costTime"]), default=None),
-                    "costTimeMin": min((r["timestamp"] for r in exact["costTime"]), default=None),
-                    "costTimeTotals": reduce_cost_time(exact["costTime"], 0),
-                    "rates": {name: cost_groups(rows) for name, rows in exact["costUsage"].items()}}
-                artifacts = []
-                for level in LEVELS:
-                    frame = empty_view()
-                    frame["quotaPoints"] = reduce_quota(exact["quotaPoints"], level)
-                    frame["costUsage"] = {name: reduce_cost(rows, level) for name, rows in exact["costUsage"].items()}
-                    frame["costTime"] = reduce_cost_time(exact["costTime"], DAY if level >= DAY else 3600 if level else 60)
-                    # Encoding and compression happen outside the database writer lock.
-                    from monitor_dashboard import dashboard_safe_json
-                    body = encoded(dashboard_safe_json(frame))
-                    artifacts.append((level, hashlib.sha256(body).hexdigest(), body, gzip.compress(body, compresslevel=3, mtime=0)))
-                with self.index.transaction() as db:
-                    if db.execute("SELECT revision FROM dashboard_days WHERE view=? AND day=?", (view, day)).fetchone()[0] != claim:
-                        continue
-                    for level, digest, body, compressed in artifacts:
-                        db.execute("INSERT OR IGNORE INTO dashboard_blobs VALUES(?,?,?,?)", (digest, body, compressed, now))
-                        db.execute("INSERT OR REPLACE INTO dashboard_parts VALUES(?,?,?,?)", (view, day, level, digest))
-                    db.execute("INSERT OR REPLACE INTO dashboard_day_meta VALUES(?,?,?)", (view, day, encoded(meta).decode()))
-                    db.execute("UPDATE dashboard_days SET dirty=0 WHERE view=? AND day=? AND revision=?", (view, day, claim))
-                self.metrics["daysPrepared"] += 1
-                self.metrics["chunksEncoded"] += len(LEVELS)
-            for view in ("local", "merged"):
-                self._publish(view, now)
-            # Keep previous generations available for downloads already in flight.
+        with self.index.transaction() as db:
+            self.force_epoch = False
+            cursors = self.cursors(db)
+            for view, account in list(db.execute("SELECT view,account FROM delivery_dirty")):
+                self._account(db, projector, view, account, now)
+            if status is not None:
+                from monitor_dashboard import dashboard_safe_json
+                state = numeric_state(dashboard_safe_json(status))
+                state["revision"] = hashlib.sha256(encoded(state)).hexdigest()
+            else:
+                state = self.state or {}
+            if state.get("revision") != (self.state or {}).get("revision") or self.state is None:
+                self._packet(db, "state", "state", None, state, now)
+                db.execute("INSERT OR REPLACE INTO delivery_meta VALUES('statePayload',?)", (encoded(state).decode(),))
+            changed = cursors != self.cursors(db)
+            old_accounts = {row.get("usageAccountId") for row in (self.state or {}).get("accounts", {}).get("items", [])}
+            new_accounts = {row.get("usageAccountId") for row in state.get("accounts", {}).get("items", [])}
+            self.force_epoch |= old_accounts != new_accounts and self.state is not None
+            if self.cloud_pending:
+                if any(cursors[v] != self.cursors(db)[v] for v in ("local", "merged")):
+                    self.force_epoch = True
+                self.cloud_pending = False
+            if self.force_epoch:
+                self.resetting = True
+                db.execute("UPDATE delivery_meta SET value=? WHERE name='epoch'", (uuid.uuid4().hex,))
+                db.execute("DELETE FROM delivery_journal")
+                force = True
+            db.execute("DELETE FROM delivery_journal WHERE created<?", (now - DAY,))
+            size = db.execute("SELECT COALESCE(SUM(length(body)),0) FROM delivery_journal").fetchone()[0]
+            while size > JOURNAL_BYTES:
+                oldest = db.execute("SELECT stream,seq,length(body) FROM delivery_journal ORDER BY created,stream,seq LIMIT 1").fetchone()
+                db.execute("DELETE FROM delivery_journal WHERE stream=? AND seq=?", oldest[:2])
+                size -= oldest[2]
+            self.pending_snapshot |= changed
+            need_snapshot = force or self.snapshot is None or self.pending_snapshot and now - self.last_prepare >= 1
+            head = (db.execute("SELECT value FROM delivery_meta WHERE name='epoch'").fetchone()[0], self.cursors(db))
+        self.state = state
+        if not self.resetting:
+            self.head = head
+        with self.changed:
+            self.changed.notify_all()
+        # Serialization and compression never hold the ingestion writer lock.
+        if need_snapshot:
+            with closing(samples.connect(self.index.path)) as db:
+                db.execute("BEGIN")
+                body = encoded(self._bulk(db, state))
+            compressed = gzip.compress(body, compresslevel=3, mtime=0)
             with self.index.transaction() as db:
-                db.execute("DELETE FROM dashboard_manifests WHERE scope LIKE '%:Date:%' AND updated<?", (now - DAY,))
-                references = set(row[0] for row in db.execute("SELECT digest FROM dashboard_parts"))
-                for (data,) in db.execute("SELECT data FROM dashboard_manifests"):
-                    references.update(json.loads(data).get("chunks", []))
-                for signature, digest in list(db.execute("SELECT signature,digest FROM dashboard_rollups WHERE created<?", (now - DAY,))):
-                    if digest not in references:
-                        db.execute("DELETE FROM dashboard_rollups WHERE signature=?", (signature,))
-                references.update(row[0] for row in db.execute("SELECT digest FROM dashboard_rollups"))
-                for (digest,) in list(db.execute("SELECT digest FROM dashboard_blobs WHERE created<?", (now - DAY,))):
-                    if digest not in references:
-                        db.execute("DELETE FROM dashboard_blobs WHERE digest=?", (digest,))
-            self.metrics["prepareSeconds"] = round(time.perf_counter() - started, 4)
+                db.execute("INSERT OR REPLACE INTO delivery_snapshot VALUES(1,?,?,?)", (body, compressed, now))
+            self.snapshot = (body, compressed)
+            self.head = head
+            self.resetting = False
+            self.last_prepare = now
+            self.pending_snapshot = False
+            self.metrics.update(bulkBytes=len(body), gzipBytes=len(compressed))
+        self.metrics["prepareSeconds"] = round(time.perf_counter() - started, 6)
+        with self.changed:
+            self.changed.notify_all()
+        return changed
 
-    def _publish(self, view, now):
-        with self.reader() as db:
-            if db.execute("SELECT 1 FROM dashboard_days WHERE view=? AND dirty=1 LIMIT 1", (view,)).fetchone():
-                return
-            days = [(day, revision, json.loads(data)) for day, revision, data in db.execute(
-                "SELECT d.day,d.revision,m.data FROM dashboard_days d JOIN dashboard_day_meta m USING(view,day) WHERE d.view=? ORDER BY d.day", (view,))]
-            signature = hashlib.sha256(encoded(([(day, revision) for day, revision, _ in days], int(now // 3600)))).hexdigest()
-            current = list(db.execute("SELECT signature FROM dashboard_manifests WHERE scope IN (?,?,?,?,?)", tuple(f"{view}:{selected}" for selected in RANGES)))
-            if len(current) == len(RANGES) and all(row[0] == signature for row in current):
-                return
-            maxima = {name: max((meta.get(name) for _, _, meta in days if meta.get(name) is not None), default=None) for name in ("quotaMax", "costMax", "tokenMax", "costTimeMax")}
-            cost_start = min((meta["costTimeMin"] for _, _, meta in days if meta.get("costTimeMin") is not None), default=None)
-            manifests = []
-            for selected, seconds in RANGES.items():
-                chunks, tokens, cost_totals = [], [], []
-                cost_resolution = 60
-                rates = {"fiveHour": [], "sevenDay": []}
-                rollups = defaultdict(list)
-                bounds = {name: ((stamp - seconds) if seconds and stamp is not None else None) for name, stamp in maxima.items()}
-                cost_bounds = [bounds["costTimeMax"] if seconds else cost_start, maxima["costTimeMax"]]
-                for day, _, meta in days:
-                    if seconds and not any(stamp is not None and day * DAY <= stamp and (day + 1) * DAY > stamp - seconds for stamp in maxima.values()):
-                        continue
-                    age = now - (day + 1) * DAY
-                    level = 0 if age <= DAY else 300 if age <= 7 * DAY else 1800 if age <= 30 * DAY else 7200
-                    if selected in {"5h", "24h"}:
-                        level = 0
-                    if selected == "All" and len(days) > 365 and age > 30 * DAY:
-                        level = max(level, 86400)
-                    if meta.get("costTimeMax") is not None and (cost_bounds[0] is None or meta["costTimeMax"] >= cost_bounds[0]):
-                        cost_resolution = max(cost_resolution, DAY if level >= DAY else 3600 if level else 60)
-                    part = db.execute("SELECT digest FROM dashboard_parts WHERE view=? AND day=? AND level=?", (view, day, level)).fetchone()
-                    if part:
-                        digest = part[0]
-                        if seconds and cost_bounds[0] is not None and day * DAY < cost_bounds[0] < (day + 1) * DAY:
-                            # Only the lower boundary day needs exact rows instead of its shared overview buckets.
-                            frame = json.loads(db.execute("SELECT body FROM dashboard_blobs WHERE digest=?", (digest,)).fetchone()[0])
-                            frame["costTime"] = reduce_cost_time(self._load_cost_time(db, view, cost_bounds[0], (day + 1) * DAY), 3600 if level else 60)
-                            digest = self._store_frame(frame, now)
-                        if selected == "All" and level == 86400:
-                            # Stable partitions span days only for very old, long histories.
-                            width = 7 if len(days) <= 2000 else 30 if len(days) <= 10000 else 180
-                            rollups[(day // width, width)].append(digest)
-                        else:
-                            chunks.append(digest)
-                    if cost_bounds[0] is None or day * DAY >= cost_bounds[0]:
-                        cost_totals.extend(meta.get("costTimeTotals", []))
-                    elif (day + 1) * DAY > cost_bounds[0]:
-                        cost_totals.extend(self._load_cost_time(db, view, cost_bounds[0], (day + 1) * DAY))
-                    if bounds["tokenMax"] is None or day * DAY >= bounds["tokenMax"]:
-                        tokens.extend(meta["tokens"])
-                    elif (day + 1) * DAY > bounds["tokenMax"]:
-                        tokens.extend(self._load_tokens(db, view, bounds["tokenMax"], (day + 1) * DAY))
-                    for name in rates:
-                        if bounds["costMax"] is None or day * DAY >= bounds["costMax"]:
-                            rates[name].extend(meta["rates"][name])
-                        elif (day + 1) * DAY > bounds["costMax"]:
-                            rates[name].extend(json.loads(row[0]) for row in db.execute(
-                                "SELECT data FROM processing_display WHERE view=? AND kind=? AND event_at>=? AND event_at<?", (view, f"costUsage:{name}", bounds["costMax"], (day + 1) * DAY)))
-                for (_, width), digests in sorted(rollups.items()):
-                    chunks.append(self._rollup(db, digests, width * DAY, now))
-                manifests.append((f"{view}:{selected}", signature, self._manifest(view, selected, chunks, session_groups(tokens), maxima, now,
-                    rates={name: cost_groups(rows) for name, rows in rates.items()}, cost_bounds=cost_bounds,
-                    cost_totals=reduce_cost_time(cost_totals, 0), cost_resolution=cost_resolution,
-                    account_labels={key: label for _, _, meta in days for key, label in meta.get("accountLabels", {}).items()})))
-        with self.index.transaction() as db:
-            # If a projection committed while encoding, leave the old published generation intact.
-            actual = list(db.execute("SELECT day,revision FROM dashboard_days WHERE view=? ORDER BY day", (view,)))
-            if actual != [(day, revision) for day, revision, _ in days] or db.execute("SELECT 1 FROM dashboard_days WHERE view=? AND dirty=1 LIMIT 1", (view,)).fetchone():
-                return
-            for scope, signature, manifest in manifests:
-                db.execute("INSERT OR REPLACE INTO dashboard_manifests VALUES(?,?,?,?)", (scope, signature, encoded(manifest).decode(), now))
+    def _bulk(self, db, state):
+        models = sorted({row[0] for row in db.execute("SELECT DISTINCT model FROM delivery_tokens")})
+        def model(name):
+            if name not in models:
+                models.append(name)
+            return models.index(name)
+        accounts = []
+        api = {item["usageAccountId"] for item in state.get("accounts", {}).get("items", []) if item.get("isApiAccount")}
+        known = {item["id"] for item in state.get("accounts", {}).get("usageGroups", [])} | {item["usageAccountId"] for item in state.get("accounts", {}).get("items", [])}
+        for account, in db.execute("SELECT DISTINCT account FROM delivery_accounts ORDER BY account"):
+            item = {"id": account, "label": db.execute("SELECT label FROM delivery_accounts WHERE account=? ORDER BY view LIMIT 1", (account,)).fetchone()[0]}
+            for view in ("local", "merged"):
+                runs = {window: self._runs(db, view, account, window) for window, _ in WINDOWS}
+                intervals = {window: valid_intervals(rows) for window, rows in runs.items()}
+                tokens = aggregate_tokens(self._tokens(db, view, account), intervals, account in api)
+                for row in tokens:
+                    for entry in row[2]:
+                        entry[0] = model(entry[0])
+                data = {"tokens": tokens, "quota": {window: next((row[6] for row in reversed(rows) if row[3] is not None), None) for window, rows in runs.items()}}
+                for window in runs:
+                    data["usage:" + window] = [row[:6] for row in runs[window]]
+                    charts = [list(row[:6]) + [json.loads(row[6])] for row in db.execute("SELECT id,start,end,at,multiplier,delta,models FROM delivery_charts WHERE view=? AND account=? AND window=? ORDER BY start,id", (view, account, window))]
+                    for row in charts:
+                        for entry in row[6]:
+                            entry[0] = model(entry[0])
+                    data["chart:" + window] = charts
+                legacy = db.execute("SELECT legacy FROM delivery_accounts WHERE view=? AND account=?", (view, account)).fetchone()
+                data["legacy"] = []
+                for session in json.loads(legacy[0]) if legacy else []:
+                    entries = []
+                    for name, value in (session.get("byModel") or {}).items():
+                        row = token_row({"recordType": "usage", "occurredAt": session.get("updatedAt"), "rawModel": name, **value})
+                        if row:
+                            entries.append([model(name), row[3], *row[4:]])
+                    data["legacy"].append([parse_timestamp(session.get("startedAt")), parse_timestamp(session.get("updatedAt")), entries])
+                item[view] = data
+            local = item["local"]
+            if not known or account in known or account == "unknown" or local["tokens"] or local["usage:5h"] or local["usage:7d"] or local["legacy"]:
+                accounts.append(item)
+        return {"epoch": db.execute("SELECT value FROM delivery_meta WHERE name='epoch'").fetchone()[0], "cursors": self.cursors(db), "models": models, "state": state, "accounts": accounts}
 
-    def _rollup(self, reader, digests, seconds, now):
-        signature = hashlib.sha256(encoded([digests, seconds])).hexdigest()
-        cached = reader.execute("SELECT r.digest FROM dashboard_rollups r JOIN dashboard_blobs b USING(digest) WHERE r.signature=?", (signature,)).fetchone()
-        if cached:
-            return cached[0]
-        frame = empty_view()
-        for digest in digests:
-            part = json.loads(reader.execute("SELECT body FROM dashboard_blobs WHERE digest=?", (digest,)).fetchone()[0])
-            frame["quotaPoints"].extend(part["quotaPoints"])
-            frame["costTime"].extend(part.get("costTime", []))
-            for name in frame["costUsage"]:
-                frame["costUsage"][name].extend(part["costUsage"][name])
-        frame["quotaPoints"] = reduce_quota(sorted(frame["quotaPoints"], key=lambda row: (row["timestamp"], row["usageAccountId"])), seconds)
-        frame["costUsage"] = {name: reduce_cost(sorted(rows, key=lambda row: row["timestamp"]), seconds) for name, rows in frame["costUsage"].items()}
-        # Daily cost buckets can be regrouped into any whole-day chart interval without losing sums.
-        frame["costTime"] = reduce_cost_time(frame["costTime"], DAY)
-        body = encoded(frame)
-        digest = hashlib.sha256(body).hexdigest()
-        compressed = gzip.compress(body, compresslevel=3, mtime=0)
-        with self.index.transaction() as db:
-            db.execute("INSERT OR IGNORE INTO dashboard_blobs VALUES(?,?,?,?)", (digest, body, compressed, now))
-            db.execute("INSERT OR REPLACE INTO dashboard_rollups VALUES(?,?,?)", (signature, digest, now))
-        self.metrics["chunksEncoded"] += 1
-        return digest
+    def bulk(self, compressed=True):
+        return self.snapshot[1 if compressed else 0] if self.snapshot else None
 
-    @staticmethod
-    def _load_cost_time(db, view, start, end):
-        return [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_display WHERE view=? AND kind='costTime' AND event_at>=? AND event_at<? ORDER BY event_at,account,record_key", (view, start, end))]
-
-    def _store_frame(self, frame, now):
-        from monitor_dashboard import dashboard_safe_json
-        body = encoded(dashboard_safe_json(frame))
-        digest = hashlib.sha256(body).hexdigest()
-        compressed = gzip.compress(body, compresslevel=3, mtime=0)
-        with self.index.transaction() as db:
-            db.execute("INSERT OR IGNORE INTO dashboard_blobs VALUES(?,?,?,?)", (digest, body, compressed, now))
-        self.metrics["chunksEncoded"] += 1
-        return digest
-
-    @staticmethod
-    def _load_tokens(db, view, start, end):
-        return [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_display WHERE view=? AND kind='tokenSessions' AND event_at>=? AND event_at<?", (view, start, end))]
-
-    @staticmethod
-    def _account_labels(frame):
-        return {row["usageAccountId"]: row["accountLabel"] for rows in (frame["quotaPoints"], frame["tokenSessions"], frame.get("costTime", []), *frame["costUsage"].values())
-            for row in rows if row.get("usageAccountId") and row.get("accountLabel")}
-
-    @staticmethod
-    def _manifest(view, selected, chunks, tokens, maxima, now, bounds=None, rates=None, cost_bounds=None, cost_totals=None, cost_resolution=60, account_labels=None):
-        value = {"protocolVersion": PROTOCOL_VERSION, "view": view, "range": selected, "chunks": list(dict.fromkeys(chunks)), "tokenSessions": tokens,
-            "maxima": maxima, "bounds": bounds, "builtAt": now, "rateRows": rates or {"fiveHour": [], "sevenDay": []}}
-        value.update({"costTimeBounds": cost_bounds, "costTimeTotals": cost_totals or [], "costTimeResolution": cost_resolution})
-        value["accountLabels"] = account_labels or {}
-        value = transfer_data(value)
-        value["generation"] = hashlib.sha256(encoded(value | {"builtAt": 0})).hexdigest()
-        return value
-
-    def manifest(self, view, selected, start=None, end=None):
-        if view not in {"local", "merged"} or selected not in {*RANGES, "Date"}:
-            raise ValueError("Unknown dashboard view or range")
-        if selected != "Date":
-            with self.reader() as db:
-                row = db.execute("SELECT data FROM dashboard_manifests WHERE scope=?", (f"{view}:{selected}",)).fetchone()
-                return json.loads(row[0]) if row else None
-        if start is None or end is None or not all(math.isfinite(value) for value in (start, end)) or not 0 < end - start <= 26 * 3600:
-            raise ValueError("Expected finite start/end instants for one local calendar day")
-        scope = f"{view}:Date:{start}:{end}"
-        with self.reader() as db:
-            if not db.execute("SELECT 1 FROM processing_meta WHERE name='displayRevision'").fetchone() and db.execute("SELECT 1 FROM processing_facts LIMIT 1").fetchone():
+    def replay(self, epoch, cursors):
+        if not isinstance(cursors, dict) or not cursors or any(stream not in {"local", "merged", "state"} or type(sequence) is not int or sequence < 0 for stream, sequence in cursors.items()):
+            raise ValueError("Invalid stream cursor")
+        if self.resetting and epoch == self.head[0]:
+            return []
+        if epoch == self.head[0] and all(sequence == self.head[1][stream] for stream, sequence in cursors.items()):
+            return []
+        with closing(samples.connect(self.index.path)) as db:
+            db.execute("BEGIN")
+            if epoch != db.execute("SELECT value FROM delivery_meta WHERE name='epoch'").fetchone()[0]:
                 return None
-            revisions = list(db.execute("SELECT day,revision FROM dashboard_days WHERE view=? AND day>=? AND day<=? ORDER BY day", (view, int(start // DAY), int((end - .001) // DAY))))
-            context = []
-            accounts = list(db.execute("SELECT account FROM processing_projections WHERE view=?", (view,)))
-            if not accounts:
-                accounts = list(db.execute("SELECT DISTINCT account FROM processing_quota_points WHERE view=?", (view,)))
-            for (account,) in accounts:
-                for comparison, boundary, order in (("<", start, "DESC"), (">=", end, "ASC")):
-                    row = db.execute(f"SELECT record_key,data FROM processing_quota_points WHERE view=? AND account=? AND event_at{comparison}? ORDER BY event_at {order} LIMIT 1", (view, account, boundary)).fetchone()
-                    if row:
-                        context.append(json.loads(row[1]) | {"_key": f"quota:{account}:{row[0]}", "contextOnly": True})
-            signature = hashlib.sha256(encoded([revisions, context])).hexdigest()
-            cached = db.execute("SELECT signature,data FROM dashboard_manifests WHERE scope=?", (scope,)).fetchone()
-            if cached and cached[0] == signature:
-                with self.cache_lock:
-                    self.day_access.pop(scope, None)
-                    self.day_access[scope] = time.time()
-                    while len(self.day_access) > 32:
-                        self.day_access.popitem(last=False)
-                return json.loads(cached[1])
-            frame = self._load(db, view, start, end)
-            frame["quotaPoints"] = sorted(frame["quotaPoints"] + context, key=lambda row: (row["timestamp"], row["usageAccountId"], row["_key"]))
-        account_labels = self._account_labels(frame)
-        tokens = session_groups(frame.pop("tokenSessions"))
-        rates = {name: cost_groups(rows) for name, rows in frame["costUsage"].items()}
-        frame["tokenSessions"] = []
-        # Bound individual immutable responses even for an unusually dense day.
-        artifacts = []
-        from monitor_dashboard import dashboard_safe_json
-        for kind, rows in (("quotaPoints", frame["quotaPoints"]), ("costTime", frame["costTime"]), ("fiveHour", frame["costUsage"]["fiveHour"]), ("sevenDay", frame["costUsage"]["sevenDay"])):
-            for offset in range(0, len(rows), 1000):
-                part = empty_view()
-                (part if kind in {"quotaPoints", "costTime"} else part["costUsage"])[kind] = rows[offset:offset + 1000]
-                body = encoded(dashboard_safe_json(part))
-                artifacts.append((hashlib.sha256(body).hexdigest(), body, gzip.compress(body, compresslevel=3, mtime=0)))
-        now = time.time()
-        with self.index.transaction() as db:
-            for digest, body, compressed in artifacts:
-                db.execute("INSERT OR IGNORE INTO dashboard_blobs VALUES(?,?,?,?)", (digest, body, compressed, now))
-            manifest = self._manifest(view, selected, [digest for digest, _, _ in artifacts], tokens, {}, now, [start, end], rates,
-                cost_bounds=[start, end], cost_totals=reduce_cost_time(frame["costTime"], 0), account_labels=account_labels)
-            db.execute("INSERT OR REPLACE INTO dashboard_manifests VALUES(?,?,?,?)", (scope, signature, encoded(manifest).decode(), now))
-            # Access tracking is in memory so a warm day request remains read-only.
-            with self.cache_lock:
-                self.day_access.pop(scope, None)
-                self.day_access[scope] = now
-                scopes = list(db.execute("SELECT scope,updated FROM dashboard_manifests WHERE scope LIKE '%:Date:%'"))
-                for name, _ in sorted(scopes, key=lambda row: self.day_access.get(row[0], row[1]), reverse=True)[32:]:
-                    db.execute("DELETE FROM dashboard_manifests WHERE scope=?", (name,))
-                    self.day_access.pop(name, None)
-        return manifest
-
-    def blob(self, digest, compressed):
-        if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
-            raise ValueError("Invalid dashboard chunk identity")
-        with self.reader() as db:
-            row = db.execute(f"SELECT {'compressed' if compressed else 'body'} FROM dashboard_blobs WHERE digest=?", (digest,)).fetchone()
-        if row:
-            return row[0]
-        # A lost derived artifact must be repairable without deleting canonical data or restarting.
-        with self.index.transaction() as db:
-            db.execute("UPDATE dashboard_days SET dirty=1,revision=revision+1 WHERE (view,day) IN (SELECT view,day FROM dashboard_parts WHERE digest=?)", (digest,))
-            db.execute("DELETE FROM dashboard_rollups WHERE digest=?", (digest,))
-            db.execute("DELETE FROM dashboard_manifests WHERE EXISTS(SELECT 1 FROM json_each(dashboard_manifests.data,'$.chunks') WHERE value=?)", (digest,))
-        return None
+            result = []
+            for stream, sequence in cursors.items():
+                if stream not in {"local", "merged", "state"} or type(sequence) is not int or sequence < 0:
+                    raise ValueError("Invalid stream cursor")
+                current = int(db.execute("SELECT value FROM delivery_meta WHERE name=?", (stream,)).fetchone()[0])
+                rows = db.execute("SELECT seq,body FROM delivery_journal WHERE stream=? AND seq>? ORDER BY seq", (stream, sequence))
+                expected = sequence + 1
+                size = 0
+                for number, body in rows:
+                    size += len(body)
+                    if number != expected or size > 4 * 1024 * 1024:
+                        return None
+                    result.append(json.loads(body))
+                    expected += 1
+                if sequence > current or expected != current + 1:
+                    return None
+            return result

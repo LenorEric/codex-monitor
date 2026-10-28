@@ -205,6 +205,8 @@ class DashboardProjector:
                 return None
             for view, account, reason in dirty:
                 rows = list(db.execute("SELECT kind,record_key,event_at,session,action FROM processing_changes WHERE view=? AND account=? ORDER BY event_at,record_key", (view, account)))
+                db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", (view, account))
+                db.executemany("INSERT OR IGNORE INTO delivery_work VALUES(?,?,?,?)", [(view, account, row[0], row[1]) for row in rows])
                 if reason != "records" or not db.execute("SELECT 1 FROM processing_projections WHERE view=? AND account=?", (view, account)).fetchone() or any(row[0] == "tokenLedger" and row[4] != "append" for row in rows) or not self._fast_quota(db, view, account, rows, accounts, now, changes[view]):
                     self._rebuild(db, view, account, accounts, now, changes[view], reason if reason != "records" else "quota ordering, source change, or initial projection")
                 else:

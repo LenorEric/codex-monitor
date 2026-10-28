@@ -22,7 +22,7 @@ from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 17
+DATA_CONTRACT_VERSION = 18
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 CLOUD_DATA_CONTRACT_VERSION = 4
@@ -412,6 +412,17 @@ def _migrate_history_to_v17(paths: dict[str, Path]) -> None:
             db.execute("DELETE FROM processing_sampled_quota")
 
 
+def _migrate_history_to_v18(paths: dict[str, Path]) -> None:
+    _migrate_history_to_v17(paths)
+    with closing(samples.connect(paths["processing_index"])) as db, db:
+        for (name,) in list(db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND name LIKE 'dashboard_%'")):
+            db.execute(f'DROP TRIGGER "{name}"')
+        for (name,) in list(db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'delivery_%'")):
+            db.execute(f'DELETE FROM "{name}"')
+        from monitor_delivery import initialize_delivery
+        initialize_delivery(db)
+
+
 DATA_MIGRATIONS = {
     1: _migrate_history_to_v1,
     2: _migrate_history_to_v2,
@@ -430,6 +441,7 @@ DATA_MIGRATIONS = {
     15: _migrate_history_to_v15,
     16: lambda paths: migrate_reset_timestamps(paths),
     17: _migrate_history_to_v17,
+    18: _migrate_history_to_v18,
 }
 
 

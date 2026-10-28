@@ -26,6 +26,8 @@ Runtime state and sensitive account data are stored under `~/.codex-switch` and 
 
 Token capture runs independently of remote quota acquisition. Persistent checkpoints resume after restart, and ordinary appends update only new facts and affected dashboard rows. Watchdog supplies OS file notifications; if it is unavailable, bounded polling and scheduled audits remain active. Install the updated `requirements.txt` after upgrading to enable notifications.
 
-The local data contract is version 8. Ordered startup migration preserves canonical JSONL histories and existing v4 collection periods and peer records. Bootstrap, repair, scheduled audits/retention, and retrospective quota corrections can still read their complete affected scope. Run `python codex_monitor_daemon.py --repair-processing` to rebuild derived checkpoints and dashboard rows while preserving canonical histories and cloud ownership metadata. An older runtime cannot write a newer local contract; restore a verified backup to roll back.
+The pending local data contract is version 18 (released baseline: 17). Ordered startup migration preserves canonical JSONL histories and existing v4 collection periods and peer records. Bootstrap, repair, scheduled audits/retention, and retrospective quota corrections can still read their complete affected scope. Run `python codex_monitor_daemon.py --repair-processing` to rebuild derived checkpoints and dashboard rows while preserving canonical histories and cloud ownership metadata. An older runtime cannot write a newer local contract; restore a verified backup to roll back.
 
 This runtime is distributed under the GNU General Public License version 3. See `LICENSE` in this directory.
+
+Dashboard delivery uses one account-based gzip bulk containing both views, followed by sequenced WebSocket channels on port 8765. No HTTP protocol number is required. Cloud changes replace the complete bulk. See dashboard-delivery.md in the source repository.
