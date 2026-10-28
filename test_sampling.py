@@ -43,7 +43,30 @@ class SamplingTests(unittest.TestCase):
                     rows = [reading(0, 40), reading(1, 20)]
                     rows[0]["windows"] = {label: {"usedPercent": 40, "resetAt": 1893510000 + period - 7200, "plan": "plus"}}
                     rows[1]["windows"] = {label: {"usedPercent": 20, "resetAt": 1893510000 + period + offset, "plan": "plus"}}
-                    self.assertEqual(sample_rows(rows)[1][output]["continuous"], expected)
+                    self.assertEqual(sample_rows(rows)[-1][output]["continuous"], expected)
+
+    def test_reset_boundary_for_each_window_preserves_raw_and_state(self):
+        for label, name, period in (("5h", "fiveHour", 18000), ("7d", "sevenDay", 604800)):
+            with self.subTest(label=label):
+                rows = [reading(0, 90), reading(120, 10)]
+                rows[0]["windows"] = {label: {"usedPercent": 90, "resetAt": 1893510000 + period, "plan": "pro"}}
+                rows[1]["windows"] = {label: {"usedPercent": 10, "resetAt": 1893513600 + period, "plan": "pro"}}
+                original, states = copy.deepcopy(rows), {}
+                points = sample_rows(rows, states=states)
+                self.assertEqual([point[name]["continuous"] for point in points], [90, 0, 10])
+                self.assertEqual(points[1]["timestamp"], 1893513600)
+                self.assertEqual(points[1]["resetWindow"], name)
+                self.assertEqual(points[1][name]["plan"], "pro")
+                self.assertEqual(states["v3:a"][name]["raw"], 10)
+                self.assertEqual(rows, original)
+
+    def test_reset_boundary_requires_nonzero_accepted_value_and_valid_time(self):
+        for initial, reset, plan in ((0, 1893531600, "plus"), (90, None, "plus"), (90, 1893520800, "plus"),
+                (90, 1893517200, "plus"), (90, 1893535201, "plus"), (90, 1893531600, "pro")):
+            with self.subTest(initial=initial, reset=reset, plan=plan):
+                self.assertFalse(any(point.get("resetWindow") for point in sample_rows([reading(0, initial), reading(120, 10, reset=reset, plan=plan)])))
+        # Forward reset times also establish a zero baseline when usage has already overtaken the previous reading.
+        self.assertEqual([point["fiveHour"]["continuous"] for point in sample_rows([reading(0, 10), reading(120, 20, reset=1893531600)])], [10, 0, 20])
 
     def test_supplied_forward_reset_example_and_plateau_timestamp(self):
         self.assertEqual(sample_rows([reading(0, 40), reading(1, 20, reset=1893531600)])[1]["fiveHour"]["continuous"], 20)
@@ -91,6 +114,71 @@ class SamplingStorageTests(unittest.TestCase):
     def points(self, view="local"):
         with self.store.index.transaction() as db:
             return stored_points(db, view)
+
+    def test_reset_projection_costs_restart_correction_and_migration(self):
+        import monitor_migrations
+        from monitor_projection import DashboardProjector
+        from monitor_dashboard import dashboard_cost_usage
+        rows = [reading(0, 90, seven=10), reading(120, 10, seven=12, reset=1893531600)]
+        accounts = {"items": []}
+        projector = DashboardProjector(self.store)
+        self.append(rows[0])
+        projector.refresh(accounts, 1893510000)
+        self.append(rows[1])
+        projector.refresh(accounts, 1893517200)
+        expected = sample_rows(rows)
+        self.assertEqual(self.points(), expected)
+        for view in ("local", "merged"):
+            frame = projector.snapshot(view)
+            self.assertEqual(len(frame["quotaPoints"]), 3)
+            self.assertEqual(len({point["_key"] for point in frame["quotaPoints"]}), 3)
+            self.assertEqual([point["deltaPercent"] for point in frame["costUsage"]["fiveHour"]], [10])
+            self.assertEqual([point["deltaPercent"] for point in frame["costUsage"]["sevenDay"]], [2])
+        ledger = [{"recordType": "usage", "occurredAt": stamp, "usageAccountId": "v3:a", "rawModel": "m", "cost": {"totalCostUsd": cost}}
+            for stamp, cost in ((1893511800, 99), (1893515400, 2))]
+        costs = dashboard_cost_usage(expected, ledger)
+        self.assertEqual(costs["fiveHour"][0]["totalCostUsd"], 2)
+        self.assertEqual(costs["sevenDay"][0]["totalCostUsd"], 101)
+        original = self.store.quota_path.read_bytes()
+        (self.root / monitor_migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":16}', encoding="utf-8")
+        args = (self.root, self.root / "history.jsonl", self.store.quota_path, self.root / "sessions.jsonl", self.store.token_ledger_path, self.root / "samples.jsonl")
+        migration = monitor_migrations.DATA_MIGRATIONS[17]
+        def interrupted(paths):
+            migration(paths)
+            raise RuntimeError("migration interrupted")
+        with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {17: interrupted}), self.assertRaisesRegex(RuntimeError, "migration interrupted"):
+            monitor_migrations.migrate_history_data(*args)
+        self.assertEqual(self.store.quota_path.read_bytes(), original)
+        self.assertEqual(self.points(), expected)
+        self.assertEqual(monitor_migrations.migrate_history_data(*args), [17])
+        self.assertEqual(self.store.quota_path.read_bytes(), original)
+        self.store.index = ProcessingIndex(self.store.v4_cache_path)
+        self.store.ingest_local()
+        self.assertEqual(self.points(), expected)
+        self.assertEqual(monitor_migrations.migrate_history_data(*args), [])
+        # Removing the reset in a corrected source must remove its derived zero point too.
+        rows[1]["windows"]["5h"]["resetAt"] = rows[0]["windows"]["5h"]["resetAt"]
+        self.store.quota_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        self.store.ingest_local()
+        projector = DashboardProjector(self.store)
+        projector.refresh(accounts, 1893517200)
+        self.assertEqual(len(projector.snapshot("local")["quotaPoints"]), 2)
+
+    def test_both_reset_windows_at_observation_time_keep_distinct_points(self):
+        rows = [reading(0, 90, seven=80), reading(60, 10, seven=20)]
+        for index, row in enumerate(rows):
+            for label, period in (("5h", 18000), ("7d", 604800)):
+                row["windows"][label]["resetAt"] = 1893510000 + index * 3600 + period
+            self.append(row)
+        self.assertEqual(self.points(), sample_rows(rows))
+        self.assertEqual(len(self.points()), 4)
+        self.assertEqual([point.get("resetWindow") for point in self.points()], [None, "fiveHour", "sevenDay", None])
+        from monitor_projection import DashboardProjector
+        projector = DashboardProjector(self.store)
+        projector.refresh({"items": []}, 1893513600)
+        points = projector.snapshot("local")["quotaPoints"]
+        self.assertEqual(len(points), 4)
+        self.assertEqual(len({point["_key"] for point in points}), 4)
 
     def test_archive_append_incremental_processing_restart_and_reconstruction(self):
         rows = [reading(index, value) for index, value in enumerate([40, 20, 19, 19, 80, 80])]

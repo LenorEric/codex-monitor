@@ -392,6 +392,8 @@ def dashboard_cost_usage(quota_points: list[dict], ledger: list[dict], slot_usag
     for output_name, label in (("fiveHour", "fiveHour"), ("sevenDay", "sevenDay")):
         accounts = {}
         for point in quota_points:
+            if point.get("resetWindow") and point["resetWindow"] != label:
+                continue
             accounts.setdefault(point["usageAccountId"], []).append(point)
         for account_id, points in accounts.items():
             points.sort(key=lambda point: point["timestamp"] if point["timestamp"] is not None else float("inf"))
@@ -486,6 +488,8 @@ def _dashboard_key_rows(kind: str, rows: list[dict]) -> list[dict]:
     for row in rows:
         if kind == "quota":
             identity = (row.get("usageAccountId"), row.get("checkedAt"))
+            if row.get("resetWindow"):
+                identity += (row["resetWindow"],)
         elif kind == "token":
             identity = (row.get("usageAccountId"), row.get("sessionId"))
         elif kind == "costUsage":
@@ -706,14 +710,14 @@ class UsageDashboardState:
             event.set()
         return True
 
-    def _active_account_status_locked(self, accounts: dict) -> dict | None:
-        if accounts["awaitingLogin"]:
+    def _active_account_status_locked(self, accounts: dict, account_id: str | None = None) -> dict | None:
+        if accounts["awaitingLogin"] and account_id in (None, accounts["activeAccountId"]):
             return None
         if not hasattr(self, "account_statuses"):
             self.account_statuses = {}
         for account in accounts["items"]:
             self.account_statuses.setdefault(account["id"], None)
-        active_id = accounts["activeAccountId"]
+        active_id = account_id if account_id is not None else accounts["activeAccountId"]
         candidate = self.last_sample or getattr(self, "runtime_state", {}).get("lastSample")
         if self.account_statuses.get(active_id) is None and isinstance(candidate, dict) and candidate.get("activeAccountSlotId") == active_id:
             self._update_account_status_locked(active_id, candidate)
@@ -746,14 +750,19 @@ class UsageDashboardState:
             if last_sample is not None and getattr(self.args, "background_token_capture", False):
                 last_sample = last_sample | {"tokenUsage": getattr(self.args, "token_capture_snapshot", None), "cost": self.runtime_state.get("cost"), "costByModel": self.runtime_state.get("costByModel")}
             sample = dashboard_sample(last_sample)
+            account_statuses = {}
+            for account in accounts["items"]:
+                account_sample = last_sample if account["id"] == accounts["activeAccountId"] else self._active_account_status_locked(accounts, account["id"])
+                account_statuses[account["id"]] = {"lastSample": dashboard_sample(account_sample), "display": dashboard_display(account_sample)}
             control_password_configured = control_password_is_configured(self.cloud.config()["control"]) if hasattr(self, "cloud") else True
             processing = {"ingestion": dict(self.usage_data.index.metrics), "projection": dict(self.projector.metrics)} if hasattr(self, "projector") else None
             return {
-                "revision": _dashboard_revision({"sample": sample, "accounts": accounts, "error": self.last_error, "controlPasswordConfigured": control_password_configured, **({"processing": processing} if processing else {})}),
+                "revision": _dashboard_revision({"sample": sample, "accountStatuses": {key: value["lastSample"] for key, value in account_statuses.items()}, "accounts": accounts, "error": self.last_error, "controlPasswordConfigured": control_password_configured, **({"processing": processing} if processing else {})}),
                 "controlPasswordConfigured": control_password_configured,
                 "lastSample": sample,
                 "display": dashboard_display(last_sample),
                 "accounts": accounts,
+                "accountStatuses": account_statuses,
                 **({"processing": processing} if processing else {}),
             }
 
@@ -1827,7 +1836,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                 elif path == "/api/manage/accounts/delete":
                     self.send_json(200, {"accounts": state.delete_account(body.get("accountId"))})
                     return
-                self.send_json(200, {"accounts": result})
+                self.send_json(200, {"accounts": result, "status": state.status_payload()})
             except (AccountError, SkillError, CloudError, OperationSkipped) as exc:
                 self.send_json(exc.status, {"error": str(exc), **({"details": exc.details} if getattr(exc, "details", None) else {}), **({"decryptFailed": True} if getattr(exc, "decrypt_failed", False) else {})})
             except (UnicodeDecodeError, json.JSONDecodeError, ValueError):

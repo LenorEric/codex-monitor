@@ -1,6 +1,6 @@
 """Own local/cloud data contracts, ordered upgrades, journal recovery and old-format conversion.
 
-Released steps are immutable. Merge saved-data changes into local 16 / cloud 4 until
+Released steps are immutable. Merge saved-data changes into local 17 until
 the next successful release. Frozen historical codecs remain separate implementation
 helpers; application modules only invoke the entry points here.
 """
@@ -22,7 +22,7 @@ from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 16
+DATA_CONTRACT_VERSION = 17
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 CLOUD_DATA_CONTRACT_VERSION = 4
@@ -403,6 +403,15 @@ def _migrate_history_to_v15(paths: dict[str, Path], codex_home: Path | None = No
     migrate_local_formats(paths, codex_home)
 
 
+def _migrate_history_to_v17(paths: dict[str, Path]) -> None:
+    # Retained raw quota facts reconstruct reset boundaries and their cost intervals.
+    _migrate_history_to_v10(paths)
+    with closing(samples.connect(paths["processing_index"])) as db, db:
+        db.execute("DELETE FROM processing_meta WHERE name='samplingRule' OR name LIKE 'samplingState:%' OR name LIKE 'quotaState:%'")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_sampled_quota'").fetchone():
+            db.execute("DELETE FROM processing_sampled_quota")
+
+
 DATA_MIGRATIONS = {
     1: _migrate_history_to_v1,
     2: _migrate_history_to_v2,
@@ -420,6 +429,7 @@ DATA_MIGRATIONS = {
     14: _migrate_history_to_v14,
     15: _migrate_history_to_v15,
     16: lambda paths: migrate_reset_timestamps(paths),
+    17: _migrate_history_to_v17,
 }
 
 

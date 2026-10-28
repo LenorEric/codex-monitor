@@ -56,14 +56,14 @@ class DashboardProjector:
 
     def _rebuild(self, db, view, account, accounts, now, patches, reason="quota ordering or source change"):
         from monitor_dashboard import _dashboard_display_data
-        from monitor_sampling import stored_points
+        from monitor_sampling import point_key, stored_points
         rows, ledger = self._datasets(db, view, account)
         points = stored_points(db, view, account)
         frame = _dashboard_display_data(rows, ledger, accounts, now, processed_quota=points)
         db.execute("DELETE FROM processing_quota_points WHERE view=? AND account=?", (view, account))
         for point in points:
             if point["timestamp"] is not None:
-                db.execute("INSERT INTO processing_quota_points VALUES(?,?,?,?,?)", (view, account, point["timestamp"], point["checkedAt"], encode(point)))
+                db.execute("INSERT INTO processing_quota_points VALUES(?,?,?,?,?)", (view, account, point["timestamp"], point_key(point), encode(point)))
         state = {"last": points[-1] if points else None}
         self.index.put(db, f"quotaState:{view}:{account}", state)
         for kind in ("quotaPoints", "tokenSessions", "costTime"):
@@ -103,6 +103,9 @@ class DashboardProjector:
         points.sort(key=lambda row: row["timestamp"])
         if not points:
             return True
+        # A reset can insert earlier, window-specific points; replay the account to preserve sibling intervals.
+        if any(point.get("resetWindows") for point in points):
+            return False
         # Eligibility is established before writing display rows. A failed fast-path is rebuilt in this transaction.
         previous = state["last"]
         for point in points:

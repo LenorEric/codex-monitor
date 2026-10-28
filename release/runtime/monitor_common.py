@@ -37,7 +37,7 @@ TARGET_WINDOWS = {
 PLAN_MULTIPLIERS = {
     "plus": 1.0,
     "pro_lite": 5.0,
-    "pro": 20.0,
+    "pro": 10.0,
     "unknown": 1.0,
 }
 

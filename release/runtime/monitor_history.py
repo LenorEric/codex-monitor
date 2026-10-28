@@ -84,7 +84,7 @@ def normalize_plan_type(value) -> str:
         return "unknown"
     if "5x" in text or "5 x" in text or ("pro" in text and ("lite" in text or "light" in text or "5" in text)):
         return "pro_lite"
-    if "20x" in text or "20 x" in text or ("pro" in text and "plus" not in text):
+    if "10x" in text or "10 x" in text or "20x" in text or "20 x" in text or ("pro" in text and "plus" not in text):
         return "pro"
     if "plus" in text:
         return "plus"

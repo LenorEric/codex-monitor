@@ -26,7 +26,7 @@ from test_usage_v4 import MemoryWebDav
 class UnifiedContractTests(unittest.TestCase):
     def test_contract_metadata_requires_aligned_targets_and_contiguous_registries(self):
         import monitor_migrations
-        metadata = {"dataContractVersion": 16, "cloudDataContractVersion": 4}
+        metadata = {"dataContractVersion": 17, "cloudDataContractVersion": 4}
         monitor_migrations.validate_contract_metadata(metadata)
         for field in metadata:
             with self.subTest(field=field), self.assertRaises(monitor_migrations.MigrationError):

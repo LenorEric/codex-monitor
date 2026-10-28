@@ -78,7 +78,7 @@ button.active,.date-range.active{background:#263650;border-color:#3d5d92;color:#
 <div class="control-group time-range-group"><span class="control-label">Time range</span><div class="controls"><div class="range-buttons" id="ranges"></div><span class="date-selector" id="dateSelector"><button id="prevDate" aria-label="Previous day">&lt;</button>
 <input class="date-range" id="rangeDate" type="date" aria-label="Calendar day"><button id="nextDate" aria-label="Next day">&gt;</button></span></div></div>
 <div class="control-group"><span class="control-label">Data source</span><div class="data-view-buttons" aria-label="Data source"><button data-data-view="local">Local</button><button data-data-view="merged">Merged</button></div></div>
-<div class="control-group"><span class="control-label">Chart display</span><div class="fold-buttons" aria-label="Usage chart display options"><button id="collapseUsageGaps" type="button">Collapse gaps</button><button id="collapseUsageFlat" type="button">Collapse flat</button><button id="normalizeUsage" type="button" title="Show Plus-equivalent usage: Pro Lite ×5 and Pro ×20">Normalized usage</button></div></div>
+<div class="control-group"><span class="control-label">Chart display</span><div class="fold-buttons" aria-label="Usage chart display options"><button id="collapseUsageGaps" type="button">Collapse gaps</button><button id="collapseUsageFlat" type="button">Collapse flat</button><button id="normalizeUsage" type="button" title="Show Plus-equivalent usage: Pro Lite ×5 and Pro ×10">Normalized usage</button></div></div>
 </div>
 <div class="account-banner" id="accountBanner" role="status"></div>
 <div class="status" id="historyStatus" role="status" aria-live="polite">Loading history…</div>
@@ -178,12 +178,13 @@ const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
 const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections";
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
 let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}};
+let statusGeneration=0;
 let pendingStatusRequest=null, statusEtag=null, currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false, seriesLoadSequence=0;
 let historyScope=null,displayedScope=null,historyGeneration=null,drawGeneration=0,chunkCacheBytes=0;
 let curveColors=new Map();
 let availableScopeAccounts=new Map();
 let costTimeMode="spending", costTimeFrame=null;
-const chunkCache=new Map(),scopeCache=new Map(),historyRequests=new Map(),deferredCharts=new Map();
+const chunkCache=new Map(),scopeCache=new Map(),historyRequests=new Map();
 let lastAccountError="", lastAccountMessage="", awaitingLoginMessageShown=false, visibleTokenSessions=[], lastUpdateTimestamp=null;
 let dateLeaveIntent=null, dateLeaveFrame=null;
 const DATE_LEAVE_DELAY_MS=140, DATE_LEAVE_DISTANCE=50, DATE_PICKER_VIRTUAL_WIDTH=280, DATE_PICKER_VIRTUAL_HEIGHT=360, DATE_PICKER_VIRTUAL_PADDING=8;
@@ -483,6 +484,7 @@ function setupUsageFoldControls(){
 addEventListener("pointermove",updateDateLeavePointer,{passive:true});
 function requestStatus(){
   if(pendingStatusRequest)return pendingStatusRequest;
+  const generation=statusGeneration;
   const request=!vscode?fetch("/api/status",{cache:"no-store",headers:statusEtag?{"If-None-Match":statusEtag}:{}}).then(async response=>{if(response.status===304)return {payload:currentStatus,etag:statusEtag,notModified:true};if(!response.ok)throw new Error(`HTTP ${response.status}`);return {payload:await response.json(),etag:response.headers.get("ETag"),notModified:false}}):new Promise((resolve,reject)=>{
     const receive=event=>{
       if(event.data?.type!=="codexUsageStatus")return;
@@ -493,7 +495,7 @@ function requestStatus(){
     addEventListener("message",receive);
     vscode.postMessage({type:"getCodexUsageStatus"});
   });
-  pendingStatusRequest=request.finally(()=>pendingStatusRequest=null);
+  pendingStatusRequest=request.then(response=>({...response,statusGeneration:generation})).finally(()=>pendingStatusRequest=null);
   return pendingStatusRequest;
 }
 function accountAction(action,body){
@@ -568,10 +570,10 @@ function renderAccounts(accounts){
 }
 async function performAccountAction(action,body){
   if(actionBusy)return;
-  actionBusy=true;if(payload.accounts)payload.accounts={...payload.accounts,error:null};renderAccounts(payload.accounts);
+  actionBusy=true;statusGeneration++;if(payload.accounts)payload.accounts={...payload.accounts,error:null};renderAccounts(payload.accounts);
   const actionName={switch:"Account Switch",rename:"Account Rename",delete:"Account Delete"}[action],workingDetail={switch:"Saving the outgoing account and activating the selected account.",rename:"Updating the account label and persisted local history.",delete:"Removing the inactive account from this machine."}[action],workingSteps={switch:["Verify and save outgoing credentials","Load selected credentials into auth.json"],rename:["Update the account label","Rewrite matching local history labels"],delete:["Validate that deletion is allowed","Remove local credentials and manifest entry"]}[action],workingMessage=showMessage(`${actionName} Started`,workingDetail,messageDetailReport(actionName,"In progress",workingSteps.map((name,index)=>({name,status:index?"pending":"in progress",detail:index?"Waiting for the preceding step.":"The operation is running."}))),"progress");
   let succeeded=false;
-  try{const result=await authenticatedAccountAction(action,body);payload.accounts=result.accounts||payload.accounts;if(currentStatus)currentStatus={...currentStatus,accounts:payload.accounts};succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(`${actionName} Completed`,{switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(action,"Completed",steps),"success")}
+  try{const result=await authenticatedAccountAction(action,body);applyCurrentStatus({...currentStatus,...result.status,accounts:result.status?.accounts||result.accounts||payload.accounts});statusEtag=null;succeeded=true;const active=(payload.accounts?.items||[]).find(account=>account.id===payload.accounts?.activeAccountId),steps={switch:[{name:"Outgoing account save",status:"passed",detail:"The previous ready account was verified and saved."},{name:"auth.json replacement",status:"passed",detail:`${active?.label||"The selected account"} is now active.`}],rename:[{name:"Account label",status:"passed",detail:`The account label is now ${body.label}.`},{name:"Persisted local history",status:"passed",detail:"Matching account labels were rewritten transactionally."}],delete:[{name:"Deletion eligibility",status:"passed",detail:"The account was inactive and was not the sole remaining account."},{name:"Local credentials",status:"passed",detail:"The local vault record was removed."},{name:"Cloud data",status:"skipped",detail:"Account deletion is local-only and did not change WebDAV."}]}[action];showMessage(`${actionName} Completed`,{switch:`${active?.label||"The selected account"} is now active.`,rename:`The account was renamed to ${body.label}.`,delete:"The saved account was removed from this machine."}[action],messageDetailReport(action,"Completed",steps),"success")}
   catch(error){payload.accounts={...(payload.accounts||{}),error:error.message||String(error)}}
   finally{workingMessage.dismiss();actionBusy=false;renderAccounts(payload.accounts)}
   if(succeeded)load(true);
@@ -600,8 +602,16 @@ function setupAccountControls(){
   bindBackdropDismiss(deleteModal);
 }
 document.getElementById("managePage").onclick=()=>vscode?vscode.postMessage({type:"codexUsageNavigate",page:"manage"}):location.assign("/manage");
+function applyCurrentStatus(status){
+  if(status.accountStatuses){
+    const active=status.accountStatuses[status.accounts?.activeAccountId];
+    status={...status,lastSample:active?.lastSample??null,display:active?.display||{}};
+  }
+  currentStatus=status;payload={...payload,accounts:status.accounts,lastSample:status.lastSample,display:status.display};
+  renderCurrentStatus(status);
+}
 function renderCurrentStatus(status){
-  const points=payload.points||[], latest=pointFromSample(status.lastSample)||points[points.length-1]||pointFromSample(payload.lastSample), display=status.display||{}, displayWindows=display.windows||{};
+  const latest=pointFromSample(status.lastSample), display=status.display||{}, displayWindows=display.windows||{};
   if(status.accounts){payload.accounts=status.accounts;renderAccounts(payload.accounts)}
   document.getElementById("top5h").textContent=`5h: ${displayWindows["5h"]?.usageText??pct(latest?.fiveHour?.raw)}`;
   document.getElementById("top7d").textContent=`7d: ${displayWindows["7d"]?.usageText??pct(latest?.sevenDay?.raw)}`;
@@ -635,7 +645,7 @@ async function load(force=false){
     historyScope=key;historyGeneration=null;
     if(cached)showScope(key,cached);
     else{
-      drawGeneration++;deferredCharts.clear();hideTip();
+      drawGeneration++;hideTip();
       document.getElementById("historyStatus").textContent="";
     }
   }
@@ -685,15 +695,17 @@ function setupDataView(){
   document.querySelectorAll("[data-data-view]").forEach(button=>{button.classList.toggle("active",button.dataset.dataView===dataView);button.onclick=()=>{if(button.dataset.dataView===dataView)return;dataView=button.dataset.dataView;saveSelections();setupDataView();load(true)}});
 }
 async function pollStatus(force=false){
-  if(document.hidden&&!force)return;
+  if(actionBusy||document.hidden&&!force)return;
+  const generation=statusGeneration;
   try{
     const response=await requestStatus(), status=response.payload;
+    if(generation!==statusGeneration||response.statusGeneration!==undefined&&response.statusGeneration!==statusGeneration)return;
     if(!status)throw new Error("Status response was empty");
     const namesChanged=JSON.stringify(currentStatus?.accounts?.usageGroups)!==JSON.stringify(status.accounts?.usageGroups);
-    currentStatus=status;statusEtag=response.etag||statusEtag;payload={...payload,accounts:status.accounts,lastSample:status.lastSample,display:status.display};
-    refreshErrorShown=false;renderCurrentStatus(status);if(namesChanged&&historyGeneration)drawAll();
+    statusEtag=response.etag||statusEtag;
+    refreshErrorShown=false;applyCurrentStatus(status);if(namesChanged&&historyGeneration)drawAll();
     ensureControlPassword(status);
-  }catch(error){showRefreshError(error)}
+  }catch(error){if(generation===statusGeneration)showRefreshError(error)}
 }
 function extent(values){
   const nums=values.filter(Number.isFinite);
@@ -924,7 +936,7 @@ function axisTickPosition(start,pixels,index,count){return count===1?start+pixel
 function drawXAxisTickLabels(ctx,labels,start,pixels,y){
   labels.forEach((label,index)=>{ctx.textAlign=labels.length===1?"center":index===0?"left":index===labels.length-1?"right":"center";ctx.fillText(label,axisTickPosition(start,pixels,index,labels.length),y)});
 }
-function plusEquivalentUsage(point,label,valueOf){return valueOf(point)*({plus:1,pro_lite:5,pro:20}[point[label]?.plan]||1)}
+function plusEquivalentUsage(point,label,valueOf){return valueOf(point)*({plus:1,pro_lite:5,pro:10}[point[label]?.plan]||1)}
 function compactedUsageRanges(points){
   return points.map(point=>({start:point.overviewBucket?.start??point.compactedFrom,end:point.overviewBucket?.end??eventTimestamp(point)})).filter(range=>Number.isFinite(range.start)&&Number.isFinite(range.end)&&range.start<range.end).sort((a,b)=>a.start-b.start||a.end-b.end).reduce((merged,range)=>{
     const previous=merged.at(-1);
@@ -1056,8 +1068,9 @@ function drawUsageTimeFolds(ctx,folds,top,bottom,part="all"){
 function accountCurveColor(accountId){
   return curveColors.get(accountId)||"#4f8cff";
 }
+function compareQuotaPoints(a,b){return eventTimestamp(a)-eventTimestamp(b)||Number(Boolean(b.resetWindow))-Number(Boolean(a.resetWindow))}
 function usageTimeAccountTotal(points,valueOf){
-  const values=points.filter(point=>Number.isFinite(valueOf(point))).sort((a,b)=>eventTimestamp(a)-eventTimestamp(b)).map(valueOf);
+  const values=points.filter(point=>Number.isFinite(valueOf(point))).sort(compareQuotaPoints).map(valueOf);
   return values.slice(1).reduce((total,value,index)=>total+Math.max(0,value-values[index]),0);
 }
 function renderUsageLegend(id,groups){
@@ -1081,7 +1094,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
   let currentSeries=[], currentFolds=[], mousemove=null;
   if(!valid.length){labelContext.fillStyle=css("--muted");labelContext.textAlign="center";labelContext.fillText(points.length?"Not enough data for the selected scope":"No data for this range",w/2,h/2)}
   else{
-    groups.forEach(([,accountPoints])=>accountPoints.sort((a,b)=>eventTimestamp(a)-eventTimestamp(b)));
+    groups.forEach(([,accountPoints])=>accountPoints.sort(compareQuotaPoints));
     ctx.font="11px system-ui";
     const timestamps=valid.map(eventTimestamp), values=valid.map(point=>Math.max(0,normalizedUsage?renderedValueOf(point):Math.min(100,renderedValueOf(point)))), xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1], dateOnly=x1-x0>=7*24*3600, crossesDate=!sameLocalDate(x0,x1), timeScale=usageTimeScale(x0,x1,usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width,collapseUsageGaps,collapseUsageFlat),m.l,w-m.r), X=timeScale.x, Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
     currentFolds=timeScale.folds;
@@ -1102,7 +1115,7 @@ function drawUsageTimeChart(id,label,points,animate=false){
       const point=nearest.point, tip=document.getElementById("tip"), window=point[label]||{};
       renderTip(tip,[
         {text:new Date(eventTimestamp(point)*1000).toLocaleString(),strong:true},`${label==="fiveHour"?"5h":"7d"} ${normalizedUsage?"normalized ":""}usage ${Number(nearest.value).toFixed(1)}%`,
-        normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}% · ${window.plan==="pro_lite"?"Pro Lite":window.plan==="pro"?"Pro":"Plus"} ×${{pro_lite:5,pro:20}[window.plan]||1}`:null,
+        normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}% · ${window.plan==="pro_lite"?"Pro Lite":window.plan==="pro"?"Pro":"Plus"} ×${{pro_lite:5,pro:10}[window.plan]||1}`:null,
         `Account ${accountDisplayName(usageAccountId(point),point.accountLabel)}`,window.resetAt?`Reset ${new Date(window.resetAt*1000).toLocaleString()}`:null,
       ]);
       tip.style.display="block";positionTip(event,tip);
@@ -1204,11 +1217,11 @@ function costTimeUsageIndex(points,time,after=false){
 function costTimeUsageSeries(start,end){
   const accounts=[...availableScopeAccounts.keys()].filter(accountId=>!selectedAccounts.size||selectedAccounts.has(accountId)).sort((a,b)=>compareAccountNames(a,b,availableScopeAccounts.get(a),availableScopeAccounts.get(b))), grouped=new Map(accounts.map(accountId=>[accountId,[]]));
   for(const point of accountFilteredQuotaPoints(payload.quotaPoints||[])){const points=grouped.get(usageAccountId(point));if(points&&Number.isFinite(eventTimestamp(point)))points.push(point)}
-  for(const points of grouped.values())points.sort((a,b)=>eventTimestamp(a)-eventTimestamp(b));
+  for(const points of grouped.values())points.sort(compareQuotaPoints);
   return accounts.flatMap(accountId=>{
-    const ordered=grouped.get(accountId), invalidStart=Number.isNaN(Number(start)), invalidEnd=Number.isNaN(Number(end)), startIndex=costTimeUsageIndex(ordered,start), endIndex=costTimeUsageIndex(ordered,end,true);
-    const before=invalidStart?undefined:ordered[startIndex-1], after=invalidEnd?undefined:ordered[endIndex], points=invalidStart||invalidEnd?[]:[...(before?[before]:[]),...ordered.slice(startIndex,endIndex),...(after?[after]:[])], compactedRanges=compactedUsageRanges(points);
     return ["fiveHour","sevenDay"].map(label=>{
+      const ordered=grouped.get(accountId).filter(point=>!point.resetWindow||point.resetWindow===label), invalidStart=Number.isNaN(Number(start)), invalidEnd=Number.isNaN(Number(end)), startIndex=costTimeUsageIndex(ordered,start), endIndex=costTimeUsageIndex(ordered,end,true);
+      const before=invalidStart?undefined:ordered[startIndex-1], after=invalidEnd?undefined:ordered[endIndex], points=invalidStart||invalidEnd?[]:[...(before?[before]:[]),...ordered.slice(startIndex,endIndex),...(after?[after]:[])], compactedRanges=compactedUsageRanges(points);
       const valueOf=point=>Number.isFinite(point[label]?.continuous)?normalizedUsage?plusEquivalentUsage(point,label,row=>row[label].continuous):point[label].continuous:null;
       return {accountId,label,valueOf,color:accountCurveColor(accountId),dash:label==="fiveHour"?[6,4]:[],compactedRanges,
         name:`${label==="fiveHour"?"5h":"7d"}${normalizedUsage?" normalized":""} · ${accountDisplayName(accountId,ordered[0]?.accountLabel)}`,
@@ -1348,7 +1361,7 @@ function drawCostTimeChart(animate=false){
 }
 function drawAll(animate=false){
   if(historyScope&&!historyGeneration)return;
-  const generation=++drawGeneration;deferredCharts.clear();
+  const generation=++drawGeneration;
   const e=payload.costUsage||{}, fiveInRange=filteredEvents(e.fiveHour||[]), sevenInRange=filteredEvents(e.sevenDay||[]), quotaPoints=payload.quotaPoints||[], quotaInRange=quotaPointsInRange(quotaPoints,quotaTimeDomain(quotaPoints)), tokenSessions=filteredTokenSessions(payload.tokenSessions||[]);
   const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], labels=new Map([...quotaPoints,...fiveInRange,...sevenInRange].map(row=>[usageAccountId(row),row.accountLabel]));
   curveColors=new Map([...labels.keys()].sort((a,b)=>compareAccountNames(a,b,labels.get(a),labels.get(b))).map((id,index)=>[id,palette[index%palette.length]]));
@@ -1361,15 +1374,13 @@ function drawAll(animate=false){
   updateTokenSummary(selectedTokenSessions);
   updateRate("rate5h",payload.rateRows?modelFilteredEvents(accountFilteredEvents(payload.rateRows.fiveHour)):five);
   updateRate("rate7d",payload.rateRows?modelFilteredEvents(accountFilteredEvents(payload.rateRows.sevenDay)):seven);
-  const jobs=[["usageTime5h",()=>drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)],["usageTime7d",()=>drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)],
-    ["scatter5h",()=>drawDeltaChart("scatter5h","5h cost vs usage",css("--blue"),five,animate)],["scatter7d",()=>drawDeltaChart("scatter7d","7d cost vs usage",css("--green"),seven,animate)],
-    ["costTime",()=>drawCostTimeChart(animate)]];
-  const drawNext=()=>{if(generation!==drawGeneration||!jobs.length)return;const [id,draw]=jobs.shift(),canvas=document.getElementById(id),rect=canvas.getBoundingClientRect();
-    if(chartObserver&&(rect.top>=innerHeight||rect.bottom<=0)){deferredCharts.set(id,{generation,draw});chartObserver.observe(canvas)}else draw();
+  const jobs=[()=>drawUsageTimeChart("usageTime5h","fiveHour",quota,animate),()=>drawUsageTimeChart("usageTime7d","sevenDay",quota,animate),
+    ()=>drawDeltaChart("scatter5h","5h cost vs usage",css("--blue"),five,animate),()=>drawDeltaChart("scatter7d","7d cost vs usage",css("--green"),seven,animate),
+    ()=>drawCostTimeChart(animate)];
+  const drawNext=()=>{if(generation!==drawGeneration||!jobs.length)return;jobs.shift()();
     requestAnimationFrame(()=>setTimeout(drawNext,0));
   };requestAnimationFrame(()=>setTimeout(drawNext,0));
 }
-const chartObserver=typeof IntersectionObserver==="undefined"?null:new IntersectionObserver(entries=>{for(const entry of entries){if(!entry.isIntersecting)continue;const task=deferredCharts.get(entry.target.id);if(task&&task.generation===drawGeneration){deferredCharts.delete(entry.target.id);chartObserver.unobserve(entry.target);requestAnimationFrame(()=>setTimeout(()=>{if(task.generation===drawGeneration)task.draw()},0))}}});
 restoreSelections();setupControls();setupDataView();setupAccountControls();setupUsageFoldControls();setupCostTimeControls();pollStatus(true);load(true);setInterval(pollStatus,5000);setInterval(load,5000);setInterval(updateLastUpdateAge,1000);setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS);addEventListener("pagehide",saveSelections);addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();pollStatus(true);load(true)}});addEventListener("resize",()=>{cancelAnimationFrame(drawAll.resizeFrame);drawAll.resizeFrame=requestAnimationFrame(()=>drawAll())});
 </script>
 </body>

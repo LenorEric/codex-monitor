@@ -2232,9 +2232,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         windows = quota_history_windows({"usage": compact})
 
         self.assertEqual(windows["5h"]["plan"], "pro")
-        self.assertEqual(windows["5h"]["planMultiplier"], 20.0)
+        self.assertEqual(windows["5h"]["planMultiplier"], 10.0)
         self.assertEqual(windows["7d"]["plan"], "pro")
-        self.assertEqual(windows["7d"]["planMultiplier"], 20.0)
+        self.assertEqual(windows["7d"]["planMultiplier"], 10.0)
 
     def test_quota_extraction_treats_missing_5h_as_unavailable(self):
         compact = compact_quota({
@@ -3033,6 +3033,16 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(events[1]["cumulativePercent"], 5)
         self.assertEqual(events[1]["cumulativeCostUsd"], 3)
 
+    def test_pro_multiplier_applies_to_new_samples_and_preserves_saved_samples(self):
+        history = [event_sample(f"2030-01-01T0{index}:00:00Z", five_hour=3 + index, cost=12 + 3 * index, plan="pro") for index in range(3)]
+        self.assertEqual(build_delta_event_series(history, "5h")[-1]["deltaPercent"], 10)
+        for row in history:
+            row["windows"]["5h"]["planMultiplier"] = 20
+        events = build_delta_event_series(history, "5h")
+        self.assertEqual((events[-1]["deltaPercent"], events[-1]["planMultiplier"]), (20, 20))
+        for alias in ("10x", "10 x", "pro", "20x"):
+            self.assertEqual(__import__("monitor_history").quota_plan({"plan_type": alias}), {"type": "pro", "multiplier": 10})
+
     def test_delta_event_series_discards_account_type_switch_sample(self):
         events = build_delta_event_series([
             event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=8, plan="plus"),
@@ -3226,7 +3236,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", cost=112, plan=plan, **third), [])
 
                 self.assertEqual(len(events), 1)
-                self.assertEqual(events[0]["deltaPercent"], {"plus": 1, "pro_lite": 5, "pro": 20}[plan])
+                self.assertEqual(events[0]["deltaPercent"], {"plus": 1, "pro_lite": 5, "pro": 10}[plan])
                 self.assertEqual(events[0]["deltaCostUsd"], 2)
 
     def test_plus_five_hour_keeps_immediate_integer_baseline(self):
@@ -3615,6 +3625,29 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(payload["lastSample"]["cost"]["totalCostUsd"], 1.5)
         self.assertEqual(len(payload["revision"]), 20)
 
+
+    def test_status_includes_all_account_usage_and_revises_when_inactive_usage_changes(self):
+        state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
+        state.args = SimpleNamespace()
+        state.lock = threading.Lock()
+        state.accounts = SimpleNamespace(status=lambda: {
+            "activeAccountId": "a", "awaitingLogin": False,
+            "items": [{"id": account_id, "label": account_id, "ready": True} for account_id in ("a", "b", "empty")],
+        })
+        state.last_sample, state.last_error, state.runtime_state = None, None, {}
+        state.account_statuses = {
+            account_id: {"checkedAt": "2030-01-01T00:00:00Z", "windows": {"5h": {"usedPercent": percent, "resetAt": 1893456000}}, "access_token": "secret"}
+            for account_id, percent in (("a", 10), ("b", 70))
+        }
+        payload = state.status_payload()
+        self.assertEqual(set(payload["accountStatuses"]), {"a", "b", "empty"})
+        self.assertEqual(payload["accountStatuses"]["a"]["lastSample"], payload["lastSample"])
+        self.assertEqual(payload["accountStatuses"]["b"]["lastSample"]["windows"]["5h"], {"usedPercent": 70, "resetAt": 1893456000, "plan": "plus"})
+        self.assertIn("70.0%", payload["accountStatuses"]["b"]["display"]["statusBarText"])
+        self.assertIsNone(payload["accountStatuses"]["empty"]["lastSample"])
+        self.assertNotIn("secret", json.dumps(payload))
+        state.account_statuses["b"]["windows"]["5h"]["usedPercent"] = 80
+        self.assertNotEqual(state.status_payload()["revision"], payload["revision"])
 
     def test_dashboard_display_keeps_exact_points_at_every_age(self):
         now = 100 * 24 * 60 * 60
@@ -4280,7 +4313,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('<button id="collapseUsageGaps" type="button">Collapse gaps</button>', html)
         self.assertIn('<button id="collapseUsageFlat" type="button">Collapse flat</button>', html)
         self.assertIn('<button id="normalizeUsage" type="button"', html)
-        self.assertIn('Pro Lite ×5 and Pro ×20', html)
+        self.assertIn('Pro Lite ×5 and Pro ×10', html)
         self.assertIn('function setupUsageFoldControls()', html)
         self.assertIn('button.setAttribute("aria-pressed",String(getValue()))', html)
         self.assertIn('normalize.setAttribute("aria-pressed",String(normalizedUsage))', html)
@@ -4357,7 +4390,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('points.length?"Not enough data for the selected scope":"No data for this range"', html)
         self.assertNotIn("Not enough data for the selected accounts", html)
         self.assertIn('function plusEquivalentUsage(point,label,valueOf)', html)
-        self.assertIn('{plus:1,pro_lite:5,pro:20}[point[label]?.plan]||1', html)
+        self.assertIn('{plus:1,pro_lite:5,pro:10}[point[label]?.plan]||1', html)
         self.assertIn('function compactedUsageRanges(points)', html)
         self.assertIn('ranges.some(range=>range.start<=previousAt&&currentAt<=range.end)', html)
         self.assertIn('function compactedUsageGap(previous,current,ranges)', html)
@@ -4396,7 +4429,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 const valueOf=point=>point.fiveHour.continuous;
 const point=(plan,continuous)=>({fiveHour:{plan,continuous}});
 if(plusEquivalentUsage(point("pro_lite",20),"fiveHour",valueOf)!==100)throw new Error("Pro Lite 20% did not normalize to 100%");
-if(plusEquivalentUsage(point("pro",20),"fiveHour",valueOf)!==400)throw new Error("Pro 20% did not normalize to 400%");
+if(plusEquivalentUsage(point("pro",20),"fiveHour",valueOf)!==200)throw new Error("Pro 20% did not normalize to 200%");
 if(plusEquivalentUsage(point(undefined,20),"fiveHour",valueOf)!==20)throw new Error("Missing plan was not treated as Plus");
 '''
 
@@ -7087,7 +7120,7 @@ def event_sample(checked_at, five_hour=None, seven_day=None, cost=0, plan="unkno
     row = sample(checked_at, five_hour=five_hour, seven_day=seven_day, five_hour_reset=five_hour_reset, seven_day_reset=seven_day_reset)
     for window in row["windows"].values():
         window["plan"] = plan
-        window["planMultiplier"] = {"plus": 1.0, "pro_lite": 5.0, "pro": 20.0, "unknown": 1.0}[plan]
+        window["planMultiplier"] = {"plus": 1.0, "pro_lite": 5.0, "pro": 10.0, "unknown": 1.0}[plan]
     row["cost"] = {"inputCostUsd": 0, "cachedInputCostUsd": 0, "outputCostUsd": 0, "totalCostUsd": cost}
     return row
 
@@ -7161,7 +7194,7 @@ class RawCostUsageTests(unittest.TestCase):
         ]
         points = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "v3:usage-a"}), [], {"a": "v3:usage-a"})["fiveHour"]
         self.assertEqual(len(points), 4)
-        self.assertEqual((points[0]["startUsagePercent"], points[0]["endUsagePercent"], points[0]["deltaPercent"]), (20.0, 40.0, 20.0))
+        self.assertEqual((points[0]["startUsagePercent"], points[0]["endUsagePercent"], points[0]["deltaPercent"]), (10.0, 20.0, 10.0))
         self.assertEqual(points[0]["costPer100PercentUsd"], 0.0)
 
 

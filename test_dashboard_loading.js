@@ -9,7 +9,19 @@ const flush = () => new Promise(resolve => setImmediate(resolve));
 const frame = point => ({ quotaPoints: point ? [{ _key: point, timestamp: 1, usageAccountId: "a" }] : [], tokenSessions: [], costUsage: { fiveHour: [], sevenDay: [] }, historyStats: {} });
 const manifest = (range, generation, chunks = []) => ({ protocolVersion: 4, view: "merged", range, generation, chunks, tokenSessions: [], rateRows: { fiveHour: [], sevenDay: [] }, builtAt: 1 });
 
-function harness() {
+test("reset baselines stay in their window and sort before simultaneous observations", () => {
+    const h = harness();
+    h.run(`payload.quotaPoints=[
+        {timestamp:0,usageAccountId:'a',fiveHour:{continuous:90},sevenDay:{continuous:10}},
+        {timestamp:60,usageAccountId:'a',fiveHour:{continuous:10},sevenDay:{continuous:12}},
+        {timestamp:60,usageAccountId:'a',resetWindow:'fiveHour',fiveHour:{continuous:0},sevenDay:{continuous:null}}];
+        updateAccountControls(payload.quotaPoints)`);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(costTimeUsageSeries(0,60).map(item=>item.points.map(item.valueOf)))")), [[90, 0, 10], [10, 12]]);
+    assert.equal(h.run("usageTimeAccountTotal(payload.quotaPoints,point=>point.fiveHour.continuous)"), 10);
+    assert.equal(h.run("costTimeUsageSeries(61,62)[1].points[0].sevenDay.continuous"), 12);
+});
+
+function harness(overrides = {}) {
     const elements = new Map(), noop = () => {};
     const element = id => {
         if (!elements.has(id)) elements.set(id, { value: "", textContent: "", style: {}, dataset: {}, width: 800, height: 300,
@@ -20,12 +32,47 @@ function harness() {
         return elements.get(id);
     };
     const context = vm.createContext({ console, performance, URLSearchParams, setTimeout, clearTimeout, requestAnimationFrame: () => 0, cancelAnimationFrame: noop, addEventListener: noop,
-        innerHeight: 900, document: { hidden: false, getElementById: element, createElement: () => element(Symbol()), querySelectorAll: () => [] } });
+        innerHeight: 900, document: { hidden: false, getElementById: element, createElement: () => element(Symbol()), querySelectorAll: () => [] }, ...overrides });
     vm.runInContext(script, context);
+    const drawAll = vm.runInContext("drawAll", context);
     vm.runInContext("selected='Date';selectedDate='2030-01-01';drawAll=()=>{drawCount++};", context);
     context.drawCount = 0;
-    return { context, elements, run: source => vm.runInContext(source, context) };
+    return { context, elements, drawAll, run: source => vm.runInContext(source, context) };
 }
+
+function offscreenChartHarness() {
+    const scheduled = [], draws = [];
+    const h = harness({ requestAnimationFrame: callback => scheduled.push(callback), setTimeout: callback => scheduled.push(callback),
+        IntersectionObserver: class { observe() {} unobserve() {} } });
+    h.context.drawAll = h.drawAll;
+    h.context.css = () => "blue";
+    h.context.drawUsageTimeChart = (id, period, points, animate) => draws.push({ id, range: h.run("selected"), animate });
+    h.context.drawDeltaChart = (id, title, color, points, animate) => draws.push({ id, range: h.run("selected"), animate });
+    h.context.drawCostTimeChart = animate => draws.push({ id: "costTime", range: h.run("selected"), animate });
+    for (const id of ["usageTime5h", "usageTime7d", "scatter5h", "scatter7d", "costTime"]) {
+        h.context.document.getElementById(id).getBoundingClientRect = () => ({ top: 1200, bottom: 1500, width: 800, height: 300 });
+    }
+    return { ...h, draws, drain: () => { while (scheduled.length) scheduled.shift()(); } };
+}
+
+test("scope switches redraw every offscreen chart including cached scopes", async () => {
+    const h = offscreenChartHarness();
+    h.context.requestDashboard = async scope => ({ payload: manifest(scope.range, scope.range) });
+    for (const [range, animate] of [["Date", false], ["All", true], ["Date", true]]) {
+        h.context.nextRange = range;
+        h.run("selected=nextRange");
+        await h.run("load(true)");
+        h.drain();
+        assert.deepEqual(h.draws.splice(0), ["usageTime5h", "usageTime7d", "scatter5h", "scatter7d", "costTime"].map(id => ({ id, range, animate })));
+    }
+});
+
+test("a newer scope cancels queued chart draws and updates all charts offscreen", () => {
+    const h = offscreenChartHarness();
+    h.run("drawAll(true);selected='All';drawAll(true)");
+    h.drain();
+    assert.deepEqual(h.draws, ["usageTime5h", "usageTime7d", "scatter5h", "scatter7d", "costTime"].map(id => ({ id, range: "All", animate: true })));
+});
 
 test("timestamp-only chart records use shared labels and refresh names independently of history", async () => {
     const h = harness();
@@ -432,4 +479,64 @@ test("combined hover lookup keeps real gaps and honors precomputed compacted ran
     assert.equal(h.run("costTimeUsageAt(gapItem,10000)"), null);
     h.run("gapPoints[1].overviewBucket={start:0,end:20000};gapItem.compactedRanges=compactedUsageRanges(gapPoints)");
     assert.equal(h.run("costTimeUsageAt(gapItem,10000)"), 20);
+});
+
+
+test("account switch renders cached usage and reset times before another status poll", async () => {
+    const h = harness();
+    h.context.showMessage = () => ({ dismiss() {} });
+    h.context.load = () => {};
+    h.context.authenticatedAccountAction = async () => ({ accounts: { activeAccountId: "b", items: [] } });
+    h.run(`applyCurrentStatus({accounts:{activeAccountId:"a",items:[]},accountStatuses:{
+        a:{lastSample:{windows:{"5h":{usedPercent:10,resetAt:1893456000}}}},
+        b:{lastSample:{windows:{"5h":{usedPercent:70,resetAt:1893460000},"7d":{usedPercent:80,resetAt:1893888000}}}}
+    }})`);
+    assert.equal(h.elements.get("usage5hValue").textContent, "10.0%");
+    await h.run('performAccountAction("switch",{accountId:"b"})');
+    assert.equal(h.elements.get("usage5hValue").textContent, "70.0%");
+    assert.equal(h.elements.get("usage7dValue").textContent, "80.0%");
+    assert.ok(h.elements.get("time5hReset").textContent.includes(new Date(1893460000000).toLocaleString()));
+    assert.equal(h.run("currentStatus.accounts.activeAccountId"), "b");
+});
+
+test("switch response status wins over a pending poll and uncached accounts clear old readings", async () => {
+    const h = harness();
+    let finishPoll;
+    h.context.requestStatus = () => new Promise(resolve => finishPoll = resolve);
+    h.context.showMessage = () => ({ dismiss() {} });
+    h.context.load = () => {};
+    h.context.ensureControlPassword = () => {};
+    h.context.authenticatedAccountAction = async () => ({ accounts: { activeAccountId: "b", items: [] }, status: {
+        accounts: { activeAccountId: "b", items: [] }, accountStatuses: { b: { lastSample: null, display: {} } }
+    } });
+    h.run('payload.points=[{fiveHour:{raw:99,resetAt:1893456000}}]');
+    const poll = h.run("pollStatus(true)");
+    await h.run('performAccountAction("switch",{accountId:"b"})');
+    finishPoll({ payload: { accounts: { activeAccountId: "a", items: [] }, lastSample: { windows: { "5h": { usedPercent: 99 } } } } });
+    await poll;
+    assert.equal(h.run("currentStatus.accounts.activeAccountId"), "b");
+    assert.equal(h.elements.get("usage5hValue").textContent, "N/A");
+    assert.equal(h.elements.get("time5hReset").textContent, "Reset: N/A");
+    assert.equal(h.elements.get("status").textContent, "Refreshing account usage…");
+});
+
+
+test("a poll sharing a pre-switch request cannot replace the switch response", async () => {
+    let finishFetch;
+    const h = harness({ fetch: () => new Promise(resolve => finishFetch = resolve) });
+    h.context.showMessage = () => ({ dismiss() {} });
+    h.context.load = () => {};
+    h.context.ensureControlPassword = () => {};
+    h.context.authenticatedAccountAction = async () => ({ status: {
+        accounts: { activeAccountId: "b", items: [] },
+        accountStatuses: { b: { lastSample: { windows: { "5h": { usedPercent: 42, resetAt: 1893456000 } } } } }
+    } });
+    const oldPoll = h.run("pollStatus(true)");
+    await h.run('performAccountAction("switch",{accountId:"b"})');
+    const sharedPoll = h.run("pollStatus(true)");
+    finishFetch({ ok: true, status: 200, headers: { get: () => "old" }, json: async () => ({ accounts: { activeAccountId: "a", items: [] } }) });
+    await Promise.all([oldPoll, sharedPoll]);
+    assert.equal(h.run("currentStatus.accounts.activeAccountId"), "b");
+    assert.equal(h.elements.get("usage5hValue").textContent, "42.0%");
+    assert.equal(h.run("statusEtag"), null);
 });

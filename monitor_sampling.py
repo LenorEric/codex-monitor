@@ -3,6 +3,7 @@
 import hashlib
 import json
 import math
+from datetime import datetime, timezone
 from pathlib import Path
 
 from monitor_common import coerce_float, parse_timestamp
@@ -26,7 +27,7 @@ def quota_point(row, slot_usage_accounts=None):
     return point
 
 
-def sample_point(point, state):
+def sample_point(point, state, reset_points=None):
     """Advance only this observation. Rejected observations are never reconsidered."""
     for name, (_, period) in WINDOWS.items():
         window = point[name]
@@ -42,6 +43,13 @@ def sample_point(point, state):
                 previous["protection"] = raw
                 window["continuous"] = None
                 continue
+            if reset_points is not None and previous["raw"] != 0 and reset_at is not None and previous_reset is not None and reset_at > previous_reset and previous["timestamp"] < reset_at - period <= timestamp:
+                point.setdefault("resetWindows", []).append(name)
+                reset_points.append({**{key: point[key] for key in ("accountSlotId", "accountLabel", "usageAccountId")},
+                    "checkedAt": datetime.fromtimestamp(reset_at - period, timezone.utc).isoformat(), "timestamp": reset_at - period,
+                    "compactedFrom": None, "resetWindow": name,
+                    **{other: {"raw": 0 if other == name else None, "continuous": 0 if other == name else None,
+                        "resetAt": window["resetAt"] if other == name else None, "plan": point[other]["plan"]} for other in WINDOWS}})
         state[name] = {"raw": raw, "timestamp": timestamp, "checkedAt": point["checkedAt"], "resetAt": window.get("resetAt"), "plan": window["plan"]}
     return point
 
@@ -66,9 +74,14 @@ def sample_rows(rows, slot_usage_accounts=None, states=None):
         merged[key] = point
     states = {} if states is None else states
     points = sorted(merged.values(), key=lambda point: (point["timestamp"] is None, point["timestamp"] or 0, point["checkedAt"] or "", point["usageAccountId"]))
+    reset_points = []
     for point in points:
-        sample_point(point, states.setdefault(point["usageAccountId"], {}))
-    return points
+        sample_point(point, states.setdefault(point["usageAccountId"], {}), reset_points)
+    return sorted(points + reset_points, key=lambda point: (point["timestamp"] is None, point["timestamp"] or 0, point["usageAccountId"], not bool(point.get("resetWindow")), point.get("resetWindow", "")))
+
+
+def point_key(point):
+    return f"{point['checkedAt']}:reset:{point['resetWindow']}" if point.get("resetWindow") else point["checkedAt"]
 
 
 def initialize(db):
@@ -121,7 +134,7 @@ def refresh(db, index):
         points = sample_rows([row | {"usageAccountId": account} for row in rows], states={account: state["windows"]})
         index.metrics["quotaSamplesProcessed"] = index.metrics.get("quotaSamplesProcessed", 0) + len(points)
         for point in points:
-            db.execute("INSERT OR REPLACE INTO processing_sampled_quota VALUES(?,?,?,?,?)", (view, account, point["checkedAt"], point["timestamp"], encode(point)))
+            db.execute("INSERT OR REPLACE INTO processing_sampled_quota VALUES(?,?,?,?,?)", (view, account, point_key(point), point["timestamp"], encode(point)))
             if point["timestamp"] is not None:
                 state["timestamp"] = point["timestamp"]
         index.put(db, state_key, state)
@@ -134,4 +147,5 @@ def stored_points(db, view, account=None):
     if account is not None:
         query += " AND account=?"
         values.append(account)
-    return [json.loads(row[0]) for row in db.execute(query + " ORDER BY event_at IS NULL,event_at,account,record_key", values)]
+    points = [json.loads(row[0]) for row in db.execute(query + " ORDER BY event_at IS NULL,event_at,account,record_key", values)]
+    return sorted(points, key=lambda point: (point["timestamp"] is None, point["timestamp"] or 0, point["usageAccountId"], not bool(point.get("resetWindow")), point.get("resetWindow", "")))
