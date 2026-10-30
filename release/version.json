@@ -1,5 +1,5 @@
 {
-  "version": "1.5.22",
+  "version": "1.5.23",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 6078,
@@ -24,6 +24,10 @@
     "monitor_auto_update.py": {
       "size": 11752,
       "sha256": "82ab11f58b76441f0e8ab30877ea065880aa051a5e56a918b4d388283b2eda9f"
+    },
+    "monitor_backup.py": {
+      "size": 2586,
+      "sha256": "aa28784f802b29bccfe68b410d39b3ed55df298a33f28f1e8d8e1cc354ad3838"
     },
     "monitor_cloud.py": {
       "size": 138240,
@@ -64,6 +68,10 @@
     "monitor_history.py": {
       "size": 25550,
       "sha256": "a8cb8b2d2fbb7db574697ef3d2e532dfdef210c1e2b36c8faa911a9af4e119e2"
+    },
+    "monitor_ingestion.py": {
+      "size": 29025,
+      "sha256": "99e82f7a1c12f1fb86aaf468c1f804dbfa4c24fd2d90248b2fd280c06fd59057"
     },
     "monitor_interpretation.py": {
       "size": 5321,
@@ -147,7 +155,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "89743debc8868a92f393fbdb6e00c66455d448cc096e67e8ef850f88b1172351"
+      "sha256": "039ed51943ee10d3d4c2cb3f00765571f9962ec2ec4ae339b2e334218be94845"
     }
   }
 }

@@ -1,3 +1,4 @@
+import ast
 import hashlib
 import json
 import re
@@ -25,6 +26,7 @@ RUNTIME_FILES = (
     "monitor_migration_history.py",
     "monitor_migration_samples.py",
     "monitor_auto_update.py",
+    "monitor_backup.py",
     "monitor_dependencies.py",
     "monitor_cloud.py",
     "monitor_cloud_queue.py",
@@ -38,6 +40,7 @@ RUNTIME_FILES = (
     "monitor_live.py",
     "monitor_events.py",
     "monitor_history.py",
+    "monitor_ingestion.py",
     "monitor_quota.py",
     "monitor_sampling.py",
     "monitor_processing.py",
@@ -87,9 +90,30 @@ def write_text_lf(path: Path, text: str) -> None:
         output.write(text)
 
 
+def validate_runtime_files() -> None:
+    """Reject omitted local imports, including imports inside startup functions."""
+    packaged = set(RUNTIME_FILES)
+    missing = []
+    for name in RUNTIME_FILES:
+        if not (ROOT / name).is_file():
+            missing.append(f"missing runtime source: {name}")
+            continue
+        if not name.endswith(".py"):
+            continue
+        for node in ast.walk(ast.parse((ROOT / name).read_text(encoding="utf-8"), filename=name)):
+            modules = [alias.name for alias in node.names] if isinstance(node, ast.Import) else [node.module] if isinstance(node, ast.ImportFrom) and node.module else []
+            for module in modules:
+                dependency = f"{module.split('.')[0]}.py"
+                if (ROOT / dependency).is_file() and dependency not in packaged:
+                    missing.append(f"{name} imports unpackaged {dependency}")
+    if missing:
+        raise ValueError("Incomplete runtime package: " + "; ".join(sorted(set(missing))))
+
+
 def rebuild_runtime(version: str) -> None:
     metadata = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
     validate_contract_metadata(metadata)
+    validate_runtime_files()
     if RUNTIME_DIR.exists():
         shutil.rmtree(RUNTIME_DIR)
     RUNTIME_DIR.mkdir(parents=True)
@@ -165,6 +189,7 @@ def commit_release(version: str) -> None:
 
 def main() -> None:
     validate_contract_metadata(json.loads((ROOT / "package.json").read_text(encoding="utf-8")))
+    validate_runtime_files()
     version = bump_package_version()
     build_release(version)
     commit_release(version)

@@ -1,6 +1,8 @@
 import hashlib
 import json
 import shutil
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -346,6 +348,44 @@ class AutoUpdateTests(unittest.TestCase):
             self.assertEqual(manifest["version"], "1.5.0")
             self.assertEqual(list(manifest["files"]), ["A.py", "b.py"])
             self.assertEqual(manifest["files"]["A.py"], descriptor(b"a"))
+
+    def test_missing_runtime_import_cannot_bump_version_or_replace_runtime(self):
+        with temporary_directory() as root:
+            runtime = root / "runtime"
+            runtime.mkdir()
+            (runtime / "preserved.txt").write_text("existing release", encoding="utf-8")
+            for omitted in ("monitor_backup.py", "monitor_ingestion.py"):
+                with self.subTest(omitted=omitted), mock.patch.object(build_release, "RUNTIME_FILES", tuple(name for name in build_release.RUNTIME_FILES if name != omitted)), mock.patch.object(build_release, "RUNTIME_DIR", runtime), mock.patch.object(build_release, "bump_package_version") as bump:
+                    with self.assertRaisesRegex(ValueError, omitted):
+                        build_release.main()
+                    bump.assert_not_called()
+                    with self.assertRaisesRegex(ValueError, omitted):
+                        build_release.rebuild_runtime("1.5.22")
+                self.assertEqual((runtime / "preserved.txt").read_text(encoding="utf-8"), "existing release")
+
+    def test_packaged_runtime_imports_and_sqlite_migration_work_in_isolation(self):
+        with temporary_directory() as root:
+            release = root / "release"
+            runtime = release / "runtime"
+            with mock.patch.object(build_release, "RELEASE_DIR", release), mock.patch.object(build_release, "RUNTIME_DIR", runtime):
+                build_release.rebuild_runtime("1.5.22")
+            result = subprocess.run([sys.executable, "-I", "-c", """
+import sys, threading
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import monitor_dashboard
+from monitor_usage_sync import UsageDataStore
+from monitor_migrations import _migrate_history_to_v19
+root = Path(sys.argv[2])
+store = UsageDataStore(root / "quota.jsonl", root / "ledger.jsonl", "machine", lambda _: "v3:a", threading.RLock())
+store.record_quota({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 10}}})
+_migrate_history_to_v19({"processing_index": store.index.path, "token_ledger": store.token_ledger_path})
+assert len(store.datasets()[0]) == 1
+assert all(Path(module.__file__).parent == Path(sys.argv[1]) for name, module in sys.modules.items() if name.startswith("monitor_") and getattr(module, "__file__", None))
+print("Packaged runtime imports and SQLite migration OK")
+""", str(runtime), str(root / "data")], cwd=root, capture_output=True, text=True, timeout=60)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("SQLite migration OK", result.stdout)
 
     def test_release_commit_stages_everything_and_uses_version_message(self):
         with mock.patch.object(build_release.shutil, "which", return_value="C:/Git/git.exe"), mock.patch.object(build_release.subprocess, "run") as run:
