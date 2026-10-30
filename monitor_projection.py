@@ -21,7 +21,7 @@ class DashboardProjector:
     def _datasets(self, db, view, account):
         from monitor_usage_sync import merge_quota_rows, merge_token_ledger_rows
         quota, ledger = [], []
-        sources = [str(self.store.quota_path.resolve()), str(self.store.token_ledger_path.resolve())]
+        sources = ["local:quota", "local:tokenLedger"]
         for source, kind, data in db.execute("SELECT source,kind,data FROM processing_facts WHERE account=? ORDER BY source,position", (account,)):
             if source not in sources and (view != "merged" or not source.startswith("peer:")):
                 continue
@@ -93,7 +93,7 @@ class DashboardProjector:
             if action != "append" or stamp is None or stamp <= state["last"]["timestamp"]:
                 return False
             candidates = [json.loads(row[1]) for row in db.execute("SELECT source,data FROM processing_facts WHERE account=? AND kind='quota' AND record_key=? ORDER BY source,position", (account, key))
-                if row[0] == str(self.store.quota_path.resolve()) or view == "merged" and row[0].startswith("peer:")]
+                if row[0] == "local:quota" or view == "merged" and row[0].startswith("peer:")]
             if len(candidates) != 1:
                 return False
             sampled = db.execute("SELECT data FROM processing_sampled_quota WHERE view=? AND account=? AND record_key=?", (view, account, candidates[0]["checkedAt"])).fetchone()
@@ -133,7 +133,7 @@ class DashboardProjector:
         if view == "merged":
             return (json.loads(row[0]) for row in db.execute("SELECT data FROM processing_effective WHERE account=? AND event_at>=? AND event_at<? ORDER BY event_at,record_key", (account, start, end)))
         return (json.loads(row[0]) for row in db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' AND account=? AND event_at>=? AND event_at<? ORDER BY event_at,event_id",
-            (str(self.store.token_ledger_path.resolve()), account, start, end)))
+            ("local:tokenLedger", account, start, end)))
 
     def _range_costs(self, db, view, account, start, end):
         from monitor_common import coerce_float
@@ -146,7 +146,7 @@ class DashboardProjector:
 
     def _sessions(self, db, view, account, changes, accounts, patches):
         from monitor_dashboard import dashboard_token_session, _dashboard_key_rows
-        source = str(self.store.token_ledger_path.resolve()) if view == "local" else f"view:merged:{account}"
+        source = "local:tokenLedger" if view == "local" else f"view:merged:{account}"
         labels = {str(row["id"]): row["label"] for row in accounts.get("items", [])}
         for session in {item[3] for item in changes if item[0] == "tokenLedger"}:
             rows = []
@@ -174,15 +174,15 @@ class DashboardProjector:
                 records = db.execute("SELECT data FROM processing_effective WHERE account=? AND record_key=?", (account, key))
             else:
                 records = db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' AND account=? AND record_key=?",
-                    (str(self.store.token_ledger_path.resolve()), account, key))
+                    ("local:tokenLedger", account, key))
             for row in dashboard_cost_time([json.loads(record[0]) | {"usageAccountId": account} for record in records]):
                 self._row(db, view, account, "costTime", row, patches)
 
     def _stats(self, db, view, account):
         def count(scope, kind):
             return db.execute("SELECT COALESCE(SUM(count),0) FROM processing_counts WHERE scope=? AND account=? AND kind=?", (scope, account, kind)).fetchone()[0]
-        return {"quotaRows": count(f"quota:{view}", "quota") if view == "merged" else count(str(self.store.quota_path.resolve()), "quota"),
-            "tokenLedgerRows": count("effective" if view == "merged" else str(self.store.token_ledger_path.resolve()), "tokenLedger"),
+        return {"quotaRows": count(f"quota:{view}", "quota") if view == "merged" else count("local:quota", "quota"),
+            "tokenLedgerRows": count("effective" if view == "merged" else "local:tokenLedger", "tokenLedger"),
             "fiveHourCostUsagePoints": count(f"display:{view}", "costUsage:fiveHour"), "sevenDayCostUsagePoints": count(f"display:{view}", "costUsage:sevenDay")}
 
     def refresh(self, accounts, now, force=False):

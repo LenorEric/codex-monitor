@@ -17,14 +17,14 @@ def benchmark(count):
     root = Path.cwd() / f".processing-benchmark-{uuid.uuid4().hex}"
     root.mkdir()
     try:
-        store = UsageDataStore(root / "quota.jsonl", root / "ledger.jsonl", "machine", lambda _: "account", threading.RLock())
+        store = UsageDataStore(root / "quota.jsonl", root / "ledger.jsonl", "machine", lambda _: "v3:account", threading.RLock())
         def sample(index):
             return {"checkedAt": datetime.fromtimestamp(1893456000 + index, timezone.utc).isoformat(), "accountSlotId": "slot", "accountLabel": "Account",
                 "windows": {"5h": {"usedPercent": 0, "plan": "plus"}, "7d": {"usedPercent": 0, "plan": "plus"}}}
-        with store.quota_path.open("w", encoding="utf-8", newline="\n") as output:
-            for index in range(count):
-                output.write(json.dumps(sample(index)) + "\n")
-        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "account"}]}
+        with store.index.transaction() as db:
+            store.index.write_records(db, "quota", [store.normalize_new_quota(sample(index)) for index in range(count)], backup_path=store.quota_path)
+        store.backup.flush()
+        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
         projector = DashboardProjector(store)
         started = time.perf_counter()
         projector.refresh(accounts, 1893456000 + count)
@@ -36,17 +36,15 @@ def benchmark(count):
             assert projector.refresh(accounts, 1893456000 + count) is None
         idle_seconds, idle_cpu = (time.perf_counter() - started) / 3, (time.process_time() - cpu) / 3
         assert store.index.metrics == before
-        encoded = json.dumps(sample(count)) + "\n"
-        with store.quota_path.open("a", encoding="utf-8", newline="\n") as output:
-            output.write(encoded)
         started, cpu = time.perf_counter(), time.process_time()
+        store.record_quota(sample(count))
         projector.refresh(accounts, 1893456000 + count + 1)
         result = {"historicalRows": count, "initialSeconds": round(initial_seconds, 6), "idleSeconds": round(idle_seconds, 6), "idleCpuSeconds": round(idle_cpu, 6),
             "appendSeconds": round(time.perf_counter() - started, 6), "appendCpuSeconds": round(time.process_time() - cpu, 6),
             "appendCanonicalBytesRead": store.index.metrics["canonicalBytesRead"] - before["canonicalBytesRead"],
             "appendVerificationBytesRead": store.index.metrics["sourceVerificationBytes"] - before["sourceVerificationBytes"],
             "appendRecordsImported": store.index.metrics["recordsImported"] - before["recordsImported"], "appendQuotaRowsReplayed": projector.metrics["quotaRowsReplayed"] - replayed}
-        assert result["appendRecordsImported"] == 1 and result["appendQuotaRowsReplayed"] == 0 and result["appendCanonicalBytesRead"] == len(encoded.encode()), result
+        assert result["appendRecordsImported"] == 1 and result["appendQuotaRowsReplayed"] == 0 and result["appendCanonicalBytesRead"] == 0, result
         return result
     finally:
         if not root.resolve().is_relative_to(Path.cwd().resolve()) or not root.name.startswith(".processing-benchmark-"):

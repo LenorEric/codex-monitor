@@ -10,7 +10,6 @@ from types import SimpleNamespace
 from unittest import mock
 
 from monitor_dashboard import UsageDashboardState
-from monitor_history import append_quota_history_sample
 from monitor_processing import ProcessingIndex
 from monitor_quota import compact_quota
 from monitor_sampling import sample_rows, stored_points
@@ -108,7 +107,7 @@ class SamplingStorageTests(unittest.TestCase):
         self.store.ingest_local()
 
     def append(self, row):
-        append_quota_history_sample(self.store.quota_path, row)
+        self.store.record_quota(row)
         self.store.ingest_local()
 
     def points(self, view="local"):
@@ -150,7 +149,7 @@ class SamplingStorageTests(unittest.TestCase):
             monitor_migrations.migrate_history_data(*args)
         self.assertEqual(self.store.quota_path.read_bytes(), original)
         self.assertEqual(self.points(), expected)
-        self.assertEqual(monitor_migrations.migrate_history_data(*args), [17, 18])
+        self.assertEqual(monitor_migrations.migrate_history_data(*args), [17, 18, 19])
         self.assertEqual(self.store.quota_path.read_bytes(), original)
         self.store.index = ProcessingIndex(self.store.v4_cache_path)
         self.store.ingest_local()
@@ -158,7 +157,8 @@ class SamplingStorageTests(unittest.TestCase):
         self.assertEqual(monitor_migrations.migrate_history_data(*args), [])
         # Removing the reset in a corrected source must remove its derived zero point too.
         rows[1]["windows"]["5h"]["resetAt"] = rows[0]["windows"]["5h"]["resetAt"]
-        self.store.quota_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+        for row in rows:
+            self.store.record_quota(row)
         self.store.ingest_local()
         projector = DashboardProjector(self.store)
         projector.refresh(accounts, 1893517200)
@@ -184,7 +184,7 @@ class SamplingStorageTests(unittest.TestCase):
         rows = [reading(index, value) for index, value in enumerate([40, 20, 19, 19, 80, 80])]
         for row in rows:
             self.append(row)
-        self.assertEqual(len(self.store.quota_path.read_text().splitlines()), len(rows))
+        self.assertEqual(len([line for line in self.store.quota_path.read_text().splitlines() if line.strip()]), len(rows))
         self.assertEqual(len(quota_sync_boundary_rows(rows, "device")), len(rows))
         self.assertEqual(self.points(), sample_rows(rows))
         rebuilds = self.store.index.metrics["quotaSamplingRebuilds"]
@@ -196,7 +196,9 @@ class SamplingStorageTests(unittest.TestCase):
         self.assertEqual([point["fiveHour"]["continuous"] for point in expected], [40, None, None, 19, 80, 80, None, 70])
         # A new database must reproduce every decision, including rejected points.
         rebuilt = UsageDataStore(self.store.quota_path, self.store.token_ledger_path, "device", lambda slot: slot, threading.RLock(), cache_path=self.root / "rebuilt.json")
-        rebuilt.ingest_local()
+        self.assertEqual(rebuilt.datasets(), ([], []))
+        for row in self.store.index.rows("quota"):
+            rebuilt.record_quota(row)
         with rebuilt.index.transaction() as db:
             self.assertEqual(stored_points(db, "local"), expected)
 
@@ -207,13 +209,11 @@ class SamplingStorageTests(unittest.TestCase):
         self.assertEqual([point["fiveHour"]["continuous"] for point in self.points()], [40, None])
         self.append(reading(1, 20))
         self.assertEqual([point["fiveHour"]["continuous"] for point in self.points()], [40, None, 20])
-        self.store.quota_path.write_text(json.dumps(reading(0, 10)) + "\n", encoding="utf-8")
-        self.store.ingest_local()
-        self.assertEqual([point["fiveHour"]["continuous"] for point in self.points()], [10])
+        self.store.record_quota(reading(0, 10))
+        self.assertEqual([point["fiveHour"]["continuous"] for point in self.points()], [10, 20, 20])
 
     def test_failed_sql_transaction_replays_durable_raw_without_double_confirmation(self):
         self.append(reading(0, 40))
-        append_quota_history_sample(self.store.quota_path, reading(1, 20))
         import monitor_sampling
         refresh = monitor_sampling.refresh
         def fail(db, index):
@@ -221,8 +221,9 @@ class SamplingStorageTests(unittest.TestCase):
             raise RuntimeError("interrupted before commit")
         with mock.patch.object(monitor_sampling, "refresh", side_effect=fail):
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
-                self.store.ingest_local()
-        self.store.ingest_local()
+                self.store.record_quota(reading(1, 20))
+        self.assertEqual([point["fiveHour"]["continuous"] for point in self.points()], [40])
+        self.store.record_quota(reading(1, 20))
         self.assertEqual([point["fiveHour"]["continuous"] for point in self.points()], [40, None])
         self.append(reading(2, 20))
         self.assertEqual(self.points()[-1]["fiveHour"]["continuous"], 20)
@@ -240,7 +241,7 @@ class SamplingStorageTests(unittest.TestCase):
         self.assertEqual(second["windows"]["7d"]["usedPercent"], 11)
         state._record_quota_sample_locked(third)
         self.assertEqual(third["windows"]["5h"]["usedPercent"], 20)
-        raw = [json.loads(line) for line in self.store.quota_path.read_text().splitlines()]
+        raw = [json.loads(line) for line in self.store.quota_path.read_text().splitlines() if line.strip()]
         self.assertEqual([row["windows"]["5h"]["usedPercent"] for row in raw], [40, 20, 20])
         self.assertNotIn("continuous", self.store.quota_path.read_text())
 
@@ -279,7 +280,7 @@ class SamplingStorageTests(unittest.TestCase):
         self.assertFalse(state.external_auth_validation_threads)
         self.assertEqual([point["fiveHour"]["continuous"] for point in self.points()], [40, None, 20, None])
         self.assertEqual(state.account_statuses["slot"]["windows"]["5h"]["usedPercent"], 20)
-        self.assertEqual(len(self.store.quota_path.read_text().splitlines()), 4)
+        self.assertEqual(len([line for line in self.store.quota_path.read_text().splitlines() if line.strip()]), 4)
 
 
 if __name__ == "__main__":

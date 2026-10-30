@@ -35,12 +35,12 @@ from monitor_events import (
 )
 from monitor_quota import fetch_usage
 from monitor_history import (
-    append_capped_jsonl, append_quota_history_sample, collect_usage_sample, default_dashboard_cache_path,
-    load_quota_history, load_state, make_history_sample, normalize_quota_history_row, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, rewrite_account_labels, write_state,
+    collect_usage_sample, default_dashboard_cache_path,
+    make_history_sample, normalize_quota_history_row, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, write_state,
 )
 from monitor_skills import SkillError, SkillManager
 from monitor_session_refresh import refresh_session
-from monitor_token_ledger import default_token_ledger_path, load_token_ledger, sync_token_ledger, token_cost_snapshot, token_sessions_from_ledger
+from monitor_token_ledger import default_token_ledger_path, token_cost_snapshot, token_sessions_from_ledger
 from monitor_usage_sync import UsageDataStore, add_record_provenance
 
 DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
@@ -548,11 +548,11 @@ class UsageDashboardState:
             getattr(self.args, "usage_sync_cache", None), self.cloud.usage_account_revision,
         )
         self.args.usage_sync_cache = self.usage_data.cache_path
-        self.args.processing_index = self.usage_data.index
+        self.args.source_ingestor = self.usage_data.sources
         print("Startup: initializing usage processing and dashboard stores...", flush=True)
-        self.usage_data.initialize_processing()
-        self.usage_data.initialize_v4_index()
-        self.usage_data.index.on_new_cost = self.accounts.promote_active_slot_on_cost
+        self.usage_data.initialize_processing(ingest=False)
+        self.usage_data.initialize_v4_index(ingest=False)
+        self.usage_data.sources.on_new_cost = self.accounts.promote_active_slot_on_cost
         from monitor_projection import DashboardProjector
         self.projector = DashboardProjector(self.usage_data)
         from monitor_delivery import DashboardDelivery
@@ -600,7 +600,7 @@ class UsageDashboardState:
         self.dashboard_cache_event.set()
         print("Startup: restoring runtime state and reconciling live authentication...", flush=True)
         with self.usage_data.index.transaction() as db:
-            self.runtime_state = reset_runtime_baselines(self.usage_data.index.get(db, "runtimeState", load_state(args.state)))
+            self.runtime_state = reset_runtime_baselines(self.usage_data.index.get(db, "runtimeState", {}))
         self.restore_console_event_state()
         account_status = self.accounts.status()
         self.account_statuses = {account["id"]: None for account in account_status["items"]}
@@ -626,7 +626,7 @@ class UsageDashboardState:
         from monitor_history import compact_monitor_state
         with self.usage_data.index.transaction() as db:
             self.usage_data.index.put(db, "runtimeState", compact_monitor_state(self.runtime_state))
-        # The legacy status file contains no derived quota state.
+        # Compatibility output only; restart state is owned by SQLite.
         write_state(self.args.state, {key: value for key, value in self.runtime_state.items() if key not in {"windows", "lastSample", "remoteUsageIdentity"}})
 
     def restore_console_event_state(self) -> None:
@@ -670,13 +670,13 @@ class UsageDashboardState:
         return self.device_auth.regenerate(active["id"])
 
     def _record_quota_sample_locked(self, sample: dict) -> None:
-        """Write raw evidence first; only SQLite decisions may update live quota status."""
+        """Commit raw readings directly; only SQLite decisions update live quota status."""
         sample["sync"] = sample.get("sync") or {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": self.cloud.usage_account_id(sample.get("accountSlotId"))}
         sample["sync"] = add_record_provenance("quota", sample, self.cloud.machine_id, sample["sync"]["accountId"])["sync"]
         raw_windows = copy.deepcopy(sample.get("windows") or {})
-        append_quota_history_sample(self.args.quota_history, sample)
+        self.usage_data.record_quota(sample)
         if getattr(self.args, "sample_log", None):
-            append_capped_jsonl(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample}, self.args.sample_log_max_bytes)
+            self.usage_data.record_diagnostic(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample})
         self.usage_data.ingest_local()
         from monitor_usage_sync import record_account_key
         from monitor_sampling import WINDOWS, accepted_windows
@@ -805,6 +805,7 @@ class UsageDashboardState:
                 if hasattr(self, "delivery"):
                     self.delivery.cloud_pending |= cloud_refresh
                     self.delivery.prepare(projector=self.projector, status=self.status_payload())
+                    self.usage_data.backup.flush()
                     self.usage_data.index.maintain_disk_space()
             except Exception as exc:
                 if cloud_refresh:
@@ -826,7 +827,7 @@ class UsageDashboardState:
 
     def quota_history(self) -> list[dict]:
         with self.lock:
-            return load_quota_history(self.args.quota_history)
+            return self.usage_data.index.rows("quota")
 
     def _print_usage_console_events(self, sample: dict) -> None:
         process_sample_delta_events(self.console_event_state, copy.deepcopy(sample), None)
@@ -838,10 +839,10 @@ class UsageDashboardState:
     def run_token_capture(self) -> None:
         while self.running:
             try:
-                token_usage = self.usage_data.index.scan(self.args.codex_home)
+                token_usage = self.usage_data.sources.scan(self.args.codex_home)
                 status = self.accounts.status()
                 label = next((row["label"] for row in status["items"] if row["id"] == status["activeAccountId"]), "Unknown")
-                cost, by_model = self.usage_data.index.sync_ledger(self.args.token_ledger, status["activeAccountId"], label, self.accounts.attribution_timeline(),
+                cost, by_model = self.usage_data.sources.sync_ledger(self.args.token_ledger, status["activeAccountId"], label, self.accounts.attribution_timeline(),
                     lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
                     self.usage_data.normalize_new_ledger, self.cloud.machine_id)
                 with self.lock:
@@ -889,22 +890,23 @@ class UsageDashboardState:
             if token_usage.get("incremental") and getattr(self.args, "background_token_capture", False):
                 sample["cost"], sample["costByModel"] = self.runtime_state.get("cost") or empty_cost_totals(), self.runtime_state.get("costByModel") or {}
             elif token_usage.get("incremental"):
-                sample["cost"], sample["costByModel"] = self.usage_data.index.sync_ledger(
+                sample["cost"], sample["costByModel"] = self.usage_data.sources.sync_ledger(
                     self.args.token_ledger, account_status["activeAccountId"], sample["accountLabel"], self.accounts.attribution_timeline(),
                     lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
                     self.usage_data.normalize_new_ledger, self.cloud.machine_id,
                 )
             elif token_usage:
-                token_sessions = sync_token_ledger(
-                    self.args.token_ledger,
-                    token_usage.get("events") or [],
-                    account_status["activeAccountId"],
-                    sample["accountLabel"],
-                    self.accounts.attribution_timeline(),
-                    record_provenance=lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
-                    source_files=token_usage.get("sourceFiles"), own_machine_id=self.cloud.machine_id,
-                    on_new_cost=self.accounts.promote_active_slot_on_cost,
+                from monitor_token_ledger import reconcile_token_ledger
+                rows, new_costs = reconcile_token_ledger(
+                    self.usage_data.index.rows("tokenLedger"), token_usage.get("events") or [],
+                    account_status["activeAccountId"], sample["accountLabel"], self.accounts.attribution_timeline(),
+                    lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
+                    token_usage.get("sourceFiles"), self.cloud.machine_id,
                 )
+                self.usage_data.record_ledger(rows, replace=True)
+                for row in new_costs:
+                    self.accounts.promote_active_slot_on_cost(row)
+                token_sessions = token_sessions_from_ledger(rows)
                 sample["cost"], sample["costByModel"] = token_cost_snapshot(token_sessions)
                 token_usage.pop("sessions", None)
                 token_usage.pop("events", None)
@@ -915,7 +917,7 @@ class UsageDashboardState:
             if not api_account:
                 self._record_quota_sample_locked(sample)
             else:
-                append_capped_jsonl(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample}, self.args.sample_log_max_bytes)
+                self.usage_data.record_diagnostic(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample})
             sample.pop("costDelta", None)
             sample.pop("costDeltaByModel", None)
             self.runtime_state.update({"tokenUsage": token_usage or None, "cost": sample.get("cost") or empty_cost_totals(), "costByModel": sample.get("costByModel") or {}, "lastSample": sample, "updatedAt": sample.get("checkedAt")})
@@ -1370,9 +1372,7 @@ class UsageDashboardState:
     def rename_account(self, account_id: str, label: str) -> dict:
         account = next((account for account in self.accounts.status()["items"] if account["id"] == str(account_id or "")), None)
         with self.lock:
-            result = self.accounts.rename(account_id, label, lambda renamed_id, renamed_label: rewrite_account_labels(
-                (path for path in (getattr(self.args, "quota_history", None), self.args.sample_log, self.args.state) if path is not None), renamed_id, renamed_label,
-            ))
+            result = self.accounts.rename(account_id, label, self.usage_data.rename_account)
             renamed_label = next(item["label"] for item in result["items"] if item["id"] == str(account_id))
             replace_account_label(self.runtime_state, str(account_id), renamed_label)
             replace_account_label(self.last_sample, str(account_id), renamed_label)
@@ -1844,10 +1844,10 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
     source_watcher = None
     print("Startup: starting token capture, quota polling, session refresh, dashboard, cloud, and configuration workers...", flush=True)
     if hasattr(state, "projector") and not getattr(args, "no_token_scan", True):
-        from monitor_processing import SourceWatcher
+        from monitor_ingestion import SourceWatcher
         try:
             source_watcher = SourceWatcher(args.codex_home)
-            state.usage_data.index.source_watcher = source_watcher
+            state.usage_data.sources.source_watcher = source_watcher
         except (ImportError, OSError) as exc:
             print(f"Session notifications unavailable; bounded polling and audits remain active: {exc}", file=sys.stderr, flush=True)
         args.background_token_capture = True

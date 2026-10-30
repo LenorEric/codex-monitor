@@ -26,7 +26,8 @@
 
 # Persistent data contracts
 
-- Increment the data contract only when changes to locally or cloud-saved data require conversion or rebuilding, including changes to persistent formats, schemas, field meanings, filenames, or derived data. Transport-only client/server changes do not require a bump.
+- Update the data contract only when existing locally or cloud-saved data needs conversion, cleanup, or rebuilding because its persisted representation or meaning changes, including formats, schemas, field meanings, filenames, or derived data.
+- Changes solely to reader/writer code, modules, libraries, or access methods do not require a contract update when existing saved data remains valid without modification. Transport-only client/server changes do not require a bump.
 - Keep at most one unreleased migration: if the latest released contract is N, the pending target is N+1. Create it for the first persistent-contract change; merge all further unreleased changes into that same migration instead of incrementing again.
 - Keep `package.json.dataContractVersion`, `DATA_CONTRACT_VERSION`, and the newest `DATA_MIGRATIONS` entry aligned. Packaging propagates the target to `release/runtime/version.json`; do not increment it merely for a build or a release without saved-data changes.
 - A successful explicit release through `build_release.py` freezes the included migration. The next persistent-contract change then creates the next number. Failed builds, commits, tests, and generated runtime/manifest refreshes do not freeze a pending migration.

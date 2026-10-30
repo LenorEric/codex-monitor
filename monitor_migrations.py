@@ -1,6 +1,6 @@
 """Own local/cloud data contracts, ordered upgrades, journal recovery and old-format conversion.
 
-Released steps are immutable. Merge saved-data changes into local 17 until
+Released steps are immutable. Merge saved-data changes into local 18 until
 the next successful release. Frozen historical codecs remain separate implementation
 helpers; application modules only invoke the entry points here.
 """
@@ -22,7 +22,7 @@ from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 18
+DATA_CONTRACT_VERSION = 19
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 CLOUD_DATA_CONTRACT_VERSION = 4
@@ -419,8 +419,76 @@ def _migrate_history_to_v18(paths: dict[str, Path]) -> None:
             db.execute(f'DROP TRIGGER "{name}"')
         for (name,) in list(db.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'delivery_%'")):
             db.execute(f'DELETE FROM "{name}"')
+        for table in ("days", "parts", "day_meta", "blobs", "manifests", "rollups"):
+            db.execute(f"DROP TABLE IF EXISTS dashboard_{table}")
+        for name in ("dashboard_quota_time", "dashboard_display_time"):
+            db.execute(f"DROP INDEX IF EXISTS {name}")
         from monitor_delivery import initialize_delivery
         initialize_delivery(db)
+
+
+def _load_v18_token_ledger(path: Path) -> list[dict]:
+    """Frozen contract-18 reader used only by the ordered upgrade migration."""
+    try:
+        content = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    except OSError as exc:
+        raise ValueError(f"Cannot read token ledger: {exc}") from exc
+    rows = []
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            if index == len(lines) - 1 and not content.endswith((b"\n", b"\r")):
+                break
+            raise ValueError(f"Invalid token ledger row {index + 1}: {exc}") from exc
+        if not isinstance(row, dict) or row.get("schemaVersion") != 2 or row.get("recordType") not in {"sessionBaseline", "usage"}:
+            raise ValueError(f"Unsupported token ledger row {index + 1}")
+        rows.append(row)
+    return rows
+
+
+def _migrate_history_to_v19(paths: dict[str, Path]) -> None:
+    """Convert complete SQLite data to path-independent local source identities.
+
+    Recorder logs are neither read nor used to supplement or replace SQL facts.
+    The migration journal protects the database while its derived state changes.
+    """
+    from monitor_processing import ProcessingIndex
+    from monitor_usage_sync import initialize_v4_cache, record_account_key
+    initialize_v4_cache(paths["processing_index"])
+    index = ProcessingIndex(paths["processing_index"])
+    with index.transaction() as db, index.defer_sessions(db):
+        for kind in ("quota", "tokenLedger"):
+            rows = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_facts WHERE kind=? AND source NOT LIKE 'peer:%' ORDER BY source,position", (kind,))]
+            # Logical source identities must not depend on backup output filenames.
+            for row in rows:
+                index.dirty(db, record_account_key(row), "database authority migration")
+            db.execute("DELETE FROM processing_facts WHERE kind=? AND source NOT LIKE 'peer:%'", (kind,))
+            if kind == "tokenLedger":
+                db.execute("DELETE FROM processing_ledger_sessions WHERE source NOT LIKE 'peer:%' AND source NOT LIKE 'view:%'")
+                db.execute("DELETE FROM processing_meta WHERE name LIKE 'ledgerCost:%' AND name NOT LIKE 'ledgerCost:view:%'")
+            index.write_records(db, kind, rows)
+        # Finish released batches once; new ingestion commits everything together.
+        for name, data in list(db.execute("SELECT name,value FROM processing_meta WHERE name LIKE 'ledgerBatch:%'")):
+            home, batch = name[len("ledgerBatch:"):], json.loads(data)
+            index.write_records(db, "tokenLedger", list(batch["replacements"].values()) + batch["additions"], backup_path=paths["token_ledger"])
+            db.executemany("UPDATE processing_scan_events SET ledger_done=1 WHERE event_id=?", ((key,) for key in batch["ids"]))
+            db.executemany("INSERT OR REPLACE INTO processing_coverage VALUES(?,?,?,?,?)", ((home, *key, json.dumps(value)) for key, value in batch["coverage"]))
+            db.executemany("INSERT OR REPLACE INTO processing_ledger_order VALUES(?,?,?,?)", ((home, key, *value) for key, value in batch["order"].items()))
+            if batch["additions"]:
+                index.put(db, f"ledgerNotifications:{home}", index.get(db, f"ledgerNotifications:{home}", []) + batch["additions"])
+            db.execute("DELETE FROM processing_meta WHERE name=?", (name,))
+        db.execute("DELETE FROM processing_blocks WHERE source NOT IN (SELECT path FROM processing_scan_sources)")
+        db.execute("DELETE FROM processing_files")
+        db.execute("DELETE FROM processing_meta WHERE name='canonicalNormalized'")
+        index.put(db, "factRevision", index.get(db, "factRevision", 0) + 1)
+        index.put(db, "sqliteAuthoritative", True)
+
 
 
 DATA_MIGRATIONS = {
@@ -442,6 +510,7 @@ DATA_MIGRATIONS = {
     16: lambda paths: migrate_reset_timestamps(paths),
     17: _migrate_history_to_v17,
     18: _migrate_history_to_v18,
+    19: _migrate_history_to_v19,
 }
 
 
@@ -466,6 +535,8 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
     if not isinstance(journal, dict) or not isinstance(journal.get("version"), int) or isinstance(journal.get("version"), bool) or not isinstance(journal.get("targets"), dict) or not isinstance(journal.get("backups"), dict) or not isinstance(journal.get("existing"), list):
         raise MigrationError("Cannot recover data migration: invalid journal")
     expected_targets = {name: str(path.resolve()) for name, path in paths.items()}
+    if journal["version"] == 19 and set(journal["targets"]) == {"processing_index"}:
+        expected_targets = {"processing_index": expected_targets["processing_index"]}
     if journal["version"] < 15:
         for name in list(expected_targets):
             if name in {"config", "machine", "skills"} or name.startswith(("vault_", "cache_source_")):
@@ -510,7 +581,8 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
 
 
 def _run_data_migration(migration, paths: dict[str, Path], version: int, state_path: Path, journal_path: Path) -> None:
-    existing = {name for name, path in paths.items() if path.exists()}
+    protected_paths = {"processing_index": paths["processing_index"]} if version == 19 else paths
+    existing = {name for name, path in protected_paths.items() if path.exists()}
     backups = {}
     try:
         for name in existing:
@@ -533,13 +605,13 @@ def _run_data_migration(migration, paths: dict[str, Path], version: int, state_p
             backups[name] = Path(backup)
         _atomic_write(journal_path, (json.dumps({
             "version": version, "existing": sorted(existing), "backups": {name: str(path.resolve()) for name, path in backups.items()},
-            "targets": {name: str(path.resolve()) for name, path in paths.items()},
+            "targets": {name: str(path.resolve()) for name, path in protected_paths.items()},
         }, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
         migration(paths)
         _atomic_write(state_path, (json.dumps({"dataContractVersion": version}, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
     except Exception as exc:
         rollback_errors = []
-        for name, path in paths.items():
+        for name, path in protected_paths.items():
             try:
                 if name in backups:
                     _restore_data_backup(backups[name], path)
@@ -1095,6 +1167,7 @@ def migrate_local_formats(paths, codex_home=None):
         # Stage decoded rows in SQLite, keeping the conversion bounded in memory.
         # The outer journal restores the whole DB if a stage or conversion fails.
         with closing(old_samples.connect(paths["processing_index"])) as db, db:
+            old_samples._initialize_legacy_delivery(db)
             for name, query in (
                 ("peers", "SELECT source,kind,data FROM processing_facts WHERE source LIKE 'peer:%:legacy'"),
                 ("local", "SELECT record_key,period,record_json FROM local_records"),

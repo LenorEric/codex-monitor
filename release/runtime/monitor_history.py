@@ -1,16 +1,13 @@
 #!/usr/bin/env python3
 
 import json
-import os
-import shutil
-import tempfile
 import time
 from pathlib import Path
 import urllib.request
 
 from monitor_common import atomic_write_bytes as _write_atomic_bytes
 from monitor_common import (
-    DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, TARGET_WINDOWS, UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
+    DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, TARGET_WINDOWS, UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
     load_json, now_iso, parse_timestamp,
 )
 from monitor_accounts import is_api_auth
@@ -20,9 +17,6 @@ from monitor_tokens import (
     scan_codex_token_usage, sum_cost_totals, token_progress,
 )
 
-SAMPLE_LOG_COMPACT_RATIO = 0.8
-QUOTA_HISTORY_DISCONTINUITY_SECONDS = 4 * 60 * 60
-JSONL_COPY_CHUNK_BYTES = 1024 * 1024
 
 def default_history_path(data_home: Path | None = None) -> Path:
     return (Path(data_home) if data_home is not None else codex_switch_home()) / "usage_monitor_history.jsonl"
@@ -188,25 +182,6 @@ def load_quota_history(path: Path) -> list[dict]:
         rows = parse_history_rows(content[:content.rfind(b"\n") + 1].decode("utf-8"))
     return [normalized for row in rows if (normalized := normalize_quota_history_row(row)) is not None]
 
-def write_quota_history(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            normalized = [value for row in rows if (value := normalize_quota_history_row(row)) is not None]
-            normalized.sort(key=lambda row: (parse_timestamp(row["checkedAt"]) is None, parse_timestamp(row["checkedAt"]) or 0, row["checkedAt"], row["accountSlotId"]))
-            for row in normalized:
-                f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")))
-                f.write("\n")
-            f.flush()
-            os.fsync(f.fileno())
-        os.replace(temp_name, path)
-    except Exception:
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
 
 def merge_quota_history_rows(rows: list[dict]) -> list[dict]:
     merged = {}
@@ -223,25 +198,6 @@ def merge_quota_history_rows(rows: list[dict]) -> list[dict]:
             normalized = normalized | {"windows": windows}
         merged[key] = normalized
     return sorted(merged.values(), key=lambda row: (parse_timestamp(row["checkedAt"]) is None, parse_timestamp(row["checkedAt"]) or 0, row["accountSlotId"]))
-
-def backfill_quota_history(sample_log_path: Path, quota_history_path: Path) -> int:
-    existing = load_quota_history(quota_history_path)
-    try:
-        sample_rows = parse_history_rows(sample_log_path.read_text(encoding="utf-8"))
-    except FileNotFoundError:
-        sample_rows = []
-    imported = [row for item in sample_rows if (row := quota_history_row_from_sample(item.get("sample") if isinstance(item.get("sample"), dict) else item)) is not None]
-    merged = merge_quota_history_rows(imported + existing)
-    if merged != existing:
-        write_quota_history(quota_history_path, merged)
-    return len(merged) - len(existing)
-
-def append_quota_history_sample(path: Path, sample: dict) -> bool:
-    row = quota_history_row_from_sample(sample)
-    if row is None:
-        return False
-    append_jsonl(path, row, durable=True, recover_torn_tail=True)
-    return True
 
 
 def is_delta_event_row(row: dict) -> bool:
@@ -356,85 +312,6 @@ def grouped_delta_event_rows(rows: list[dict]) -> list[dict]:
     result.extend(row for row in rows if row.get("window") not in TARGET_WINDOWS)
     return result
 
-def append_history(path: Path, sample: dict) -> None:
-    if is_delta_event_row(sample):
-        write_history(path, load_history(path) + [sample])
-        return
-    append_jsonl(path, sample)
-
-def _repair_jsonl_tail(stream) -> None:
-    size = stream.seek(0, os.SEEK_END)
-    if not size:
-        return
-    stream.seek(-1, os.SEEK_END)
-    if stream.read(1) in {b"\n", b"\r"}:
-        return
-    position = size
-    tail_start = 0
-    while position:
-        chunk_start = max(0, position - 4096)
-        stream.seek(chunk_start)
-        chunk = stream.read(position - chunk_start)
-        if (newline := chunk.rfind(b"\n")) >= 0:
-            tail_start = chunk_start + newline + 1
-            break
-        position = chunk_start
-    stream.seek(tail_start)
-    try:
-        if not isinstance(json.loads(stream.read(size - tail_start).decode("utf-8")), dict):
-            raise ValueError("JSONL row is not an object")
-        stream.seek(0, os.SEEK_END)
-        stream.write(b"\n")
-    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-        stream.seek(tail_start)
-        stream.truncate()
-
-def append_jsonl(path: Path, row: dict, durable: bool = False, recover_torn_tail: bool = False) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as f:
-        if recover_torn_tail:
-            _repair_jsonl_tail(f)
-        f.seek(0, os.SEEK_END)
-        f.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
-        if durable:
-            f.flush()
-            os.fsync(f.fileno())
-
-def trim_jsonl_to_size(path: Path, max_bytes: int, current_size: int | None = None) -> None:
-    if max_bytes <= 0 or current_size is not None and current_size <= max_bytes:
-        return
-    try:
-        current_size = max(current_size or 0, path.stat().st_size)
-        if current_size <= max_bytes:
-            return
-    except FileNotFoundError:
-        return
-    fd, temp_name = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with path.open("rb") as source, os.fdopen(fd, "wb") as target:
-            source.seek(max(0, current_size - int(max_bytes * SAMPLE_LOG_COMPACT_RATIO)))
-            source.readline()
-            shutil.copyfileobj(source, target, JSONL_COPY_CHUNK_BYTES)
-            target.flush()
-            os.fsync(target.fileno())
-        os.replace(temp_name, path)
-    except Exception:
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            os.unlink(temp_name)
-        except OSError:
-            pass
-        raise
-
-def append_capped_jsonl(path: Path, row: dict, max_bytes: int) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("ab") as stream:
-        stream.write(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n")
-        current_size = stream.tell()
-    trim_jsonl_to_size(path, max_bytes, current_size)
 
 def replace_account_label(value, account_id: str, label: str) -> int:
     changed = 0
@@ -449,42 +326,10 @@ def replace_account_label(value, account_id: str, label: str) -> int:
             changed += replace_account_label(child, account_id, label)
     return changed
 
-def parse_json_sequence(text: str) -> list:
-    decoder = json.JSONDecoder()
-    values = []
-    index = 0
-    while index < len(text):
-        while index < len(text) and text[index].isspace():
-            index += 1
-        if index < len(text):
-            value, index = decoder.raw_decode(text, index)
-            values.append(value)
-    return values
 
 def _atomic_write_bytes(path: Path, data: bytes) -> None:
     _write_atomic_bytes(path, data)
 
-def rewrite_account_labels(paths, account_id: str, label: str):
-    originals = {}
-    try:
-        for path in dict.fromkeys(Path(path) for path in paths):
-            try:
-                original = path.read_bytes()
-            except FileNotFoundError:
-                continue
-            values = parse_json_sequence(original.decode("utf-8"))
-            if not sum(replace_account_label(value, account_id, label) for value in values):
-                continue
-            originals[path] = original
-            _atomic_write_bytes(path, ("\n".join(json.dumps(value, ensure_ascii=False, separators=(",", ":")) for value in values) + "\n").encode("utf-8"))
-    except Exception:
-        for path, original in originals.items():
-            _atomic_write_bytes(path, original)
-        raise
-    def rollback() -> None:
-        for path, original in originals.items():
-            _atomic_write_bytes(path, original)
-    return rollback
 
 def write_history(path: Path, rows: list[dict]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -676,6 +521,6 @@ def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, pre
         ))
     if not args.no_token_scan:
         output["tokenUsage"] = getattr(args, "token_capture_snapshot", None) if getattr(args, "background_token_capture", False) else (
-            args.processing_index.scan(args.codex_home) if getattr(args, "processing_index", None) is not None else scan_codex_token_usage(args.codex_home))
+            args.source_ingestor.scan(args.codex_home) if getattr(args, "source_ingestor", None) is not None else scan_codex_token_usage(args.codex_home))
     output["checkedAt"] = (output.get("remoteUsage") or {}).get("completedAt") or now_iso()
     return make_history_sample(output, previous_token_usage, previous_cost, previous_cost_by_model=(runtime_state or {}).get("costByModel"))

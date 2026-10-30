@@ -9,12 +9,25 @@ from pathlib import Path
 from unittest import mock
 
 import monitor_processing
+import monitor_ingestion
+import monitor_backup
 import monitor_token_ledger
 import monitor_tokens
 from monitor_usage_sync import UsageDataStore, add_record_provenance
 
 
 class ProcessingTests(unittest.TestCase):
+    def test_startup_preparation_uses_database_without_reading_history_files(self):
+        self.store.quota_path.write_text("unread quota history\n", encoding="utf-8")
+        self.store.token_ledger_path.write_text("unread token history\n", encoding="utf-8")
+        with mock.patch.object(self.store.sources, "audit", side_effect=AssertionError("startup history audit")):
+            self.store.initialize_processing(ingest=False)
+            self.store.initialize_v4_index(ingest=False)
+        self.assertEqual(self.store.index.metrics["canonicalBytesRead"], 0)
+        with self.store.index.transaction() as db:
+            self.assertTrue(self.store.index.get(db, "peersInitialized"))
+            self.assertTrue(self.store.index.get(db, "localFactsInitialized"))
+
     def setUp(self):
         self.root = Path.cwd() / f".test-processing-{uuid.uuid4().hex}"
         self.root.mkdir()
@@ -47,13 +60,13 @@ class ProcessingTests(unittest.TestCase):
 
     def sync(self, store=None):
         store = store or self.store
-        store.index.scan(self.root)
-        return store.index.sync_ledger(store.token_ledger_path, "slot", "Account", [],
+        store.sources.scan(self.root)
+        return store.sources.sync_ledger(store.token_ledger_path, "slot", "Account", [],
             lambda row: add_record_provenance("tokenLedger", row, "machine", "v3:account"), store.normalize_new_ledger, "machine")
 
     def test_restart_and_idle_do_not_read_or_hash_history(self):
         expected = monitor_tokens.scan_codex_token_usage(self.root)
-        actual = self.store.index.scan(self.root)
+        actual = self.store.sources.scan(self.root)
         self.assertEqual(actual["totals"], expected["totals"])
         self.sync()
         first = dict(self.store.index.metrics)
@@ -61,8 +74,8 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(self.store.index.metrics["sourceBytesRead"], first["sourceBytesRead"])
         self.assertEqual(self.store.index.metrics["eventsHashed"], first["eventsHashed"])
         restarted = UsageDataStore(self.store.quota_path, self.store.token_ledger_path, "machine", lambda _: "v3:account", threading.RLock())
-        with mock.patch.object(monitor_token_ledger, "load_token_ledger", side_effect=AssertionError("history reload")):
-            self.assertEqual(self.sync(restarted), self.store.index.ledger_cost(self.store.token_ledger_path))
+        with mock.patch("monitor_migrations._load_v18_token_ledger", side_effect=AssertionError("history reload")):
+            self.assertEqual(self.sync(restarted), self.store.index.ledger_cost())
         self.assertEqual(restarted.index.metrics["sourceBytesRead"], 0)
         self.assertEqual(restarted.index.metrics["eventsHashed"], 0)
 
@@ -70,21 +83,21 @@ class ProcessingTests(unittest.TestCase):
         self.sync()
         before = self.store.token_ledger_path.read_bytes()
         self.write([self.event(2, 150)], append=True)
-        with mock.patch.object(monitor_token_ledger, "load_token_ledger", side_effect=AssertionError("history reload")), mock.patch.object(self.store.index, "_rebuild_merged_session", side_effect=AssertionError("session replay")):
+        with mock.patch("monitor_migrations._load_v18_token_ledger", side_effect=AssertionError("history reload")), mock.patch.object(self.store.index, "_rebuild_merged_session", side_effect=AssertionError("session replay")):
             self.sync()
         self.assertTrue(self.store.token_ledger_path.read_bytes().startswith(before))
-        rows = monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)
+        rows = self.store.index.rows("tokenLedger")
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[-1]["tokens"]["inputTokens"], 50)
-        self.assertEqual(self.store.index.ledger_cost(self.store.token_ledger_path), monitor_token_ledger.token_cost_snapshot(monitor_token_ledger.token_sessions_from_ledger(rows)))
+        self.assertEqual(self.store.index.ledger_cost(), monitor_token_ledger.token_cost_snapshot(monitor_token_ledger.token_sessions_from_ledger(rows)))
 
     def test_new_cost_notification_is_incremental_and_retries_after_order_save_failure(self):
         self.sync()
-        notify = self.store.index.on_new_cost = mock.Mock()
+        notify = self.store.sources.on_new_cost = mock.Mock()
         self.sync()
         notify.assert_not_called()
         self.write([self.event(2, 150)], append=True)
-        with mock.patch.object(monitor_token_ledger, "load_token_ledger", side_effect=AssertionError("history reload")):
+        with mock.patch("monitor_migrations._load_v18_token_ledger", side_effect=AssertionError("history reload")):
             self.sync()
         notify.assert_called_once()
         self.assertEqual(notify.call_args.args[0]["accountSlotId"], "slot")
@@ -99,7 +112,7 @@ class ProcessingTests(unittest.TestCase):
         notify.reset_mock()
         self.sync()
         notify.assert_called_once()
-        self.assertEqual(len(monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)), 3)
+        self.assertEqual(len(self.store.index.rows("tokenLedger")), 3)
         notify.reset_mock()
         with self.store.index.transaction() as db:
             self.store.index.put(db, f"reconcile:{self.root}", True)
@@ -107,17 +120,37 @@ class ProcessingTests(unittest.TestCase):
         notify.assert_not_called()
 
     def test_crash_after_append_replays_without_duplicate(self):
-        append = monitor_token_ledger.append_token_ledger
+        append = monitor_backup.append_backup
 
         def interrupted(path, rows):
             append(path, rows)
             raise RuntimeError("interrupted after durable append")
 
-        with mock.patch.object(monitor_token_ledger, "append_token_ledger", side_effect=interrupted), self.assertRaises(RuntimeError):
+        with mock.patch.object(monitor_backup, "append_backup", side_effect=interrupted), self.assertRaises(RuntimeError):
             self.sync()
         restarted = UsageDataStore(self.store.quota_path, self.store.token_ledger_path, "machine", lambda _: "v3:account", threading.RLock())
         self.sync(restarted)
-        self.assertEqual(len(monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)), 1)
+        self.assertEqual(len(self.store.index.rows("tokenLedger")), 1)
+
+    def test_ledger_commit_failure_preserves_pending_events_and_retries_once(self):
+        import monitor_sampling
+        self.store.sources.scan(self.root)
+        refresh = monitor_sampling.refresh
+        def interrupted(db, index):
+            refresh(db, index)
+            if db.execute("SELECT 1 FROM processing_scan_events WHERE ledger_done=1").fetchone():
+                raise RuntimeError("ledger commit interrupted")
+        with mock.patch.object(monitor_sampling, "refresh", side_effect=interrupted), self.assertRaisesRegex(RuntimeError, "ledger commit interrupted"):
+            self.sync()
+        self.assertEqual(self.store.index.rows("tokenLedger"), [])
+        self.assertFalse(self.store.token_ledger_path.exists())
+        with self.store.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT ledger_done FROM processing_scan_events").fetchone()[0], 0)
+        self.sync()
+        self.assertEqual(len(self.store.index.rows("tokenLedger")), 1)
+        with self.store.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT ledger_done FROM processing_scan_events").fetchone()[0], 1)
+            self.assertIsNone(db.execute("SELECT 1 FROM processing_meta WHERE name LIKE 'ledgerBatch:%'").fetchone())
 
     def test_replacement_reconciles_and_missing_source_preserves_ledger(self):
         self.sync()
@@ -127,16 +160,16 @@ class ProcessingTests(unittest.TestCase):
             self.event(1, 200),
         ])
         self.sync()
-        self.assertEqual(monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)[0]["tokens"]["inputTokens"], 200)
+        self.assertEqual(self.store.index.rows("tokenLedger")[0]["tokens"]["inputTokens"], 200)
         self.log.unlink()
         with self.store.index.transaction() as db:
             self.store.index.put(db, f"discovery:{str(self.root.resolve())}", 0)
         self.sync()
-        self.assertEqual(len(monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)), 1)
+        self.assertEqual(len(self.store.index.rows("tokenLedger")), 1)
 
     def test_quota_tailing_and_no_change_publication_avoid_history_hashes(self):
         row = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}}
-        self.store.quota_path.write_text(json.dumps(row) + "\n", encoding="utf-8")
+        self.store.record_quota(row)
         self.store.initialize_v4_index(1893456300)
         with self.store.index.transaction() as db:
             claims = dict(db.execute("SELECT day,generation FROM processing_dirty_days"))
@@ -145,12 +178,11 @@ class ProcessingTests(unittest.TestCase):
             content, claims = self.store.v4_publication_changes(1893456400, {})
             self.assertEqual((content, claims), ({}, {}))
         row["checkedAt"] = "2030-01-01T00:01:00Z"
-        with self.store.quota_path.open("a", encoding="utf-8") as stream:
-            stream.write(json.dumps(row) + "\n")
+        self.store.record_quota(row)
         before = self.store.index.metrics["fullImports"]
         self.store.ingest_local()
         self.assertEqual(self.store.index.metrics["fullImports"], before)
-        self.assertEqual(len(self.store.index.rows(self.store.quota_path, "quota")), 2)
+        self.assertEqual(len(self.store.index.rows("quota")), 2)
 
     def test_projector_matches_reference_and_monotonic_appends_do_not_replay(self):
         import monitor_dashboard
@@ -162,8 +194,7 @@ class ProcessingTests(unittest.TestCase):
         for minute in range(5):
             row = {"checkedAt": f"2030-01-01T00:{minute:02}:00Z", "accountSlotId": "slot", "accountLabel": "Account",
                 "windows": {"5h": {"usedPercent": minute, "plan": "plus"}, "7d": {"usedPercent": minute, "plan": "plus"}}}
-            with self.store.quota_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(row) + "\n")
+            self.store.record_quota(row)
             now = 1893456000 + minute * 60
             projector.refresh(accounts, now)
             for view in ("local", "merged"):
@@ -188,8 +219,7 @@ class ProcessingTests(unittest.TestCase):
                 "windows": {"5h": {"usedPercent": value, "resetAt": "2030-01-01T05:00:00Z", "plan": "plus"}, "7d": {"usedPercent": value, "plan": "plus"}}}
             if minute == 20:
                 row["checkedAt"] = "2030-01-01T00:01:30Z"
-            with self.store.quota_path.open("a", encoding="utf-8") as stream:
-                stream.write(json.dumps(row) + "\n")
+            self.store.record_quota(row)
             projector.refresh(accounts, now)
             for view in ("local", "merged"):
                 self.assertEqual(projector.snapshot(view), monitor_dashboard.dashboard_transfer_view(monitor_dashboard._dashboard_display_data(*self.store.datasets(view), accounts, now)), (minute, view))
@@ -199,18 +229,18 @@ class ProcessingTests(unittest.TestCase):
         self.log.write_text(self.log.read_text().replace('"input_tokens": 100', '"input_tokens": 200'), encoding="utf-8")
         self.write([self.event(2, 250)], append=True)
         self.sync()
-        rows = monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)
+        rows = self.store.index.rows("tokenLedger")
         self.assertEqual(sum(row["tokens"]["inputTokens"] for row in rows), 250)
 
-    def test_audit_detects_middle_rewrite_hidden_by_append(self):
+    def test_recorder_rewrite_is_never_ingested_or_audited(self):
         self.sync()
-        self.store.quota_path.write_text("".join(json.dumps({"checkedAt": f"2030-01-01T00:{index:02}:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}, "padding": "x" * 500}) + "\n" for index in range(40)), encoding="utf-8")
+        self.store.record_quota({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}})
+        expected = self.store.datasets()
+        self.store.quota_path.write_text("corrupt backup", encoding="utf-8")
+        self.store.token_ledger_path.unlink()
+        self.store.sources.audit(force=True)
         self.store.ingest_local()
-        self.store.quota_path.write_text(self.store.quota_path.read_text().replace('00:20:00Z', '00:20:01Z') + json.dumps({"checkedAt": "2030-01-01T00:41:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}}) + "\n", encoding="utf-8")
-        self.store.ingest_local()
-        self.store.index.audit(force=True)
-        self.store.ingest_local()
-        self.assertTrue(any(row["checkedAt"] == "2030-01-01T00:20:01Z" for row in self.store.index.rows(self.store.quota_path, "quota")))
+        self.assertEqual(self.store.datasets(), expected)
 
     def test_repair_preserves_collection_periods_and_ledger(self):
         self.sync()
@@ -229,7 +259,7 @@ class ProcessingTests(unittest.TestCase):
         from monitor_usage_sync import v4_record_envelope, record_key, v4_logical_hash
         self.store.account_mapper = lambda *_: ("slot", "Account")
         self.sync()
-        row = monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)[0]
+        row = self.store.index.rows("tokenLedger")[0]
         row = row | {"eventId": "remote-event", "sessionId": "remote-session", "sync": {"version": 1, "originMachineId": "remote", "accountId": "v3:account"}}
         record = {"kind": "tokenLedger", "row": row}
         entry = v4_record_envelope("remote", record_key("tokenLedger", row), record, "2030-01-01T00:00Z")
@@ -242,7 +272,7 @@ class ProcessingTests(unittest.TestCase):
             self.assertIsNone(db.execute("SELECT 1 FROM processing_ledger_sessions WHERE source LIKE 'view:merged:%' AND session='remote-session'").fetchone())
 
     def test_os_watcher_stops_and_delivers_new_session_changes(self):
-        watcher = monitor_processing.SourceWatcher(self.root)
+        watcher = monitor_ingestion.SourceWatcher(self.root)
         self.addCleanup(watcher.stop)
         self.store.index.source_watcher = watcher
         self.sync()
@@ -255,9 +285,9 @@ class ProcessingTests(unittest.TestCase):
                     break
             time.sleep(.01)
         self.sync()
-        self.assertEqual(self.store.index.ledger_cost(self.store.token_ledger_path), monitor_token_ledger.token_cost_snapshot(
-            monitor_token_ledger.token_sessions_from_ledger(monitor_token_ledger.load_token_ledger(self.store.token_ledger_path))))
-        self.assertEqual(len(monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)), 2)
+        self.assertEqual(self.store.index.ledger_cost(), monitor_token_ledger.token_cost_snapshot(
+            monitor_token_ledger.token_sessions_from_ledger(self.store.index.rows("tokenLedger"))))
+        self.assertEqual(len(self.store.index.rows("tokenLedger")), 2)
 
     def test_streamed_snapshot_matches_regular_snapshot(self):
         from monitor_projection import DashboardProjector
@@ -285,7 +315,7 @@ class ProcessingTests(unittest.TestCase):
         expected = projector.snapshot("local")
         snapshot = projector.snapshot("local", True)
         try:
-            self.store.quota_path.write_text(json.dumps({"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}}) + "\n", encoding="utf-8")
+            self.store.record_quota({"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}})
             projector.refresh(accounts, 1893456060)
             self.assertEqual(json.loads(b"".join(json_chunks(snapshot))), expected)
             self.assertEqual(len(projector.snapshot("local")["quotaPoints"]), 1)
@@ -296,7 +326,7 @@ class ProcessingTests(unittest.TestCase):
         from monitor_usage_sync import v4_record_envelope, record_key, v4_logical_hash
         self.store.account_mapper = lambda *_: ("slot", "Account")
         self.sync()
-        row = monitor_token_ledger.load_token_ledger(self.store.token_ledger_path)[0] | {"eventId": "remote-one", "sessionId": "remote-session",
+        row = self.store.index.rows("tokenLedger")[0] | {"eventId": "remote-one", "sessionId": "remote-session",
             "sync": {"version": 1, "originMachineId": "remote", "accountId": "v3:account"}}
         def envelope(row):
             return v4_record_envelope("remote", record_key("tokenLedger", row), {"kind": "tokenLedger", "row": row}, "2030-01-01T00:00Z")

@@ -37,7 +37,7 @@ class CostTimeProcessingTests(unittest.TestCase):
         self.assertGreater(local["costTime"][1]["timestamp"] - local["costTime"][0]["timestamp"], DAY)
         self.assertAlmostEqual(sum(row["totalCostUsd"] for row in local["costTime"]), local["tokenSessions"][0]["byModel"]["gpt-5.5"]["cost"]["totalCostUsd"])
         # Importing the same event from a second source must not double merged cost.
-        ledger = self.store.index.rows(self.store.token_ledger_path, "tokenLedger")
+        ledger = self.store.index.rows("tokenLedger")
         with self.store.index.transaction() as db:
             for position, row in enumerate(ledger):
                 self.store.index.fact(db, "peer:duplicate", position, "tokenLedger", row)

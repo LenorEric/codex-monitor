@@ -127,7 +127,7 @@ class TimestampMigrationTests(unittest.TestCase):
             samples.put_local(db, "quota:quota-a", "2030-01-01T00:00Z", content_hash(record), record)
             samples.put_remote(db, "machine-a", "2030-01-01", "bulk", "quota:quota-a", content_hash(record), envelope)
             db.execute("INSERT INTO remote_days VALUES('machine-a','2030-01-01','old','{}')")
-        self.assertEqual(self.migrate(), [16, 17, 18])
+        self.assertEqual(self.migrate(), [16, 17, 18, 19])
         self.assertEqual(json.loads(self.paths[1].read_text())["windows"]["5h"]["resetAt"], 1893474000)
         with closing(samples.connect(path)) as db:
             data = json.loads(db.execute("SELECT record_json FROM remote_records").fetchone()[0])
@@ -146,7 +146,7 @@ class TimestampMigrationTests(unittest.TestCase):
         with mock.patch.dict(migrations.DATA_MIGRATIONS, {16: fail}), self.assertRaisesRegex(RuntimeError, "interrupted"):
             self.migrate()
         self.assertEqual(self.paths[1].read_bytes(), original)
-        self.assertEqual(self.migrate(), [16, 17, 18])
+        self.assertEqual(self.migrate(), [16, 17, 18, 19])
 
     def test_pending_migration_rebuilds_quota_decisions_from_preserved_raw(self):
         import threading
@@ -155,9 +155,13 @@ class TimestampMigrationTests(unittest.TestCase):
         rows = [self.row | {"checkedAt": f"2030-01-01T00:0{index}:00Z", "windows": {"5h": self.row["windows"]["5h"] | {"usedPercent": value}},
             "sync": self.row["sync"] | {"recordId": f"reading-{index}"}} for index, value in enumerate((40, 20, 20))]
         self.paths[1].write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-        self.assertEqual(self.migrate(), [16, 17, 18])
+        # Complete SQLite facts are the migration input; the recorder is only backup.
+        store = UsageDataStore(self.paths[1], self.paths[3], "machine-a", lambda _: "v3:account", threading.RLock(), cache_path=self.root / "usage_monitor_sync_cache.json")
+        for row in rows:
+            store.record_quota(row)
+        self.assertEqual(self.migrate(), [16, 17, 18, 19])
         original = self.paths[1].read_bytes()
-        store = UsageDataStore(self.paths[1], self.paths[3], "machine-a", lambda _: "v3:account", threading.RLock())
+        store = UsageDataStore(self.paths[1], self.paths[3], "machine-a", lambda _: "v3:account", threading.RLock(), cache_path=self.root / "usage_monitor_sync_cache.json")
         store.ingest_local()
         with store.index.transaction() as db:
             self.assertEqual([point["fiveHour"]["continuous"] for point in stored_points(db, "local")], [40, None, 20])

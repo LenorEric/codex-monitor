@@ -1,93 +1,17 @@
 #!/usr/bin/env python3
 
 import json
-import os
-import tempfile
 from pathlib import Path
 
 from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, empty_cost_totals, empty_token_totals, parse_timestamp
 from monitor_tokens import add_cost_delta, add_token_delta, normalize_codex_model, normalize_saved_token_totals, pricing_epoch_for_model, sum_cost_totals, token_totals_delta
 
 LEDGER_SCHEMA_VERSION = 2
-SUPPORTED_LEDGER_SCHEMA_VERSIONS = {LEDGER_SCHEMA_VERSION}
 TOKEN_KEYS = tuple(empty_token_totals())
 
 def default_token_ledger_path(history_path: Path) -> Path:
     return history_path.with_name("usage_monitor_token_events.jsonl") if history_path.name in {"usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_quota_readings.jsonl"} else history_path.with_suffix(".token-ledger.jsonl")
 
-def load_token_ledger(path: Path) -> list[dict]:
-    try:
-        content = path.read_bytes()
-    except FileNotFoundError:
-        return []
-    except OSError as exc:
-        raise ValueError(f"Cannot read token ledger: {exc}") from exc
-    rows = []
-    lines = content.splitlines()
-    for index, line in enumerate(lines):
-        try:
-            row = json.loads(line.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            if index == len(lines) - 1 and not content.endswith((b"\n", b"\r")):
-                break
-            raise ValueError(f"Invalid token ledger row {index + 1}: {exc}") from exc
-        if not isinstance(row, dict) or row.get("schemaVersion") not in SUPPORTED_LEDGER_SCHEMA_VERSIONS or row.get("recordType") not in {"sessionBaseline", "usage"}:
-            raise ValueError(f"Unsupported token ledger row {index + 1}")
-        rows.append(row)
-    return rows
-
-def append_token_ledger(path: Path, rows: list[dict]) -> None:
-    if not rows:
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a+b") as stream:
-        size = stream.seek(0, os.SEEK_END)
-        if size:
-            stream.seek(-1, os.SEEK_END)
-            if stream.read(1) not in {b"\n", b"\r"}:
-                position, tail_start = size, 0
-                while position:
-                    chunk_start = max(0, position - 4096)
-                    stream.seek(chunk_start)
-                    chunk = stream.read(position - chunk_start)
-                    if (newline := chunk.rfind(b"\n")) >= 0:
-                        tail_start = chunk_start + newline + 1
-                        break
-                    position = chunk_start
-                stream.seek(tail_start)
-                try:
-                    tail = json.loads(stream.read(size - tail_start).decode("utf-8"))
-                    if not isinstance(tail, dict) or tail.get("schemaVersion") not in SUPPORTED_LEDGER_SCHEMA_VERSIONS:
-                        raise ValueError("unsupported tail row")
-                    stream.seek(0, os.SEEK_END)
-                    stream.write(b"\n")
-                except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-                    stream.seek(tail_start)
-                    stream.truncate()
-        stream.seek(0, os.SEEK_END)
-        for row in rows:
-            stream.write((json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
-        stream.flush()
-        os.fsync(stream.fileno())
-
-def write_token_ledger(path: Path, rows: list[dict]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as stream:
-            for row in rows:
-                if not isinstance(row, dict) or row.get("schemaVersion") not in SUPPORTED_LEDGER_SCHEMA_VERSIONS or row.get("recordType") not in {"sessionBaseline", "usage"}:
-                    raise ValueError("Unsupported token ledger row")
-                stream.write((json.dumps(row, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
-            stream.flush()
-            os.fsync(stream.fileno())
-        os.replace(temporary, path)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
 
 def _subtract_tokens(current: dict | None, previous: dict | None) -> dict:
     current, previous = normalize_saved_token_totals(current), normalize_saved_token_totals(previous)
@@ -215,11 +139,8 @@ def token_cost_snapshot(sessions: list[dict]) -> tuple[dict, dict[str, dict]]:
             by_model[normalized] = sum_cost_totals(by_model.get(normalized), value.get("cost") if isinstance(value, dict) else None)
     return sum_cost_totals(*(session.get("cost") for session in sessions)), by_model
 
-def sync_token_ledger(
-    path: Path, events: list[dict], account_slot_id: str, account_label: str,
-    account_timeline: list[dict] | None = None, record_provenance=None, source_files=None, own_machine_id: str | None = None, on_new_cost=None,
-) -> list[dict]:
-    rows = load_token_ledger(path)
+def reconcile_token_ledger(rows, events, account_slot_id, account_label, account_timeline=None, record_provenance=None, source_files=None, own_machine_id=None):
+    """Calculate ledger corrections from database rows and original source events."""
     timeline = sorted(account_timeline or [], key=lambda row: parse_timestamp(row.get("checkedAt")) or 0)
     usages = _usage_records(events, _source_highwaters(rows), account_slot_id, account_label, timeline)
     source_files = set(source_files or ())
@@ -250,15 +171,4 @@ def sync_token_ledger(
                 usage = record_provenance(usage)
             new_costs.append(usage)
         reconciled.append(usage)
-    updated = retained + reconciled
-    if updated != rows:
-        write_token_ledger(path, updated)
-    if on_new_cost is not None:
-        for row in new_costs:
-            on_new_cost(row)
-    sessions = token_sessions_from_ledger(updated)
-    labels = {str(row["accountSlotId"]): str(row["accountLabel"]) for row in timeline if row.get("accountSlotId") and row.get("accountLabel")} | {str(account_slot_id): str(account_label)}
-    for session in sessions:
-        if session.get("accountSlotId") in labels:
-            session["accountLabel"] = labels[session["accountSlotId"]]
-    return sessions
+    return retained + reconciled, new_costs

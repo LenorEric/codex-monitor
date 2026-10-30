@@ -19,13 +19,24 @@ test("reset baselines stay in their window and sort before simultaneous observat
     assert.equal(h.run("costTimeUsageSeries(61,62)[1].points[0].sevenDay.continuous"), 12);
 });
 
+test("nearby cost points chain across horizontal gaps up to 20px", () => {
+    const h = harness();
+    h.run(`mergePoints=[0,20,35,36,56,77,97].map((timestamp,index)=>({timestamp,costPer100PercentUsd:index%2?1000:1,deltaPercent:1,deltaCostUsd:1}));
+        mergeMetrics={plotWidth:100,minTime:0,maxTime:100,minDistance:denseMergeMetrics('scatter5h',mergePoints).minDistance};
+        mergedPoints=mergeDenseDeltaEvents(mergePoints,mergeMetrics)`);
+    assert.equal(h.run("mergeMetrics.minDistance"), 20);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(mergedPoints.map(point=>point.rawKeys))")), [["0", "20", "35", "36", "56"], ["77", "97"]]);
+    assert.equal(h.run("mergedPoints.reduce((sum,point)=>sum+point.deltaPercent,0)"), 7);
+    assert.equal(h.run("mergedPoints.reduce((sum,point)=>sum+point.deltaCostUsd,0)"), 7);
+});
+
 function harness(overrides = {}) {
     const elements = new Map(), noop = () => {};
     const element = id => {
         if (!elements.has(id)) elements.set(id, { value: "", textContent: "", style: {}, dataset: {}, width: 800, height: 300,
             classList: { add: noop, remove: noop, toggle: noop, contains: () => false },
-            replaceChildren(...children) { this.textContent = children.map(child => child.textContent || "").join(" "); },
-            append(...children) { this.textContent += children.map(child => typeof child === "string" ? child : child.textContent || "").join(""); }, appendChild: noop, setAttribute: noop,
+            replaceChildren(...children) { this.children = children; this.textContent = children.map(child => child.textContent || "").join(" "); },
+            append(...children) { this.textContent += children.map(child => typeof child === "string" ? child : child.textContent || "").join(""); }, appendChild(child) { (this.children ??= []).push(child); }, setAttribute: noop,
             getContext: () => ({ clearRect: noop }), getBoundingClientRect: () => ({ top: 0, bottom: 300, width: 800, height: 300 }) });
         return elements.get(id);
     };
@@ -37,6 +48,72 @@ function harness(overrides = {}) {
     context.drawCount = 0;
     return { context, elements, drawAll, run: source => vm.runInContext(source, context) };
 }
+
+function animationHarness() {
+    const frames = new Map();
+    let nextFrame = 0;
+    const h = harness({ devicePixelRatio: 1, matchMedia: () => ({ matches: false }),
+        requestAnimationFrame: callback => { frames.set(++nextFrame, callback); return nextFrame; },
+        cancelAnimationFrame: id => frames.delete(id), getComputedStyle: () => ({ getPropertyValue: () => "#aabbcc" }) });
+    const context = canvas => new Proxy({ canvas, images: [], globalAlpha: 1,
+        measureText: text => ({ width: String(text).length * 6, actualBoundingBoxAscent: 8, actualBoundingBoxDescent: 2 }),
+        drawImage(layer) { this.images.push({ layer, alpha: this.globalAlpha }); } }, { get: (target, key) => key in target ? target[key] : () => {} });
+    const attach = canvas => { const ctx = context(canvas); canvas.getContext = () => ctx; return canvas; };
+    const createElement = h.context.document.createElement;
+    h.context.document.createElement = tag => tag === "canvas" ? attach(createElement(tag)) : createElement(tag);
+    for (const id of ["usageTime7d", "costTime", "scatter7d"]) attach(h.context.document.getElementById(id));
+    return { ...h, frames, finish() {
+        while (frames.size) { const pending = [...frames.values()]; frames.clear(); pending.forEach(callback => callback(performance.now() + 2000)); }
+    } };
+}
+
+test("local to merged keeps identical charts still despite different transport IDs", () => {
+    const h = animationHarness(), fixture = bulkFixture(), start = new Date(2030, 0, 1).getTime() / 1000;
+    for (const view of ["local", "merged"]) {
+        const data = fixture.accounts[0][view];
+        data.tokens = [[view, start + 100, [[0, "default", 10, 5, 2, 1, 100000000]]]];
+        data["usage:7d"] = [[view, start, start + 200, 20, 1, 1], [view + "2", start + 300, start + 400, 30, 1, 0]];
+        data["usage:5h"] = [];
+        data["chart:7d"] = [[view, start, start + 300, start + 100, 1, 10, [[0, 100000000, 10]]]];
+    }
+    h.context.fixture = fixture;
+    h.run(`dataView='local';acceptBulk(fixture);updateAccountControls(payload.quotaPoints);
+        drawUsageTimeChart('usageTime7d','sevenDay',payload.quotaPoints);drawCostTimeChart();
+        drawDeltaChart('scatter7d','', '#aabbcc',payload.costUsage.sevenDay);`);
+    const signature = h.run("usageTimeChartStates.usageTime7d.renderSignature");
+    h.run(`dataView='merged';showBulkView();
+        drawUsageTimeChart('usageTime7d','sevenDay',payload.quotaPoints,true);drawCostTimeChart(true);
+        drawDeltaChart('scatter7d','', '#aabbcc',payload.costUsage.sevenDay,true);`);
+    assert.equal(h.run("usageTimeChartStates.usageTime7d.renderSignature"), signature);
+    assert.equal(h.frames.size, 0, "identical rendered results must not schedule animation");
+    assert.equal(typeof h.elements.get("costTime").onmousemove, "function", "tooltips remain usable");
+    h.run("payload.costTime[0].costByModelUsd['model-x']=2;drawCostTimeChart(true)");
+    assert.equal(h.frames.size, 1, "changed spending still animates");
+    h.finish();
+    h.run("drawCostTimeChart(true)");
+    assert.equal(h.frames.size, 0);
+    h.run("costTimeMode='cumulative';drawCostTimeChart(true)");
+    assert.equal(h.frames.size, 1, "mode changes still animate");
+    h.finish();
+});
+
+test("changed quota curves preserve shared segments and identical labels across transport IDs", () => {
+    const h = animationHarness();
+    h.run(`collapseUsageGaps=false;collapseUsageFlat=false;
+        payload.quotaPoints=[10,20,30,40].map((value,index)=>({_key:'local'+index,timestamp:index*60,usageAccountId:'a',sevenDay:{continuous:value}}));
+        drawUsageTimeChart('usageTime7d','sevenDay',payload.quotaPoints);`);
+    const previous = JSON.parse(h.run("JSON.stringify(usageTimeChartStates.usageTime7d.series[0].points.map(p=>[p.x,p.y]))"));
+    h.run(`payload.quotaPoints=payload.quotaPoints.map((point,index)=>({...point,_key:'merged'+index,sevenDay:{continuous:index===2?35:point.sevenDay.continuous}}));
+        drawUsageTimeChart('usageTime7d','sevenDay',payload.quotaPoints,true);`);
+    assert.equal(h.frames.size, 1, "changed quota still animates");
+    assert.equal(h.run("usageTimeChartStates.usageTime7d.series[0].alpha"), 1, "shared curve must not fade in");
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(usageTimeChartStates.usageTime7d.series[0].points.slice(0,2).map(p=>[p.x,p.y]))")), previous.slice(0, 2));
+    const labelImages = h.run("usageTimeChartStates.usageTime7d.labelLayer.getContext('2d').images");
+    assert.equal(labelImages.length, 1, "identical labels are drawn once without crossfade");
+    assert.equal(labelImages[0].alpha, 1);
+    h.finish();
+    assert.notEqual(h.run("usageTimeChartStates.usageTime7d.series[0].points[2].y"), previous[2][1]);
+});
 
 function offscreenChartHarness() {
     const scheduled = [], draws = [];
@@ -75,7 +152,7 @@ test("cost time bins preserve hourly sums, gaps, exact filters and independent t
     assert.equal(series().buckets.at(-1).cumulative, 5.3);
     assert.equal(series().buckets[0].start, 1800);
     h.run("selectedModels=new Set(['m']);selectedAccounts=new Set(['a']);normalizedUsage=true;collapseUsageGaps=true;");
-    assert.deepEqual(series().buckets.map(row => row.amount), [.1, .2, 0, 0]);
+    assert.deepEqual(series().buckets.map(row => row.amount), [.1, .2]);
     assert.equal(series().total, .3);
     assert.equal(series().buckets.at(-1).cumulative, .3);
     h.run("payload.costTime=[]");
@@ -115,27 +192,66 @@ test("cost time canvas renders bars, cumulative mode and interval tooltips", () 
     assert.match(h.elements.get("costTimeTotal").textContent, /5/);
     h.elements.get("costTime").onmousemove({ offsetX: 60, offsetY: 30 });
     assert.ok(h.context.tooltipRows.some(row => String(row).includes("Spending: $2")));
+    assert.ok(h.context.tooltipRows.some(row => String(row).includes("M: $2 (Cum.")));
+    assert.ok(h.context.tooltipRows.every(row => !String(row).includes("%")));
     h.run("costTimeMode='cumulative';drawCostTimeChart()");
-    assert.equal(bars.length, 2);
     assert.ok(lines.length > 0);
+    h.elements.get("costTime").onmousemove({ offsetX: 60, offsetY: 30 });
+    assert.ok(h.context.tooltipRows.every(row => !String(row).includes("%")));
     h.run("payload.costTime=[];drawCostTimeChart()");
     assert.ok(labels.includes("No timestamped cost events for the selected scope"));
 });
 
 test("cost intervals follow plot width and allow arbitrary integer minutes, hours and days", () => {
     const h = harness();
-    h.run("payload={costTimeResolution:60,costTimeBounds:[0,18000],costTime:[{timestamp:0,usageAccountId:'a',costByModelUsd:{m:1}}]}");
+    h.run("selected='All';payload={costTimeResolution:60,costTimeBounds:[0,18000],costTime:[{timestamp:0,usageAccountId:'a',costByModelUsd:{m:1}},{timestamp:18000,usageAccountId:'a',costByModelUsd:{m:0}}]}");
     assert.equal(h.run("costTimeSeries(1300).seconds"), 7 * 60);
     assert.equal(h.run("costTimeSeries(1200).seconds"), 8 * 60);
     assert.equal(h.run("costTimeSeries(360).seconds"), 25 * 60);
     assert.equal(h.run("costTimeSeries(520).total"), 1);
-    h.run("payload.costTimeBounds=[0,7*86400];payload.costTimeResolution=3600");
+    h.run("payload.costTimeBounds=[0,7*86400];payload.costTime[1].timestamp=7*86400;payload.costTimeResolution=3600");
     assert.equal(h.run("costTimeSeries(1200).seconds"), 4 * 3600);
-    h.run("payload.costTimeBounds=[0,30*86400]");
+    h.run("payload.costTimeBounds=[0,30*86400];payload.costTime[1].timestamp=30*86400");
     assert.equal(h.run("costTimeSeries(1200).seconds"), 18 * 3600);
-    h.run("payload.costTimeBounds=[0,700*86400];payload.costTimeResolution=86400");
+    h.run("payload.costTimeBounds=[0,700*86400];payload.costTime[1].timestamp=700*86400;payload.costTimeResolution=86400");
     assert.equal(h.run("costTimeSeries(1200).seconds"), 18 * 86400);
     assert.equal(h.run("costTimeSeries(1200).buckets.length"), 39);
+});
+
+test("cost time trims empty edges after filtering and preserves interior gaps and zero records", () => {
+    const h = harness();
+    h.run(`selected='All';payload={costTimeResolution:60,costTimeBounds:[0,3600],costTime:[
+        {timestamp:60,usageAccountId:'b',costByModelUsd:{m:9}},
+        {timestamp:610,usageAccountId:'a',costByModelUsd:{m:1}},
+        {timestamp:850,usageAccountId:'a',costByModelUsd:{m:0}},
+        {timestamp:1800,usageAccountId:'a',costByModelUsd:{n:2}}]};
+        selectedAccounts=new Set(['a']);selectedModels=new Set(['m']);`);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(costTimeSeries().buckets.map(row=>row.amount))")), [1, 0, 0, 0, 0]);
+    assert.equal(h.run("costTimeSeries().start"), 600);
+    assert.equal(h.run("costTimeSeries().end"), 900);
+    assert.equal(h.run("costTimeSeries().total"), 1);
+    h.run("payload.costTime=[payload.costTime[1]]");
+    assert.equal(h.run("costTimeSeries().buckets.length"), 1);
+    assert.equal(h.run("costTimeSeries().end-costTimeSeries().start"), 60);
+    h.run("selected='Date';payload.costTimeBounds=[600,610]");
+    assert.equal(h.run("costTimeSeries().buckets.length"), 0);
+});
+
+test("trimmed cost edges retain complete display intervals across plot widths", () => {
+    const h = harness();
+    h.run(`selected='All';payload={costTimeResolution:60,costTimeBounds:[0,7200],costTime:[
+        {timestamp:610,usageAccountId:'a',costByModelUsd:{m:1}},
+        {timestamp:3610,usageAccountId:'a',costByModelUsd:{m:2}}]}`);
+    for (const width of [240, 520, 1200]) {
+        const series = JSON.parse(h.run(`JSON.stringify(costTimeSeries(${width}))`));
+        assert.equal(series.start % series.seconds, 0);
+        assert.equal(series.end % series.seconds, 0);
+        assert.equal(series.buckets[0].end - series.buckets[0].start, series.seconds);
+        assert.equal(series.buckets.at(-1).end - series.buckets.at(-1).start, series.seconds);
+        assert.equal(series.buckets[0].amount, 1);
+        assert.equal(series.buckets.at(-1).amount, 2);
+        assert.equal(series.total, 3);
+    }
 });
 
 test("partial cost bar widths and hover boundaries follow actual durations", () => {
@@ -208,7 +324,7 @@ test("combined flat toggle and folded coordinates preserve active cost and time 
     assert.ok(h.run("scale.x(1800)-scale.x(0)") > 150);
 });
 
-test("combined canvas draws percentage axes, both usage lines and percentage tooltips", () => {
+test("combined canvas keeps quota curves and excludes quota from cost tooltips", () => {
     const h = combinedCostHarness(), labels = [], strokes = [], noop = () => {};
     h.context.devicePixelRatio = 1;
     h.run("document.getElementById('costTime');payload.costTimeResolution=60;payload.costTime=[{timestamp:10,usageAccountId:'a',costByModelUsd:{m:1}}];collapseUsageGaps=false;collapseUsageFlat=false;");
@@ -224,8 +340,10 @@ test("combined canvas draws percentage axes, both usage lines and percentage too
     assert.ok(strokes.some(stroke => stroke.color === "#4f8cff" && stroke.dash.join(",") === "6,4"));
     assert.ok(strokes.some(stroke => stroke.color === "#4f8cff" && stroke.dash.length === 0));
     h.elements.get("costTime").onmousemove({ offsetX: 55, offsetY: 30 });
-    assert.ok(h.context.tooltipRows.some(row => typeof row === "string" && row.startsWith("5h ·")));
-    assert.ok(h.context.tooltipRows.some(row => typeof row === "string" && row.startsWith("7d ·")));
+    assert.ok(h.context.tooltipRows.every(row => typeof row !== "string" || !row.includes("%")));
+    h.run("costTimeMode='cumulative';drawCostTimeChart()");
+    h.elements.get("costTime").onmousemove({ offsetX: 55, offsetY: 30 });
+    assert.ok(h.context.tooltipRows.every(row => typeof row !== "string" || !row.includes("%")));
     h.run("payload.costTime=[];drawCostTimeChart()");
     assert.doesNotMatch(h.elements.get("costTimeLegend").textContent, /Spending|Cumulative/);
     assert.match(h.elements.get("costTimeLegend").textContent, /5h.*7d/);
@@ -323,6 +441,33 @@ function bulkFixture(){
         'usage:5h':[['q',0,100,10,20,1]],'usage:7d':[['w',0,100,20,1,1]],'chart:5h':[],'chart:7d':[]});
     return {epoch:'e',cursors:{local:0,merged:0,state:0},models:['model-x'],state:{accounts:{activeAccountId:'slot',items:[{id:'slot',usageAccountId:'a',ready:true}],usageGroups:[{id:'a',label:'Nomei'}]}},accounts:[{id:'a',local:view(),merged:view()}]};
 }
+test('filter choices follow the date, rolling range and Local or Merged scope',()=>{
+    const h=harness();h.context.drawAll=h.drawAll;
+    const start=new Date(2030,0,1).getTime()/1000,end=new Date(2030,0,2).getTime()/1000;
+    const fixture=bulkFixture();fixture.models=['current','old','remote','next-day'];
+    const view=(timestamp,model)=>({...bulkFixture().accounts[0].local,
+        tokens:[['t',timestamp,[[model,'default',10,0,0,0,100000000]]]],
+        'usage:5h':[['q',timestamp,timestamp,10,1,1]],'usage:7d':[]});
+    const empty={quota:{},tokens:[],legacy:[],'usage:5h':[],'usage:7d':[],'chart:5h':[],'chart:7d':[]};
+    fixture.accounts=[{id:'a',local:view(start+3600,0),merged:view(start+3600,0)},
+        {id:'old',local:view(start-86400,1),merged:view(start-86400,1)},
+        {id:'remote',local:empty,merged:view(start+7200,2)},
+        {id:'next',local:view(end,3),merged:view(end,3)}];
+    h.context.fixture=fixture;h.run('dataView="local";acceptBulk(fixture)');
+    const choices=id=>h.elements.get(id).children.map(button=>button.dataset.model??button.dataset.accountId).sort();
+    assert.deepEqual(choices('models'),['all','current']);
+    assert.deepEqual(choices('eventAccounts'),['a','all']);
+    h.run('dataView="merged";showBulkView()');
+    assert.deepEqual(choices('models'),['all','current','remote']);
+    assert.deepEqual(choices('eventAccounts'),['a','all','remote']);
+    h.run('dataView="local";selected="All";showBulkView()');
+    assert.deepEqual(choices('models'),['all','current','next-day','old']);
+    assert.deepEqual(choices('eventAccounts'),['a','all','next','old']);
+    h.run('selected="24h";showBulkView()');
+    assert.deepEqual(choices('models'),['all','current','next-day']);
+    assert.deepEqual(choices('eventAccounts'),['a','all','next']);
+});
+
 test('bulk decoding preserves both quota windows and numeric times',()=>{
     const h=harness();h.context.bulkFixture=bulkFixture();h.run('acceptBulk(bulkFixture)');
     assert.equal(h.run('payload.costTime[0].totalCostUsd'),1);

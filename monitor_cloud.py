@@ -26,6 +26,7 @@ from cryptography.exceptions import InvalidTag
 
 from monitor_accounts import api_identity_id, atomic_write_json, auth_identity, parse_auth_bytes
 from monitor_cloud_queue import CloudOperationQueue, OperationSkipped
+from monitor_webdav_log import WebDavLog
 from monitor_common import SafeRedirectHandler, now_iso as _timestamp
 from monitor_skills import SkillError
 from monitor_migrations import CLOUD_DATA_CONTRACT_PATH, read_cloud_contract, ensure_cloud_contract
@@ -269,7 +270,9 @@ class CryptoBox:
 
 
 class WebDavClient:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, diagnostic_log=None):
+        self.diagnostic_log = diagnostic_log
+        self._diagnostic_secrets = tuple(str(config.get(key) or "") for key in ("username", "password", "encryptionPassphrase", "encryptionPassphraseHash"))
         self.base = str(config.get("baseUrl", "")).rstrip("/") + "/"
         parsed = urllib.parse.urlsplit(self.base)
         if parsed.scheme.lower() != "https" and not (parsed.scheme.lower() == "http" and parsed.hostname in {"localhost", "127.0.0.1", "::1"}):
@@ -278,6 +281,7 @@ class WebDavClient:
         token = base64.b64encode(f"{config.get('username', '')}:{config.get('password', '')}".encode()).decode()
         self.opener = urllib.request.build_opener(SafeRedirectHandler())
         self.authorization = f"Basic {token}"
+        self._diagnostic_secrets += (token, self.authorization)
         self.transfers = []
         self.transfer_category = "metadata"
         self._file_lock_token = None
@@ -405,6 +409,25 @@ class WebDavClient:
         return urllib.parse.urljoin(self.base, "/".join(parts))
 
     def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204), output=None) -> tuple[bytes, str | None, int]:
+        if not getattr(self, "diagnostic_log", None):
+            return self._request(method, path, data, headers, expected, output)
+        started = time.monotonic()
+        diagnostic = {"requestId": uuid.uuid4().hex, "method": method, "url": WebDavLog.safe_url(self._url(path)), "category": self.transfer_category,
+            "expectedStatuses": expected, "timeoutSeconds": 30, "conditional": bool(headers and any(key.lower() in {"if-match", "if-none-match", "if"} for key in headers)),
+            "lockHeld": bool(self._file_lock_token), "lockWriting": self._lock_writing}
+        self.diagnostic_log.write("request_start", secrets=self._diagnostic_secrets, **diagnostic)
+        try:
+            result = self._request(method, path, data, headers, expected, output, diagnostic)
+            diagnostic.update(status=result[2], outcome="succeeded")
+            return result
+        except Exception as exc:
+            diagnostic.update(outcome="failed", error=str(exc), exceptionType=type(exc).__name__, errorCategory=getattr(exc, "category", None))
+            raise
+        finally:
+            diagnostic["elapsedMs"] = round((time.monotonic() - started) * 1000, 3)
+            self.diagnostic_log.write("request_end", secrets=self._diagnostic_secrets, **diagnostic)
+
+    def _request(self, method, path, data, headers, expected, output, diagnostic=None):
         if self._file_lock_token and method != "UNLOCK":
             if self._lock_status_failed and path != CLOUD_LOCK_PATH:
                 raise CloudError("Cloud lock status update failed; operation stopped before further data access", 409)
@@ -433,11 +456,17 @@ class WebDavClient:
         request.add_unredirected_header("Authorization", self.authorization)
         transfer = {"method": method, "path": path, "category": self.transfer_category, "attemptedUploadBytes": size if method == "PUT" else 0, "successfulUploadBytes": 0, "downloadBytes": 0}
         self.transfers.append(transfer)
+        if diagnostic is not None:
+            diagnostic["transfer"] = transfer
+            diagnostic["requestBytes"] = size
         try:
             with self.opener.open(request, timeout=30) as response:
                 etag, status = response.headers.get("ETag"), response.status
+                if diagnostic is not None:
+                    diagnostic.update(status=status, responseHeaders=WebDavLog.response_headers(response.headers), rateLimited=status == 429)
                 if output is None:
                     body = response.read()
+                    transfer["downloadBytes"] = len(body)
                 else:
                     from monitor_streaming import CHUNK_BYTES, PAYLOAD_LIMIT
                     for chunk in iter(lambda: response.read(CHUNK_BYTES), b""):
@@ -448,6 +477,8 @@ class WebDavClient:
                     output.seek(0)
                     body = b""
         except urllib.error.HTTPError as exc:
+            if diagnostic is not None:
+                diagnostic.update(status=exc.code, reason=str(exc.reason), responseHeaders=WebDavLog.response_headers(exc.headers), rateLimited=exc.code == 429)
             if exc.code in expected:
                 with exc:
                     body = exc.read()
@@ -461,8 +492,6 @@ class WebDavClient:
             raise CloudError(f"WebDAV {method} returned HTTP {status}", 502, http_status=status, category="protocol")
         if self._file_lock_token and method not in {"LOCK", "UNLOCK"} and time.monotonic() >= self._file_lock_deadline:
             raise CloudError("WebDAV cloud contract lock expired during transfer; operation stopped", 409)
-        if output is None:
-            transfer["downloadBytes"] = len(body)
         transfer["successfulUploadBytes"] = transfer["attemptedUploadBytes"]
         return body, etag, status
 
@@ -477,6 +506,9 @@ class WebDavClient:
                 except CloudError as exc:
                     if attempt + 1 >= WEBDAV_MKCOL_MAX_ATTEMPTS or exc.category != "network" and not (exc.category == "http" and exc.http_status in {408, 425, 429, 500, 502, 503, 504}):
                         raise
+                    if self.diagnostic_log:
+                        self.diagnostic_log.write("request_retry", secrets=self._diagnostic_secrets, method="MKCOL", url=WebDavLog.safe_url(self._url(current)),
+                            attempt=attempt + 1, maxAttempts=WEBDAV_MKCOL_MAX_ATTEMPTS, delaySeconds=WEBDAV_MKCOL_RETRY_SECONDS, status=exc.http_status, errorCategory=exc.category)
                     time.sleep(WEBDAV_MKCOL_RETRY_SECONDS)
 
     def get(self, path: str) -> tuple[bytes, str]:
@@ -569,7 +601,8 @@ class CloudManager:
         self._machine = json.loads(self.machine_path.read_text(encoding="utf-8"))
         self._state = json.loads(self.state_path.read_text(encoding="utf-8"))
         self._operation_lock = threading.RLock()
-        self._queue = CloudOperationQueue()
+        self._webdav_log = WebDavLog(self.private_root / "webdav.log")
+        self._queue = CloudOperationQueue(self._webdav_log)
         self._observed_skill_hashes = None
         self._pending_skill_pushes = {}
         self._auto_push_failures = {}
@@ -1187,7 +1220,7 @@ class CloudManager:
         identity = normalized_webdav_identity(webdav["baseUrl"], webdav.get("username", "")) + "\n" + webdav.get("remoteRoot", "codex-switch-sync")
         if identity in self._contract_clients:
             return self._contract_clients[identity]
-        client = WebDavClient(webdav)
+        client = WebDavClient(webdav, diagnostic_log=getattr(self, "_webdav_log", None))
         # Check newer versions before even attempting root creation or locking.
         read_cloud_contract(client)
         client.acquire_file_lock()

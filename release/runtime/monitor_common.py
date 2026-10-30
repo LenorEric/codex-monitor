@@ -281,10 +281,20 @@ def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth
     if auth_path is None and (auth_lock is not None or refreshed_callback is None):
         raise UsageError("in-memory token refresh requires a persistence callback and no file lock")
     if auth_lock is not None:
+        refreshed = False
+
+        def mark_refreshed():
+            nonlocal refreshed
+            refreshed = True
+
         with auth_lock:
             auth.clear()
             auth.update(load_json(auth_path))
-            return refresh_access_token(auth, opener, auth_path, timeout, retries, refreshed_callback=refreshed_callback, allow_refresh=allow_refresh, force_refresh=force_refresh)
+            access_token = refresh_access_token(auth, opener, auth_path, timeout, retries, refreshed_callback=mark_refreshed, allow_refresh=allow_refresh, force_refresh=force_refresh)
+        # Reconciliation may acquire data locks; never invoke it while holding the account lock.
+        if refreshed and refreshed_callback is not None:
+            refreshed_callback()
+        return access_token
     if not tokens.get("refresh_token"):
         raise UsageError("access token is expired and auth.json has no refresh_token")
     old_account_id = token_account_id(tokens)

@@ -502,8 +502,7 @@ def initialize_processing_index(path: Path) -> None:
             db.execute("INSERT INTO processing_meta VALUES('countsInitialized','true')")
         if db.execute("SELECT value FROM processing_meta WHERE name='schemaVersion'").fetchone()[0] != str(PROCESSING_SCHEMA_VERSION):
             raise ValueError("Unsupported processing index schema")
-        from monitor_delivery import initialize_delivery
-        initialize_delivery(db)
+        _initialize_legacy_delivery(db)
 
 
 def initialize_v4_cache(path: Path) -> None:
@@ -522,3 +521,17 @@ def initialize_v4_cache(path: Path) -> None:
             db.execute("CREATE INDEX IF NOT EXISTS remote_records_day ON remote_records(machine_id, day, part_id)")
         db.execute("CREATE TABLE IF NOT EXISTS remote_origins (machine_id TEXT PRIMARY KEY)")
         db.execute("CREATE TABLE IF NOT EXISTS metadata (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+
+
+def _initialize_legacy_delivery(db):
+    """Retain old delivery schemas for released sequential migration steps."""
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS dashboard_days(view TEXT,day INTEGER,revision INTEGER NOT NULL,dirty INTEGER NOT NULL,PRIMARY KEY(view,day));
+        CREATE TABLE IF NOT EXISTS dashboard_parts(view TEXT,day INTEGER,level INTEGER,digest TEXT NOT NULL,PRIMARY KEY(view,day,level));
+        CREATE TABLE IF NOT EXISTS dashboard_day_meta(view TEXT,day INTEGER,data TEXT NOT NULL,PRIMARY KEY(view,day));
+        CREATE TABLE IF NOT EXISTS dashboard_blobs(digest TEXT PRIMARY KEY,body BLOB NOT NULL,compressed BLOB NOT NULL,created REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS dashboard_manifests(scope TEXT PRIMARY KEY,signature TEXT NOT NULL,data TEXT NOT NULL,updated REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS dashboard_rollups(signature TEXT PRIMARY KEY,digest TEXT NOT NULL,created REAL NOT NULL);
+        CREATE INDEX IF NOT EXISTS dashboard_quota_time ON processing_quota_points(view,event_at,account);
+        CREATE INDEX IF NOT EXISTS dashboard_display_time ON processing_display(view,kind,event_at,account);
+    """)

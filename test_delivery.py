@@ -132,6 +132,10 @@ class DeliveryTests(unittest.TestCase):
             self.assertFalse(self.delivery.prepare(1002, self.projector))
             self.assertTrue(self.delivery.bulk())
 
+    def test_runtime_initialization_does_not_create_legacy_delivery_schema(self):
+        with self.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE name GLOB 'dashboard_*'").fetchall(), [])
+
     def test_v18_migration_rolls_back_derived_store_and_keeps_originals(self):
         import monitor_migrations as migrations
         self.quota(10);self.prepare()
@@ -152,6 +156,10 @@ class DeliveryTests(unittest.TestCase):
         migrations._run_data_migration(migrations._migrate_history_to_v18, paths, 18, state, journal)
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 18)
         self.assertEqual(quota.read_bytes(), b'{"original":"retained"}\n')
+        ProcessingIndex(self.index.path)
+        with self.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE name GLOB 'dashboard_*'").fetchall(), [])
+            self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_snapshot'").fetchone())
 
     def test_cloud_signal_during_preparation_is_consumed_by_next_projection(self):
         from monitor_dashboard import UsageDashboardState
@@ -164,7 +172,7 @@ class DeliveryTests(unittest.TestCase):
         state.dashboard_cache_wait_seconds = lambda: 0
         state.status_payload = lambda: {}
         state.projector = None
-        state.usage_data = SimpleNamespace(index=SimpleNamespace(maintain_disk_space=lambda: None))
+        state.usage_data = SimpleNamespace(index=SimpleNamespace(maintain_disk_space=lambda: None), backup=SimpleNamespace(flush=lambda: None))
         observed = []
         def project():
             if not observed:
@@ -187,7 +195,7 @@ class DeliveryTests(unittest.TestCase):
         bulk = self.prepare()
         event = self.events[0] | {"eventId": "new", "occurredAt": "2030-01-01T01:00:00Z"}
         with self.index.transaction() as db:
-            self.index.fact(db, str(self.projector.store.token_ledger_path.resolve()), 0, "tokenLedger", event)
+            self.index.fact(db, "local:tokenLedger", 0, "tokenLedger", event)
             db.execute("INSERT INTO delivery_work VALUES('local','a','tokenLedger',?)", (record_key("tokenLedger", event),))
             db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES('local','a')")
         self.prepare(1002)

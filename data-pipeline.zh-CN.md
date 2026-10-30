@@ -2,7 +2,7 @@
 
 本文按“API / 本地 session → 本地事实记录 → 云端发布与下载 → Local / Merged → 后端展示数据 → 客户端处理与绘制”的顺序，说明 Codex Usage Monitor 的数据内容、格式、存储及优化方式。
 
-依据：2026-10-28 当前实现。本地待发布合同为 18，已发布基线为 17，云端合同为 4。历史设计文档中的目标与版本描述不能替代当前代码和成功发布记录。
+依据：2026-10-30 当前实现。本地待发布合同为 19，已发布基线为 18，云端合同为 4。历史设计文档中的目标与版本描述不能替代当前代码和成功发布记录。
 
 ## 1. 总体结构与职责
 
@@ -10,10 +10,10 @@
 flowchart TD
     API[额度 API 原始响应] --> Q[提取窗口与采样校验]
     SESSION[本地 sessions / archived_sessions] --> P[增量解析 token 事件]
-    Q --> FACT[本地规范事实 JSONL]
-    P --> LEDGER[事件归因与成本账本 JSONL]
-    FACT --> DB[SQLite 处理索引与持久状态]
-    LEDGER --> DB
+    Q --> DB[SQLite 规范事实与持久状态]
+    P --> DB
+    DB --> QUEUE[同一事务提交备份待写队列]
+    QUEUE --> FACT[只写 JSONL 备份日志]
     DB --> PUB[本机可同步记录与脏日期]
     PUB --> CLOUD[WebDAV 加密 v4 对象]
     CLOUD --> PEER[验证后的远端记录缓存]
@@ -165,11 +165,11 @@ Python 服务承担采集、归因、持久化、同步、去重及业务计算�
 
 | 文件或目录 | 角色 | 保留 / 恢复要求 |
 | --- | --- | --- |
-| `usage_monitor_quota_readings.jsonl` | 本地规范额度事实 | 核心历史；受明确保留策略影响 |
-| `usage_monitor_token_events.jsonl` | 本地 token 事件及已存成本 | 核心账本；修正时可受控重写 |
-| `usage_monitor_diagnostic_samples.jsonl` | 采样诊断与请求信息 | 有容量上限，不保证完整历史 |
-| `usage_monitor_state.json` | 运行基线、累计状态与检查点 | 用于重启续接，避免重复累计 |
-| `usage_monitor_sync_cache-v4.sqlite3` | 同步持久状态、处理索引、业务投影与交付缓存 | 混合存放不可丢元数据和可重建派生数据 |
+| `usage_monitor_quota_readings.jsonl` | 只写额度备份日志 | 不参与正常读取、修复或同步 |
+| `usage_monitor_token_events.jsonl` | 只写 token 与成本备份日志 | 修正追加普通记录；数据库删除不写入日志 |
+| `usage_monitor_diagnostic_samples.jsonl` | 只写诊断备份日志 | 不再按旧容量参数裁剪 |
+| `usage_monitor_state.json` | 兼容状态输出 | 不再作为迁移或重启的数据来源；从 SQLite 恢复 |
+| `usage_monitor_sync_cache-v4.sqlite3` | 规范事实、同步持久状态、业务投影与交付缓存 | 活跃用量数据的权威来源，必须备份 |
 | `usage_monitor_sync_cache.json` 及关联旧缓存 | 兼容历史同步缓存 | 旧 peer 数据在对应 v4 来源生效前可作临时来源 |
 | `accounts/` | 本地账号管理、凭据与归因相关状态 | 与用量事实分工保存，备份注意敏感性 |
 
@@ -177,11 +177,11 @@ Python 服务承担采集、归因、持久化、同步、去重及业务计算�
 
 ### 4.2 为什么同时使用 JSONL 与 SQLite
 
-JSONL 是 UTF-8 文本，每行一个完整 JSON 对象。它适合追加、逐行恢复和排查，也适合保留规范事实。普通新增不必重写整个数组；纠错、保留策略或历史规范化可能通过临时文件和原子替换重写。
+SQLite 是活跃用量数据的权威数据库。Python 采集逻辑直接读取原始 Codex session 文件、执行解析和归因，再写入 SQLite；数据库本身不追踪文件。`monitor_ingestion.py` 管理源文件发现、增量解析与纠错，`monitor_processing.py` 管理数据库访问和事务处理状态。
 
-SQLite 提供事务、主键、时间索引、事件去重和范围查询。旧布局保存结构化索引列及完整 JSON；工作区新增布局将已知采样字段拆成类型化列，通过兼容视图按需重建 JSON，见 4.5。两者都避免查询时读取全部 JSONL，并保留兼容字段。整体仍采用“JSONL 事实 + SQLite 索引与持久状态”的组合。
+JSONL 仅作只写备份日志，用于人工分析和显式恢复。额度、token 与成本事实提交时，同一 SQLite 事务将备份内容放入 `processing_backup_queue`，由 `monitor_backup.py` 独立追加。正常启动、查询、同步、账号改名、修复和源文件替换处理均不读取 recorder JSONL。删除、截断或修改备份文件不会改变数据库中的活跃数据。
 
-演进建议：若未来选择 SQL 作为唯一事实存储，需要明确事务提交、备份导出和恢复机制，并迁移现有事实及同步身份。这是持久合同变更，不能仅为减少文件数而直接删除 JSONL。
+合同 19 假定现有 SQLite 数据完整，仅转换数据库中的本地来源身份并完成已有数据库处理状态，保留收集期、远端记录和解析状态。该迁移不读取 JSONL 或旧状态文件，不用备份日志补齐或替换数据库事实；回滚备份仅覆盖数据库。人工重建由外部工具或人员负责，本程序不提供恢复读取器、重放规则或人工重建命令。
 
 ### 4.3 SQLite 逻辑表与视图的职责
 
@@ -191,10 +191,11 @@ SQLite 提供事务、主键、时间索引、事件去重和范围查询。旧�
 | --- | --- |
 | `local_records` | 本机发布逻辑键、固定收集期、内容哈希和同步记录 |
 | `remote_days` / `remote_records` / `remote_origins` | 已验证远端日期、布局、记录及 v4 来源状态 |
-| `processing_files` / `processing_blocks` | 规范文件读取偏移和前缀校验信息 |
+| `processing_blocks` | 原始 session 文件校验信息；不追踪备份日志 |
+| `processing_backup_queue` | 同一事务提交的备份待写记录；追加成功后确认 |
 | `processing_scan_sources` / `processing_scan_events` / `processing_occurrences` | session 解析检查点、事件队列和文件出现关系 |
-| `processing_facts` | 规范事实的查询索引，带来源、账号、会话、事件时间和 JSON |
-| `processing_coverage` / `processing_ledger_order` / `processing_meta` | 覆盖水位、处理顺序、准备批次和修订状态 |
+| `processing_facts` | 权威规范事实视图，带来源、账号、会话、事件时间和 JSON |
+| `processing_coverage` / `processing_ledger_order` / `processing_meta` | 覆盖水位、处理顺序、待发送通知和修订状态 |
 | `processing_effective` / `processing_ledger_sessions` / `processing_totals` | 有效去重事件及增量汇总 |
 | `processing_dirty` / `processing_changes` / `processing_dirty_days` | 待更新的业务范围与待发布日期 |
 | `processing_quota_points` / `processing_display` / `processing_cost_ranges` | 精确额度点、会话、事件成本和成本额度区间 |
@@ -208,13 +209,13 @@ SQLite 提供事务、主键、时间索引、事件去重和范围查询。旧�
 
 SQLite 使用 WAL，让读取已提交状态与短写事务协作。JSONL 和 SQLite 是两个存储介质，不能假设一条 SQLite 事务可以同时原子提交二者。
 
-token 增量处理因此先持久化准备批次，再写入或修正账本、刷新事实索引，最后确认事件已处理并推进覆盖水位。重启后先恢复准备批次，按事件身份检查已存在记录，避免“文件已追加、数据库尚未确认”导致重复账。
+token 增量处理在同一 SQLite 事务中提交账本记录、源事件确认、覆盖水位、通知与备份待写内容，不再额外保存准备批次。合同 19 迁移一次性完成旧运行时遗留的准备批次。额度同样直接提交数据库中的原始读数及备份队列。日志写入失败不阻断已提交的数据，重启后继续重试待写内容。
 
-JSONL 追加路径支持处理损坏尾行，重要写入使用 flush/fsync 或原子替换。读取检查点不能越过尚未可靠记录和应用的事实。异常输入、文件替换及中断需要显式恢复，而不是静默清空历史。
+备份日志只以追加方式打开，不读取、修补尾行或原子替换。每个批次前写入换行符隔离损坏尾行，随后 flush/fsync。修正以相同身份追加普通新版本；数据库删除不追加操作记录，也不修改已有日志。显式重建时由当前预处理和处理逻辑决定保留哪些记录。若 fsync 后、队列确认前中断，备份中可能重复投递；显式恢复按身份重放即可去重。原始 Codex session 文件仍由采集代码处理截断、替换和中断，与备份文件相互独立。
 
 ### 4.5 工作区新增的类型化采样存储
 
-`monitor_sample_store.py` 将 SQLite 中重复保存的采样载荷收敛为共享记录。这里改变的是 SQL 物理布局与访问方式，本地 JSONL 事实及云端 v4 格式仍按各自边界保存。
+`monitor_sample_store.py` 将 SQLite 中重复保存的采样载荷收敛为共享记录。这里改变的是 SQL 物理布局与访问方式，本地 JSONL 只写备份及云端 v4 格式仍按各自边界保存。
 
 | 物理表族 | 保存内容 |
 | --- | --- |
@@ -240,7 +241,7 @@ JSONL 追加路径支持处理损坏尾行，重要写入使用 flush/fsync 或�
 
 ### 5.1 云端保存什么
 
-用量同步发布本机拥有且允许同步的规范额度和 token 账本记录，不上传 Merged 全量结果。远端下载内容保留来源身份，进入独立 peer 缓存，不追加到本地规范 JSONL，也不重新冒充本机事实上传。
+用量同步发布本机拥有且允许同步的规范额度和 token 账本记录，不上传 Merged 全量结果。远端下载内容保留来源身份，进入独立 peer 缓存，不追加到本地只写 JSONL 备份，也不重新冒充本机事实上传。
 
 `sync.localOnly` 为真的记录不能发布。同步转换还会去掉部分纯本地字段；云端记录与本地账本无需逐字相同。账号和 skills 有各自同步对象，本文重点是用量数据；原始聊天正文不因用量同步而被整份上传。
 
@@ -336,7 +337,7 @@ token 同身份但不同内容时，比较排除本地槽、标签和同步来�
 
 ## 7. 后端解释层与网络传输
 
-当前待发布本地合同为 18，已发布基线为 17，云端合同仍为 4。数据库布局、规范事实/云端格式和网络格式分别维护。HTTP 没有显式协议版本号。解释层在采集及后台处理中准备数据，客户端连接只读取已准备字节，不重跑历史计算。
+当前待发布本地合同为 19，已发布基线为 18，云端合同仍为 4。数据库布局、规范事实/云端格式和网络格式分别维护。HTTP 没有显式协议版本号。解释层在采集及后台处理中准备数据，客户端连接只读取已准备字节，不重跑历史计算。
 
 `delivery_runs`、`delivery_tokens`、`delivery_charts`、`delivery_members` 分别保存分账号/窗口的区间、token、成本图表和归因关系；`delivery_work` 标记受影响输入。解释结果与独立的 Local/Merged/state 序列日志事务提交。完整快照的序列化及最终 gzip 压缩在写锁外完成，每秒最多准备一次。
 
@@ -371,7 +372,7 @@ VS Code 宿主维护共享 WebSocket，未打开仪表盘时仅订阅当前状�
 假设机器 A 的会话在 `02:04:42Z` 新增一次 1500 token 的事件：
 
 1. session 文件追加，解析器从上次偏移读取 token_count，得到本次增量及稳定事件身份。
-2. 按事件时间归因到用量账号 A，并按适用价格计算预估成本；先保存准备批次，再写 token JSONL。
+2. 按事件时间归因到用量账号 A，并按适用价格计算预估成本；在同一事务内提交 SQLite token 记录、处理检查点及独立备份队列。
 3. SQLite 索引确认该事件，更新会话、模型汇总，标记 Local 和 Merged 对应范围，以及云端发布日期为 dirty。
 4. Local 立即可以包含本条；Merged 纳入本机事件，并检查 peer 中是否已有相同账号 / 事件副本。
 5. 后台投影生成事件成本、会话汇总和适用的额度成本区间，生成解释层增量并与序列日志一同提交，后台准备新的完整快照。
@@ -379,15 +380,19 @@ VS Code 宿主维护共享 WebSocket，未打开仪表盘时仅订阅当前状�
 7. 云同步等该记录所属半小时封口后发布不可变块与新 head；机器 B 验证并缓存下载结果，重算 Merged，并通知它的客户端整体替换 Local/Merged 合并全量快照。
 8. 机器 B 若本来就拥有同一事件副本，Merged 仍只计算一次；B 的 Local 不因这次下载新增 A 的规范事实。
 
-若 A 在第 2 步写账本后中断，准备批次用于恢复且不会重复追加；若第 7 步上传块后 head 提交失败，远端仍以旧 head 为准，下次重试。
+若 A 在第 2 步事务提交前中断，账本与源事件确认一同回滚；提交后中断则由备份队列继续投递，不会重复计费；若第 7 步上传块后 head 提交失败，远端仍以旧 head 为准，下次重试。
 
 ## 12. 演进约束与验证重点
 
 演进时保持以下约束：事实与展示缓存分层；本地与 peer 来源分开；业务时间与收集期分开；去重依据稳定身份；空值与零分开；精确统计与降采样分开；持久检查点只能在对应数据可靠保存后推进。
 
-持久格式、字段含义、文件名或派生数据表示改变且需要转换 / 重建时，更新数据合同和迁移。最新已发布合同为 N 时，只保留一个 N+1 的待发布迁移；后续未发布变更并入它。成功显式发布后冻结迁移，已经发布的中间版本必须保留以支持连续升级。纯传输层变化无需因此增加持久合同。
+仅当已有本地或云端保存的数据因持久表示或含义改变而需要转换、清理或重建时，更新数据合同和迁移；这包括格式、结构、字段含义、文件名或派生数据表示的变化。
 
-验证应覆盖：同一事件多机去重、账号切换与改名、累计 token 回退、文件截断 / 替换、额度缺失 / 重置 / 平坦区间、迟到纠错、JSONL 写入与数据库确认间中断、head 冲突、下载认证失败、packing-only 更新、旧缓存恢复、范围切换及夏令时边界。
+如果已有保存数据无需修改仍然有效，仅改变读写代码、模块、库或访问方法，不需要更新数据合同。纯传输层变化也无需因此增加持久合同。
+
+最新已发布合同为 N 时，只保留一个 N+1 的待发布迁移；后续未发布变更并入它。成功显式发布后冻结迁移，已经发布的中间版本必须保留以支持连续升级。
+
+验证应覆盖：同一事件多机去重、账号切换与改名、累计 token 回退、文件截断 / 替换、额度缺失 / 重置 / 平坦区间、迟到纠错、SQLite 提交、备份追加与队列确认间中断、head 冲突、下载认证失败、packing-only 更新、旧缓存恢复、范围切换及夏令时边界。
 
 性能验证分别测量新增字节、解析事件数、回放账号范围、dirty 日期、上传下载字节、manifest / chunk 时间和浏览器绘制时间。正常无变化轮询不应隐式全量重建，但目录审计、迁移、纠错和历史日 bulk 更新的成本需单独记录。所有测试服务和临时实例结束后必须停止。
 
@@ -397,7 +402,9 @@ VS Code 宿主维护共享 WebSocket，未打开仪表盘时仅订阅当前状�
 | --- | --- |
 | [monitor_quota.py](monitor_quota.py) / [monitor_history.py](monitor_history.py) | API 窗口提取、采样仲裁、规范额度、JSONL 与状态 |
 | [monitor_tokens.py](monitor_tokens.py) / [monitor_token_ledger.py](monitor_token_ledger.py) | session 解析、事件身份、账号归因、token 与成本账本 |
-| [monitor_processing.py](monitor_processing.py) | 持久扫描、事实索引、恢复批次、有效事件与增量汇总 |
+| [monitor_ingestion.py](monitor_ingestion.py) | 原始 session 文件发现、追踪、解析与数据库直接写入 |
+| [monitor_processing.py](monitor_processing.py) | 数据库访问、事实事务、有效事件与增量汇总 |
+| [monitor_backup.py](monitor_backup.py) | 只写备份队列投递；人工重建由外部负责 |
 | [monitor_sample_store.py](monitor_sample_store.py) | 工作区新增类型化采样、共享载荷、引用仓储、兼容视图及迁移 |
 | [monitor_usage_sync.py](monitor_usage_sync.py) | 记录身份、同步校验、收集期、peer 应用及合并 |
 | [monitor_cloud.py](monitor_cloud.py) / [monitor_streaming.py](monitor_streaming.py) | WebDAV 协调、v4 发布下载、加密压缩及流式处理 |

@@ -4,15 +4,12 @@ import hashlib
 import heapq
 import json
 import math
-import os
 import monitor_sample_store as samples
-import tempfile
 import time
 from contextlib import closing
 from datetime import datetime, timezone
 from pathlib import Path
 
-from monitor_common import atomic_write_bytes as _write_atomic_bytes
 from monitor_common import MIN_DELTA_COST_PER_PERCENT_USD, RESET_TIME_JITTER_SECONDS, coerce_float, empty_cost_totals, empty_token_totals, parse_timestamp
 from monitor_tokens import normalize_codex_model
 
@@ -428,8 +425,6 @@ def v4_logical_hash(entries: list[dict]) -> str:
     return content_hash([[entry["recordKey"], content_hash(entry["record"])] for entry in sorted(entries, key=lambda item: item["recordKey"])])
 
 
-
-
 class UsageDataStore:
     def __init__(self, quota_path: Path, token_ledger_path: Path, machine_id: str, account_id_resolver, lock, account_mapper=None, cache_path: Path | None = None, account_revision_resolver=None):
         self.quota_path, self.token_ledger_path = Path(quota_path), Path(token_ledger_path)
@@ -441,12 +436,18 @@ class UsageDataStore:
         self._local_datasets_cache = None
         self._merged_datasets_cache = None
         self._account_revision = None
-        self._v4_source_stats = None
         from monitor_processing import ProcessingIndex
         initialize_v4_cache(self.v4_cache_path)
         self.index = ProcessingIndex(self.v4_cache_path)
+        from monitor_backup import BackupRecorder
+        from monitor_ingestion import SourceIngestor
+        self.backup = BackupRecorder(self.index)
+        self.sources = SourceIngestor(self)
+        self._database_revision = None
 
     def normalize_new_quota(self, row):
+        if sync_meta(row).get("originMachineId", self.machine_id) != self.machine_id:
+            raise ValueError("Foreign records in local history require data migration")
         from monitor_history import normalize_quota_history_row
         row = normalize_quota_history_row(row)
         if row is None:
@@ -457,6 +458,8 @@ class UsageDataStore:
         return row
 
     def normalize_new_ledger(self, row):
+        if sync_meta(row).get("originMachineId", self.machine_id) != self.machine_id:
+            raise ValueError("Foreign records in local history require data migration")
         if (row := canonical_ledger_row(row, preserve_highwater=True)) is None:
             return None
         source = row.get("session") or row
@@ -470,17 +473,36 @@ class UsageDataStore:
             return self._ingest_local()
 
     def _ingest_local(self):
-        with self.index.transaction() as db:
-            normalized = self.index.get(db, "canonicalNormalized", False)
-        if not normalized:
-            self._normalize_local()
-            with self.index.transaction() as db:
-                self.index.put(db, "canonicalNormalized", True)
-        self.index.audit()
-        changed = self.index.refresh(self.quota_path, "quota", self.normalize_new_quota)
-        changed = self.index.refresh(self.token_ledger_path, "tokenLedger", self.normalize_new_ledger) or changed
+        # Recorder logs are never ingestion inputs. Refresh only in-memory SQL views.
+        revision = self.index.revision()
+        changed = revision != self._database_revision
         if changed:
             self._local_datasets_cache = self._merged_datasets_cache = None
+            self._database_revision = revision
+        return changed
+
+    def record_quota(self, sample):
+        from monitor_history import quota_history_row_from_sample
+        row = quota_history_row_from_sample(sample)
+        if row is None:
+            return False
+        row = self.normalize_new_quota(row)
+        with self.lock, self.index.transaction() as db:
+            changed = self.index.write_records(db, "quota", [row])
+            self.backup.enqueue(db, self.quota_path, [row])
+        self.backup.flush()
+        return changed
+
+    def record_diagnostic(self, path, row):
+        with self.index.transaction() as db:
+            self.backup.enqueue(db, path, [row])
+        self.backup.flush()
+
+    def record_ledger(self, rows, *, replace=False):
+        rows = [normalized for row in rows if (normalized := self.normalize_new_ledger(row)) is not None]
+        with self.lock, self.index.transaction() as db:
+            changed = self.index.write_records(db, "tokenLedger", rows, replace=replace, backup_path=self.token_ledger_path)
+        self.backup.flush()
         return changed
 
     def refresh_peer_partition(self, machine_id, day, force=False):
@@ -522,8 +544,9 @@ class UsageDataStore:
             self.index.put(db, "factRevision", self.index.get(db, "factRevision", 0) + 1)
         self._merged_datasets_cache = None
 
-    def initialize_processing(self):
-        self.ingest_local()
+    def initialize_processing(self, *, ingest=True):
+        if ingest:
+            self.ingest_local()
         with self.index.transaction() as db:
             initialized = self.index.get(db, "peersInitialized", False)
             peers = list(db.execute("SELECT machine_id,day FROM remote_days")) if not initialized else []
@@ -533,8 +556,9 @@ class UsageDataStore:
             with self.index.transaction() as db:
                 self.index.put(db, "peersInitialized", True)
 
-    def initialize_v4_index(self, now=None):
-        self.ingest_local()
+    def initialize_v4_index(self, now=None, *, ingest=True):
+        if ingest:
+            self.ingest_local()
         current = time.time() if now is None else now
         with self.index.transaction() as db:
             historical = db.execute("SELECT value FROM metadata WHERE name='localInitialized'").fetchone() is None
@@ -606,50 +630,6 @@ class UsageDataStore:
                 else:
                     db.execute("DELETE FROM processing_dirty_days WHERE day=? AND generation=?", (day, generation))
 
-    @staticmethod
-    def _v4_stat(path: Path) -> tuple[int, int, int] | None:
-        try:
-            value = path.stat()
-        except FileNotFoundError:
-            return None
-        return value.st_ino, value.st_size, value.st_mtime_ns
-
-    def _v4_local_sources(self) -> tuple[list[dict], list[dict]]:
-        quota_stat, ledger_stat = self._v4_stat(self.quota_path), self._v4_stat(self.token_ledger_path)
-        previous = self._v4_source_stats
-        if previous and self._local_datasets_cache is not None and (self.account_revision_resolver is None or self.account_revision_resolver() == self._account_revision):
-            if previous == (quota_stat, ledger_stat):
-                return self._local_datasets_cache
-            if previous[1] == ledger_stat and previous[0] and quota_stat and previous[0][0] == quota_stat[0] and quota_stat[1] > previous[0][1]:
-                from monitor_history import normalize_quota_history_row
-                with self.quota_path.open("rb") as source:
-                    source.seek(previous[0][1])
-                    tail = source.read()
-                if tail.endswith(b"\n"):
-                    try:
-                        rows = [normalize_quota_history_row(json.loads(line)) for line in tail.decode("utf-8").splitlines() if line]
-                        if all(row is not None and sync_meta(row).get("originMachineId") == self.machine_id and sync_meta(row).get("accountId") and sync_meta(row).get("recordId") for row in rows):
-                            for key, record in active_records(rows, [], self.machine_id, self.account_id_resolver, False).items():
-                                validate_sync_operation({"action": "upsert", "key": key, "record": record})
-                            local = self._local_datasets_cache[0] + rows, self._local_datasets_cache[1]
-                            self._materialize_datasets(local)
-                            self._v4_source_stats = quota_stat, ledger_stat
-                            return local
-                    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
-                        pass
-        local = self._normalize_local()
-        self._v4_source_stats = self._v4_stat(self.quota_path), self._v4_stat(self.token_ledger_path)
-        return local
-
-    def _load(self) -> tuple[list[dict], list[dict]]:
-        from monitor_history import load_quota_history
-        from monitor_token_ledger import load_token_ledger
-        return load_quota_history(self.quota_path), load_token_ledger(self.token_ledger_path)
-
-    @staticmethod
-    def _atomic_write(path: Path, data: bytes) -> None:
-        _write_atomic_bytes(path, data)
-
     def _map_account(self, kind: str, row: dict) -> dict | None:
         account_id = sync_meta(row).get("accountId")
         if not account_id or self.account_mapper is None:
@@ -690,79 +670,40 @@ class UsageDataStore:
             transport["session"] = {key: value for key, value in transport["session"].items() if key not in {"accountSlotId", "accountLabel"}}
         return {"kind": kind, "row": transport}
 
-    @staticmethod
-    def _quota_bytes(rows: list[dict]) -> bytes:
-        from monitor_history import normalize_quota_history_row
-        return "".join(json.dumps(normalized, ensure_ascii=False, separators=(",", ":")) + "\n" for row in rows if (normalized := normalize_quota_history_row(row)) is not None).encode()
-
-    def _normalize_local(self) -> tuple[list[dict], list[dict]]:
-        quota, ledger = self._load()
-        def normalize_quota(row: dict) -> dict | None:
-            meta = sync_meta(row)
-            if meta.get("originMachineId") and meta["originMachineId"] != self.machine_id:
-                raise ValueError("Foreign records in local history require data migration")
-            account_id = meta.get("accountId") or self.account_id_resolver(row.get("accountSlotId"))
-            if not meta.get("accountId") or not meta.get("recordId"):
-                row = {key: value for key, value in row.items() if key != SYNC_META_KEY}
-            if not str(account_id).startswith("v3:"):
-                raise ValueError("Quota identity requires data migration")
-            return add_record_provenance("quota", row, self.machine_id, account_id) if not sync_meta(row).get("recordId") else row
-
-        def normalize_ledger(row: dict) -> dict | None:
-            if (row := canonical_ledger_row(row, preserve_highwater=True)) is None:
-                return None
-            meta, source = sync_meta(row), row.get("session") or row
-            if meta.get("originMachineId") and meta["originMachineId"] != self.machine_id:
-                raise ValueError("Foreign records in local history require data migration")
-            if not meta.get("originMachineId") or not meta.get("accountId"):
-                return add_record_provenance("tokenLedger", {key: value for key, value in row.items() if key != SYNC_META_KEY}, self.machine_id, self.account_id_resolver(source.get("accountSlotId")))
-            if not str(meta.get("accountId") or "").startswith("v3:"):
-                raise ValueError("Ledger identity requires data migration")
-            return row
-
-        normalized_quota = [normalized for row in quota if (normalized := normalize_quota(row)) is not None]
-        normalized_ledger = [normalized for row in ledger if (normalized := normalize_ledger(row)) is not None]
-        if normalized_quota != quota:
-            self._atomic_write(self.quota_path, self._quota_bytes(normalized_quota))
-        if normalized_ledger != ledger:
-            from monitor_token_ledger import write_token_ledger
-            write_token_ledger(self.token_ledger_path, normalized_ledger)
-        local = normalized_quota, normalized_ledger
-        if local != self._local_datasets_cache or self._merged_datasets_cache is None:
-            self._materialize_datasets(local)
-        return local
-
-    def normalize_local(self) -> tuple[list[dict], list[dict]]:
-        with self.lock:
-            return self._normalize_local()
-
     def refresh_accounts(self) -> None:
         with self.lock:
-            self._normalize_local()
             with self.index.transaction() as db:
-                db.execute("DELETE FROM processing_files")
                 peers = list(db.execute("SELECT machine_id,day FROM remote_days"))
-            self._ingest_local()
+            self._local_datasets_cache = self._merged_datasets_cache = None
             for machine_id, day in peers:
                 self.refresh_peer_partition(machine_id, day, force=True)
 
-    def _datasets(self, view: str) -> tuple[list[dict], list[dict]]:
+    def rename_account(self, account_id, label):
+        from monitor_history import replace_account_label
+        with self.lock, self.index.transaction() as db:
+            for path, kind in ((self.quota_path, "quota"), (self.token_ledger_path, "tokenLedger")):
+                rows = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_facts WHERE source=? AND kind=?", (f"local:{kind}", kind))]
+                for row in rows:
+                    replace_account_label(row, account_id, label)
+                self.index.write_records(db, kind, rows, replace=True, backup_path=path)
+        self.backup.flush()
+        self.refresh_accounts()
+
+    def _datasets_locked(self, view):
+        self._ingest_local()
         if self._local_datasets_cache is None or self._merged_datasets_cache is None:
-            self._normalize_local()
+            self._materialize_datasets((self.index.rows("quota"), self.index.rows("tokenLedger")))
         elif self.account_revision_resolver is not None and self.account_revision_resolver() != self._account_revision:
             self._materialize_datasets(self._local_datasets_cache)
         return self._merged_datasets_cache if view == "merged" else self._local_datasets_cache
 
     def datasets(self, view: str = "local") -> tuple[list[dict], list[dict]]:
         with self.lock:
-            self._ingest_local()
-            if self._local_datasets_cache is None or self._merged_datasets_cache is None:
-                self._materialize_datasets((self.index.rows(self.quota_path, "quota"), self.index.rows(self.token_ledger_path, "tokenLedger")))
-            return self._merged_datasets_cache if view == "merged" else self._local_datasets_cache
+            return self._datasets_locked(view)
 
     def snapshot(self, necessary_only: bool = True) -> tuple[dict[str, dict], set[str]]:
         with self.lock:
-            quota, ledger = self._normalize_local()
+            quota, ledger = self._datasets_locked("local")
             local = active_records(quota, ledger, self.machine_id, self.account_id_resolver, necessary_only)
             return local, set(local)
 
@@ -786,7 +727,7 @@ class UsageDataStore:
         """Assign collection periods once; a later edit keeps its original owner."""
         with self.lock:
             current = datetime.now(timezone.utc).timestamp() if now is None else now
-            quota, ledger = self._v4_local_sources()
+            quota, ledger = self._datasets_locked("local")
             records = active_records(quota, ledger, self.machine_id, self.account_id_resolver, False)
             initialize_v4_cache(self.v4_cache_path)
             with closing(samples.connect(self.v4_cache_path)) as db, db:

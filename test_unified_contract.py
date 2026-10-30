@@ -18,7 +18,8 @@ from monitor_cloud import CloudManager, CryptoBox, passphrase_hash, valid_passph
 from monitor_common import empty_cost_totals, empty_token_totals
 from monitor_migrations import FormatConverter, convert_verifier, stable_id, write_json
 from monitor_processing import initialize_processing_index
-from monitor_token_ledger import load_token_ledger, token_sessions_from_ledger
+from monitor_token_ledger import token_sessions_from_ledger
+from monitor_migrations import _load_v18_token_ledger as load_token_ledger
 from monitor_usage_sync import UsageDataStore, content_hash, initialize_v4_cache, record_key, validate_sync_operation
 from test_usage_v4 import MemoryWebDav
 
@@ -26,7 +27,7 @@ from test_usage_v4 import MemoryWebDav
 class UnifiedContractTests(unittest.TestCase):
     def test_contract_metadata_requires_aligned_targets_and_contiguous_registries(self):
         import monitor_migrations
-        metadata = {"dataContractVersion": 18, "cloudDataContractVersion": 4}
+        metadata = {"dataContractVersion": 19, "cloudDataContractVersion": 4}
         monitor_migrations.validate_contract_metadata(metadata)
         for field in metadata:
             with self.subTest(field=field), self.assertRaises(monitor_migrations.MigrationError):
@@ -130,10 +131,11 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertEqual(migrated[0]["tokens"], row["tokens"])
         replay = {"eventId": "session-a:hash", "sessionId": "session-a", "checkedAt": row["occurredAt"], "model": "gpt-5", "tokens": {"input": 20, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}}
         self.assertEqual(_usage_records([replay], _source_highwaters(migrated), "slot-a", "A", []), [])
-        from monitor_token_ledger import sync_token_ledger
+        from monitor_token_ledger import reconcile_token_ledger
         self.assertNotIn("sourceFile", migrated[0])
-        sync_token_ledger(self.paths[3], [replay], "slot-a", "A", source_files=["missing.jsonl"], own_machine_id="machine-a")
-        self.assertEqual(load_token_ledger(self.paths[3]), migrated)
+        reconciled, new_costs = reconcile_token_ledger(migrated, [replay], "slot-a", "A", source_files=["missing.jsonl"], own_machine_id="machine-a")
+        self.assertEqual(reconciled, migrated)
+        self.assertEqual(new_costs, [])
 
     def test_peer_usage_ids_are_converted_consistently_without_changing_recorded_cost(self):
         row = {"schemaVersion": 1, "recordType": "usage", "eventId": "session-a:1", "sessionId": "session-a", "occurredAt": "2026-07-15T11:55:40Z",

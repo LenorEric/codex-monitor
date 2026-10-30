@@ -42,8 +42,6 @@ from monitor_cloud_queue import CloudOperationQueue
 from monitor_usage_sync import UsageDataStore, record_key, validate_sync_operation
 from monitor_codex_usage import (
     add_token_delta,
-    append_capped_jsonl,
-    append_history,
     apply_runtime_cost_measurement,
     build_delta_event_series,
     calculate_token_costs,
@@ -569,11 +567,41 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 thread.join()
                 return 200, {"account_id": "acct-a", "access_token": "access-rotated", "refresh_token": "refresh-rotated"}
 
+            def reconcile_after_refresh():
+                # A dashboard worker holding its data lock must be able to read accounts
+                # before reconciliation waits for that data lock.
+                def read_accounts():
+                    contender_acquired.append(manager.lock.acquire(timeout=1))
+                    if contender_acquired[-1]:
+                        manager.lock.release()
+
+                thread = threading.Thread(target=read_accounts)
+                thread.start()
+                thread.join()
+                self.assertTrue(contender_acquired[-1])
+                self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-rotated")
+                manager.sync_active_from_live()
+
             with mock.patch.object(monitor_common, "request_json", side_effect=refresh_response):
-                refresh_access_token(auth, object(), auth_path, 10, auth_lock=manager.lock, refreshed_callback=manager.sync_active_from_live)
-            self.assertEqual(contender_acquired, [False])
+                refresh_access_token(auth, object(), auth_path, 10, auth_lock=manager.lock, refreshed_callback=reconcile_after_refresh)
+            self.assertEqual(contender_acquired, [False, True])
             saved = json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["tokens"]["refresh_token"], "refresh-rotated")
+
+    def test_locked_refresh_skips_callback_when_reloaded_credentials_are_fresh(self):
+        with self.account_directory() as directory:
+            auth_path = directory / "auth.json"
+            auth = self.account_auth("acct-a", "refresh-original")
+            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-new")), encoding="utf-8")
+            with (
+                mock.patch.object(monitor_common, "token_expired", side_effect=[True, False]),
+                mock.patch.object(monitor_common, "request_json") as request,
+            ):
+                callback = mock.Mock()
+                self.assertEqual(refresh_access_token(auth, object(), auth_path, 10, auth_lock=threading.RLock(), refreshed_callback=callback), auth["tokens"]["access_token"])
+            request.assert_not_called()
+            callback.assert_not_called()
+            self.assertEqual(auth["tokens"]["refresh_token"], "refresh-new")
 
     def test_in_memory_token_refresh_persists_via_callback_without_auth_file(self):
         auth = self.account_auth("acct-a", "refresh-original")
@@ -1550,37 +1578,25 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertNotIn("refresh-secret", output)
 
 
-    def test_account_rename_rolls_back_local_data_when_manifest_save_fails(self):
+    def test_account_rename_rolls_back_callback_when_manifest_save_fails(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-            history = directory / "history.jsonl"
-            history.write_text('{"accountSlotId":"ppl-pro","accountLabel":"Current account"}\n', encoding="utf-8")
-            original = history.read_bytes()
-
-            with mock.patch.object(manager, "_save_manifest", side_effect=OSError("disk full")):
-                with self.assertRaises(AccountError):
-                    manager.rename("ppl-pro", "Renamed Pro", lambda account_id, label: monitor_history.rewrite_account_labels((history,), account_id, label))
-
+            manager = AccountManager(auth_path, root=directory / "accounts")
+            rollback = mock.Mock()
+            with mock.patch.object(manager, "_save_manifest", side_effect=OSError("disk full")), self.assertRaises(AccountError):
+                manager.rename("ppl-pro", "Renamed Pro", lambda account_id, label: rollback)
+            rollback.assert_called_once_with()
             self.assertEqual(manager.active_account()["label"], "Current account")
-            self.assertEqual(history.read_bytes(), original)
 
-    def test_account_rename_keeps_all_data_when_a_local_log_is_invalid(self):
+    def test_account_rename_keeps_manifest_when_callback_fails(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-            history, invalid_log = directory / "history.jsonl", directory / "samples.jsonl"
-            history.write_text('{"accountSlotId":"ppl-pro","accountLabel":"Current account"}\n', encoding="utf-8")
-            invalid_log.write_text('{invalid json\n', encoding="utf-8")
-            originals = history.read_bytes(), invalid_log.read_bytes()
-
+            manager = AccountManager(auth_path, root=directory / "accounts")
             with self.assertRaises(AccountError):
-                manager.rename("ppl-pro", "Renamed Pro", lambda account_id, label: monitor_history.rewrite_account_labels((history, invalid_log), account_id, label))
-
+                manager.rename("ppl-pro", "Renamed Pro", mock.Mock(side_effect=OSError("callback failed")))
             self.assertEqual(manager.active_account()["label"], "Current account")
-            self.assertEqual((history.read_bytes(), invalid_log.read_bytes()), originals)
 
     def test_account_manager_recovers_live_identity_mismatch(self):
         with self.account_directory() as directory:
@@ -2543,10 +2559,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"eventId": "historical:2", "sessionId": "historical", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-terra", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
             ]
 
-            monitor_token_ledger.write_token_ledger(path, [{"schemaVersion": 2, "recordType": "sessionBaseline", "session": legacy}])
-            rows = monitor_token_ledger.sync_token_ledger(path, events, "account", "Account")
-            repeated = monitor_token_ledger.sync_token_ledger(path, events, "account", "Account")
-            ledger = monitor_token_ledger.load_token_ledger(path)
+            ledger, _ = monitor_token_ledger.reconcile_token_ledger([{"schemaVersion": 2, "recordType": "sessionBaseline", "session": legacy}], events, "account", "Account")
+            rows = monitor_token_ledger.token_sessions_from_ledger(ledger)
+            repeated, _ = monitor_token_ledger.reconcile_token_ledger(ledger, events, "account", "Account")
+            repeated = monitor_token_ledger.token_sessions_from_ledger(repeated)
             with mock.patch.dict(monitor_tokens.MODEL_PRICES_PER_MILLION, {"gpt-5.6-terra": {"input": 99.0, "cachedInput": 99.0, "cacheWriteInput": 99.0, "output": 99.0}}):
                 reloaded = monitor_token_ledger.token_sessions_from_ledger(ledger)
 
@@ -2565,8 +2581,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"eventId": "session:2", "sessionId": "session", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
             ]
 
-            sessions = monitor_token_ledger.sync_token_ledger(path, events, "account", "Account")
-            ledger = monitor_token_ledger.load_token_ledger(path)
+            ledger, _ = monitor_token_ledger.reconcile_token_ledger([], events, "account", "Account")
+            sessions = monitor_token_ledger.token_sessions_from_ledger(ledger)
 
         self.assertEqual(sessions[0]["cost"]["totalCostUsd"], 1.2)
         self.assertEqual([row["cost"]["totalCostUsd"] for row in ledger], [1.0, 0.2])
@@ -2583,8 +2599,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "API"},
             ]
 
-            sessions = monitor_token_ledger.sync_token_ledger(directory / "token-ledger.jsonl", events, "api", "API", timeline)
-            usage_rows = [row for row in monitor_token_ledger.load_token_ledger(directory / "token-ledger.jsonl") if row["recordType"] == "usage"]
+            usage_rows, _ = monitor_token_ledger.reconcile_token_ledger([], events, "api", "API", timeline)
+            sessions = monitor_token_ledger.token_sessions_from_ledger(usage_rows)
 
         self.assertEqual([(row["accountSlotId"], row["tokens"]["freshInputTokens"]) for row in sessions], [("normal", 70), ("api", 140)])
         self.assertEqual([row["accountSlotId"] for row in usage_rows], ["normal", "api"])
@@ -2594,8 +2610,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
             event = {"eventId": "session:1", "sessionId": "session", "checkedAt": "2030-01-01T01:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 100, "cachedInput": 0, "cacheWriteInput": 0, "output": 10}}
             activation_timeline = [{"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "UU API Pro"}]
 
-            monitor_token_ledger.sync_token_ledger(directory / "token-ledger.jsonl", [event], "api", "UU API Pro", activation_timeline)
-            usage_row = next(row for row in monitor_token_ledger.load_token_ledger(directory / "token-ledger.jsonl") if row["recordType"] == "usage")
+            usages, _ = monitor_token_ledger.reconcile_token_ledger([], [event], "api", "UU API Pro", activation_timeline)
+            usage_row = usages[0]
 
         self.assertEqual((usage_row["accountSlotId"], usage_row["accountLabel"]), ("api", "UU API Pro"))
 
@@ -3618,7 +3634,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.last_sample, state.last_error, state.runtime_state = sample, None, {}
         state.wake_event = threading.Event()
 
-        with mock.patch.object(monitor_dashboard, "load_quota_history", side_effect=AssertionError("status must not load history")), mock.patch.object(monitor_dashboard, "load_token_ledger", side_effect=AssertionError("status must not load ledger")):
+        with mock.patch.object(monitor_history, "load_quota_history", side_effect=AssertionError("status must not load history")), mock.patch("monitor_migrations._load_v18_token_ledger", side_effect=AssertionError("status must not load ledger")):
             payload = state.status_payload()
 
         self.assertEqual(payload["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
@@ -4044,106 +4060,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(display["lastUpdateText"], "67s ago")
         self.assertIn("Last update 67s ago", display["tooltip"])
 
-    def test_capped_jsonl_drops_oldest_rows_after_append(self):
-        path = Path(__file__).with_name("test_samples_tmp.jsonl")
-        try:
-            if path.exists():
-                path.unlink()
-            for index in range(1, 5):
-                append_capped_jsonl(path, {"index": index, "payload": "x" * 24}, 120)
 
-            rows = load_history(path)
 
-            self.assertLessEqual(path.stat().st_size, 120)
-            self.assertEqual(rows[-1]["index"], 4)
-            self.assertGreater(rows[0]["index"], 1)
-        finally:
-            if path.exists():
-                path.unlink()
 
-    def test_capped_jsonl_compacts_to_hysteresis_target_without_full_file_read(self):
-        with self.account_directory() as directory:
-            path, max_bytes = directory / "samples.jsonl", 1024
-            index = 0
-            while True:
-                row = {"index": index, "payload": "测" * 40}
-                encoded_size = len(json.dumps(row, ensure_ascii=False, separators=(",", ":")).encode("utf-8")) + 1
-                if path.exists() and path.stat().st_size + encoded_size > max_bytes:
-                    break
-                append_capped_jsonl(path, row, max_bytes)
-                index += 1
 
-            with mock.patch.object(Path, "read_bytes", side_effect=AssertionError("compaction must stream the retained suffix")):
-                append_capped_jsonl(path, row, max_bytes)
 
-            rows = load_history(path)
-            self.assertLessEqual(path.stat().st_size, int(max_bytes * monitor_history.SAMPLE_LOG_COMPACT_RATIO))
-            self.assertEqual(rows[-1]["index"], index)
-            self.assertGreater(rows[0]["index"], 0)
-
-    def test_capped_jsonl_failed_atomic_compaction_keeps_complete_appended_log(self):
-        with self.account_directory() as directory:
-            path, max_bytes = directory / "samples.jsonl", 256
-            append_capped_jsonl(path, {"index": 1, "payload": "x" * 120}, max_bytes)
-
-            with mock.patch.object(monitor_history.os, "replace", side_effect=OSError("replace failed")), self.assertRaises(OSError):
-                append_capped_jsonl(path, {"index": 2, "payload": "y" * 120}, max_bytes)
-
-            self.assertEqual([row["index"] for row in load_history(path)], [1, 2])
-            self.assertEqual(list(directory.glob(".samples.jsonl.*.tmp")), [])
-
-    def test_quota_history_backfills_accepted_samples_per_account_idempotently(self):
-        with self.account_directory() as directory:
-            sample_log, quota_history = directory / "samples.jsonl", directory / "quota.jsonl"
-            rows = [
-                {"sample": {
-                    "checkedAt": "2030-01-01T00:00:00Z", "percentCheckedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A",
-                    "remoteUsage": {"accepted": True}, "windows": {"5h": {"usedPercent": 12, "resetAt": "2030-01-01T05:00:00Z", "plan": "plus"}, "7d": {"usedPercent": 34, "resetAt": "2030-01-08T00:00:00Z", "plan": "pro_lite"}},
-                }},
-                {"sample": {"checkedAt": "2030-01-01T00:01:30Z", "accountSlotId": "account-b", "accountLabel": "Account B", "remoteUsage": {"accepted": True}, "windows": {"5h": {"usedPercent": 56}, "7d": {"usedPercent": None, "unavailable": True}}}},
-                {"sample": {"checkedAt": "2030-01-01T00:03:00Z", "accountSlotId": "account-a", "remoteUsage": {"accepted": False}, "windows": {"5h": {"usedPercent": 99}}}},
-                {"sample": {
-                    "checkedAt": "2030-01-01T00:03:30Z", "accountSlotId": "account-a", "accountLabel": "Account A", "remoteUsage": {"accepted": False}, "usingPreviousWindows": True,
-                    "windows": {"5h": {"usedPercent": 12}}, "rejectedWindows": {"5h": {"usedPercent": 88}},
-                }},
-                {"sample": {"checkedAt": "2030-01-01T00:04:30Z", "accountSlotId": "account-a", "usingPreviousWindows": True, "windows": {"5h": {"usedPercent": 12}}}},
-            ]
-            sample_log.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
-
-            self.assertEqual(monitor_history.backfill_quota_history(sample_log, quota_history), 3)
-            self.assertEqual(monitor_history.backfill_quota_history(sample_log, quota_history), 0)
-            history = monitor_history.load_quota_history(quota_history)
-
-            self.assertEqual([(row["accountSlotId"], sorted(row["windows"])) for row in history], [("account-a", ["5h", "7d"]), ("account-b", ["5h"]), ("account-a", ["5h"])])
-            self.assertEqual(history[0]["windows"]["5h"]["usedPercent"], 12.0)
-            self.assertEqual(history[0]["windows"]["5h"]["plan"], "plus")
-            self.assertEqual(history[0]["windows"]["7d"]["plan"], "pro_lite")
-            self.assertEqual(history[1]["windows"]["5h"]["plan"], "plus")
-            self.assertEqual(history[-1]["windows"]["5h"]["usedPercent"], 88.0)
-            self.assertNotIn("model", quota_history.read_text(encoding="utf-8"))
-
-    def test_append_quota_history_sample_skips_cached_fallback(self):
-        with self.account_directory() as directory:
-            path = directory / "quota.jsonl"
-            accepted = {
-                "checkedAt": "2030-01-01T00:00:00Z", "percentCheckedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A",
-                "remoteUsage": {"accepted": True}, "windows": {"5h": {"usedPercent": 12}, "7d": {"usedPercent": 34}},
-            }
-
-            self.assertTrue(monitor_history.append_quota_history_sample(path, accepted))
-            self.assertFalse(monitor_history.append_quota_history_sample(path, accepted | {"checkedAt": "2030-01-01T00:01:30Z", "usingPreviousWindows": True}))
-            self.assertEqual(len(monitor_history.load_quota_history(path)), 1)
-
-    def test_append_quota_history_sample_keeps_complete_local_plateau(self):
-        with self.account_directory() as directory:
-            path = directory / "quota.jsonl"
-            for index, percent in enumerate((5, 5, 5, 5, 5, 6)):
-                self.assertTrue(monitor_history.append_quota_history_sample(path, {
-                    "checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "Account A",
-                    "windows": {"5h": {"usedPercent": percent, "resetAt": "2030-01-01T05:00:00Z", "plan": "plus"}},
-                }))
-
-            self.assertEqual([row["checkedAt"] for row in monitor_history.load_quota_history(path)], [f"2030-01-01T00:0{index}:00Z" for index in range(6)])
 
 
     def test_quota_history_sample_does_not_require_cost_or_trusted_delta_baseline(self):
@@ -4166,7 +4087,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_poll_persists_raw_ledger_and_quota(self):
         source = Path(monitor_dashboard.__file__).read_text(encoding="utf-8")
         poll = source[source.index("    def poll_once(self)"):source.index("    def _poll_inactive_account", source.index("    def poll_once(self)"))]
-        self.assertIn("sync_token_ledger(", poll)
+        self.assertIn("reconcile_token_ledger(", poll)
         self.assertIn("self._record_quota_sample_locked(sample)", poll)
 
     def test_dashboard_projection_returns_quota_points_for_all_accounts(self):
@@ -4549,25 +4470,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             if path.exists():
                 path.unlink()
 
-    def test_append_history_preserves_grouped_delta_event_history(self):
-        path = Path(__file__).with_name("test_history_tmp.jsonl")
-        try:
-            if path.exists():
-                path.unlink()
-
-            append_history(path, {"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "deltaPercent": 1, "deltaCostUsd": 2})
-            append_history(path, {"checkedAt": "2030-01-01T01:00:00Z", "window": "7d", "deltaPercent": 3, "deltaCostUsd": 4})
-
-            text = path.read_text(encoding="utf-8")
-
-            self.assertIn('{\n  "window": "5h",\n  "delta": [', text)
-            self.assertIn('"accountSlotId":"unknown","accountLabel":"Unknown"', text)
-            self.assertIn('{\n  "window": "7d",\n  "delta": [', text)
-            self.assertEqual(text.count('"accountSlotId":"unknown"'), 2)
-            self.assertEqual(load_history(path)[-1]["window"], "7d")
-        finally:
-            if path.exists():
-                path.unlink()
 
     def test_write_history_marks_model_split_as_nested_delta(self):
         path = Path(__file__).with_name("test_history_tmp.jsonl")
@@ -6996,9 +6898,10 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "windows": {"5h": {"usedPercent": 5 if index < 5 else 6, "resetAt": "2030-01-01T05:00:00Z"}, "7d": {"usedPercent": 20, "resetAt": "2030-01-08T00:00:00Z"}},
                 "sync": {"version": 1, "originMachineId": "machine-a", "accountId": "v3:usage-a", "recordId": f"quota-{index}"},
             } for index in range(6)]
-            quota.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in rows), encoding="utf-8")
             store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
 
+            for row in rows:
+                store.record_quota(row)
             records, present = store.snapshot()
             full_records, full_present = store.snapshot(necessary_only=False)
 
@@ -7016,10 +6919,12 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             history.write_text("", encoding="utf-8")
             tokens.write_text("", encoding="utf-8")
             make_row = lambda index: {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 5, "resetAt": "2030-01-01T05:00:00Z"}}}
-            monitor_history.write_quota_history(quota, [make_row(index) for index in range(3)])
             store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
+            for index in range(3):
+                store.record_quota(make_row(index))
             first, _ = store.snapshot()
-            monitor_history.write_quota_history(quota, monitor_history.load_quota_history(quota) + [make_row(3), make_row(4)])
+            store.record_quota(make_row(3))
+            store.record_quota(make_row(4))
 
             second, present = store.snapshot()
 
@@ -7040,9 +6945,10 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "checkedAt": f"2030-01-01T00:0{index}:30Z", "accountSlotId": "account-b", "accountLabel": "B",
                 "windows": {"5h": {"usedPercent": 5, "plan": "plus", "resetAt": "2030-01-01T05:00:00Z"}},
             } for index in range(3)]
-            monitor_history.write_quota_history(quota, rows)
             store = UsageDataStore(quota, tokens, "machine-a", lambda slot: "v3:usage-a" if slot == "account-a" else "v3:usage-b", threading.Lock())
 
+            for row in sorted(rows, key=lambda row: row["checkedAt"]):
+                store.record_quota(row)
             records, _ = store.snapshot()
             selected = [(record["row"]["sync"]["accountId"], record["row"]["checkedAt"]) for record in records.values()]
 

@@ -95,33 +95,13 @@ class LocalContractV3Tests(unittest.TestCase):
         self.assertEqual(sessions[0]["accountSlotId"], "deleted-slot")
         self.assertEqual(sessions[0]["usageAccountId"], "v3:stable-account")
 
-    def test_quota_append_recovers_only_torn_tail_and_fsyncs(self):
-        with workspace_directory() as directory:
-            path = Path(directory) / "quota.jsonl"
-            path.write_bytes(json.dumps(quota_row("2026-01-01T00:00:00Z"), separators=(",", ":")).encode() + b"\n{\"checkedAt\":")
-            sample = quota_row("2026-01-01T00:01:00Z")
-            with mock.patch("monitor_history.os.fsync") as fsync:
-                self.assertTrue(monitor_history.append_quota_history_sample(path, sample))
-            self.assertEqual([row["checkedAt"] for row in monitor_history.load_quota_history(path)], ["2026-01-01T00:00:00Z", "2026-01-01T00:01:00Z"])
-            self.assertTrue(path.read_bytes().endswith(b"\n"))
-            fsync.assert_called_once()
 
-    def test_ledger_load_and_append_recover_torn_tail(self):
-        with workspace_directory() as directory:
-            path = Path(directory) / "ledger.jsonl"
-            first, second = usage_row(), usage_row() | {"eventId": "event-2", "occurredAt": "2026-01-01T00:01:00Z"}
-            path.write_bytes(json.dumps(first, separators=(",", ":")).encode() + b"\n{\"schemaVersion\":2")
-            self.assertEqual(monitor_token_ledger.load_token_ledger(path), [first])
-            monitor_token_ledger.append_token_ledger(path, [second])
-            self.assertEqual(monitor_token_ledger.load_token_ledger(path), [first, second])
 
     def test_new_ledger_rows_persist_provenance_at_creation(self):
         with workspace_directory() as directory:
             path = Path(directory) / "ledger.jsonl"
             event = {"eventId": "session:1", "sessionId": "session", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 10, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}}
-            monitor_token_ledger.sync_token_ledger(path, [event], "account", "Account", record_provenance=lambda row: row | {"sync": {"version": 1, "originMachineId": "machine", "accountId": "usage-account"}})
-
-            rows = monitor_token_ledger.load_token_ledger(path)
+            rows, _ = monitor_token_ledger.reconcile_token_ledger([], [event], "account", "Account", record_provenance=lambda row: row | {"sync": {"version": 1, "originMachineId": "machine", "accountId": "usage-account"}})
             self.assertEqual(rows[0]["sync"], {"version": 1, "originMachineId": "machine", "accountId": "usage-account"})
             self.assertEqual(monitor_token_ledger.token_sessions_from_ledger(rows)[0]["usageAccountId"], "usage-account")
 
@@ -129,7 +109,7 @@ class LocalContractV3Tests(unittest.TestCase):
         with workspace_directory() as directory:
             path = Path(directory) / "state.json"
             path.write_text('{"previous":true}\n', encoding="utf-8")
-            with mock.patch("monitor_history.os.replace", side_effect=OSError("replace failed")), self.assertRaises(OSError):
+            with mock.patch("monitor_common.os.replace", side_effect=OSError("replace failed")), self.assertRaises(OSError):
                 monitor_history.write_state(path, {"updatedAt": "now"})
             self.assertEqual(path.read_text(encoding="utf-8"), '{"previous":true}\n')
 
@@ -148,7 +128,7 @@ class LocalContractV3Tests(unittest.TestCase):
             ledger.write_text("\n".join(json.dumps(row) for row in (price, old_usage)) + "\n", encoding="utf-8")
 
             self.assertEqual(monitor_migrations.migrate_history_data(root, history, quota, sessions, ledger, samples, 3, dashboard_cache_path=dashboard_cache, usage_sync_cache_path=sync_cache), [3])
-            migrated = monitor_token_ledger.load_token_ledger(ledger)
+            migrated = monitor_migrations._load_v18_token_ledger(ledger)
             self.assertEqual(len(migrated), 1)
             self.assertEqual(migrated[0]["schemaVersion"], 2)
             self.assertNotIn("pricingId", migrated[0])

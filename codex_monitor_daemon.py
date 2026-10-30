@@ -33,10 +33,10 @@ def _main(instance_lock) -> int:
     parser.add_argument("--codex-home", type=Path, default=codex_home(), help="Codex config directory containing sessions/. Defaults to CODEX_HOME or ~/.codex.")
     parser.add_argument("--interval", type=int, default=90)
     parser.add_argument("--timeout", type=int, default=10, help="Per-request timeout in seconds.")
-    parser.add_argument("--quota-history", type=Path, help="Per-account quota reading path. Defaults to ~/.codex-switch/usage_monitor_quota_readings.jsonl.")
-    parser.add_argument("--token-ledger", type=Path, help="Append-only token event and stored-cost path. Defaults to ~/.codex-switch/usage_monitor_token_events.jsonl.")
+    parser.add_argument("--quota-history", type=Path, help="Write-only quota backup path. Defaults to ~/.codex-switch/usage_monitor_quota_readings.jsonl.")
+    parser.add_argument("--token-ledger", type=Path, help="Write-only token event and stored-cost backup path. Defaults to ~/.codex-switch/usage_monitor_token_events.jsonl.")
     parser.add_argument("--sample-log", type=Path, help="Detailed JSONL diagnostic sample path. Defaults to ~/.codex-switch/usage_monitor_diagnostic_samples.jsonl.")
-    parser.add_argument("--sample-log-max-bytes", type=int, default=DEFAULT_SAMPLE_LOG_MAX_BYTES, help="Maximum detailed sample debug log size before oldest rows are trimmed. Defaults to 50 MiB.")
+    parser.add_argument("--sample-log-max-bytes", type=int, default=DEFAULT_SAMPLE_LOG_MAX_BYTES, help="Deprecated compatibility option; write-only backup logs are never trimmed.")
     parser.add_argument("--dashboard", action="store_true", help="Open the local dashboard in the default browser after starting the server.")
     parser.add_argument("--reencrypt-cloud", action="store_true", help="Re-encrypt and verify every encrypted WebDAV payload with the configured hash key, then exit.")
     parser.add_argument("--local-only", action="store_true", help="Only scan local Codex session logs; do not call ChatGPT usage endpoints.")
@@ -72,17 +72,11 @@ def _main(instance_lock) -> int:
     )
     args.account_root = args.data_home / "accounts"
     from monitor_processing import ProcessingIndex
-    print("Startup: initializing the processing index and diagnostic backfill...", flush=True)
+    print("Startup: initializing the processing index...", flush=True)
     index = ProcessingIndex(args.usage_sync_cache.with_name(f"{args.usage_sync_cache.stem}-v4.sqlite3"))
     if args.repair_processing:
         print("Startup: repairing derived processing data...", flush=True)
         index.repair()
-    with index.transaction() as db:
-        backfilled = index.get(db, "diagnosticBackfillComplete", False)
-    if not backfilled:
-        backfill_quota_history(args.sample_log, args.quota_history)
-        with index.transaction() as db:
-            index.put(db, "diagnosticBackfillComplete", True)
     if args.reencrypt_cloud:
         result = CloudManager(args.data_home, SkillManager(args.codex_home, args.data_home), None).reencrypt_remote_data()
         print(f"Re-encrypted and verified {result['reencrypted']} cloud payloads.")

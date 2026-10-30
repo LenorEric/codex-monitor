@@ -22,8 +22,6 @@ def encoded(value):
 
 
 def initialize_delivery(db):
-    from monitor_delivery_legacy import initialize_delivery as legacy
-    legacy(db)  # Empty tables required by released sequential migrations.
     db.executescript("""
         CREATE TABLE IF NOT EXISTS delivery_meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS delivery_dirty(view TEXT,account TEXT,PRIMARY KEY(view,account));
@@ -125,7 +123,7 @@ class DashboardDelivery:
                 if view == "merged":
                     rows = db.execute("SELECT data FROM processing_effective WHERE account=? AND record_key=?", (account, key))
                 else:
-                    rows = db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' AND account=? AND record_key=?", (str(projector.store.token_ledger_path.resolve()), account, key))
+                    rows = db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' AND account=? AND record_key=?", ("local:tokenLedger", account, key))
                 events.extend(json.loads(row[0]) for row in rows)
         if existing is None:
             point = db.execute("SELECT data FROM processing_quota_points WHERE view=? AND account=? ORDER BY event_at DESC LIMIT 1", (view, account)).fetchone()

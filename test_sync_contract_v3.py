@@ -9,8 +9,9 @@ from unittest import mock
 
 from monitor_migrations import FormatConverter
 from monitor_common import empty_cost_totals, empty_token_totals
-from monitor_history import load_quota_history, write_quota_history
-from monitor_token_ledger import _source_highwaters, load_token_ledger, write_token_ledger
+from monitor_history import load_quota_history
+from monitor_token_ledger import _source_highwaters
+from monitor_migrations import _load_v18_token_ledger as load_token_ledger
 from monitor_usage_sync import v4_record_envelope, v4_logical_hash, UsageDataStore, add_record_provenance, canonical_ledger_row, merge_token_ledger_rows, record_key, validate_sync_operation
 
 
@@ -89,8 +90,8 @@ class SyncContractV3Tests(unittest.TestCase):
             store = self.store(directory)
             local = quota_row("machine-a", "local:machine-a:slot-a", "old-record") | {"accountSlotId": "slot-a", "accountLabel": "A"}
             converter = FormatConverter({}, {"usage": {"accountAliases": {local["sync"]["accountId"]: "v3:stable-a"}}}, {}, "machine-a")
-            write_quota_history(store.quota_path, [converter.row("quota", local)])
-            normalized, _ = store.normalize_local()
+            store.record_quota(converter.row("quota", local))
+            normalized, _ = store.datasets()
             self.assertEqual(normalized[0]["sync"]["accountId"], "v3:stable-a")
             self.assertNotEqual(normalized[0]["sync"]["recordId"], "old-record")
             self.assertEqual(load_quota_history(store.quota_path), normalized)
@@ -103,8 +104,8 @@ class SyncContractV3Tests(unittest.TestCase):
             legacy = usage_row(account="legacy-hmac", event_id="event-b")
             stable = usage_row(account="v3:" + "a" * 64, event_id="event-c")
             converter = FormatConverter({}, {"usage": {"accountAliases": {"legacy-hmac": "v3:stable-a"}}}, {}, "machine-a")
-            write_token_ledger(store.token_ledger_path, [untagged, converter.row("tokenLedger", legacy), stable])
-            store.normalize_local()
+            store.record_ledger([untagged, converter.row("tokenLedger", legacy), stable])
+            store.datasets()
             identities = {row["eventId"]: row["sync"]["accountId"] for row in load_token_ledger(store.token_ledger_path)}
             self.assertEqual(identities, {"event-a": "v3:stable-a", "event-b": "v3:stable-a", "event-c": "v3:" + "a" * 64})
 
@@ -120,8 +121,8 @@ class SyncContractV3Tests(unittest.TestCase):
             }
             baseline = FormatConverter({}, {}, {}, "machine-a").row("tokenLedger", baseline)
             before = _source_highwaters([baseline])
-            write_token_ledger(store.token_ledger_path, [baseline])
-            store.normalize_local()
+            store.record_ledger([baseline])
+            store.datasets()
             persisted = load_token_ledger(store.token_ledger_path)
             self.assertEqual(_source_highwaters(persisted), before)
             self.assertIn("sourceTotals", persisted[0])
@@ -133,7 +134,7 @@ class SyncContractV3Tests(unittest.TestCase):
             store = UsageDataStore(directory / "quota.jsonl", directory / "ledger.jsonl", "machine-a", lambda _slot: stable_id, threading.Lock(), mapper)
             store.quota_path.write_text("", encoding="utf-8")
             local = usage_row(account=stable_id)
-            write_token_ledger(store.token_ledger_path, [local])
+            store.record_ledger([local])
             remote = usage_row(machine="machine-b", account="legacy-hmac")
             remote = FormatConverter({}, {"usage": {"accountAliases": {"legacy-hmac": stable_id}}}, {}, "machine-a").row("tokenLedger", remote)
             self.import_peer(store, "machine-b", "tokenLedger", remote)
@@ -158,11 +159,9 @@ class SyncContractV3Tests(unittest.TestCase):
     def test_foreign_history_is_rejected_until_explicit_migration(self):
         with self.directory() as directory:
             store = self.store(directory, mapper=lambda *_args: ("slot-a", "A"))
-            write_quota_history(store.quota_path, [quota_row()])
-            original = store.quota_path.read_bytes()
             with self.assertRaisesRegex(ValueError, "require data migration"):
-                store.normalize_local()
-            self.assertEqual(store.quota_path.read_bytes(), original)
+                store.record_quota(quota_row())
+            self.assertEqual(store.datasets(), ([], []))
 
 
 if __name__ == "__main__":

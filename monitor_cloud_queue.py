@@ -3,6 +3,7 @@
 from collections import deque
 from copy import deepcopy
 import threading
+import time
 import uuid
 
 from monitor_common import now_iso as timestamp
@@ -17,7 +18,8 @@ class OperationCancelled(OperationSkipped):
 
 
 class CloudOperationQueue:
-    def __init__(self):
+    def __init__(self, diagnostic_log=None):
+        self.diagnostic_log = diagnostic_log
         self.session_id = uuid.uuid4().hex
         self.lock = threading.RLock()
         self.pending = deque()
@@ -34,6 +36,14 @@ class CloudOperationQueue:
     def _event(self, operation, phase):
         self.sequence += 1
         self.events.append({"id": self.sequence, "phase": phase, "operation": deepcopy(operation["public"])})
+        if self.diagnostic_log:
+            public = operation["public"]
+            self.diagnostic_log.write("operation_" + phase, **operation["sanitize"]({
+                "operationId": public["id"], "sessionId": self.session_id, "action": public["action"], "source": public["source"], "target": public["target"], "status": public["status"],
+                "elapsedMs": round((time.monotonic() - operation["queued_monotonic"]) * 1000, 3),
+                "error": {key: value for key, value in (public.get("error") or {}).items() if key != "details"},
+                "partial": public["status"] == "failed" and operation.get("exception") is None,
+                "failures": str((public.get("result") or {}).get("errors", ""))[:2048] if isinstance(public.get("result"), dict) else ""}))
 
     def submit(self, action, execute, *, target="", source="manual", validate=None, combine_key=None, context=None, sanitize=None):
         with self.lock:
@@ -42,6 +52,7 @@ class CloudOperationQueue:
             operation = {
                 "public": {"id": uuid.uuid4().hex, "action": action, "target": target, "source": source, "status": "queued", "queuedAt": timestamp(), "context": context or {}},
                 "execute": execute, "validate": validate, "combineKey": combine_key, "done": threading.Event(), "sanitize": sanitize or (lambda value: value),
+                "queued_monotonic": time.monotonic(),
             }
             self.pending.append(operation)
             self._event(operation, "start")
@@ -67,6 +78,7 @@ class CloudOperationQueue:
         operation["public"].update(status=status, finishedAt=timestamp())
         if error is not None:
             operation["public"]["error"] = operation["sanitize"]({"message": str(error), "status": getattr(error, "status", 500),
+                "category": getattr(error, "category", None), "httpStatus": getattr(error, "http_status", None), "exceptionType": type(error).__name__,
                 "details": getattr(error, "details", None), "decryptFailed": bool(getattr(error, "decrypt_failed", False))})
         else:
             operation["public"]["result"] = operation["sanitize"](deepcopy(result))
@@ -106,6 +118,8 @@ class CloudOperationQueue:
             valid = []
             for operation in batch:
                 try:
+                    if self.diagnostic_log:
+                        self.diagnostic_log.context.operation_id = operation["public"]["id"]
                     if operation["validate"]:
                         operation["validate"]()
                     valid.append(operation)
@@ -114,6 +128,9 @@ class CloudOperationQueue:
                         self._finish(operation, "skipped" if isinstance(exc, OperationSkipped) or getattr(exc, "status", None) in {400, 404, 409} else "failed", error=exc)
             if valid:
                 try:
+                    if self.diagnostic_log:
+                        self.diagnostic_log.context.operation_id = valid[0]["public"]["id"]
+                        self.diagnostic_log.write("operation_running", operationIds=[item["public"]["id"] for item in valid], action=valid[0]["public"]["action"])
                     result = valid[0]["execute"]()
                 except Exception as exc:
                     with self.lock:
@@ -126,6 +143,8 @@ class CloudOperationQueue:
                             self._finish(operation, "failed" if pending else "succeeded", result=result)
             with self.lock:
                 self.active = []
+            if self.diagnostic_log:
+                self.diagnostic_log.context.operation_id = None
 
     def close(self):
         with self.lock:

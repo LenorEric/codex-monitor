@@ -58,6 +58,7 @@ class UsageV4Tests(unittest.TestCase):
         self.root.mkdir()
         self.addCleanup(shutil.rmtree, self.root, True)
         self.client = MemoryWebDav()
+        self.stores = {}
         key = passphrase_hash("test passphrase", "https://example.test", "user")
         self.box = CryptoBox(key, CryptoBox.descriptor(key))
 
@@ -70,14 +71,13 @@ class UsageV4Tests(unittest.TestCase):
         quota, ledger = root / "quota.jsonl", root / "ledger.jsonl"
         store = UsageDataStore(quota, ledger, cloud.machine_id, lambda _slot: "v3:account-a", threading.RLock())
         cloud.configure_usage_sync(store)
+        self.stores[quota] = store
         return cloud, quota
 
-    @staticmethod
-    def append(quota, machine_id, key, checked_at, used=1):
+    def append(self, quota, machine_id, key, checked_at, used=1):
         quota.parent.mkdir(parents=True, exist_ok=True)
         row = {"checkedAt": checked_at, "windows": {"5h": {"usedPercent": used, "plan": "plus"}}, "sync": {"version": 1, "originMachineId": machine_id, "accountId": "v3:account-a", "recordId": key}}
-        with quota.open("a", encoding="utf-8") as output:
-            output.write(json.dumps(row) + "\n")
+        self.stores[quota].record_quota(row)
 
     def test_periods_consolidation_and_reader_digest(self):
         author, quota = self.device("author")
@@ -229,16 +229,16 @@ class UsageV4Tests(unittest.TestCase):
         self.assertEqual(reader._usage_data.v4_cached_days("future-client")["2030-01-01"]["logicalHash"], manifest["logicalHash"])
         self.assertEqual(reader._usage_data.datasets("merged"), ([], []))
 
-    def test_appended_quota_uses_tail_and_rewrite_reconciles(self):
+    def test_direct_quota_writes_publish_and_log_rewrite_does_not_reconcile(self):
         author, quota = self.device("author")
         self.append(quota, author.machine_id, "one", "2030-01-01T00:01:00Z")
         self.assertEqual(len(author._usage_data.v4_local_snapshot(moment("2030-01-01T00:05:00Z"))["2030-01-01"]["parts"]), 1)
         self.append(quota, author.machine_id, "two", "2030-01-01T00:06:00Z")
-        with mock.patch.object(author._usage_data, "_load", side_effect=AssertionError("full source scan")):
+        with mock.patch("monitor_history.load_quota_history", side_effect=AssertionError("backup read")):
             author._usage_data.v4_local_snapshot(moment("2030-01-01T00:07:00Z"))
         self.assertEqual(len(author._usage_data.v4_local_snapshot(moment("2030-01-01T00:08:00Z"))["2030-01-01"]["parts"]), 1)
         quota.write_text("", encoding="utf-8")
-        self.assertEqual(author._usage_data.v4_local_snapshot(moment("2030-01-01T00:09:00Z")), {})
+        self.assertTrue(author._usage_data.v4_local_snapshot(moment("2030-01-01T00:09:00Z")))
 
 
 if __name__ == "__main__":

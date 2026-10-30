@@ -228,13 +228,13 @@ Automatic usage synchronization supplements the directional manual Push and Fetc
 
 - It runs every 60 minutes when `usageDataAutoSync` is enabled. The one-hour interval is measured from the last attempted sync, so both successful and failed attempts delay the next attempt by one hour.
 - It synchronizes quota history and every event-level token-ledger record. Cost/usage chart points and token-session summaries are rebuilt locally and are never synchronized.
-- Local quota history keeps every accepted poll. Cloud synchronization removes only redundant interior samples from unchanged quota plateaus and marks the retained endpoint with the covered range;
+- SQLite keeps raw local quota readings, including repeats and rejected readings. Cloud synchronization preserves the raw history;
   gaps over four hours remain separate and unmarked so charts can distinguish compaction from a real monitoring outage.
 - It excludes credentials, skill contents, detailed sample logs, and runtime state.
 - Each machine publishes a v4 encrypted head pointing to month catalogs, day manifests and immutable data partitions. Changed days are uploaded and verified before the head commits with a conditional ETag.
 - Fetch compares remote day hashes with the SQLite cache and downloads missing or changed partitions. Removed machine origins are reconciled after reading the complete inventory.
 - Usage account IDs are domain-separated hashes of account identity and stay unchanged when the encryption passphrase changes. Ordered migration converts old IDs before normal loading; runtime account matching uses current IDs only.
-- Dashboard projections and prepared account snapshots share the typed SQLite store. Raw recorder files and token/session totals remain authoritative; obsolete JSON display caches are removed during migration.
+- Dashboard projections and prepared account snapshots share the typed SQLite store. SQLite facts and token/session totals remain authoritative; recorder files are write-only logs and obsolete JSON display caches are removed during migration.
 
 Every 60 minutes, periodic Fetch also checks the authoritative skill index and refreshes the remote-account list. Strong head ETags skip unchanged usage inventories. Every 30 days a full fetch verifies active remote partitions. The first periodic Fetch runs immediately when no previous attempt is recorded or when that attempt is at least one hour old.
 
@@ -247,18 +247,23 @@ The canonical data root is `~/.codex-switch`:
 | `config.json` | Server and auto-update settings, plaintext WebDAV login password, cookie secret, password verifier, and derived encryption key | No |
 | `accounts/` | Sensitive Codex account vault and manifest | Explicit API Share/Link or OpenAI Release/Bind only |
 | `skills/` | Private managed skill source | Optional encrypted packages |
-| `usage_monitor_quota_readings.jsonl` | Complete local accepted quota readings | Compacted derived records only |
-| `usage_monitor_token_events.jsonl` | Append-only usage events with recorded costs and preserved session baselines; authoritative for token and cost totals | Every record, encrypted |
-| `usage_monitor_diagnostic_samples.jsonl` | Detailed local diagnostic samples | Never |
-| `usage_monitor_state.json` | Runtime baselines and cursors | Never |
+| `usage_monitor_quota_readings.jsonl` | Write-only backup of raw quota readings | Raw SQLite records, encrypted |
+| `usage_monitor_token_events.jsonl` | Write-only backup of usage events, stored costs, and corrections | Every record, encrypted |
+| `usage_monitor_diagnostic_samples.jsonl` | Write-only diagnostic backup | Never |
+| `usage_monitor_state.json` | Compatibility status output; SQLite owns restart state | Never |
+| `webdav.log` | Local WebDAV operation and HTTP diagnostics, capped at 5 MB (5,000,000 bytes); oldest complete entries are removed when full | Never |
 | `usage_monitor_sync_cache-v4.sqlite3` | Typed local/remote facts, incremental processing, dashboard projections and bulk/live interpretation data | Never uploaded as a database |
 
 Each token event stores its cost calculated using the price effective at the event time. Stored costs remain authoritative after pricing changes; redundant price-epoch records and references are removed by the ordered data-contract migration after verifying totals. Existing session-only totals are preserved as schema 2 `sessionBaseline` records, which contribute to token summaries but not Cost vs Usage charts. Source high-water totals are retained to prevent historical usage from being replayed.
 
-Derived charts are rebuilt from retained quota history and token-ledger events; obsolete cost-chart records are not converted. Local quota and ledger entries are appended and flushed to disk, runtime state is atomically replaced, and interrupted migrations recover before affected data is loaded.
+SQLite is authoritative for usage facts, token costs, parser checkpoints, synchronization ownership, and derived charts. Python ingestion reads original Codex session files and writes records directly to SQLite. The same transaction queues independent JSONL backup appends; failed log writes retry without blocking committed usage data. Startup, queries, synchronization, renaming, repair, and source reconciliation never read recorder JSONL. Contract 19 converts existing complete SQLite data to fixed local source identities and finalizes saved database processing state. It does not read or import recorder histories.
 
 > [!WARNING]
 > Protect the whole `~/.codex-switch` directory. Never commit it, place it in support bundles, log it, or share screenshots of its contents. Losing the encryption passphrase makes encrypted remote data unrecoverable.
+
+For WebDAV failures, inspect `webdav.log` as JSON lines: Unix timestamps and operation IDs link queued/running/completed operations to individual requests, HTTP statuses, durations, byte counts, retries, and allowlisted response headers
+(including `Retry-After`, rate-limit headers, and server request IDs). Credentials, authorization/cookie/lock headers, and request/response bodies are omitted. Treat remote paths and diagnostic error messages as private.
+Logging is automatic; a full log drops its oldest entries, and a logging I/O failure does not interrupt synchronization.
 
 Dashboard series and status are intentionally readable from the configured server address. Every account, skill, WebDAV, cloud, server, and configuration mutation requires the control password.
 Control requests are accepted through public addresses and reverse proxies without an origin restriction so cloud deployments retain all dashboard features.
@@ -280,10 +285,10 @@ python codex_monitor_daemon.py --help
 | `--auth PATH` | Override the live authentication file. |
 | `--interval SECONDS` | Set the remote usage polling interval; default is 90 seconds. |
 | `--timeout SECONDS` | Set the per-request timeout; default is 10 seconds. |
-| `--quota-history PATH` | Override per-account quota-history JSONL. |
-| `--token-ledger PATH` | Override the append-only token and recorded-cost ledger JSONL. |
-| `--sample-log PATH` | Override the detailed diagnostic JSONL. |
-| `--sample-log-max-bytes N` | Compact the sample log after this size; default is 50 MiB with an 80% target. |
+| `--quota-history PATH` | Override the write-only quota backup path. |
+| `--token-ledger PATH` | Override the write-only token/cost backup path. |
+| `--sample-log PATH` | Override the write-only diagnostic backup path. |
+| `--sample-log-max-bytes N` | Deprecated compatibility option; write-only logs are never trimmed. |
 | `--local-only` | Scan local session logs without calling ChatGPT usage endpoints. |
 | `--no-token-scan` | Disable local session token scanning. |
 | `--reencrypt-cloud` | Refresh nonces and verify all encrypted WebDAV payloads using the configured key, then exit. |
@@ -372,6 +377,8 @@ Codex Usage Monitor is free software licensed under the <a href="./LICENSE">GNU 
 
 ### Quota sampling and raw history
 
-Quota JSONL is an append-only archive of extracted API readings, including repeated and rejected readings. Cloud synchronization transfers this raw history without plateau compaction. Processed quota decisions and per-account/window decrease protection live in SQLite and can be rebuilt from the retained raw history. Quota charts show exact backend values at every resolution, without rate filtering, rounding smoothing, or averaging.
+Quota JSONL is a write-only backup of extracted API readings, including repeated and rejected readings. SQLite owns the raw history, processed quota decisions, per-account/window decrease protection, and cloud publication inputs. Deleting, truncating, or editing recorder JSONL does not change active data. Database backups must preserve synchronization ownership as well as facts. Quota charts show exact backend values at every resolution, without rate filtering, rounding smoothing, or averaging.
 
 Only `reset_at` determines resets; `reset_after_seconds` is ignored. Every decrease is rejected unless its reset timestamp moves forward and is strictly later than the last accepted sample time plus the window period (5h or 7d). A rejected decrease establishes a protection baseline: the next equal or higher reading is accepted; a lower reading is rejected and replaces the baseline. Accepted readings clear protection. Missing windows retain their state, plans establish fresh baselines, and 5h/7d windows are independent. Rejected points are never accepted retroactively.
+
+Recorder logs are append-only, including diagnostics. Corrections append an ordinary updated record with the same identity. Removing a database record does not append an operation or alter earlier log entries. Batches begin with a newline to isolate torn tails without reading the log. A crash between fsync and queue acknowledgement may duplicate a backup delivery. Manual rebuilding from JSONL is controlled by external tools or people. The application provides no recovery reader, replay rules, or manual rebuild command. Normal startup and migration 19 never import these logs.
