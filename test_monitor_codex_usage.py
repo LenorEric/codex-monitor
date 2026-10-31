@@ -78,8 +78,12 @@ from monitor_codex_usage import (
 )
 
 
-def session_baselines_from_sessions(sessions):
-    return [{"schemaVersion": 2, "recordType": "sessionBaseline", "session": session} for session in sessions]
+def usage_records_from_sessions(sessions):
+    # Build current event fixtures; the application no longer reads session baselines.
+    return [{"schemaVersion": 2, "recordType": "usage", "eventId": f"{session['sessionId']}:{model}", "sessionId": session["sessionId"],
+        "occurredAt": session.get("updatedAt"), "accountSlotId": session.get("accountSlotId"), "accountLabel": session.get("accountLabel"),
+        "rawModel": model, "billingModel": model, "serviceTier": "default", "tokens": value.get("tokens", {}), "cost": value.get("cost", {})}
+        for session in sessions for model, value in (session.get("byModel") or {"unknown": session}).items()]
 
 
 def migrate_test_data(root, codex_home=None):
@@ -2548,7 +2552,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(row["cost"], recorded_cost)
         self.assertEqual(row["byModel"]["gpt-5.6-terra"]["cost"], recorded_cost)
 
-    def test_token_ledger_migrates_legacy_cost_once_and_prices_only_new_usage(self):
+    def test_token_ledger_rejects_baselines_and_prices_rebuilt_events(self):
         with self.account_directory() as directory:
             path = directory / "token-ledger.jsonl"
             old_cost = {"inputCostUsd": 2.5, "cachedInputCostUsd": 0.0, "cacheWriteInputCostUsd": 0.0, "outputCostUsd": 0.0, "totalCostUsd": 2.5}
@@ -2559,7 +2563,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"eventId": "historical:2", "sessionId": "historical", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-terra", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
             ]
 
-            ledger, _ = monitor_token_ledger.reconcile_token_ledger([{"schemaVersion": 2, "recordType": "sessionBaseline", "session": legacy}], events, "account", "Account")
+            with self.assertRaises(ValueError):
+                monitor_token_ledger.reconcile_token_ledger([{"schemaVersion": 2, "recordType": "sessionBaseline", "session": legacy}], events, "account", "Account")
+            ledger, _ = monitor_token_ledger.reconcile_token_ledger([], events, "account", "Account")
             rows = monitor_token_ledger.token_sessions_from_ledger(ledger)
             repeated, _ = monitor_token_ledger.reconcile_token_ledger(ledger, events, "account", "Account")
             repeated = monitor_token_ledger.token_sessions_from_ledger(repeated)
@@ -2569,7 +2575,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(rows[0]["cost"]["totalCostUsd"], 4.5)
         self.assertEqual(repeated[0]["cost"]["totalCostUsd"], 4.5)
         self.assertEqual(reloaded[0]["cost"]["totalCostUsd"], 4.5)
-        self.assertEqual([row["recordType"] for row in ledger], ["sessionBaseline", "usage"])
+        self.assertEqual([row["recordType"] for row in ledger], ["usage", "usage"])
         self.assertEqual(ledger[1]["cost"]["totalCostUsd"], 2.0)
         self.assertNotIn("pricingId", ledger[1])
 
@@ -3615,7 +3621,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             "tokens": {"inputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}, "byModel": {"gpt-5.5": {"tokens": {"inputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}}},
         }
         accounts = {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "Account A"}]}
-        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard._dashboard_display_data([], session_baselines_from_sessions([monitor_history.normalize_token_session_row(session)]), monitor_dashboard.dashboard_account_status(accounts)))
+        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard._dashboard_display_data([], usage_records_from_sessions([monitor_history.normalize_token_session_row(session)]), monitor_dashboard.dashboard_account_status(accounts)))
 
         model = payload["tokenSessions"][0]["byModel"]["gpt-5.5"]
         self.assertEqual(model["usageTokens"], {"inputTokens": 123, "freshInputTokens": 123, "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 45, "totalTokens": 168, "requests": 0})
@@ -3722,7 +3728,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         local_quota = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}
         merged_quota = {"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 2}}}
         local_session = {"sessionId": "local", "tokens": {}, "byModel": {}}
-        payload = monitor_dashboard._dashboard_display_data([local_quota], session_baselines_from_sessions([monitor_history.normalize_token_session_row(local_session)]), {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]})
+        payload = monitor_dashboard._dashboard_display_data([local_quota], usage_records_from_sessions([monitor_history.normalize_token_session_row(local_session)]), {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]})
 
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 1)
         self.assertEqual(payload["tokenSessions"][0]["sessionId"], "local")
@@ -4104,7 +4110,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 12.0)
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["continuous"], 12.0)
         self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["plan"], "plus")
-        self.assertEqual(payload["quotaPoints"][1]["compactedFrom"], monitor_common.parse_timestamp("2029-12-31T12:00:00Z"))
+        self.assertNotIn("compactedFrom", payload["quotaPoints"][1])
 
 
     def test_usage_time_filter_rebases_same_account_on_subscription_change(self):

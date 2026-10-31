@@ -114,6 +114,42 @@ class SamplingStorageTests(unittest.TestCase):
         with self.store.index.transaction() as db:
             return stored_points(db, view)
 
+    def test_independent_refresh_does_not_advance_or_replace_other_window(self):
+        first = reading(0, 10, seven=20)
+        self.append(first)
+        later = reading(1, 10, seven=21)
+        later["windows"]["5h"]["percentCheckedAt"] = first["checkedAt"]
+        self.append(later)
+        with self.store.index.transaction() as db:
+            state = self.store.index.get(db, "samplingState:local:v3:a")["windows"]
+            self.assertEqual(state["fiveHour"]["checkedAt"], first["checkedAt"])
+            self.assertEqual(state["sevenDay"]["checkedAt"], later["checkedAt"])
+            self.assertEqual(db.execute("SELECT count(*) FROM quota_windows WHERE window='5h'").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM quota_windows WHERE window='7d'").fetchone()[0], 1)
+            self.assertEqual(
+                [row[0] for row in db.execute("SELECT seven_day_usedPercent FROM sample_records ORDER BY id")],
+                [20.0, 21.0],
+            )
+        rows = self.store.index.rows("quota")
+        self.assertEqual(rows[0]["windows"]["7d"]["usedPercent"], 20)
+        self.assertEqual(set(rows[1]["windows"]), {"7d"})
+        # A second partial reading at the same timestamp preserves its sibling.
+        partial = reading(1, 11)
+        self.append(partial)
+        self.assertEqual(set(self.store.index.rows("quota")[1]["windows"]), {"5h", "7d"})
+        restarted = ProcessingIndex(self.store.v4_cache_path)
+        with restarted.transaction() as db:
+            self.assertEqual(restarted.get(db, "samplingState:local:v3:a")["windows"]["sevenDay"]["raw"], 21)
+        reverse = reading(2, 12, seven=21)
+        reverse["windows"]["7d"]["percentCheckedAt"] = later["checkedAt"]
+        self.append(reverse)
+        with self.store.index.transaction() as db:
+            state = self.store.index.get(db, "samplingState:local:v3:a")["windows"]
+            self.assertEqual(state["fiveHour"]["checkedAt"], reverse["checkedAt"])
+            self.assertEqual(state["sevenDay"]["checkedAt"], later["checkedAt"])
+            self.assertEqual(db.execute("SELECT count(*) FROM sample_records WHERE seven_day_usedPercent IS NOT NULL").fetchone()[0], 2)
+
+
     def test_reset_projection_costs_restart_correction_and_migration(self):
         import monitor_migrations
         from monitor_projection import DashboardProjector
@@ -149,7 +185,7 @@ class SamplingStorageTests(unittest.TestCase):
             monitor_migrations.migrate_history_data(*args)
         self.assertEqual(self.store.quota_path.read_bytes(), original)
         self.assertEqual(self.points(), expected)
-        self.assertEqual(monitor_migrations.migrate_history_data(*args), [17, 18, 19])
+        self.assertEqual(monitor_migrations.migrate_history_data(*args), [17, 18, 19, 20])
         self.assertEqual(self.store.quota_path.read_bytes(), original)
         self.store.index = ProcessingIndex(self.store.v4_cache_path)
         self.store.ingest_local()
@@ -244,6 +280,13 @@ class SamplingStorageTests(unittest.TestCase):
         raw = [json.loads(line) for line in self.store.quota_path.read_text().splitlines() if line.strip()]
         self.assertEqual([row["windows"]["5h"]["usedPercent"] for row in raw], [40, 20, 20])
         self.assertNotIn("continuous", self.store.quota_path.read_text())
+        fourth = reading(3, 20, seven=13)
+        fourth["windows"]["5h"]["percentCheckedAt"] = third["checkedAt"]
+        state._record_quota_sample_locked(fourth)
+        self.assertNotIn("5h", fourth["rejectedWindows"])
+        self.assertEqual(fourth["windows"]["5h"]["percentCheckedAt"], third["checkedAt"])
+        self.assertEqual(fourth["windows"]["7d"]["percentCheckedAt"], fourth["checkedAt"])
+
 
     def test_cloud_raw_replay_matches_local_and_preserves_rejected_records(self):
         rows = [reading(index, value) for index, value in enumerate([40, 20, 20, 19, 19])]

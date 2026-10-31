@@ -97,34 +97,15 @@ def _validate_token_ledger_row(row: dict) -> None:
         raise ValueError("Invalid synchronized token ledger provenance")
     if meta.get("localOnly") not in {None, False}:
         raise ValueError("Local-only token ledger records cannot be synchronized")
-    if "sourceCoverage" in row:
-        from monitor_token_ledger import validate_source_coverage
-        validate_source_coverage(row["sourceCoverage"])
-    if row.get("recordType") == "usage":
-        if (
-            not isinstance(row.get("eventId"), str) or not row["eventId"] or not isinstance(row.get("sessionId"), str) or not row["sessionId"] or parse_timestamp(row.get("occurredAt")) is None
-            or not isinstance(row.get("rawModel"), str) or not row["rawModel"] or not isinstance(row.get("billingModel"), str) or not row["billingModel"] or row.get("serviceTier") not in {"default", "fast"}
-        ):
-            raise ValueError("Invalid synchronized token usage record")
-        _validate_totals(row.get("tokens"), empty_token_totals(), integral=True, label="token")
-        _validate_totals(row.get("cost"), empty_cost_totals(), integral=False, label="cost")
-    elif row.get("recordType") == "sessionBaseline":
-        session = row.get("session")
-        if not isinstance(session, dict) or not isinstance(session.get("sessionId"), str) or not session["sessionId"]:
-            raise ValueError("Invalid synchronized token baseline record")
-        _validate_totals(session.get("tokens"), empty_token_totals(), integral=True, label="token")
-        _validate_totals(session.get("cost"), empty_cost_totals(), integral=False, label="cost")
-        if any(session.get(key) is not None and parse_timestamp(session.get(key)) is None for key in ("startedAt", "updatedAt")) or not isinstance(session.get("byModel"), dict):
-            raise ValueError("Invalid synchronized token baseline session")
-        for model, value in session["byModel"].items():
-            if not isinstance(model, str) or not model or not isinstance(value, dict):
-                raise ValueError("Invalid synchronized token baseline model")
-            _validate_totals(value.get("tokens"), empty_token_totals(), integral=True, label="token")
-            _validate_totals(value.get("cost"), empty_cost_totals(), integral=False, label="cost")
-            if "fastTokens" in value:
-                _validate_totals(value["fastTokens"], empty_token_totals(), integral=True, label="token")
-    else:
-        raise ValueError("Invalid synchronized token ledger record")
+    from monitor_token_ledger import canonical_token_ledger_rows
+    canonical_token_ledger_rows([row])
+    if (
+        not isinstance(row.get("eventId"), str) or not row["eventId"] or not isinstance(row.get("sessionId"), str) or not row["sessionId"] or parse_timestamp(row.get("occurredAt")) is None
+        or not isinstance(row.get("rawModel"), str) or not row["rawModel"] or not isinstance(row.get("billingModel"), str) or not row["billingModel"] or row.get("serviceTier") not in {"default", "fast"}
+    ):
+        raise ValueError("Invalid synchronized token usage record")
+    _validate_totals(row.get("tokens"), empty_token_totals(), integral=True, label="token")
+    _validate_totals(row.get("cost"), empty_cost_totals(), integral=False, label="cost")
 
 
 def _validate_totals(value: object, template: dict, integral: bool, label: str) -> None:
@@ -148,12 +129,6 @@ def _validate_quota_row(row: dict) -> None:
             or window.get("resetAt") is not None and parse_timestamp(window.get("resetAt")) is None or not isinstance(window.get("plan"), str) or not window["plan"]
         ):
             raise ValueError("Invalid synchronized quota window")
-    compaction = row.get("compaction")
-    if compaction is not None and (
-        not isinstance(compaction, dict) or parse_timestamp(compaction.get("continuousFrom")) is None or isinstance(compaction.get("omittedSamples"), bool)
-        or not isinstance(compaction.get("omittedSamples"), int) or compaction["omittedSamples"] <= 0
-    ):
-        raise ValueError("Invalid synchronized quota compaction")
 
 
 def validate_sync_operation(operation: dict) -> None:
@@ -205,8 +180,6 @@ def merge_quota_rows(rows: list[dict]) -> list[dict]:
         if key in merged:
             previous = merged[key]
             row = previous | row | {"windows": (previous.get("windows") or {}) | (row.get("windows") or {})}
-            if previous.get("compaction") and not row.get("compaction"):
-                row["compaction"] = previous["compaction"]
             if sync_meta(previous).get("originMachineId") and not sync_meta(row).get("originMachineId"):
                 row[SYNC_META_KEY] = previous[SYNC_META_KEY]
         merged[key] = row
@@ -217,23 +190,18 @@ def _ledger_identity(row: dict) -> tuple | None:
     record_type = row.get("recordType")
     if record_type == "usage" and row.get("eventId"):
         return record_type, record_account_key(row), str(row["eventId"])
-    session = row.get("session") or {}
-    if record_type == "sessionBaseline" and session.get("sessionId"):
-        return record_type, record_account_key(row), str(session["sessionId"])
     return None
 
 
 def _ledger_content(row: dict) -> dict:
     value = {key: item for key, item in row.items() if key not in {"accountSlotId", "accountLabel", SYNC_META_KEY}}
-    if row.get("recordType") == "sessionBaseline" and isinstance(value.get("session"), dict):
-        value["session"] = {key: item for key, item in value["session"].items() if key not in {"accountSlotId", "accountLabel", SYNC_META_KEY}}
     return value
 
 
-def canonical_ledger_row(row: dict, preserve_highwater: bool = False) -> dict:
+def canonical_ledger_row(row: dict) -> dict:
     from monitor_token_ledger import canonical_token_ledger_rows
     canonical_token_ledger_rows([row])
-    return row if preserve_highwater else {key: value for key, value in row.items() if key != "sourceTotals"}
+    return row
 
 
 def merge_token_ledger_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
@@ -251,8 +219,6 @@ def merge_token_ledger_rows(rows: list[dict]) -> tuple[list[dict], list[dict]]:
     def sort_key(row: dict) -> tuple:
         if row.get("recordType") == "usage":
             return 2, parse_timestamp(row.get("occurredAt")) or 0, str(row.get("eventId") or "")
-        if row.get("recordType") == "sessionBaseline":
-            return 1, 0, str((row.get("session") or {}).get("sessionId") or "")
         return 0, 0, ""
     return sorted(merged.values(), key=sort_key), conflicts
 
@@ -377,8 +343,6 @@ def active_records(quota: list[dict], ledger: list[dict], machine_id: str, accou
         if not syncable_record("tokenLedger", row, machine_id):
             continue
         transport = {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}
-        if source.get("recordType") == "sessionBaseline" and isinstance(transport.get("session"), dict):
-            transport["session"] = {key: value for key, value in transport["session"].items() if key not in {"accountSlotId", "accountLabel"}}
         records[record_key("tokenLedger", row)] = {"kind": "tokenLedger", "row": transport}
     return records
 
@@ -460,7 +424,7 @@ class UsageDataStore:
     def normalize_new_ledger(self, row):
         if sync_meta(row).get("originMachineId", self.machine_id) != self.machine_id:
             raise ValueError("Foreign records in local history require data migration")
-        if (row := canonical_ledger_row(row, preserve_highwater=True)) is None:
+        if (row := canonical_ledger_row(row)) is None:
             return None
         source = row.get("session") or row
         row = add_record_provenance("tokenLedger", row, self.machine_id, self.account_id_resolver(source.get("accountSlotId")))
@@ -482,21 +446,20 @@ class UsageDataStore:
         return changed
 
     def record_quota(self, sample):
-        from monitor_history import quota_history_row_from_sample
-        row = quota_history_row_from_sample(sample)
-        if row is None:
+        from monitor_history import quota_history_rows_from_sample
+        rows = [self.normalize_new_quota(row) for row in quota_history_rows_from_sample(sample)]
+        if not rows:
             return False
-        row = self.normalize_new_quota(row)
         with self.lock, self.index.transaction() as db:
-            changed = self.index.write_records(db, "quota", [row])
-            self.backup.enqueue(db, self.quota_path, [row])
+            # A partial window update must retain the other window at that timestamp.
+            for i, row in enumerate(rows):
+                previous = db.execute("SELECT data FROM processing_facts WHERE source='local:quota' AND record_key=?", (record_key("quota", row),)).fetchone()
+                if previous:
+                    rows[i] = json.loads(previous[0]) | row | {"windows": json.loads(previous[0])["windows"] | row["windows"]}
+            changed = self.index.write_records(db, "quota", rows)
+            self.backup.enqueue(db, self.quota_path, rows)
         self.backup.flush()
         return changed
-
-    def record_diagnostic(self, path, row):
-        with self.index.transaction() as db:
-            self.backup.enqueue(db, path, [row])
-        self.backup.flush()
 
     def record_ledger(self, rows, *, replace=False):
         rows = [normalized for row in rows if (normalized := self.normalize_new_ledger(row)) is not None]
@@ -514,6 +477,7 @@ class UsageDataStore:
                 return
             previous_revision = self.index.get(db, f"peerRevision:{source}")
             remap = force or previous_revision is None or previous_revision[1] != revision[1]
+            device_id = samples._dimension(db, "device", machine_id)
             def remove(position):
                 previous = db.execute("SELECT kind,record_key,account FROM processing_facts WHERE source=? AND position=?", (source, position)).fetchone()
                 if previous:
@@ -521,24 +485,36 @@ class UsageDataStore:
                     self.index.dirty(db, previous[2], "peer update", ("merged",))
                     if previous[0] == "tokenLedger":
                         self.index._effective(db, previous[1])
-            for key, position in list(db.execute("SELECT p.record_key,p.position FROM processing_peer_rows p WHERE p.source=? AND NOT EXISTS "
-                "(SELECT 1 FROM remote_records r WHERE r.machine_id=? AND r.day=? AND r.record_key=p.record_key)", (source, machine_id, day))):
+            for (position,) in list(db.execute(
+                "SELECT f.position FROM processing_facts f WHERE f.source=? AND NOT EXISTS ("
+                "SELECT 1 FROM remote_record_refs r WHERE r.device_id=? AND r.day=? AND r.record_key=f.record_key)",
+                (source, device_id, day),
+            )):
                 remove(position)
-                db.execute("DELETE FROM processing_peer_rows WHERE source=? AND record_key=?", (source, key))
-            position = db.execute("SELECT COALESCE(MAX(position),-1)+1 FROM processing_peer_rows WHERE source=?", (source,)).fetchone()[0]
-            for key, digest, data in db.execute("SELECT r.record_key,r.content_hash,r.record_json FROM remote_records r LEFT JOIN processing_peer_rows p ON p.source=? AND p.record_key=r.record_key "
-                "WHERE r.machine_id=? AND r.day=? AND (? OR p.record_key IS NULL OR p.digest<>r.content_hash) ORDER BY r.record_key", (source, machine_id, day, remap)):
-                previous = db.execute("SELECT position FROM processing_peer_rows WHERE source=? AND record_key=?", (source, key)).fetchone()
-                target = previous[0] if previous else position
+            max_fact = db.execute("SELECT COALESCE(MAX(position),-1) FROM processing_facts WHERE source=?", (source,)).fetchone()[0]
+            max_peer = db.execute("SELECT COALESCE(MAX(peer_position),-1) FROM remote_record_refs WHERE device_id=? AND day=?", (device_id, day)).fetchone()[0]
+            position = max(max_fact, max_peer) + 1
+            for key, peer_pos, data in db.execute(
+                "SELECT r.record_key,x.peer_position,r.record_json FROM remote_records r "
+                "JOIN remote_record_refs x ON x.device_id=? AND x.record_key=r.record_key "
+                "WHERE r.machine_id=? AND r.day=? AND (? OR x.peer_position IS NULL) ORDER BY r.record_key",
+                (device_id, machine_id, day, remap),
+            ):
+                existing = db.execute("SELECT position FROM processing_facts WHERE source=? AND record_key=? LIMIT 1", (source, key)).fetchone()
+                had_previous = existing is not None or (peer_pos is not None and peer_pos >= 0)
+                target = existing[0] if existing is not None else (peer_pos if peer_pos is not None and peer_pos >= 0 else position)
                 record = json.loads(data)["record"]
                 row = self._map_account(record["kind"], record["row"]) if record.get("kind") in {"quota", "tokenLedger"} else None
-                if previous:
+                if had_previous:
                     remove(target)
                 if row is not None:
                     self.index.fact(db, source, target, record["kind"], row)
-                db.execute("INSERT OR REPLACE INTO processing_peer_rows VALUES(?,?,?,?)", (source, key, target, digest))
-                if not previous:
-                    position += 1
+                    new_peer_pos = target
+                    if not had_previous:
+                        position += 1
+                else:
+                    new_peer_pos = -1
+                db.execute("UPDATE remote_record_refs SET peer_position=? WHERE device_id=? AND record_key=?", (new_peer_pos, device_id, key))
             db.execute("DELETE FROM processing_ledger_sessions WHERE source=?", (source,))
             self.index.put(db, f"peerRevision:{source}", revision)
             self.index.put(db, "factRevision", self.index.get(db, "factRevision", 0) + 1)
@@ -642,8 +618,6 @@ class UsageDataStore:
         if not str(account_id).startswith("v3:"):
             raise ValueError("Account identity requires data migration")
         projected = row
-        if kind == "tokenLedger" and row.get("recordType") == "sessionBaseline":
-            return projected | {"session": source | {"accountSlotId": slot_id, "accountLabel": label}}
         return projected | {"accountSlotId": slot_id, "accountLabel": label}
 
     def _materialize_datasets(self, local: tuple[list[dict], list[dict]]) -> None:
@@ -666,8 +640,6 @@ class UsageDataStore:
         if kind == "tokenLedger":
             row = canonical_ledger_row(row)
         transport = {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}
-        if kind == "tokenLedger" and row.get("recordType") == "sessionBaseline" and isinstance(transport.get("session"), dict):
-            transport["session"] = {key: value for key, value in transport["session"].items() if key not in {"accountSlotId", "accountLabel"}}
         return {"kind": kind, "row": transport}
 
     def refresh_accounts(self) -> None:
@@ -772,6 +744,14 @@ class UsageDataStore:
                     changed = set(parts) if force or "bulk" in parts or "bulk" in old_parts else {part for part, digest in parts.items() if old_parts.get(part) != digest}
                     if set(downloaded) != changed:
                         raise ValueError("Downloaded usage parts do not match the changed day manifest")
+                    device_id = samples._dimension(db, "device", machine_id)
+                    prior_peers = {
+                        key: (digest, pos)
+                        for key, digest, pos in db.execute(
+                            "SELECT record_key,content_hash,peer_position FROM remote_record_refs WHERE device_id=? AND day=? AND peer_position IS NOT NULL",
+                            (device_id, day),
+                        )
+                    }
                     for part in (set(old_parts) - set(parts)) | changed:
                         db.execute("DELETE FROM remote_records WHERE machine_id=? AND day=? AND part_id=?", (machine_id, day, part))
                     for part, entries in downloaded.items():
@@ -779,7 +759,11 @@ class UsageDataStore:
                             validate_v4_envelope(entry, machine_id)
                             if entry["collectionPeriod"][:10] != day or part != "bulk" and entry["collectionPeriod"] != part or db.execute("SELECT 1 FROM remote_records WHERE machine_id=? AND record_key=?", (machine_id, entry["recordKey"])).fetchone():
                                 raise ValueError("Usage v4 record is stored outside its owning collection period")
-                            samples.put_remote(db, machine_id, day, part, entry["recordKey"], content_hash(entry["record"]), entry)
+                            digest = content_hash(entry["record"])
+                            samples.put_remote(db, machine_id, day, part, entry["recordKey"], digest, entry)
+                            prior = prior_peers.get(entry["recordKey"])
+                            if prior and prior[0] == digest:
+                                db.execute("UPDATE remote_record_refs SET peer_position=? WHERE device_id=? AND record_key=?", (prior[1], device_id, entry["recordKey"]))
                     from monitor_streaming import logical_hash_sorted
                     rows = (json.loads(record_json) for (record_json,) in db.execute("SELECT record_json FROM remote_records WHERE machine_id=? AND day=? ORDER BY record_key", (machine_id, day)))
                     if logical_hash_sorted(rows) != manifest["logicalHash"]:

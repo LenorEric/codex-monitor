@@ -33,6 +33,9 @@
 - A successful explicit release through `build_release.py` freezes the included migration. The next persistent-contract change then creates the next number. Failed builds, commits, tests, and generated runtime/manifest refreshes do not freeze a pending migration.
 - Determine the released baseline from the last successful release, not working-tree metadata or refreshed `release/runtime` files. Never rewrite or merge migrations already released to users; leave every released intermediate version available for sequential upgrades.
 - The pending migration must convert the latest released data directly to the final intended representation. Avoid repeated cache rebuilds and temporary schemas or indexes superseded before release.
+- Rebuilds are optional migration work, never an automatic consequence of completing a migration. Preserve valid projections for representation-only changes; request a rebuild explicitly when changed data or calculation semantics make it useful.
+- Use `request_migration_rebuild(paths, reason, sampling=...)` for explicit rebuild requests. Cascading migrations accumulate a durable pending flag; publish one final projection rebuild request and replay sampling only after the whole cascade succeeds. Preserve pending work on failure and retry.
+- Use explicit sampling/projection rule versions for semantic invalidation; do not hash whole source files or rebuild merely because code changed. Migration steps may request targeted work instead of invalidating all histories.
 - Every migration must cover existing data by preserving it or safely rebuilding an equivalent representation from retained sources. Preserve originals on failure, make retries safe, and run pending steps consecutively on first startup before affected data is used.
 
 ## Developing

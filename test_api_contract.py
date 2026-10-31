@@ -127,7 +127,7 @@ class TimestampMigrationTests(unittest.TestCase):
             samples.put_local(db, "quota:quota-a", "2030-01-01T00:00Z", content_hash(record), record)
             samples.put_remote(db, "machine-a", "2030-01-01", "bulk", "quota:quota-a", content_hash(record), envelope)
             db.execute("INSERT INTO remote_days VALUES('machine-a','2030-01-01','old','{}')")
-        self.assertEqual(self.migrate(), [16, 17, 18, 19])
+        self.assertEqual(self.migrate(), [16, 17, 18, 19, 20])
         self.assertEqual(json.loads(self.paths[1].read_text())["windows"]["5h"]["resetAt"], 1893474000)
         with closing(samples.connect(path)) as db:
             data = json.loads(db.execute("SELECT record_json FROM remote_records").fetchone()[0])
@@ -146,7 +146,7 @@ class TimestampMigrationTests(unittest.TestCase):
         with mock.patch.dict(migrations.DATA_MIGRATIONS, {16: fail}), self.assertRaisesRegex(RuntimeError, "interrupted"):
             self.migrate()
         self.assertEqual(self.paths[1].read_bytes(), original)
-        self.assertEqual(self.migrate(), [16, 17, 18, 19])
+        self.assertEqual(self.migrate(), [16, 17, 18, 19, 20])
 
     def test_pending_migration_rebuilds_quota_decisions_from_preserved_raw(self):
         import threading
@@ -159,7 +159,7 @@ class TimestampMigrationTests(unittest.TestCase):
         store = UsageDataStore(self.paths[1], self.paths[3], "machine-a", lambda _: "v3:account", threading.RLock(), cache_path=self.root / "usage_monitor_sync_cache.json")
         for row in rows:
             store.record_quota(row)
-        self.assertEqual(self.migrate(), [16, 17, 18, 19])
+        self.assertEqual(self.migrate(), [16, 17, 18, 19, 20])
         original = self.paths[1].read_bytes()
         store = UsageDataStore(self.paths[1], self.paths[3], "machine-a", lambda _: "v3:account", threading.RLock(), cache_path=self.root / "usage_monitor_sync_cache.json")
         store.ingest_local()
@@ -201,7 +201,7 @@ class TimestampMigrationTests(unittest.TestCase):
         manifest = cloud._v4_day_manifest(client, box, "machine-a", "2030-01-01", catalog["2030-01-01"])
         records = cloud._v4_data(client, box, "machine-a", "2030-01-01", "bulk", manifest["parts"]["bulk"])
         self.assertEqual(records[0]["record"]["row"]["windows"]["5h"]["resetAt"], 1893474000)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], migrations.CLOUD_DATA_CONTRACT_VERSION)
 
 
 if __name__ == "__main__":

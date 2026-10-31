@@ -27,8 +27,8 @@ class SampleStoreTests(unittest.TestCase):
         return [
             ("quota", {"checkedAt": "2026-10-01T00:00:00.000+00:00", "sync": sync, "accountSlotId": "slot", "accountLabel": "Name",
                 "windows": {"5h": {"usedPercent": 1.0, "resetAt": None, "plan": "plus"}, "7d": None},
-                "compaction": {"continuousFrom": "2026-09-01T00:00:00Z", "omittedSamples": 40}, "future": {"nested": True}}),
-            ("quota", {"checkedAt": None, "windows": {"5h": {}, "newWindow": {"future": 1}}, "compaction": None, "sync": None}),
+                "future": {"nested": True}}),
+            ("quota", {"checkedAt": None, "windows": {"5h": {}, "newWindow": {"future": 1}}, "sync": None}),
             ("quota", {}),
             ("tokenLedger", {"schemaVersion": 2, "recordType": "usage", "eventId": "event", "occurredAt": "2026-10-01T00:00:00.000Z",
                 "sessionId": "session", "rawModel": "gpt-5", "billingModel": "gpt-5", "serviceTier": "fast", "sourceFile": "rollout.jsonl", "sync": sync,
@@ -86,6 +86,180 @@ class SampleStoreTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT count(*) FROM sample_records").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM quota_windows").fetchone()[0], 0)
             self.assertEqual(db.execute("SELECT count(*) FROM sample_releases").fetchone()[0], 0)
+
+    def test_inline_one_to_one_nodes_and_independent_window_ownership(self):
+        row = self.records()[0][1]
+        row["windows"] = {
+            "5h": {"usedPercent": 10, "percentCheckedAt": row["checkedAt"], "resetAt": 1790830800, "plan": "plus"},
+            "7d": {"usedPercent": 20, "resetAt": 1791417600, "plan": "plus"},
+        }
+        later = copy.deepcopy(row)
+        later["checkedAt"] = "2026-10-01T00:01:00Z"
+        later["windows"]["7d"]["usedPercent"] = 21
+        rolled = copy.deepcopy(later)
+        rolled["checkedAt"] = "2026-10-01T00:02:00Z"
+        rolled["windows"]["7d"]["resetAt"] = 1792022400
+        index = ProcessingIndex(self.path)
+        with index.transaction() as db:
+            samples.put_local(db, "first", "period", "hash", {"kind": "quota", "row": row})
+            samples.put_local(db, "later", "period", "hash", {"kind": "quota", "row": later})
+            names = {name for name, in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+            self.assertTrue(set(samples.INLINE).isdisjoint(names))
+            refs = db.execute(
+                "SELECT five_hour_id,seven_day_id,five_hour_percentCheckedAt,seven_day_usedPercent FROM sample_records ORDER BY id"
+            ).fetchall()
+            self.assertEqual(refs[0][:2], refs[1][:2])
+            self.assertEqual(refs[0][2], row["checkedAt"])
+            self.assertEqual([refs[0][3], refs[1][3]], [20.0, 21.0])
+            self.assertEqual(db.execute("SELECT count(*) FROM quota_windows").fetchone()[0], 2)
+            self.assertEqual(
+                db.execute("SELECT resetAt,extensions FROM quota_windows WHERE id=?", (refs[0][0],)).fetchone(),
+                (1790830800.0, None),
+            )
+            samples.put_local(db, "rolled", "period", "hash", {"kind": "quota", "row": rolled})
+            refs = db.execute("SELECT five_hour_id,seven_day_id FROM sample_records ORDER BY id").fetchall()
+            self.assertEqual(refs[0][0], refs[2][0])
+            self.assertNotEqual(refs[0][1], refs[2][1])
+            self.assertEqual(db.execute("SELECT count(*) FROM quota_windows").fetchone()[0], 3)
+            db.execute("DELETE FROM local_records WHERE record_key IN ('first','later')")
+        with index.transaction() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM quota_windows").fetchone()[0], 2)
+            self.assertEqual(
+                samples.select_sample(db, db.execute("SELECT sample_id FROM local_record_refs").fetchone()[0]),
+                samples._payload(rolled),
+            )
+            db.execute("DELETE FROM local_records")
+        with index.transaction() as db:
+            self.assertEqual(db.execute("SELECT count(*) FROM quota_windows").fetchone()[0], 0)
+
+    def test_redundancy_fixes_shared_payloads_and_delivery_tables(self):
+        index = ProcessingIndex(self.path)
+        _, usage_row = self.records()[3]
+        quota_point = {
+            "checkedAt": "2026-10-01T00:00:00.000+00:00",
+            "accountSlotId": "account",
+            "windows": {"5h": {"usedPercent": 10.0, "resetAt": 1790830800, "plan": "plus"}},
+        }
+        with index.transaction() as db:
+            virtual_cols = {
+                row[1] for row in db.execute("PRAGMA table_xinfo(sample_records)") if row[6] == 2
+            }
+            self.assertTrue({"subtype", "account_id", "origin_device_id", "identity_session_id"}.issubset(virtual_cols))
+            fact_cols = [row[1] for row in db.execute("PRAGMA table_xinfo(processing_fact_refs)") if row[6] == 0]
+            self.assertEqual(fact_cols, ["source_id", "position", "record_key", "account_id", "sample_id", "attribution"])
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_peer_rows'").fetchone())
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_members'").fetchone())
+
+            samples.put_fact(db, ("source", 0, "tokenLedger", "u1", "account", "session", "event", 1790812800.0, samples.canonical(usage_row)))
+            attr, = db.execute("SELECT attribution FROM processing_fact_refs WHERE record_key='u1'").fetchone()
+            self.assertIsNone(attr)
+
+            index._effective(db, "u1")
+            self.assertEqual(db.execute("SELECT count(*) FROM processing_effective_refs").fetchone()[0], 1)
+            self.assertEqual(json.loads(db.execute("SELECT data FROM processing_effective WHERE record_key='u1'").fetchone()[0]), usage_row)
+
+            raw_point = samples.canonical(quota_point)
+            display_point = samples.canonical(quota_point | {"_key": "q1"})
+            db.execute(
+                "INSERT INTO processing_sampled_quota VALUES(?,?,?,?,?)",
+                ("q1", "account", "device", 1790812800.0, raw_point),
+            )
+            db.execute(
+                "INSERT INTO processing_quota_points VALUES(?,?,?,?,?)",
+                ("local", "account", 1790812800.0, "q1", raw_point),
+            )
+            db.execute(
+                "INSERT INTO processing_quota_points VALUES(?,?,?,?,?)",
+                ("merged", "account", 1790812800.0, "q1", raw_point),
+            )
+            db.execute(
+                "INSERT INTO processing_display VALUES(?,?,?,?,?,?)",
+                ("local", "account", "quotaPoints", "q1", 1790812800.0, display_point),
+            )
+            db.execute(
+                "INSERT INTO processing_display VALUES(?,?,?,?,?,?)",
+                ("merged", "account", "quotaPoints", "q1", 1790812800.0, display_point),
+            )
+            self.assertEqual(db.execute("SELECT count(*) FROM processing_payloads").fetchone()[0], 1)
+            self.assertEqual(
+                json.loads(db.execute("SELECT data FROM processing_display WHERE view='local' AND record_key='q1'").fetchone()[0]),
+                quota_point | {"_key": "q1"},
+            )
+
+            token_args = ("account", "u1", 1790812800.0, "gpt-5", "fast", 10, 0, 20, 0, 100)
+            db.execute("INSERT INTO delivery_tokens VALUES('local',?,?,?,?,?,?,?,?,?,?)", token_args)
+            db.execute("INSERT INTO delivery_tokens VALUES('merged',?,?,?,?,?,?,?,?,?,?)", token_args)
+            self.assertEqual(db.execute("SELECT count(*) FROM delivery_token_payloads").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM delivery_token_refs").fetchone()[0], 2)
+
+            run_args = ("account", "5h", 100, 100.0, 200.0, 10.0, 1.0, 0, 300.0, "plus")
+            db.execute("INSERT INTO delivery_runs VALUES('local',?,?,?,?,?,?,?,?,?,?)", run_args)
+            db.execute("INSERT INTO delivery_runs VALUES('merged',?,?,?,?,?,?,?,?,?,?)", run_args)
+            self.assertEqual(db.execute("SELECT count(*) FROM delivery_run_payloads").fetchone()[0], 1)
+            self.assertEqual(db.execute("SELECT count(*) FROM delivery_run_refs").fetchone()[0], 2)
+
+    def test_layout_migration_is_lossless_atomic_and_retryable(self):
+        import monitor_migration_samples as legacy
+        with closing(legacy.connect(self.path)) as db, db:
+            legacy.initialize(db)
+            legacy.create_views(db)
+            for i, (kind, row) in enumerate(self.records()):
+                legacy.put_local(db, str(i), "period", content_hash({"kind": kind, "row": row}), {"kind": kind, "row": row})
+            before = db.execute("SELECT record_key,record_json FROM local_records ORDER BY record_key").fetchall()
+        with closing(samples.connect(self.path)) as db, db:
+            with mock.patch.object(samples, "_insert_window", side_effect=RuntimeError("interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    samples.migrate_layout(db)
+            self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_sync'").fetchone())
+            self.assertNotIn("five_hour_id", {column[1] for column in db.execute("PRAGMA table_info(sample_records)")})
+            samples.migrate_layout(db)
+            samples.migrate_layout(db)
+            after = db.execute("SELECT record_key,record_json FROM local_records ORDER BY record_key").fetchall()
+            self.assertEqual(before, after)
+            self.assertFalse(db.execute("PRAGMA foreign_key_check").fetchall())
+        with closing(samples.connect(self.path)) as db:
+            samples.prepare(db)
+            self.assertEqual(before, db.execute("SELECT record_key,record_json FROM local_records ORDER BY record_key").fetchall())
+
+    def test_retired_compaction_is_removed_and_migration_merges_equivalent_samples(self):
+        import monitor_migration_samples as legacy
+        row = self.records()[0][1]
+        with closing(legacy.connect(self.path)) as db, db:
+            legacy.initialize(db)
+            legacy.create_views(db)
+            for i in range(2):
+                old = row | {"compaction": {"continuousFrom": "2026-09-01T00:00:00Z", "omittedSamples": i + 1}}
+                record = {"kind": "quota", "row": legacy._payload(old)}
+                legacy.put_fact(db, ("source", i, "quota", str(i), "account", "", "", 0, samples.canonical(old)))
+                legacy.put_local(db, str(i), "period", content_hash(record), record)
+                legacy.put_remote(db, "device", "2026-10-01", "bulk", str(i), content_hash(record),
+                    v4_record_envelope("device", str(i), record, "2026-10-01T00:00Z"))
+        with closing(samples.connect(self.path)) as db, db:
+            with mock.patch.object(samples, "_insert_window", side_effect=RuntimeError("interrupted")):
+                with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                    samples.migrate_layout(db)
+            self.assertEqual(db.execute("SELECT count(*) FROM quota_samples WHERE omittedSamples IS NOT NULL").fetchone()[0], 2)
+            samples.migrate_layout(db)
+            samples.migrate_layout(db)
+        with closing(samples.connect(self.path)) as db:
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='quota_samples'").fetchone())
+            self.assertFalse(any(column[1].startswith("quota_") for column in db.execute("PRAGMA table_info(sample_records)")))
+            self.assertEqual(db.execute("SELECT count(*) FROM sample_records").fetchone()[0], 1)
+            for data, in db.execute("SELECT data FROM processing_facts"):
+                self.assertEqual(json.loads(data), row)
+            for digest, data in db.execute("SELECT content_hash,record_json FROM local_records"):
+                self.assertNotIn("compaction", json.loads(data)["row"])
+                self.assertEqual(digest, content_hash(json.loads(data)))
+            for digest, data in db.execute("SELECT content_hash,record_json FROM remote_records"):
+                envelope = json.loads(data)
+                self.assertNotIn("compaction", envelope["record"]["row"])
+                self.assertEqual(digest, content_hash(envelope["record"]))
+                self.assertEqual(digest, envelope["contentSha256"])
+            self.assertFalse(db.execute("PRAGMA foreign_key_check").fetchall())
+        with closing(samples.connect(self.root / "fresh.sqlite3")) as db, db:
+            samples.prepare(db)
+            sample, attrs = samples.insert_sample(db, "quota", row | {"compaction": {"omittedSamples": 1}})
+            self.assertEqual(samples.select_sample(db, sample, attrs), row)
 
     def legacy(self):
         kind, row = self.records()[0]

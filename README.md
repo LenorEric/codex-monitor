@@ -249,7 +249,6 @@ The canonical data root is `~/.codex-switch`:
 | `skills/` | Private managed skill source | Optional encrypted packages |
 | `usage_monitor_quota_readings.jsonl` | Write-only backup of raw quota readings | Raw SQLite records, encrypted |
 | `usage_monitor_token_events.jsonl` | Write-only backup of usage events, stored costs, and corrections | Every record, encrypted |
-| `usage_monitor_diagnostic_samples.jsonl` | Write-only diagnostic backup | Never |
 | `usage_monitor_state.json` | Compatibility status output; SQLite owns restart state | Never |
 | `webdav.log` | Local WebDAV operation and HTTP diagnostics, capped at 5 MB (5,000,000 bytes); oldest complete entries are removed when full | Never |
 | `usage_monitor_sync_cache-v4.sqlite3` | Typed local/remote facts, incremental processing, dashboard projections and bulk/live interpretation data | Never uploaded as a database |
@@ -287,8 +286,6 @@ python codex_monitor_daemon.py --help
 | `--timeout SECONDS` | Set the per-request timeout; default is 10 seconds. |
 | `--quota-history PATH` | Override the write-only quota backup path. |
 | `--token-ledger PATH` | Override the write-only token/cost backup path. |
-| `--sample-log PATH` | Override the write-only diagnostic backup path. |
-| `--sample-log-max-bytes N` | Deprecated compatibility option; write-only logs are never trimmed. |
 | `--local-only` | Scan local session logs without calling ChatGPT usage endpoints. |
 | `--no-token-scan` | Disable local session token scanning. |
 | `--reencrypt-cloud` | Refresh nonces and verify all encrypted WebDAV payloads using the configured key, then exit. |
@@ -381,4 +378,4 @@ Quota JSONL is a write-only backup of extracted API readings, including repeated
 
 Only `reset_at` determines resets; `reset_after_seconds` is ignored. Every decrease is rejected unless its reset timestamp moves forward and is strictly later than the last accepted sample time plus the window period (5h or 7d). A rejected decrease establishes a protection baseline: the next equal or higher reading is accepted; a lower reading is rejected and replaces the baseline. Accepted readings clear protection. Missing windows retain their state, plans establish fresh baselines, and 5h/7d windows are independent. Rejected points are never accepted retroactively.
 
-Recorder logs are append-only, including diagnostics. Corrections append an ordinary updated record with the same identity. Removing a database record does not append an operation or alter earlier log entries. Batches begin with a newline to isolate torn tails without reading the log. A crash between fsync and queue acknowledgement may duplicate a backup delivery. Manual rebuilding from JSONL is controlled by external tools or people. The application provides no recovery reader, replay rules, or manual rebuild command. Normal startup and migration 19 never import these logs.
+Quota and token recorder logs are append-only. Diagnostic sample logs are no longer written; existing files are retained. Corrections append an ordinary updated record with the same identity. Removing a database record does not append an operation or alter earlier log entries. Batches begin with a newline to isolate torn tails without reading the log. A crash between fsync and queue acknowledgement may duplicate a backup delivery. Manual rebuilding from JSONL is controlled by external tools or people. The application provides no recovery reader, replay rules, or manual rebuild command. Normal startup and migration 19 never import these logs.

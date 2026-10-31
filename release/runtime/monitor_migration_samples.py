@@ -1,4 +1,4 @@
-"""Frozen readers for ordered data migrations only. Never import from runtime paths."""
+"""Historical migration codecs, with lossless routing when a current layout is already installed."""
 """Typed sampled history and transactional ownership. JSON exists only at codec boundaries.
 
 The public SQL views are read compatibility boundaries for processing and sync. Their
@@ -126,6 +126,9 @@ def _payload(row):
 
 
 def insert_sample(db, kind, row):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%sync_present%'").fetchone():
+        from monitor_sample_store import insert_sample as current_insert
+        return current_insert(db, kind, row)
     payload = _payload(row)
     digest = hashlib.sha256(canonical([kind, payload]).encode()).digest()
     found = db.execute("SELECT id FROM sample_records WHERE content_hash=?", (digest,)).fetchone()
@@ -225,6 +228,9 @@ FIELDS["baseline_totals"] = FIELDS["token_samples"]
 
 
 def select_sample(db, sample, attribution="{}"):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%sync_present%'").fetchone():
+        from monitor_sample_store import select_sample as current_select
+        return current_select(db, sample, attribution)
     kind, subtype, opaque, containers = db.execute("SELECT kind,subtype,opaque,containers FROM sample_records WHERE id=?", (sample,)).fetchone()
     if opaque is not None:
         row = json.loads(opaque)
@@ -262,7 +268,7 @@ def select_sample(db, sample, attribution="{}"):
                 for model, tier, model_id, tier_id in db.execute(('SELECT m.value,t.value,b.model_id,b.tier_id FROM baseline_tiers b JOIN sample_models m ON m.id=b.model_id JOIN sample_tiers t ON t.id=b.tier_id WHERE '
                     "sample_id=? AND t.value LIKE 'source:%'"), (sample,)):
                     row["sourceTotals"].setdefault(model, {})[tier[7:]] = _read_node(db, "baseline_tiers", "sample_id=? AND model_id=? AND tier_id=?", (sample, model_id, tier_id))
-    attrs = json.loads(attribution)
+    attrs = json.loads(attribution) if attribution else {}
     if "session" in attrs:
         row["session"].update(attrs.pop("session"))
     if attrs:
@@ -301,6 +307,7 @@ class Connection(sqlite3.Connection):
 
 
 def connect(*args, **kwargs):
+    from monitor_sample_store import display_payload, put_payload
     db = sqlite3.connect(*args, **kwargs, factory=Connection)
     db.execute("PRAGMA foreign_keys=ON")
     db.execute("PRAGMA recursive_triggers=ON")
@@ -308,11 +315,16 @@ def connect(*args, **kwargs):
     db.create_function("sample_record", 3, lambda sample, attrs, extra: canonical(_record(db, sample, attrs, extra)))
     db.create_function("sample_envelope", 10, lambda sample, attrs, extra, envelope, version, period, event, machine, key, digest:
         canonical(_envelope(db, sample, attrs, extra, envelope, version, period, event, machine, key, digest)))
+    db.create_function("put_payload", 2, lambda data, key: put_payload(db, data, key))
+    db.create_function("display_payload", 2, display_payload)
     return db
 
 
 def _record(db, sample, attrs, extra):
     row = select_sample(db, sample, attrs)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%five_hour_usedPercent%'").fetchone():
+        meta = json.loads(extra) if extra else {}
+        return row if meta is None else {"kind": db.execute("SELECT kind FROM sample_records WHERE id=?", (sample,)).fetchone()[0], **meta, "row": row}
     return {"kind": db.execute("SELECT kind FROM sample_records WHERE id=?", (sample,)).fetchone()[0], **json.loads(extra), "row": row} if extra is not None else row
 
 
@@ -329,18 +341,27 @@ def _envelope(db, sample, attrs, extra, envelope, version, period, event, machin
 
 
 def put_fact(db, values):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%five_hour_usedPercent%'").fetchone():
+        from monitor_sample_store import put_fact as current_put_fact
+        return current_put_fact(db, values)
     sample, attrs = insert_sample(db, values[2], json.loads(values[8]))
     db.execute("INSERT OR REPLACE INTO processing_fact_refs VALUES(?,?,?,?,?,?,?,?,?,?,?)", (_dimension(db, "source", values[0]), *values[1:4],
         _dimension(db, "account", values[4]), _dimension(db, "session", values[5]), *values[6:8], sample, attrs, json.loads(values[8]).get("recordType")))
 
 
 def put_local(db, key, period, digest, record):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%five_hour_usedPercent%'").fetchone():
+        from monitor_sample_store import put_local as current_put_local
+        return current_put_local(db, key, period, digest, record)
     sample, attrs = insert_sample(db, record["kind"], record["row"])
     db.execute("INSERT INTO local_record_refs VALUES(?,?,?,?,?,?) ON CONFLICT(record_key) DO UPDATE SET content_hash=excluded.content_hash,sample_id=excluded.sample_id,attribution=excluded.attribution,record_meta=excluded.record_meta",
         (key, period, digest, sample, attrs, canonical({key: value for key, value in record.items() if key not in {"kind", "row"}})))
 
 
 def put_remote(db, machine, day, part, key, digest, envelope):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%five_hour_usedPercent%'").fetchone():
+        from monitor_sample_store import put_remote as current_put_remote
+        return current_put_remote(db, machine, day, part, key, digest, envelope)
     record = envelope["record"]
     sample, attrs = insert_sample(db, record["kind"], record["row"] if "row" in record else record)
     db.execute("INSERT OR REPLACE INTO remote_record_refs VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", (_dimension(db, "device", machine), day, part, key, digest, sample, attrs,
@@ -350,6 +371,9 @@ def put_remote(db, machine, day, part, key, digest, envelope):
 
 
 def initialize(db):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%sync_present%'").fetchone():
+        from monitor_sample_store import initialize as current_initialize
+        return current_initialize(db)
     for kind in sorted(DIMENSIONS):
         db.execute(f"CREATE TABLE IF NOT EXISTS sample_{kind}s(id INTEGER PRIMARY KEY,value TEXT NOT NULL UNIQUE)")
     owners = {"sample_records": ('id INTEGER PRIMARY KEY,kind TEXT NOT NULL,subtype TEXT,content_hash BLOB NOT NULL UNIQUE,event_at REAL,account_id INTEGER REFERENCES sample_accounts(id),'
@@ -398,6 +422,9 @@ def initialize(db):
 
 
 def create_views(db):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%five_hour_usedPercent%'").fetchone():
+        from monitor_sample_store import create_views as current_create_views
+        return current_create_views(db)
     db.execute(('CREATE VIEW IF NOT EXISTS processing_facts AS SELECT s.value AS source,f.position,f.kind,f.record_key,a.value AS account,x.value AS session,f.event_id,'
         'f.event_at,sample_row(f.sample_id,f.attribution) AS data,f.subtype FROM processing_fact_refs f JOIN sample_sources s ON s.id=f.source_id JOIN sample_accounts a '
         'ON a.id=f.account_id JOIN sample_sessions x ON x.id=f.session_id'))
@@ -425,8 +452,14 @@ PROCESSING_SCHEMA_VERSION = 1
 
 
 def initialize_processing_index(path: Path) -> None:
+    path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(connect(path)) as db, db:
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='sample_records' AND sql LIKE '%sync_present%'").fetchone():
+            from monitor_processing import initialize_processing_index as current_init_index
+            current_init_index(path)
+            _initialize_legacy_delivery(db)
+            return
         db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         db.execute("PRAGMA journal_mode=WAL")
         normalized = prepare(db)
@@ -532,6 +565,9 @@ def _initialize_legacy_delivery(db):
         CREATE TABLE IF NOT EXISTS dashboard_blobs(digest TEXT PRIMARY KEY,body BLOB NOT NULL,compressed BLOB NOT NULL,created REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS dashboard_manifests(scope TEXT PRIMARY KEY,signature TEXT NOT NULL,data TEXT NOT NULL,updated REAL NOT NULL);
         CREATE TABLE IF NOT EXISTS dashboard_rollups(signature TEXT PRIMARY KEY,digest TEXT NOT NULL,created REAL NOT NULL);
-        CREATE INDEX IF NOT EXISTS dashboard_quota_time ON processing_quota_points(view,event_at,account);
-        CREATE INDEX IF NOT EXISTS dashboard_display_time ON processing_display(view,kind,event_at,account);
+        CREATE TABLE IF NOT EXISTS processing_peer_rows(source TEXT NOT NULL,record_key TEXT NOT NULL,position INTEGER NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(source,record_key));
     """)
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='processing_quota_points'").fetchone():
+        db.execute("CREATE INDEX IF NOT EXISTS dashboard_quota_time ON processing_quota_points(view,event_at,account)")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='processing_display'").fetchone():
+        db.execute("CREATE INDEX IF NOT EXISTS dashboard_display_time ON processing_display(view,kind,event_at,account)")

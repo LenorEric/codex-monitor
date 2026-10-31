@@ -35,8 +35,6 @@ def _main(instance_lock) -> int:
     parser.add_argument("--timeout", type=int, default=10, help="Per-request timeout in seconds.")
     parser.add_argument("--quota-history", type=Path, help="Write-only quota backup path. Defaults to ~/.codex-switch/usage_monitor_quota_readings.jsonl.")
     parser.add_argument("--token-ledger", type=Path, help="Write-only token event and stored-cost backup path. Defaults to ~/.codex-switch/usage_monitor_token_events.jsonl.")
-    parser.add_argument("--sample-log", type=Path, help="Detailed JSONL diagnostic sample path. Defaults to ~/.codex-switch/usage_monitor_diagnostic_samples.jsonl.")
-    parser.add_argument("--sample-log-max-bytes", type=int, default=DEFAULT_SAMPLE_LOG_MAX_BYTES, help="Deprecated compatibility option; write-only backup logs are never trimmed.")
     parser.add_argument("--dashboard", action="store_true", help="Open the local dashboard in the default browser after starting the server.")
     parser.add_argument("--reencrypt-cloud", action="store_true", help="Re-encrypt and verify every encrypted WebDAV payload with the configured hash key, then exit.")
     parser.add_argument("--local-only", action="store_true", help="Only scan local Codex session logs; do not call ChatGPT usage endpoints.")
@@ -60,13 +58,12 @@ def _main(instance_lock) -> int:
     legacy_history = default_history_path(args.data_home)
     args.quota_history = args.quota_history or default_quota_history_path(legacy_history)
     args.token_ledger = args.token_ledger or default_token_ledger_path(legacy_history)
-    args.sample_log = args.sample_log or default_sample_log_path(legacy_history)
     args.usage_sync_cache = default_usage_sync_cache_path(args.quota_history)
     args.state = args.data_home / "usage_monitor_state.json"
     args.dashboard_cache = default_dashboard_cache_path(args.quota_history)
     print("Startup: checking and applying pending data migrations...", flush=True)
     migrate_installed_data(
-        Path(__file__).resolve().parent, args.data_home, args.quota_history, args.token_ledger, args.sample_log,
+        Path(__file__).resolve().parent, args.data_home, args.quota_history, args.token_ledger,
         runtime_state_path=args.state, dashboard_cache_path=args.dashboard_cache, usage_sync_cache_path=args.usage_sync_cache,
         codex_home=args.codex_home,
     )

@@ -18,7 +18,6 @@ from monitor_cloud import CloudManager, CryptoBox, passphrase_hash, valid_passph
 from monitor_common import empty_cost_totals, empty_token_totals
 from monitor_migrations import FormatConverter, convert_verifier, stable_id, write_json
 from monitor_processing import initialize_processing_index
-from monitor_token_ledger import token_sessions_from_ledger
 from monitor_migrations import _load_v18_token_ledger as load_token_ledger
 from monitor_usage_sync import UsageDataStore, content_hash, initialize_v4_cache, record_key, validate_sync_operation
 from test_usage_v4 import MemoryWebDav
@@ -27,7 +26,7 @@ from test_usage_v4 import MemoryWebDav
 class UnifiedContractTests(unittest.TestCase):
     def test_contract_metadata_requires_aligned_targets_and_contiguous_registries(self):
         import monitor_migrations
-        metadata = {"dataContractVersion": 19, "cloudDataContractVersion": 4}
+        metadata = {"dataContractVersion": updates.DATA_CONTRACT_VERSION, "cloudDataContractVersion": updates.CLOUD_DATA_CONTRACT_VERSION}
         monitor_migrations.validate_contract_metadata(metadata)
         for field in metadata:
             with self.subTest(field=field), self.assertRaises(monitor_migrations.MigrationError):
@@ -84,8 +83,8 @@ class UnifiedContractTests(unittest.TestCase):
         ledger = load_token_ledger(self.paths[3])
         self.assertEqual(ledger[0]["recordType"], "sessionBaseline")
         self.assertEqual(ledger[0]["sourceTotals"], self.baseline()["sourceTotals"])
-        self.assertEqual(token_sessions_from_ledger(ledger)[0]["cost"], before["cost"])
-        self.assertEqual(token_sessions_from_ledger(ledger)[0]["tokens"], before["tokens"])
+        self.assertEqual(ledger[0]["session"]["cost"], before["cost"])
+        self.assertEqual(ledger[0]["session"]["tokens"], before["tokens"])
         with closing(samples.connect(dbpath)) as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_quota_points").fetchone()[0], 0)
             record = json.loads(db.execute("SELECT record_json FROM local_records").fetchone()[0])
@@ -117,7 +116,6 @@ class UnifiedContractTests(unittest.TestCase):
             validate_sync_operation({"action": "upsert", "key": record_key("quota", old), "record": {"kind": "quota", "row": old}})
 
     def test_missing_session_logs_preserve_cost_tokens_and_replay_coverage(self):
-        from monitor_token_ledger import _source_highwaters, _usage_records
         row = {"schemaVersion": 1, "recordType": "usage", "eventId": "session-a:1", "sessionId": "session-a", "occurredAt": "2026-07-15T11:55:40Z",
             "rawModel": "gpt-5", "billingModel": "gpt-5", "serviceTier": "default", "accountSlotId": "slot-a", "accountLabel": "A", "sourceFile": "missing.jsonl",
             "tokens": empty_token_totals() | {"inputTokens": 20, "freshInputTokens": 20, "totalTokens": 20, "requests": 1}, "cost": empty_cost_totals() | {"totalCostUsd": 1.5}}
@@ -129,13 +127,11 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertEqual(migrated[0]["occurredAt"], row["occurredAt"])
         self.assertEqual(migrated[0]["cost"], row["cost"])
         self.assertEqual(migrated[0]["tokens"], row["tokens"])
-        replay = {"eventId": "session-a:hash", "sessionId": "session-a", "checkedAt": row["occurredAt"], "model": "gpt-5", "tokens": {"input": 20, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}}
-        self.assertEqual(_usage_records([replay], _source_highwaters(migrated), "slot-a", "A", []), [])
-        from monitor_token_ledger import reconcile_token_ledger
+        self.assertIn("sourceCoverage", migrated[0])
         self.assertNotIn("sourceFile", migrated[0])
-        reconciled, new_costs = reconcile_token_ledger(migrated, [replay], "slot-a", "A", source_files=["missing.jsonl"], own_machine_id="machine-a")
-        self.assertEqual(reconciled, migrated)
-        self.assertEqual(new_costs, [])
+        from monitor_token_ledger import canonical_token_ledger_rows
+        with self.assertRaises(ValueError):
+            canonical_token_ledger_rows(migrated)
 
     def test_peer_usage_ids_are_converted_consistently_without_changing_recorded_cost(self):
         row = {"schemaVersion": 1, "recordType": "usage", "eventId": "session-a:1", "sessionId": "session-a", "occurredAt": "2026-07-15T11:55:40Z",
@@ -214,7 +210,7 @@ class UnifiedContractTests(unittest.TestCase):
         client.put("usage/machines/machine-b.enc", box.encrypt("usage-pointer:machine-b", json.dumps({"version": 2, "machineId": "machine-b", "packs": {"pack": digest}}).encode()))
         from monitor_migrations import ensure_cloud_contract
         ensure_cloud_contract(client)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], updates.CLOUD_DATA_CONTRACT_VERSION)
         head, _ = cloud._v4_head(client, box, "machine-b")
         catalog = cloud._v4_catalog(client, box, "machine-b", head)
         self.assertEqual(set(catalog), {"2026-07-15"})
@@ -262,7 +258,7 @@ class UnifiedContractTests(unittest.TestCase):
         package = migrated["packages"]["demo"]
         self.assertEqual(skills.inspect_snapshot(cloud._download_skill_package(client, box, "demo", package))[1]["demo"]["SKILL.md"], b"Retain this skill")
         self.assertEqual(json.loads(client.get("crypto.json")[0])["version"], 3)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], updates.CLOUD_DATA_CONTRACT_VERSION)
 
 
 if __name__ == "__main__":

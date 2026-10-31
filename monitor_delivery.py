@@ -1,4 +1,3 @@
-
 """Prepared account snapshots and durable, independently sequenced live channels."""
 
 import gzip
@@ -21,25 +20,231 @@ def encoded(value):
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"), allow_nan=False).encode()
 
 
+def _migrate_delivery_tables(db):
+    has_members = bool(db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_members'").fetchone())
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_tokens'").fetchone():
+        db.execute(
+            "INSERT OR IGNORE INTO delivery_token_payloads(account,id,at,model,tier,fresh,cached,output,cache_write,cost) "
+            "SELECT account,id,at,model,tier,fresh,cached,output,cache_write,cost FROM delivery_tokens"
+        )
+        if has_members:
+            db.execute(
+                "INSERT OR REPLACE INTO delivery_token_refs(view,account,id,at,interval_5h,interval_7d) "
+                "SELECT t.view,t.account,t.id,t.at,m5.interval,m7.interval "
+                "FROM delivery_tokens t "
+                "LEFT JOIN delivery_members m5 ON m5.view=t.view AND m5.account=t.account AND m5.window='5h' AND m5.event=t.id "
+                "LEFT JOIN delivery_members m7 ON m7.view=t.view AND m7.account=t.account AND m7.window='7d' AND m7.event=t.id"
+            )
+        else:
+            db.execute(
+                "INSERT OR REPLACE INTO delivery_token_refs(view,account,id,at,interval_5h,interval_7d) "
+                "SELECT view,account,id,at,NULL,NULL FROM delivery_tokens"
+            )
+        db.execute("DROP TABLE delivery_tokens")
+    if has_members:
+        db.execute("DROP TABLE delivery_members")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='delivery_runs'").fetchone():
+        db.execute(
+            "INSERT OR IGNORE INTO delivery_run_payloads(first,last,value,multiplier,flags,reset,plan) "
+            "SELECT first,last,value,multiplier,flags,reset,plan FROM delivery_runs"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO delivery_run_refs(view,account,window,id,first,payload_id) "
+            "SELECT r.view,r.account,r.window,r.id,r.first,p.payload_id "
+            "FROM delivery_runs r "
+            "JOIN delivery_run_payloads p "
+            "ON p.first IS r.first AND p.last IS r.last "
+            "AND COALESCE(p.value,-1)=COALESCE(r.value,-1) "
+            "AND COALESCE(p.multiplier,-1)=COALESCE(r.multiplier,-1) "
+            "AND p.flags IS r.flags "
+            "AND COALESCE(p.reset,-1)=COALESCE(r.reset,-1) "
+            "AND COALESCE(p.plan,'')=COALESCE(r.plan,'')"
+        )
+        db.execute("DROP TABLE delivery_runs")
+
+
 def initialize_delivery(db):
     db.executescript("""
         CREATE TABLE IF NOT EXISTS delivery_meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS delivery_dirty(view TEXT,account TEXT,PRIMARY KEY(view,account));
         CREATE TABLE IF NOT EXISTS delivery_work(view TEXT,account TEXT,kind TEXT,record_key TEXT,PRIMARY KEY(view,account,kind,record_key));
         CREATE TABLE IF NOT EXISTS delivery_accounts(view TEXT,account TEXT,legacy TEXT NOT NULL,label TEXT NOT NULL DEFAULT 'Unknown',PRIMARY KEY(view,account));
-        CREATE TABLE IF NOT EXISTS delivery_runs(view TEXT,account TEXT,window TEXT,id TEXT,first REAL,last REAL,value REAL,multiplier REAL,flags INTEGER,reset REAL,plan TEXT,PRIMARY KEY(view,account,window,id));
-        CREATE INDEX IF NOT EXISTS delivery_run_time ON delivery_runs(view,account,window,first);
-        CREATE TABLE IF NOT EXISTS delivery_tokens(view TEXT,account TEXT,id TEXT,at REAL,model TEXT,tier TEXT,fresh INTEGER,cached INTEGER,output INTEGER,cache_write INTEGER,cost INTEGER,PRIMARY KEY(view,account,id));
-        CREATE INDEX IF NOT EXISTS delivery_token_time ON delivery_tokens(view,account,at);
+        CREATE TABLE IF NOT EXISTS delivery_run_payloads(
+            payload_id INTEGER PRIMARY KEY,
+            first REAL,
+            last REAL,
+            value REAL,
+            multiplier REAL,
+            flags INTEGER,
+            reset REAL,
+            plan TEXT
+        );
+        CREATE UNIQUE INDEX IF NOT EXISTS delivery_run_payload_unique
+            ON delivery_run_payloads(first,last,COALESCE(value,-1),COALESCE(multiplier,-1),flags,COALESCE(reset,-1),COALESCE(plan,''));
+        CREATE TABLE IF NOT EXISTS delivery_run_refs(
+            view TEXT NOT NULL,
+            account TEXT NOT NULL,
+            window TEXT NOT NULL,
+            id TEXT NOT NULL,
+            first REAL,
+            payload_id INTEGER NOT NULL REFERENCES delivery_run_payloads(payload_id) ON DELETE CASCADE,
+            PRIMARY KEY(view,account,window,id)
+        );
+        CREATE INDEX IF NOT EXISTS delivery_run_time ON delivery_run_refs(view,account,window,first);
+        CREATE INDEX IF NOT EXISTS delivery_run_payload ON delivery_run_refs(payload_id);
+        CREATE TRIGGER IF NOT EXISTS delivery_run_refs_delete AFTER DELETE ON delivery_run_refs BEGIN
+            DELETE FROM delivery_run_payloads
+            WHERE payload_id=OLD.payload_id
+              AND NOT EXISTS(SELECT 1 FROM delivery_run_refs WHERE payload_id=OLD.payload_id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS delivery_run_refs_update AFTER UPDATE OF payload_id ON delivery_run_refs
+        WHEN OLD.payload_id != NEW.payload_id BEGIN
+            DELETE FROM delivery_run_payloads
+            WHERE payload_id=OLD.payload_id
+              AND NOT EXISTS(SELECT 1 FROM delivery_run_refs WHERE payload_id=OLD.payload_id);
+        END;
+        CREATE TABLE IF NOT EXISTS delivery_token_payloads(
+            account TEXT NOT NULL,
+            id TEXT NOT NULL,
+            at REAL,
+            model TEXT,
+            tier TEXT,
+            fresh INTEGER,
+            cached INTEGER,
+            output INTEGER,
+            cache_write INTEGER,
+            cost INTEGER,
+            PRIMARY KEY(account,id)
+        );
+        CREATE TABLE IF NOT EXISTS delivery_token_refs(
+            view TEXT NOT NULL,
+            account TEXT NOT NULL,
+            id TEXT NOT NULL,
+            at REAL,
+            interval_5h TEXT,
+            interval_7d TEXT,
+            PRIMARY KEY(view,account,id),
+            FOREIGN KEY(account,id) REFERENCES delivery_token_payloads(account,id) ON DELETE CASCADE
+        );
+        CREATE INDEX IF NOT EXISTS delivery_token_time ON delivery_token_refs(view,account,at);
+        CREATE INDEX IF NOT EXISTS delivery_token_interval_5h ON delivery_token_refs(view,account,interval_5h) WHERE interval_5h IS NOT NULL;
+        CREATE INDEX IF NOT EXISTS delivery_token_interval_7d ON delivery_token_refs(view,account,interval_7d) WHERE interval_7d IS NOT NULL;
+        CREATE TRIGGER IF NOT EXISTS delivery_token_refs_delete AFTER DELETE ON delivery_token_refs BEGIN
+            DELETE FROM delivery_token_payloads
+            WHERE account=OLD.account AND id=OLD.id
+              AND NOT EXISTS(SELECT 1 FROM delivery_token_refs WHERE account=OLD.account AND id=OLD.id);
+        END;
         CREATE TABLE IF NOT EXISTS delivery_charts(view TEXT,account TEXT,window TEXT,id TEXT,start REAL,end REAL,at REAL,multiplier REAL,delta REAL,models TEXT,PRIMARY KEY(view,account,window,id));
-        CREATE TABLE IF NOT EXISTS delivery_members(view TEXT,account TEXT,window TEXT,event TEXT,interval TEXT,PRIMARY KEY(view,account,window,event));
-        CREATE INDEX IF NOT EXISTS delivery_member_interval ON delivery_members(view,account,window,interval);
         CREATE TABLE IF NOT EXISTS delivery_journal(stream TEXT,seq INTEGER,created REAL,body BLOB,PRIMARY KEY(stream,seq));
         CREATE TABLE IF NOT EXISTS delivery_snapshot(id INTEGER PRIMARY KEY CHECK(id=1),body BLOB,gzip BLOB,created REAL);
     """)
-    for table in ("processing_quota_points", "processing_display"):
+    _migrate_delivery_tables(db)
+    db.executescript("""
+        CREATE VIEW IF NOT EXISTS delivery_runs AS
+            SELECT r.view,r.account,r.window,r.id,p.first,p.last,p.value,p.multiplier,p.flags,p.reset,p.plan
+            FROM delivery_run_refs r
+            JOIN delivery_run_payloads p ON p.payload_id=r.payload_id;
+        CREATE TRIGGER IF NOT EXISTS delivery_runs_insert INSTEAD OF INSERT ON delivery_runs BEGIN
+            INSERT INTO delivery_run_payloads(first,last,value,multiplier,flags,reset,plan)
+            SELECT NEW.first,NEW.last,NEW.value,NEW.multiplier,NEW.flags,NEW.reset,NEW.plan
+            WHERE NOT EXISTS(
+                SELECT 1 FROM delivery_run_payloads
+                WHERE first IS CAST(NEW.first AS REAL) AND last IS CAST(NEW.last AS REAL)
+                  AND COALESCE(value,-1)=COALESCE(CAST(NEW.value AS REAL),-1)
+                  AND COALESCE(multiplier,-1)=COALESCE(CAST(NEW.multiplier AS REAL),-1)
+                  AND flags IS NEW.flags
+                  AND COALESCE(reset,-1)=COALESCE(CAST(NEW.reset AS REAL),-1)
+                  AND COALESCE(plan,'')=COALESCE(NEW.plan,'')
+            );
+            UPDATE delivery_run_refs
+            SET first=NEW.first,
+                payload_id=(SELECT payload_id FROM delivery_run_payloads
+                            WHERE first IS CAST(NEW.first AS REAL) AND last IS CAST(NEW.last AS REAL)
+                              AND COALESCE(value,-1)=COALESCE(CAST(NEW.value AS REAL),-1)
+                              AND COALESCE(multiplier,-1)=COALESCE(CAST(NEW.multiplier AS REAL),-1)
+                              AND flags IS NEW.flags
+                              AND COALESCE(reset,-1)=COALESCE(CAST(NEW.reset AS REAL),-1)
+                              AND COALESCE(plan,'')=COALESCE(NEW.plan,''))
+            WHERE view=NEW.view AND account=NEW.account AND window=NEW.window AND id=NEW.id;
+            INSERT INTO delivery_run_refs(view,account,window,id,first,payload_id)
+            SELECT NEW.view,NEW.account,NEW.window,NEW.id,NEW.first,
+                   (SELECT payload_id FROM delivery_run_payloads
+                    WHERE first IS CAST(NEW.first AS REAL) AND last IS CAST(NEW.last AS REAL)
+                      AND COALESCE(value,-1)=COALESCE(CAST(NEW.value AS REAL),-1)
+                      AND COALESCE(multiplier,-1)=COALESCE(CAST(NEW.multiplier AS REAL),-1)
+                      AND flags IS NEW.flags
+                      AND COALESCE(reset,-1)=COALESCE(CAST(NEW.reset AS REAL),-1)
+                      AND COALESCE(plan,'')=COALESCE(NEW.plan,''))
+            WHERE NOT EXISTS(
+                SELECT 1 FROM delivery_run_refs
+                WHERE view=NEW.view AND account=NEW.account AND window=NEW.window AND id=NEW.id
+            );
+        END;
+        CREATE TRIGGER IF NOT EXISTS delivery_runs_update INSTEAD OF UPDATE ON delivery_runs BEGIN
+            INSERT INTO delivery_run_payloads(first,last,value,multiplier,flags,reset,plan)
+            SELECT NEW.first,NEW.last,NEW.value,NEW.multiplier,NEW.flags,NEW.reset,NEW.plan
+            WHERE NOT EXISTS(
+                SELECT 1 FROM delivery_run_payloads
+                WHERE first IS CAST(NEW.first AS REAL) AND last IS CAST(NEW.last AS REAL)
+                  AND COALESCE(value,-1)=COALESCE(CAST(NEW.value AS REAL),-1)
+                  AND COALESCE(multiplier,-1)=COALESCE(CAST(NEW.multiplier AS REAL),-1)
+                  AND flags IS NEW.flags
+                  AND COALESCE(reset,-1)=COALESCE(CAST(NEW.reset AS REAL),-1)
+                  AND COALESCE(plan,'')=COALESCE(NEW.plan,'')
+            );
+            UPDATE delivery_run_refs
+            SET view=NEW.view,account=NEW.account,window=NEW.window,id=NEW.id,first=NEW.first,
+                payload_id=(SELECT payload_id FROM delivery_run_payloads
+                            WHERE first IS CAST(NEW.first AS REAL) AND last IS CAST(NEW.last AS REAL)
+                              AND COALESCE(value,-1)=COALESCE(CAST(NEW.value AS REAL),-1)
+                              AND COALESCE(multiplier,-1)=COALESCE(CAST(NEW.multiplier AS REAL),-1)
+                              AND flags IS NEW.flags
+                              AND COALESCE(reset,-1)=COALESCE(CAST(NEW.reset AS REAL),-1)
+                              AND COALESCE(plan,'')=COALESCE(NEW.plan,''))
+            WHERE view=OLD.view AND account=OLD.account AND window=OLD.window AND id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS delivery_runs_delete INSTEAD OF DELETE ON delivery_runs BEGIN
+            DELETE FROM delivery_run_refs WHERE view=OLD.view AND account=OLD.account AND window=OLD.window AND id=OLD.id;
+        END;
+        CREATE VIEW IF NOT EXISTS delivery_tokens AS
+            SELECT r.view,r.account,r.id,p.at,p.model,p.tier,p.fresh,p.cached,p.output,p.cache_write,p.cost
+            FROM delivery_token_refs r
+            JOIN delivery_token_payloads p ON p.account=r.account AND p.id=r.id;
+        CREATE TRIGGER IF NOT EXISTS delivery_tokens_insert INSTEAD OF INSERT ON delivery_tokens BEGIN
+            UPDATE delivery_token_payloads
+            SET at=NEW.at,model=NEW.model,tier=NEW.tier,fresh=NEW.fresh,
+                cached=NEW.cached,output=NEW.output,cache_write=NEW.cache_write,cost=NEW.cost
+            WHERE account=NEW.account AND id=NEW.id;
+            INSERT INTO delivery_token_payloads(account,id,at,model,tier,fresh,cached,output,cache_write,cost)
+            SELECT NEW.account,NEW.id,NEW.at,NEW.model,NEW.tier,NEW.fresh,NEW.cached,NEW.output,NEW.cache_write,NEW.cost
+            WHERE NOT EXISTS(SELECT 1 FROM delivery_token_payloads WHERE account=NEW.account AND id=NEW.id);
+            UPDATE delivery_token_refs SET at=NEW.at WHERE view=NEW.view AND account=NEW.account AND id=NEW.id;
+            INSERT INTO delivery_token_refs(view,account,id,at,interval_5h,interval_7d)
+            SELECT NEW.view,NEW.account,NEW.id,NEW.at,NULL,NULL
+            WHERE NOT EXISTS(SELECT 1 FROM delivery_token_refs WHERE view=NEW.view AND account=NEW.account AND id=NEW.id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS delivery_tokens_update INSTEAD OF UPDATE ON delivery_tokens BEGIN
+            INSERT INTO delivery_token_payloads(account,id,at,model,tier,fresh,cached,output,cache_write,cost)
+            VALUES(NEW.account,NEW.id,NEW.at,NEW.model,NEW.tier,NEW.fresh,NEW.cached,NEW.output,NEW.cache_write,NEW.cost)
+            ON CONFLICT(account,id) DO UPDATE SET
+                at=excluded.at,model=excluded.model,tier=excluded.tier,fresh=excluded.fresh,
+                cached=excluded.cached,output=excluded.output,cache_write=excluded.cache_write,cost=excluded.cost;
+            UPDATE delivery_token_refs
+            SET view=NEW.view,account=NEW.account,id=NEW.id,at=NEW.at
+            WHERE view=OLD.view AND account=OLD.account AND id=OLD.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS delivery_tokens_delete INSTEAD OF DELETE ON delivery_tokens BEGIN
+            DELETE FROM delivery_token_refs WHERE view=OLD.view AND account=OLD.account AND id=OLD.id;
+        END;
+    """)
+    for name, table in (("processing_quota_points", "processing_quota_point_refs"), ("processing_display", "processing_display_refs")):
+        target = table if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() else name
         for action, ref in (("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")):
-            db.execute(f"CREATE TRIGGER IF NOT EXISTS delivery_{table}_{action.lower()} AFTER {action} ON {table} BEGIN INSERT OR IGNORE INTO delivery_dirty VALUES({ref}.view,{ref}.account); END")
+            db.execute(f"DROP TRIGGER IF EXISTS delivery_{name}_{action.lower()}")
+            db.execute(
+                f"CREATE TRIGGER IF NOT EXISTS delivery_{name}_{action.lower()} AFTER {action} ON {target} BEGIN "
+                f"INSERT OR IGNORE INTO delivery_dirty VALUES({ref}.view,{ref}.account); END"
+            )
     db.execute("INSERT OR IGNORE INTO delivery_meta VALUES('epoch',?)", (uuid.uuid4().hex,))
     for stream in ("local", "merged", "state"):
         db.execute("INSERT OR IGNORE INTO delivery_meta VALUES(?, '0')", (stream,))
@@ -108,13 +313,11 @@ class DashboardDelivery:
     def _account(self, db, projector, view, account, now):
         existing = db.execute("SELECT legacy,label FROM delivery_accounts WHERE view=? AND account=?", (view, account)).fetchone()
         work = list(db.execute("SELECT kind,record_key FROM delivery_work WHERE view=? AND account=?", (view, account)))
-        legacy = json.loads(existing[0]) if existing else []
         events = []
         label = existing[1] if existing else "Unknown"
         if existing is None or self.cloud_pending:
             if projector is not None:
                 _, events = projector._datasets(db, view, account)
-            legacy = [row["session"] for row in events if row.get("recordType") == "sessionBaseline" and isinstance(row.get("session"), dict)]
             label = next((row.get("accountLabel") or (row.get("session") or {}).get("accountLabel") for row in reversed(events) if row.get("accountLabel") or (row.get("session") or {}).get("accountLabel")), label)
         elif projector is not None:
             for kind, key in work:
@@ -133,13 +336,13 @@ class DashboardDelivery:
         if existing is not None and self.cloud_pending:
             desired = {row[0]: row for event in events if (row := token_row(event)) is not None}
             before = {row[0]: row for row in self._tokens(db, view, account)}
-            if before != desired or json.loads(existing[0]) != legacy:
+            if before != desired:
                 self.force_epoch = True
                 db.execute("DELETE FROM delivery_tokens WHERE view=? AND account=?", (view, account))
         additions, added_rows = [], []
         for event in events:
             row = token_row(event)
-            if row is not None and not db.execute("SELECT 1 FROM delivery_tokens WHERE view=? AND account=? AND id=?", (view, account, row[0])).fetchone():
+            if row is not None and not db.execute("SELECT 1 FROM delivery_token_refs WHERE view=? AND account=? AND id=?", (view, account, row[0])).fetchone():
                 db.execute("INSERT INTO delivery_tokens VALUES(?,?,?,?,?,?,?,?,?,?,?)", (view, account, *row))
                 additions.append([row[0], row[1], [[row[2], row[3], *row[4:]]]])
                 added_rows.append(row)
@@ -172,6 +375,7 @@ class DashboardDelivery:
         tokens = None if fast_tokens else self._tokens(db, view, account)
         for window, values in intervals.items():
             from monitor_interpretation import nearest
+            col = "interval_5h" if window == "5h" else "interval_7d"
             ends = [row[2] for row in values]
             if fast_tokens:
                 affected = set()
@@ -180,21 +384,29 @@ class DashboardDelivery:
                     if index is not None:
                         interval = values[index][0]
                         affected.add(interval)
-                        db.execute("INSERT OR REPLACE INTO delivery_members VALUES(?,?,?,?,?)", (view, account, window, row[0], interval))
+                        db.execute(f"UPDATE delivery_token_refs SET {col}=? WHERE view=? AND account=? AND id=?", (interval, view, account, row[0]))
                 rows = []
                 for interval in values:
                     if interval[0] not in affected:
                         continue
-                    events = [list(row) for row in db.execute("SELECT t.id,t.at,t.model,t.tier,t.fresh,t.cached,t.output,t.cache_write,t.cost FROM delivery_members m JOIN delivery_tokens t ON t.view=m.view AND t.account=m.account AND t.id=m.event WHERE m.view=? AND m.account=? AND m.window=? AND m.interval=?", (view, account, window, interval[0]))]
+                    events = [
+                        list(row)
+                        for row in db.execute(
+                            f"SELECT r.id,p.at,p.model,p.tier,p.fresh,p.cached,p.output,p.cache_write,p.cost "
+                            f"FROM delivery_token_refs r JOIN delivery_token_payloads p ON p.account=r.account AND p.id=r.id "
+                            f"WHERE r.view=? AND r.account=? AND r.{col}=? ORDER BY r.at,r.id",
+                            (view, account, interval[0]),
+                        )
+                    ]
                     rows.extend(chart_rows(events, [interval]))
             else:
-                db.execute("DELETE FROM delivery_members WHERE view=? AND account=? AND window=?", (view, account, window))
+                db.execute(f"UPDATE delivery_token_refs SET {col}=NULL WHERE view=? AND account=? AND {col} IS NOT NULL", (view, account))
                 members = []
                 for row in tokens:
                     index = nearest(values, row[1], ends)
                     if index is not None:
-                        members.append((view, account, window, row[0], values[index][0]))
-                db.executemany("INSERT INTO delivery_members VALUES(?,?,?,?,?)", members)
+                        members.append((values[index][0], view, account, row[0]))
+                db.executemany(f"UPDATE delivery_token_refs SET {col}=? WHERE view=? AND account=? AND id=?", members)
                 rows = chart_rows(tokens, values)
             before = {row[0]: list(row[:6]) + [json.loads(row[6])] for row in db.execute("SELECT id,start,end,at,multiplier,delta,models FROM delivery_charts WHERE view=? AND account=? AND window=?", (view, account, window))}
             after = {row[0]: row for row in rows}
@@ -206,7 +418,7 @@ class DashboardDelivery:
                 db.execute("INSERT OR REPLACE INTO delivery_charts VALUES(?,?,?,?,?,?,?,?,?,?)", (view, account, window, *row[:6], encoded(row[6]).decode()))
             if remove or update:
                 self._packet(db, view, "chart:" + window, account, {"set": update, "remove": remove}, now)
-        db.execute("INSERT OR REPLACE INTO delivery_accounts VALUES(?,?,?,?)", (view, account, encoded(legacy).decode(), label))
+        db.execute("INSERT OR REPLACE INTO delivery_accounts VALUES(?,?,?,?)", (view, account, "[]", label))
         db.execute("DELETE FROM delivery_work WHERE view=? AND account=?", (view, account))
         db.execute("DELETE FROM delivery_dirty WHERE view=? AND account=?", (view, account))
         self.metrics["accountsPrepared"] += 1
@@ -279,7 +491,7 @@ class DashboardDelivery:
         return changed
 
     def _bulk(self, db, state):
-        models = sorted({row[0] for row in db.execute("SELECT DISTINCT model FROM delivery_tokens")})
+        models = sorted({row[0] for row in db.execute("SELECT DISTINCT model FROM delivery_token_payloads")})
         def model(name):
             if name not in models:
                 models.append(name)
@@ -304,18 +516,10 @@ class DashboardDelivery:
                         for entry in row[6]:
                             entry[0] = model(entry[0])
                     data["chart:" + window] = charts
-                legacy = db.execute("SELECT legacy FROM delivery_accounts WHERE view=? AND account=?", (view, account)).fetchone()
                 data["legacy"] = []
-                for session in json.loads(legacy[0]) if legacy else []:
-                    entries = []
-                    for name, value in (session.get("byModel") or {}).items():
-                        row = token_row({"recordType": "usage", "occurredAt": session.get("updatedAt"), "rawModel": name, **value})
-                        if row:
-                            entries.append([model(name), row[3], *row[4:]])
-                    data["legacy"].append([parse_timestamp(session.get("startedAt")), parse_timestamp(session.get("updatedAt")), entries])
                 item[view] = data
             local = item["local"]
-            if not known or account in known or account == "unknown" or local["tokens"] or local["usage:5h"] or local["usage:7d"] or local["legacy"]:
+            if not known or account in known or account == "unknown" or local["tokens"] or local["usage:5h"] or local["usage:7d"]:
                 accounts.append(item)
         return {"epoch": db.execute("SELECT value FROM delivery_meta WHERE name='epoch'").fetchone()[0], "cursors": self.cursors(db), "models": models, "state": state, "accounts": accounts}
 

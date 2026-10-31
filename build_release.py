@@ -25,6 +25,7 @@ RUNTIME_FILES = (
     "monitor_migration_ledger.py",
     "monitor_migration_history.py",
     "monitor_migration_samples.py",
+    "monitor_migration_events.py",
     "monitor_auto_update.py",
     "monitor_backup.py",
     "monitor_dependencies.py",

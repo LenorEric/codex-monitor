@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Disk-backed dashboard rows and exact account-scoped quota dependencies."""
 
-import hashlib
 import json
 import math
 from datetime import datetime, timezone
@@ -9,14 +8,14 @@ from datetime import datetime, timezone
 from monitor_common import parse_timestamp
 from monitor_processing import encode
 
+PROJECTION_RULE_VERSION = 1
+
 
 class DashboardProjector:
     def __init__(self, store):
         self.store, self.index = store, store.index
         self.metrics = {"quotaRowsReplayed": 0, "quotaFastAppends": 0, "accountRebuilds": 0, "displayRowsChanged": 0}
-        from pathlib import Path
-        import monitor_dashboard
-        self.rule = hashlib.sha256(Path(__file__).read_bytes() + Path(monitor_dashboard.__file__).read_bytes()).hexdigest()
+        self.rule = PROJECTION_RULE_VERSION
 
     def _datasets(self, db, view, account):
         from monitor_usage_sync import merge_quota_rows, merge_token_ledger_rows
@@ -45,7 +44,7 @@ class DashboardProjector:
 
     def _replace(self, db, view, account, kind, rows, patches):
         desired = {row["_key"] for row in rows}
-        for (key,) in list(db.execute("SELECT record_key FROM processing_display WHERE view=? AND account=? AND kind=?", (view, account, kind))):
+        for (key,) in list(db.execute("SELECT record_key FROM processing_display_refs WHERE view=? AND account=? AND kind=?", (view, account, kind))):
             if key not in desired:
                 db.execute("DELETE FROM processing_display WHERE view=? AND kind=? AND record_key=?", (view, kind, key))
                 db.execute("DELETE FROM processing_cost_ranges WHERE view=? AND kind=? AND record_key=?", (view, kind, key))
@@ -157,8 +156,8 @@ class DashboardProjector:
                 value["accountLabel"] = labels.get(str(value.get("accountSlotId")), value.get("accountLabel"))
                 rows.append(dashboard_token_session(value))
             desired = _dashboard_key_rows("token", rows)
-            old = list(db.execute("SELECT record_key,data FROM processing_display WHERE view=? AND account=? AND kind='tokenSessions' AND json_extract(data,'$.sessionId')=?", (view, account, session)))
-            for key, _ in old:
+            old = list(db.execute("SELECT record_key FROM processing_display_refs WHERE view=? AND account=? AND kind='tokenSessions' AND session_id=?", (view, account, session)))
+            for (key,) in old:
                 if key not in {row["_key"] for row in desired}:
                     db.execute("DELETE FROM processing_display WHERE view=? AND kind='tokenSessions' AND record_key=?", (view, key))
                     patches.setdefault("tokenSessions", {"upsert": [], "delete": []})["delete"].append(key)
@@ -191,10 +190,13 @@ class DashboardProjector:
         with self.index.transaction() as db:
             policy = {"activeApi": any(row.get("id") == accounts.get("activeAccountId") and row.get("isApiAccount") for row in accounts.get("items", [])),
                 "accounts": [{key: row.get(key) for key in ("id", "label", "usageAccountId")} for row in accounts.get("items", [])]}
-            if force or self.index.get(db, "projectionPolicy") != policy or self.index.get(db, "projectionRule") != self.rule:
+            previous_rule = self.index.get(db, "projectionRule")
+            legacy_rule = isinstance(previous_rule, str) and len(previous_rule) == 64 and all(char in "0123456789abcdef" for char in previous_rule)
+            if force or self.index.get(db, "projectionPolicy") != policy or (previous_rule != self.rule and not legacy_rule):
                 for (account,) in list(db.execute("SELECT DISTINCT account FROM processing_facts")):
                     self.index.dirty(db, account, "policy")
                 self.index.put(db, "projectionPolicy", policy)
+            if previous_rule != self.rule:
                 self.index.put(db, "projectionRule", self.rule)
             for view, account, data in list(db.execute("SELECT view,account,data FROM processing_projections")):
                 deadline = json.loads(data).get("nextMaintenanceAt")

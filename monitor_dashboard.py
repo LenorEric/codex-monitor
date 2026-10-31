@@ -675,8 +675,6 @@ class UsageDashboardState:
         sample["sync"] = add_record_provenance("quota", sample, self.cloud.machine_id, sample["sync"]["accountId"])["sync"]
         raw_windows = copy.deepcopy(sample.get("windows") or {})
         self.usage_data.record_quota(sample)
-        if getattr(self.args, "sample_log", None):
-            self.usage_data.record_diagnostic(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample})
         self.usage_data.ingest_local()
         from monitor_usage_sync import record_account_key
         from monitor_sampling import WINDOWS, accepted_windows
@@ -686,7 +684,9 @@ class UsageDashboardState:
         point = json.loads(point[0]) if point else {}
         sample["windows"], sample["rejectedWindows"] = accepted_windows(state["windows"]), {}
         for name, (label, _) in WINDOWS.items():
-            if raw_windows.get(label, {}).get("usedPercent") is not None and point.get(name, {}).get("continuous") is None:
+            if (raw_windows.get(label, {}).get("usedPercent") is not None
+                    and parse_timestamp(raw_windows[label].get("percentCheckedAt") or sample["checkedAt"]) == parse_timestamp(sample["checkedAt"])
+                    and point.get(name, {}).get("continuous") is None):
                 sample["rejectedWindows"][label] = raw_windows[label]
         sample["usingPreviousWindows"] = bool(sample["rejectedWindows"])
         sample["percentCheckedAt"] = max((window["percentCheckedAt"] for window in sample["windows"].values()), default=None)
@@ -916,8 +916,6 @@ class UsageDashboardState:
             self.runtime_state["activeAccountSlotId"] = account_status["activeAccountId"]
             if not api_account:
                 self._record_quota_sample_locked(sample)
-            else:
-                self.usage_data.record_diagnostic(self.args.sample_log, {"checkedAt": sample["checkedAt"], "sample": sample})
             sample.pop("costDelta", None)
             sample.pop("costDeltaByModel", None)
             self.runtime_state.update({"tokenUsage": token_usage or None, "cost": sample.get("cost") or empty_cost_totals(), "costByModel": sample.get("costByModel") or {}, "lastSample": sample, "updatedAt": sample.get("checkedAt")})

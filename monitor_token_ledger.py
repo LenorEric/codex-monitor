@@ -1,10 +1,9 @@
 #!/usr/bin/env python3
 
-import json
 from pathlib import Path
 
 from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, empty_cost_totals, empty_token_totals, parse_timestamp
-from monitor_tokens import add_cost_delta, add_token_delta, normalize_codex_model, normalize_saved_token_totals, pricing_epoch_for_model, sum_cost_totals, token_totals_delta
+from monitor_tokens import add_cost_delta, add_token_delta, normalize_codex_model, normalize_saved_token_totals, pricing_epoch_for_model, sum_cost_totals
 
 LEDGER_SCHEMA_VERSION = 2
 TOKEN_KEYS = tuple(empty_token_totals())
@@ -13,72 +12,32 @@ def default_token_ledger_path(history_path: Path) -> Path:
     return history_path.with_name("usage_monitor_token_events.jsonl") if history_path.name in {"usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_quota_readings.jsonl"} else history_path.with_suffix(".token-ledger.jsonl")
 
 
-def _subtract_tokens(current: dict | None, previous: dict | None) -> dict:
-    current, previous = normalize_saved_token_totals(current), normalize_saved_token_totals(previous)
-    return normalize_saved_token_totals({key: max(0, current[key] - previous[key]) for key in TOKEN_KEYS})
-
 def _add_tokens(target: dict, value: dict | None) -> None:
     value = normalize_saved_token_totals(value)
     for key in TOKEN_KEYS:
         target[key] += value[key]
 
-def _tier_totals(value: dict) -> dict[str, dict]:
-    fast = normalize_saved_token_totals(value.get("fastTokens"))
-    return {"default": _subtract_tokens(value.get("tokens"), fast), "fast": fast}
-
 def canonical_token_ledger_rows(rows: list[dict]) -> list[dict]:
     for row in rows:
-        if row.get("schemaVersion") != LEDGER_SCHEMA_VERSION or row.get("recordType") not in {"usage", "sessionBaseline"}:
+        if not isinstance(row, dict) or row.get("schemaVersion") != LEDGER_SCHEMA_VERSION or row.get("recordType") != "usage":
             raise ValueError("Token ledger requires data migration")
-        if any(key in row for key in ("pricingId", "pricingBasis")):
-            raise ValueError("Token ledger contains obsolete pricing metadata")
-        if "sourceCoverage" in row:
-            validate_source_coverage(row["sourceCoverage"])
+        if any(key in row for key in ("pricingId", "pricingBasis", "sourceCoverage", "sourceTotals")):
+            raise ValueError("Token ledger contains obsolete metadata; data migration required")
     return rows
 
-
-def validate_source_coverage(coverage):
-    if not isinstance(coverage, dict):
-        raise ValueError("Invalid token source coverage")
-    for model, tiers in coverage.items():
-        if not isinstance(model, str) or not model or not isinstance(tiers, dict) or not set(tiers).issubset({"default", "fast"}):
-            raise ValueError("Invalid token source coverage")
-        for totals in tiers.values():
-            if not isinstance(totals, dict) or set(totals) != set(TOKEN_KEYS) or any(type(value) is not int or value < 0 for value in totals.values()):
-                raise ValueError("Invalid token source coverage")
-
-
-def _source_highwaters(rows: list[dict]) -> dict[tuple[str, str, str], dict]:
-    result = {}
-    for row in rows:
-        if row.get("recordType") == "sessionBaseline" or row.get("sourceCoverage"):
-            session = row.get("session") or row
-            session_id = str(session.get("sessionId") or "")
-            source_totals = row.get("sourceCoverage") or row.get("sourceTotals")
-            if not isinstance(source_totals, dict):
-                by_model = session.get("byModel") or {"gpt-5.5": {"tokens": session.get("tokens"), "cost": session.get("cost")}}
-                source_totals = {model: _tier_totals(value) for model, value in by_model.items() if isinstance(value, dict)}
-            for model, tiers in source_totals.items():
-                for tier, totals in (tiers or {}).items():
-                    key = (session_id, str(model), str(tier))
-                    value = normalize_saved_token_totals(totals)
-                    result[key] = {name: max(value[name], result.get(key, {}).get(name, 0)) for name in TOKEN_KEYS}
-    return result
 
 def _account_for_event(event: dict, account_slot_id: str, account_label: str, account_timeline: list[dict]) -> tuple[str, str]:
     timestamp = parse_timestamp(event.get("checkedAt"))
     attributed = next((row for row in reversed(account_timeline) if timestamp is not None and (parse_timestamp(row.get("checkedAt")) or float("inf")) <= timestamp), None)
     return str((attributed or {}).get("accountSlotId") or account_slot_id or UNKNOWN_EVENT_ACCOUNT_ID), str((attributed or {}).get("accountLabel") or account_label or UNKNOWN_EVENT_ACCOUNT_LABEL)
 
-def _usage_records(events: list[dict], highwaters: dict, account_slot_id: str, account_label: str, account_timeline: list[dict], cumulative: dict | None = None) -> list[dict]:
+def _usage_records(events: list[dict], account_slot_id: str, account_label: str, account_timeline: list[dict], cumulative: dict | None = None) -> list[dict]:
     cumulative, usages = cumulative if cumulative is not None else {}, []
     for event in events:
         key = (str(event.get("sessionId") or ""), str(event.get("model") or "unknown"), "fast" if event.get("serviceTier") == "fast" else "default")
-        before = cumulative.setdefault(key, empty_token_totals()).copy()
-        add_token_delta(cumulative[key], event["tokens"])
-        baseline = highwaters.get(key, empty_token_totals())
-        uncovered_before, uncovered_after = token_totals_delta(before, baseline), token_totals_delta(cumulative[key], baseline)
-        delta = _subtract_tokens(uncovered_after, uncovered_before)
+        delta = empty_token_totals()
+        add_token_delta(delta, event["tokens"])
+        _add_tokens(cumulative.setdefault(key, empty_token_totals()), delta)
         if not any(delta[key] for key in TOKEN_KEYS):
             continue
         epoch = pricing_epoch_for_model(key[1], key[2], event.get("checkedAt"))
@@ -105,13 +64,8 @@ def _empty_session(row: dict) -> dict:
     return session
 
 def token_sessions_from_ledger(rows: list[dict]) -> list[dict]:
+    canonical_token_ledger_rows(rows)
     sessions = {}
-    for row in rows:
-        if row.get("recordType") == "sessionBaseline" and isinstance(row.get("session"), dict):
-            session = row["session"]
-            sessions[(str(session.get("sessionId")), str(session.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID))] = json.loads(json.dumps(session))
-            if (row.get("sync") or {}).get("accountId"):
-                sessions[(str(session.get("sessionId")), str(session.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID))].setdefault("usageAccountId", row["sync"]["accountId"])
     for row in rows:
         if row.get("recordType") != "usage" or not row.get("sessionId"):
             continue
@@ -142,7 +96,8 @@ def token_cost_snapshot(sessions: list[dict]) -> tuple[dict, dict[str, dict]]:
 def reconcile_token_ledger(rows, events, account_slot_id, account_label, account_timeline=None, record_provenance=None, source_files=None, own_machine_id=None):
     """Calculate ledger corrections from database rows and original source events."""
     timeline = sorted(account_timeline or [], key=lambda row: parse_timestamp(row.get("checkedAt")) or 0)
-    usages = _usage_records(events, _source_highwaters(rows), account_slot_id, account_label, timeline)
+    canonical_token_ledger_rows(rows)
+    usages = _usage_records(events, account_slot_id, account_label, timeline)
     source_files = set(source_files or ())
     canonical = {row["eventId"]: row for row in usages if row.get("eventId")}
     retained, existing = [], {}

@@ -22,6 +22,7 @@ def default_history_path(data_home: Path | None = None) -> Path:
     return (Path(data_home) if data_home is not None else codex_switch_home()) / "usage_monitor_history.jsonl"
 
 def default_sample_log_path(history_path: Path) -> Path:
+    """Legacy diagnostic path retained only for released data migrations."""
     return history_path.with_name("usage_monitor_diagnostic_samples.jsonl") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".samples.jsonl")
 
 def default_quota_history_path(history_path: Path) -> Path:
@@ -150,9 +151,6 @@ def normalize_quota_history_row(row: dict) -> dict | None:
     }
     if isinstance(row.get("sync"), dict):
         normalized["sync"] = row["sync"]
-    compaction = row.get("compaction")
-    if isinstance(compaction, dict) and compaction.get("continuousFrom") and isinstance(compaction.get("omittedSamples"), int) and compaction["omittedSamples"] > 0:
-        normalized["compaction"] = {"continuousFrom": compaction["continuousFrom"], "omittedSamples": compaction["omittedSamples"]}
     return normalized
 
 def quota_history_row_from_sample(sample: dict) -> dict | None:
@@ -168,6 +166,31 @@ def quota_history_row_from_sample(sample: dict) -> dict | None:
         "windows": rejected_windows if rejected_windows is not None else sample.get("windows") or {},
         "sync": sample.get("sync"),
     })
+
+def quota_history_rows_from_sample(sample: dict) -> list[dict]:
+    """Keep independently refreshed windows at their actual observation times."""
+    if not isinstance(sample, dict):
+        return []
+    rejected = sample.get("rejectedWindows")
+    if not isinstance(rejected, dict) and (sample.get("usingPreviousWindows") or (sample.get("remoteUsage") or {}).get("accepted") is False):
+        return []
+    rejected = rejected if isinstance(rejected, dict) else {}
+    grouped = {}
+    for label, window in ((sample.get("windows") or {}) | rejected).items():
+        if label not in TARGET_WINDOWS or not isinstance(window, dict):
+            continue
+        checked_at = (sample.get("checkedAt") if label in rejected else window.get("percentCheckedAt")
+            or sample.get("percentCheckedAt") or sample.get("checkedAt"))
+        grouped.setdefault(checked_at, {})[label] = window
+    rows = []
+    for checked_at, windows in grouped.items():
+        row = sample | {"checkedAt": checked_at, "windows": windows}
+        if isinstance(row.get("sync"), dict) and checked_at != sample.get("checkedAt"):
+            row["sync"] = {key: value for key, value in row["sync"].items() if key != "recordId"}
+        if (row := normalize_quota_history_row(row)) is not None:
+            rows.append(row)
+    return sorted(rows, key=lambda row: parse_timestamp(row["checkedAt"]) or 0)
+
 
 def load_quota_history(path: Path) -> list[dict]:
     try:

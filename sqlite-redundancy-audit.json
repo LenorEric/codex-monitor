@@ -1,0 +1,1027 @@
+{
+  "observed_at": 1793348074.501625,
+  "scope": "Global runtime schema/code inspection plus multiple read-only snapshots of the installed pre-contract-20 database; no migrations or application startup executed.",
+  "queries": {
+    "quota_window_reuse": [
+      {
+        "window": "5h",
+        "rows": 42957,
+        "distinct_readings": 42957,
+        "single_owner_readings": 42957,
+        "max_owners": 1
+      },
+      {
+        "window": "7d",
+        "rows": 64362,
+        "distinct_readings": 64362,
+        "single_owner_readings": 64362,
+        "max_owners": 1
+      }
+    ],
+    "sample_ownership": [
+      {
+        "samples": 107394,
+        "single_owner": 0,
+        "max_owners": 2
+      }
+    ],
+    "fact_relationship": [
+      {
+        "samples": 107394,
+        "single_fact": 107394,
+        "max_facts": 1
+      }
+    ],
+    "fact_duplicate_columns": [
+      {
+        "rows": 107394,
+        "same_kind": 107394,
+        "same_subtype": 107394,
+        "same_session": 43031,
+        "same_event": 107394,
+        "same_time": 107394,
+        "same_account": 107394
+      }
+    ],
+    "root_duplicate_columns": [
+      {
+        "rows": 107394,
+        "same_origin": 107394,
+        "same_account": 107394,
+        "same_subtype": 107394,
+        "same_session": 106395
+      }
+    ],
+    "quota_copy": [
+      {
+        "joined": 102945,
+        "exact_copy": 102945,
+        "payload_characters": 44338478
+      }
+    ],
+    "display_payloads": [
+      {
+        "kind": "costTime",
+        "rows": 83610,
+        "payload_characters": 24629728
+      },
+      {
+        "kind": "costUsage:fiveHour",
+        "rows": 3908,
+        "payload_characters": 2100714
+      },
+      {
+        "kind": "costUsage:sevenDay",
+        "rows": 3546,
+        "payload_characters": 1881917
+      },
+      {
+        "kind": "quotaPoints",
+        "rows": 102945,
+        "payload_characters": 48044498
+      },
+      {
+        "kind": "tokenSessions",
+        "rows": 5037,
+        "payload_characters": 3415775
+      }
+    ],
+    "json_sizes": [
+      {
+        "area": "effective",
+        "rows": 43031,
+        "payload_characters": 39487442
+      },
+      {
+        "area": "sampled_quota",
+        "rows": 102945,
+        "payload_characters": 44338478
+      },
+      {
+        "area": "scan_events",
+        "rows": 69255,
+        "payload_characters": 27760716
+      },
+      {
+        "area": "occurrences",
+        "rows": 3779,
+        "payload_characters": 1543002
+      },
+      {
+        "area": "ledger_sessions",
+        "rows": 5036,
+        "payload_characters": 5250816
+      }
+    ],
+    "membership_shape": [
+      {
+        "tokens_with_membership": 82948,
+        "one_window": 0,
+        "two_windows": 82948,
+        "max_windows": 2
+      }
+    ],
+    "membership_orphans": [
+      {
+        "orphans": 0
+      }
+    ],
+    "baseline_model_cardinality": [
+      {
+        "samples": 999,
+        "one_model": 984,
+        "max_models": 2
+      }
+    ],
+    "baseline_total_categories": [
+      {
+        "category": "cost",
+        "rows": 2013
+      },
+      {
+        "category": "tokens",
+        "rows": 2013
+      }
+    ],
+    "peer_copy": [
+      {
+        "rows": 26670,
+        "same_position": 26670,
+        "same_hash": 26670
+      }
+    ],
+    "owner_extensions": [
+      {
+        "owner": "local",
+        "rows": 80724,
+        "empty_metadata": 80724,
+        "empty_attribution": 80724
+      },
+      {
+        "owner": "remote",
+        "rows": 26670,
+        "empty_metadata": 26670,
+        "empty_attribution": 454
+      }
+    ],
+    "raw_event_reuse": [
+      {
+        "event_ids": 3779,
+        "one_occurrence": 3779,
+        "max_occurrences": 1
+      }
+    ],
+    "occurrence_winner_copy": [
+      {
+        "joined": 3779,
+        "exact_copy": 3779,
+        "payload_characters": 1543002
+      }
+    ],
+    "change_backlog": [
+      {
+        "view": "local",
+        "rows": 80724,
+        "account_dirty": 80724
+      },
+      {
+        "view": "merged",
+        "rows": 38147,
+        "account_dirty": 38147
+      }
+    ],
+    "legacy_empty_field": [
+      {
+        "rows": 16,
+        "empty_legacy": 12
+      }
+    ],
+    "effective_winner_copy": [
+      {
+        "rows": 43031,
+        "exact_existing_payload": 42032
+      }
+    ],
+    "quota_display_copy": [
+      {
+        "rows": 103323,
+        "same_after_key_removal": 102945
+      }
+    ],
+    "scan_orphans": [
+      {
+        "rows": 69255,
+        "no_occurrence": 65476,
+        "no_valid_refs": 65476
+      }
+    ],
+    "local_merged_quota_copy": [
+      {
+        "joined": 38319,
+        "exact_payload": 38287
+      }
+    ],
+    "local_merged_token_copy": [
+      {
+        "joined": 41578,
+        "exact_payload": 41578
+      }
+    ],
+    "local_merged_runs_copy": [
+      {
+        "joined": 33744,
+        "exact_payload": 33497
+      }
+    ],
+    "database_pages": [
+      {
+        "pages": 364193,
+        "free_pages": 128495,
+        "bytes_per_page": 4096
+      }
+    ],
+    "quota_stable_metadata": [
+      {
+        "window": "5h",
+        "readings": 42957,
+        "distinct_period_metadata": 14097,
+        "max_readings_per_period": 736
+      },
+      {
+        "window": "7d",
+        "readings": 64362,
+        "distinct_period_metadata": 873,
+        "max_readings_per_period": 3769
+      }
+    ],
+    "effective_types": [
+      {
+        "record_type": "sessionBaseline",
+        "rows": 999,
+        "payload_characters": 1316494
+      },
+      {
+        "record_type": "usage",
+        "rows": 42032,
+        "payload_characters": 38170948
+      }
+    ],
+    "scan_orphan_sizes": [
+      {
+        "rows": 65476,
+        "payload_characters": 26217714
+      }
+    ],
+    "quota_display_exact_distinct": [
+      {
+        "rows": 102945,
+        "exact_existing_point": 102945
+      }
+    ],
+    "delivery_counts": [
+      {
+        "view": "local",
+        "rows": 41578
+      },
+      {
+        "view": "merged",
+        "rows": 42032
+      }
+    ],
+    "quota_reset_representation": [
+      {
+        "readings": 107319,
+        "typed_reset": 0,
+        "numeric_reset_in_extensions": 107319,
+        "extension_characters": 2361018
+      }
+    ],
+    "quota_extension_fields": [
+      {
+        "field": "resetAt",
+        "rows": 107319
+      }
+    ],
+    "root_extension_fields": [
+      {
+        "field": "sourceCoverage",
+        "rows": 32
+      }
+    ]
+  },
+  "allocation_unavailable": "no such table: dbstat",
+  "table_inventory": {
+    "baseline_models": {
+      "rows": 1014,
+      "columns": [
+        "sample_id",
+        "model_id",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions"
+      ]
+    },
+    "baseline_sessions": {
+      "rows": 999,
+      "columns": [
+        "sample_id",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions",
+        "sessionId_id",
+        "startedAt",
+        "updatedAt",
+        "usageAccountId_id"
+      ]
+    },
+    "baseline_tiers": {
+      "rows": 0,
+      "columns": [
+        "sample_id",
+        "model_id",
+        "tier_id",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions",
+        "inputTokens",
+        "freshInputTokens",
+        "cachedInputTokens",
+        "cacheWriteInputTokens",
+        "outputTokens",
+        "totalTokens",
+        "requests"
+      ]
+    },
+    "baseline_totals": {
+      "rows": 4026,
+      "columns": [
+        "sample_id",
+        "model_id",
+        "category",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions",
+        "inputTokens",
+        "freshInputTokens",
+        "cachedInputTokens",
+        "cacheWriteInputTokens",
+        "outputTokens",
+        "totalTokens",
+        "requests",
+        "inputCostUsd",
+        "cachedInputCostUsd",
+        "cacheWriteInputCostUsd",
+        "outputCostUsd",
+        "totalCostUsd"
+      ]
+    },
+    "dashboard_blobs": {
+      "rows": 0,
+      "columns": [
+        "digest",
+        "body",
+        "compressed",
+        "created"
+      ]
+    },
+    "dashboard_day_meta": {
+      "rows": 0,
+      "columns": [
+        "view",
+        "day",
+        "data"
+      ]
+    },
+    "dashboard_days": {
+      "rows": 0,
+      "columns": [
+        "view",
+        "day",
+        "revision",
+        "dirty"
+      ]
+    },
+    "dashboard_manifests": {
+      "rows": 0,
+      "columns": [
+        "scope",
+        "signature",
+        "data",
+        "updated"
+      ]
+    },
+    "dashboard_parts": {
+      "rows": 0,
+      "columns": [
+        "view",
+        "day",
+        "level",
+        "digest"
+      ]
+    },
+    "dashboard_rollups": {
+      "rows": 0,
+      "columns": [
+        "signature",
+        "digest",
+        "created"
+      ]
+    },
+    "delivery_accounts": {
+      "rows": 16,
+      "columns": [
+        "view",
+        "account",
+        "legacy",
+        "label"
+      ]
+    },
+    "delivery_charts": {
+      "rows": 7457,
+      "columns": [
+        "view",
+        "account",
+        "window",
+        "id",
+        "start",
+        "end",
+        "at",
+        "multiplier",
+        "delta",
+        "models"
+      ]
+    },
+    "delivery_dirty": {
+      "rows": 0,
+      "columns": [
+        "view",
+        "account"
+      ]
+    },
+    "delivery_journal": {
+      "rows": 2858,
+      "columns": [
+        "stream",
+        "seq",
+        "created",
+        "body"
+      ]
+    },
+    "delivery_members": {
+      "rows": 165896,
+      "columns": [
+        "view",
+        "account",
+        "window",
+        "event",
+        "interval"
+      ]
+    },
+    "delivery_meta": {
+      "rows": 6,
+      "columns": [
+        "name",
+        "value"
+      ]
+    },
+    "delivery_runs": {
+      "rows": 81445,
+      "columns": [
+        "view",
+        "account",
+        "window",
+        "id",
+        "first",
+        "last",
+        "value",
+        "multiplier",
+        "flags",
+        "reset",
+        "plan"
+      ]
+    },
+    "delivery_snapshot": {
+      "rows": 1,
+      "columns": [
+        "id",
+        "body",
+        "gzip",
+        "created"
+      ]
+    },
+    "delivery_tokens": {
+      "rows": 83610,
+      "columns": [
+        "view",
+        "account",
+        "id",
+        "at",
+        "model",
+        "tier",
+        "fresh",
+        "cached",
+        "output",
+        "cache_write",
+        "cost"
+      ]
+    },
+    "delivery_work": {
+      "rows": 0,
+      "columns": [
+        "view",
+        "account",
+        "kind",
+        "record_key"
+      ]
+    },
+    "local_record_refs": {
+      "rows": 80724,
+      "columns": [
+        "record_key",
+        "period",
+        "content_hash",
+        "sample_id",
+        "attribution",
+        "record_meta"
+      ]
+    },
+    "metadata": {
+      "rows": 1,
+      "columns": [
+        "name",
+        "value"
+      ]
+    },
+    "processing_backup_queue": {
+      "rows": 0,
+      "columns": [
+        "id",
+        "path",
+        "data"
+      ]
+    },
+    "processing_blocks": {
+      "rows": 31485,
+      "columns": [
+        "source",
+        "block",
+        "size",
+        "digest"
+      ]
+    },
+    "processing_changes": {
+      "rows": 118871,
+      "columns": [
+        "view",
+        "account",
+        "kind",
+        "record_key",
+        "event_at",
+        "session",
+        "action"
+      ]
+    },
+    "processing_cost_ranges": {
+      "rows": 7454,
+      "columns": [
+        "view",
+        "account",
+        "kind",
+        "record_key",
+        "start",
+        "end"
+      ]
+    },
+    "processing_counts": {
+      "rows": 166,
+      "columns": [
+        "scope",
+        "account",
+        "kind",
+        "count"
+      ]
+    },
+    "processing_coverage": {
+      "rows": 121,
+      "columns": [
+        "home",
+        "session",
+        "model",
+        "tier",
+        "data"
+      ]
+    },
+    "processing_day_cache": {
+      "rows": 0,
+      "columns": [
+        "day",
+        "data"
+      ]
+    },
+    "processing_dirty": {
+      "rows": 16,
+      "columns": [
+        "view",
+        "account",
+        "reason"
+      ]
+    },
+    "processing_dirty_days": {
+      "rows": 173,
+      "columns": [
+        "day",
+        "generation"
+      ]
+    },
+    "processing_display": {
+      "rows": 199046,
+      "columns": [
+        "view",
+        "account",
+        "kind",
+        "record_key",
+        "event_at",
+        "data"
+      ]
+    },
+    "processing_effective": {
+      "rows": 43031,
+      "columns": [
+        "record_key",
+        "account",
+        "session",
+        "event_at",
+        "data"
+      ]
+    },
+    "processing_fact_refs": {
+      "rows": 107394,
+      "columns": [
+        "source_id",
+        "position",
+        "kind",
+        "record_key",
+        "account_id",
+        "session_id",
+        "event_id",
+        "event_at",
+        "sample_id",
+        "attribution",
+        "subtype"
+      ]
+    },
+    "processing_files": {
+      "rows": 0,
+      "columns": [
+        "path",
+        "signature",
+        "offset"
+      ]
+    },
+    "processing_health": {
+      "rows": 0,
+      "columns": [
+        "source",
+        "error"
+      ]
+    },
+    "processing_ledger_order": {
+      "rows": 2202,
+      "columns": [
+        "home",
+        "session",
+        "source",
+        "event_index"
+      ]
+    },
+    "processing_ledger_sessions": {
+      "rows": 5036,
+      "columns": [
+        "source",
+        "session",
+        "slot",
+        "data"
+      ]
+    },
+    "processing_meta": {
+      "rows": 162,
+      "columns": [
+        "name",
+        "value"
+      ]
+    },
+    "processing_occurrences": {
+      "rows": 3779,
+      "columns": [
+        "source",
+        "event_id",
+        "event_index",
+        "data"
+      ]
+    },
+    "processing_peer_rows": {
+      "rows": 26670,
+      "columns": [
+        "source",
+        "record_key",
+        "position",
+        "digest"
+      ]
+    },
+    "processing_pending_records": {
+      "rows": 0,
+      "columns": [
+        "record_key",
+        "kind",
+        "data"
+      ]
+    },
+    "processing_projections": {
+      "rows": 16,
+      "columns": [
+        "view",
+        "account",
+        "data"
+      ]
+    },
+    "processing_quota_points": {
+      "rows": 102945,
+      "columns": [
+        "view",
+        "account",
+        "event_at",
+        "record_key",
+        "data"
+      ]
+    },
+    "processing_rank_nodes": {
+      "rows": 0,
+      "columns": [
+        "scope",
+        "value",
+        "priority",
+        "frequency",
+        "size",
+        "left_value",
+        "right_value"
+      ]
+    },
+    "processing_reparse": {
+      "rows": 8,
+      "columns": [
+        "source"
+      ]
+    },
+    "processing_sampled_quota": {
+      "rows": 102945,
+      "columns": [
+        "view",
+        "account",
+        "record_key",
+        "event_at",
+        "data"
+      ]
+    },
+    "processing_sampling_changes": {
+      "rows": 0,
+      "columns": [
+        "view",
+        "account",
+        "record_key"
+      ]
+    },
+    "processing_scan_events": {
+      "rows": 69255,
+      "columns": [
+        "event_id",
+        "home",
+        "session",
+        "event_at",
+        "data",
+        "valid_refs",
+        "ledger_done"
+      ]
+    },
+    "processing_scan_sources": {
+      "rows": 161,
+      "columns": [
+        "path",
+        "home",
+        "state",
+        "valid",
+        "modified_ns"
+      ]
+    },
+    "processing_staged_occurrences": {
+      "rows": 490,
+      "columns": [
+        "source",
+        "event_id",
+        "event_index",
+        "data"
+      ]
+    },
+    "processing_totals": {
+      "rows": 6,
+      "columns": [
+        "home",
+        "model",
+        "tier",
+        "data"
+      ]
+    },
+    "quota_samples": {
+      "rows": 64363,
+      "columns": [
+        "sample_id",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions",
+        "continuousFrom",
+        "omittedSamples"
+      ]
+    },
+    "quota_windows": {
+      "rows": 107319,
+      "columns": [
+        "sample_id",
+        "window",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions",
+        "usedPercent",
+        "resetAt",
+        "plan_id"
+      ]
+    },
+    "remote_days": {
+      "rows": 24,
+      "columns": [
+        "machine_id",
+        "day",
+        "logical_hash",
+        "layout_json"
+      ]
+    },
+    "remote_origins": {
+      "rows": 1,
+      "columns": [
+        "machine_id"
+      ]
+    },
+    "remote_record_refs": {
+      "rows": 26670,
+      "columns": [
+        "device_id",
+        "day",
+        "part_id",
+        "record_key",
+        "content_hash",
+        "sample_id",
+        "attribution",
+        "record_meta",
+        "schema_version",
+        "collection_period",
+        "event_at",
+        "envelope_meta"
+      ]
+    },
+    "sample_accounts": {
+      "rows": 12,
+      "columns": [
+        "id",
+        "value"
+      ]
+    },
+    "sample_devices": {
+      "rows": 2,
+      "columns": [
+        "id",
+        "value"
+      ]
+    },
+    "sample_models": {
+      "rows": 15,
+      "columns": [
+        "id",
+        "value"
+      ]
+    },
+    "sample_plans": {
+      "rows": 3,
+      "columns": [
+        "id",
+        "value"
+      ]
+    },
+    "sample_records": {
+      "rows": 107394,
+      "columns": [
+        "id",
+        "kind",
+        "subtype",
+        "content_hash",
+        "event_at",
+        "account_id",
+        "origin_device_id",
+        "identity_session_id",
+        "opaque",
+        "containers",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions",
+        "schemaVersion",
+        "recordType",
+        "checkedAt",
+        "occurredAt",
+        "eventId",
+        "sessionId_id",
+        "rawModel_id",
+        "billingModel_id",
+        "serviceTier_id",
+        "sourceFile_id",
+        "usageAccountId_id"
+      ]
+    },
+    "sample_releases": {
+      "rows": 0,
+      "columns": [
+        "sample_id"
+      ]
+    },
+    "sample_sessions": {
+      "rows": 2364,
+      "columns": [
+        "id",
+        "value"
+      ]
+    },
+    "sample_sources": {
+      "rows": 1581,
+      "columns": [
+        "id",
+        "value"
+      ]
+    },
+    "sample_sync": {
+      "rows": 107394,
+      "columns": [
+        "sample_id",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions",
+        "version",
+        "originMachineId_id",
+        "accountId_id",
+        "recordId",
+        "localOnly"
+      ]
+    },
+    "sample_tiers": {
+      "rows": 1,
+      "columns": [
+        "id",
+        "value"
+      ]
+    },
+    "token_samples": {
+      "rows": 42032,
+      "columns": [
+        "sample_id",
+        "present",
+        "nulls",
+        "floats",
+        "bools",
+        "extensions",
+        "inputTokens",
+        "freshInputTokens",
+        "cachedInputTokens",
+        "cacheWriteInputTokens",
+        "outputTokens",
+        "totalTokens",
+        "requests",
+        "inputCostUsd",
+        "cachedInputCostUsd",
+        "cacheWriteInputCostUsd",
+        "outputCostUsd",
+        "totalCostUsd"
+      ]
+    }
+  }
+}

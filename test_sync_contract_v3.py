@@ -10,7 +10,6 @@ from unittest import mock
 from monitor_migrations import FormatConverter
 from monitor_common import empty_cost_totals, empty_token_totals
 from monitor_history import load_quota_history
-from monitor_token_ledger import _source_highwaters
 from monitor_migrations import _load_v18_token_ledger as load_token_ledger
 from monitor_usage_sync import v4_record_envelope, v4_logical_hash, UsageDataStore, add_record_provenance, canonical_ledger_row, merge_token_ledger_rows, record_key, validate_sync_operation
 
@@ -71,7 +70,7 @@ class SyncContractV3Tests(unittest.TestCase):
             validate_sync_operation({"action": "upsert", "key": record_key("tokenLedger", usage), "record": {"kind": "tokenLedger", "row": usage | {"cost": {"totalCostUsd": -1}}}})
 
     def test_canonical_ledger_key_and_content_drop_redundant_pricing_metadata(self):
-        legacy = usage_row() | {"schemaVersion": 1, "pricingId": "old-price", "pricingBasis": "old", "sourceTotals": {"unused": True}}
+        legacy = usage_row() | {"schemaVersion": 1, "pricingId": "old-price", "pricingBasis": "old"}
         legacy["sync"] = legacy["sync"] | {"recordId": "redundant", "localOnly": False}
         converter = FormatConverter({}, {}, {}, "machine-a")
         with self.assertRaises(ValueError):
@@ -109,7 +108,7 @@ class SyncContractV3Tests(unittest.TestCase):
             identities = {row["eventId"]: row["sync"]["accountId"] for row in load_token_ledger(store.token_ledger_path)}
             self.assertEqual(identities, {"event-a": "v3:stable-a", "event-b": "v3:stable-a", "event-c": "v3:" + "a" * 64})
 
-    def test_ledger_normalization_preserves_non_derivable_legacy_highwaters(self):
+    def test_ledger_normalization_rejects_non_derivable_legacy_highwaters(self):
         with self.directory() as directory:
             store = self.store(directory)
             baseline = {
@@ -120,12 +119,10 @@ class SyncContractV3Tests(unittest.TestCase):
                 "sourceTotals": {"gpt-5": {"default": empty_token_totals() | {"inputTokens": 20}, "fast": empty_token_totals()}},
             }
             baseline = FormatConverter({}, {}, {}, "machine-a").row("tokenLedger", baseline)
-            before = _source_highwaters([baseline])
-            store.record_ledger([baseline])
-            store.datasets()
-            persisted = load_token_ledger(store.token_ledger_path)
-            self.assertEqual(_source_highwaters(persisted), before)
-            self.assertIn("sourceTotals", persisted[0])
+            with self.assertRaises(ValueError):
+                store.record_ledger([baseline])
+            self.assertEqual(store.datasets()[1], [])
+            self.assertEqual(load_token_ledger(store.token_ledger_path), [])
 
     def test_mapped_legacy_remote_identity_deduplicates_with_stable_local_event(self):
         with self.directory() as directory:

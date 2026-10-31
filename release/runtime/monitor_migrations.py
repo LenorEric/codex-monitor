@@ -1,7 +1,6 @@
 """Own local/cloud data contracts, ordered upgrades, journal recovery and old-format conversion.
 
-Released steps are immutable. Merge saved-data changes into local 18 until
-the next successful release. Frozen historical codecs remain separate implementation
+Released steps are immutable. Local 20 includes independent quota storage and event-only history; cloud 5 removes legacy token history. Frozen historical codecs remain separate implementation
 helpers; application modules only invoke the entry points here.
 """
 
@@ -15,22 +14,81 @@ import shutil
 import tempfile
 import uuid
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 19
+DATA_CONTRACT_VERSION = 20
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
-CLOUD_DATA_CONTRACT_VERSION = 4
+CLOUD_DATA_CONTRACT_VERSION = 5
 CLOUD_DATA_CONTRACT_PATH = "data-contract.json"
 
 
 class MigrationError(RuntimeError):
     pass
+
+
+def request_migration_rebuild(paths: dict[str, Path], reason: str, *, sampling: bool = False) -> None:
+    """Explicitly queue one rebuild for the final representation of a cascade.
+
+    The request commits with the migration's protected database, so an interrupted
+    later step does not lose it. Representation-only steps need not request one.
+    """
+    if "processing_index" not in paths or not paths["processing_index"].exists():
+        return  # A fresh store has no derived results to preserve.
+    with closing(samples.connect(paths["processing_index"])) as db, db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_meta'").fetchone():
+            return
+        row = db.execute("SELECT value FROM processing_meta WHERE name='migrationRebuildPending'").fetchone()
+        pending = json.loads(row[0]) if row else {"reasons": [], "sampling": False}
+        if reason not in pending["reasons"]:
+            pending["reasons"].append(reason)
+        pending["sampling"] |= sampling
+        db.execute("INSERT OR REPLACE INTO processing_meta VALUES('migrationRebuildPending',?)", (json.dumps(pending),))
+
+
+def _apply_migration_rebuild(paths: dict[str, Path]) -> None:
+    """Publish requested work once, after all ordered migrations have succeeded."""
+    if not paths["processing_index"].exists():
+        return
+    with closing(samples.connect(paths["processing_index"])) as db, db:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_meta'").fetchone():
+            return
+        row = db.execute("SELECT value FROM processing_meta WHERE name='migrationRebuildPending'").fetchone()
+        if row is None:
+            return
+        pending = json.loads(row[0])
+        for view in ("local", "merged"):
+            db.execute("INSERT OR REPLACE INTO processing_dirty SELECT ?,account,? FROM processing_facts GROUP BY account", (view, "; ".join(pending["reasons"])))
+            if pending["sampling"] and db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_sampling_changes'").fetchone():
+                db.execute("INSERT OR IGNORE INTO processing_sampling_changes SELECT ?,account,'' FROM processing_facts WHERE kind='quota' GROUP BY account", (view,))
+        db.execute("DELETE FROM processing_meta WHERE name='migrationRebuildPending'")
+
+
+def _with_migration_rebuild(migration, reason: str, *, sampling: bool = False):
+    """Keep released conversion steps intact while declaring their rebuild needs."""
+    def run(paths):
+        migration(paths)
+        request_migration_rebuild(paths, reason, sampling=sampling)
+    return run
+
+
+@contextmanager
+def _preserve_projection_work(db):
+    """Rekeying identical facts must not turn valid projections into rebuild work."""
+    for table in ("dirty", "changes", "sampling_changes"):
+        db.execute(f"CREATE TEMP TABLE migration_saved_{table} AS SELECT * FROM processing_{table}")
+    try:
+        yield
+    finally:
+        for table in ("dirty", "changes", "sampling_changes"):
+            db.execute(f"DELETE FROM processing_{table}")
+            db.execute(f"INSERT INTO processing_{table} SELECT * FROM migration_saved_{table}")
+            db.execute(f"DROP TABLE migration_saved_{table}")
 
 
 def validate_contract_metadata(metadata: dict) -> None:
@@ -459,20 +517,25 @@ def _migrate_history_to_v19(paths: dict[str, Path]) -> None:
     The migration journal protects the database while its derived state changes.
     """
     from monitor_processing import ProcessingIndex
-    from monitor_usage_sync import initialize_v4_cache, record_account_key
+    from monitor_usage_sync import initialize_v4_cache, record_key
     initialize_v4_cache(paths["processing_index"])
     index = ProcessingIndex(paths["processing_index"])
+    conflicting_sources = False
     with index.transaction() as db, index.defer_sessions(db):
-        for kind in ("quota", "tokenLedger"):
-            rows = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_facts WHERE kind=? AND source NOT LIKE 'peer:%' ORDER BY source,position", (kind,))]
-            # Logical source identities must not depend on backup output filenames.
-            for row in rows:
-                index.dirty(db, record_account_key(row), "database authority migration")
-            db.execute("DELETE FROM processing_facts WHERE kind=? AND source NOT LIKE 'peer:%'", (kind,))
-            if kind == "tokenLedger":
-                db.execute("DELETE FROM processing_ledger_sessions WHERE source NOT LIKE 'peer:%' AND source NOT LIKE 'view:%'")
-                db.execute("DELETE FROM processing_meta WHERE name LIKE 'ledgerCost:%' AND name NOT LIKE 'ledgerCost:view:%'")
-            index.write_records(db, kind, rows)
+        with _preserve_projection_work(db):
+            for kind in ("quota", "tokenLedger"):
+                rows = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_facts WHERE kind=? AND source NOT LIKE 'peer:%' ORDER BY source,position", (kind,))]
+                identities = {}
+                for row in rows:
+                    key = record_key(kind, row)
+                    conflicting_sources |= key in identities and identities[key] != row
+                    identities[key] = row
+                # Logical source identities change; the readings and projections do not.
+                db.execute("DELETE FROM processing_facts WHERE kind=? AND source NOT LIKE 'peer:%'", (kind,))
+                if kind == "tokenLedger":
+                    db.execute("DELETE FROM processing_ledger_sessions WHERE source NOT LIKE 'peer:%' AND source NOT LIKE 'view:%'")
+                    db.execute("DELETE FROM processing_meta WHERE name LIKE 'ledgerCost:%' AND name NOT LIKE 'ledgerCost:view:%'")
+                index.write_records(db, kind, rows)
         # Finish released batches once; new ingestion commits everything together.
         for name, data in list(db.execute("SELECT name,value FROM processing_meta WHERE name LIKE 'ledgerBatch:%'")):
             home, batch = name[len("ledgerBatch:"):], json.loads(data)
@@ -488,7 +551,17 @@ def _migrate_history_to_v19(paths: dict[str, Path]) -> None:
         db.execute("DELETE FROM processing_meta WHERE name='canonicalNormalized'")
         index.put(db, "factRevision", index.get(db, "factRevision", 0) + 1)
         index.put(db, "sqliteAuthoritative", True)
+    if conflicting_sources:
+        request_migration_rebuild(paths, "conflicting source identities", sampling=True)
 
+
+
+def _migrate_history_to_v20(paths: dict[str, Path]) -> None:
+    # One pending migration combines all changes since released contract 19.
+    if paths["processing_index"].exists():
+        with closing(samples.connect(paths["processing_index"])) as db, db:
+            samples.migrate_layout(db)
+    __import__("monitor_migration_events").migrate_event_only(paths)
 
 
 DATA_MIGRATIONS = {
@@ -501,16 +574,17 @@ DATA_MIGRATIONS = {
     7: _migrate_history_to_v7,
     8: _migrate_history_to_v8,
     9: _migrate_history_to_v9,
-    10: _migrate_history_to_v10,
+    10: _with_migration_rebuild(_migrate_history_to_v10, "cost time migration"),
     11: _migrate_history_to_v11,
-    12: _migrate_history_to_v12,
+    12: _with_migration_rebuild(_migrate_history_to_v12, "cost time migration"),
     13: _migrate_history_to_v13,
     14: _migrate_history_to_v14,
-    15: _migrate_history_to_v15,
-    16: lambda paths: migrate_reset_timestamps(paths),
-    17: _migrate_history_to_v17,
-    18: _migrate_history_to_v18,
+    15: _with_migration_rebuild(_migrate_history_to_v15, "token identity conversion", sampling=True),
+    16: _with_migration_rebuild(lambda paths: migrate_reset_timestamps(paths), "reset timestamp conversion", sampling=True),
+    17: _with_migration_rebuild(_migrate_history_to_v17, "quota reset boundaries", sampling=True),
+    18: _with_migration_rebuild(_migrate_history_to_v18, "quota reset boundaries and delivery format", sampling=True),
     19: _migrate_history_to_v19,
+    20: _with_migration_rebuild(_migrate_history_to_v20, "event-only and independent quota storage migration"),
 }
 
 
@@ -704,7 +778,7 @@ def migrate_history_data(
         if version == 5:
             migration = lambda migration_paths: _migrate_history_to_v5(migration_paths, codex_home)
         if version == 15:
-            migration = lambda migration_paths: _migrate_history_to_v15(migration_paths, codex_home)
+            migration = _with_migration_rebuild(lambda migration_paths: _migrate_history_to_v15(migration_paths, codex_home), "token identity conversion", sampling=True)
         migration_paths = paths
         if version < 15:
             migration_paths = {name: path for name, path in migration_paths.items() if name not in {"config", "machine", "skills"} and not name.startswith(("vault_", "cache_source_"))}
@@ -717,8 +791,15 @@ def migrate_history_data(
             for legacy_name, current_name in (("legacy_quota_history", "quota_history"), ("legacy_token_ledger", "token_ledger"), ("legacy_sample_log", "sample_log")):
                 if legacy_name in paths and paths[legacy_name].exists():
                     migration_paths[current_name] = paths[legacy_name]
-        _run_data_migration(migration, migration_paths, version, state_path, journal_path)
+        from monitor_sampling import defer_refresh
+        with defer_refresh():
+            _run_data_migration(migration, migration_paths, version, state_path, journal_path)
         completed.append(version)
+    _apply_migration_rebuild(paths)
+    if target_version == DATA_CONTRACT_VERSION and paths["processing_index"].exists():
+        from monitor_processing import ProcessingIndex
+        # Sampling requests from every step are replayed together, against the final facts.
+        ProcessingIndex(paths["processing_index"])
     return completed
 
 
@@ -756,7 +837,8 @@ def _migrate_cloud_to_v3(client):
     migrate_cloud_formats(client, getattr(client, "_migration_manager", None))
 
 
-CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3, 4: lambda client: migrate_cloud_reset_timestamps(client)}
+CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3, 4: lambda client: migrate_cloud_reset_timestamps(client),
+    5: lambda client: __import__("monitor_migration_events").migrate_cloud_event_only(client)}
 
 
 def read_cloud_contract(client):
@@ -794,9 +876,13 @@ def ensure_cloud_contract(client):
         except Exception:
             if version == 4 and read_cloud_contract(client)[0] < version:
                 rollback_cloud_reset_timestamps(client)
+            if version == 5 and read_cloud_contract(client)[0] < version:
+                __import__("monitor_migration_events").rollback_cloud_event_only(client)
             raise
     if CLOUD_DATA_CONTRACT_VERSION >= 3:
         finish_cloud_format_migration(client)
+    if CLOUD_DATA_CONTRACT_VERSION >= 5:
+        __import__("monitor_migration_events").finish_cloud_event_migration(client)
 
 
 DEFAULT_DATA_FILES = (
@@ -1002,7 +1088,7 @@ def convert_historical_event_id(row):
 def resolve_unavailable_event_ids(rows, event_ids):
     """Preserve detailed usage when its old positional ID cannot be reconstructed."""
     import re
-    from monitor_token_ledger import _source_highwaters, _add_tokens
+    from monitor_migration_events import _source_highwaters, _add_tokens
     from monitor_common import empty_token_totals
     unresolved = [row for row in rows if row.get("recordType") == "usage" and row.get("eventId") not in event_ids
         and re.fullmatch(re.escape(str(row.get("sessionId"))) + r":\d+", str(row.get("eventId")))]
@@ -1184,8 +1270,8 @@ def migrate_local_formats(paths, codex_home=None):
                 if row is not None:
                     if record["kind"] == "tokenLedger" and row.get("eventId") in migrated_events:
                         row = migrated_events[row["eventId"]]
-                    from monitor_usage_sync import UsageDataStore
-                    record = UsageDataStore._transport_record(record["kind"], row)
+                    from monitor_migration_events import historical_transport_record
+                    record = historical_transport_record(record["kind"], row)
                     samples.put_local(db, record_key(record["kind"], row), period, content_hash(record), record)
             for origin, day, part, original_key, data in db.execute("SELECT machine_id,day,part_id,record_key,record_json FROM migration15_remote"):
                 envelope = json.loads(data)
@@ -1266,7 +1352,8 @@ def migrate_local_formats(paths, codex_home=None):
 def migrate_cloud_formats(client, manager):
     """Convert under the existing WebDAV operation lock, with retryable originals."""
     from monitor_cloud import CloudError, CryptoBox
-    from monitor_usage_sync import canonical_json, content_hash, record_key, v4_logical_hash, v4_period, v4_record_envelope, validate_v4_envelope
+    from monitor_usage_sync import canonical_json, content_hash, record_key, v4_logical_hash, v4_period, v4_record_envelope
+    from monitor_migration_events import validate_v4_envelope
     import time
     def optional(path):
         try:

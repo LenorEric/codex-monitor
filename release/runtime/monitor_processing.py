@@ -23,12 +23,123 @@ def encode(value) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
+def _migrate_processing_tables(db):
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='processing_effective'").fetchone():
+        for name, in db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='processing_effective'").fetchall():
+            db.execute(f"DROP TRIGGER IF EXISTS {name}")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS processing_effective_refs("
+            "record_key TEXT PRIMARY KEY,"
+            "account_id INTEGER NOT NULL REFERENCES sample_accounts(id),"
+            "session_id INTEGER NOT NULL REFERENCES sample_sessions(id),"
+            "event_at REAL,"
+            "sample_id INTEGER NOT NULL REFERENCES sample_records(id),"
+            "attribution TEXT)"
+        )
+        for key, account, session, event_at, data in db.execute("SELECT record_key,account,session,event_at,data FROM processing_effective").fetchall():
+            sample_id, attrs = samples.insert_sample(db, "tokenLedger", json.loads(data))
+            db.execute(
+                "INSERT OR REPLACE INTO processing_effective_refs VALUES(?,?,?,?,?,?)",
+                (key, samples._dimension(db, "account", account), samples._dimension(db, "session", session), event_at, sample_id, attrs),
+            )
+        db.execute("DROP TABLE processing_effective")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='processing_quota_points'").fetchone():
+        for name, in db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='processing_quota_points'").fetchall():
+            db.execute(f"DROP TRIGGER IF EXISTS {name}")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS processing_quota_point_refs("
+            "view TEXT NOT NULL,"
+            "account TEXT NOT NULL,"
+            "event_at REAL NOT NULL,"
+            "record_key TEXT NOT NULL,"
+            "payload_id INTEGER NOT NULL REFERENCES processing_payloads(id),"
+            "PRIMARY KEY(view,account,record_key))"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO processing_quota_point_refs(view,account,event_at,record_key,payload_id) "
+            "SELECT view,account,event_at,record_key,put_payload(data,NULL) FROM processing_quota_points"
+        )
+        db.execute("DROP TABLE processing_quota_points")
+    if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='processing_display'").fetchone():
+        for name, in db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND tbl_name='processing_display'").fetchall():
+            db.execute(f"DROP TRIGGER IF EXISTS {name}")
+        db.execute(
+            "CREATE TABLE IF NOT EXISTS processing_display_refs("
+            "view TEXT NOT NULL,"
+            "account TEXT NOT NULL,"
+            "kind TEXT NOT NULL,"
+            "record_key TEXT NOT NULL,"
+            "event_at REAL,"
+            "session_id TEXT,"
+            "payload_id INTEGER NOT NULL REFERENCES processing_payloads(id),"
+            "PRIMARY KEY(view,kind,record_key))"
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO processing_display_refs(view,account,kind,record_key,event_at,session_id,payload_id) "
+            "SELECT view,account,kind,record_key,event_at,json_extract(data,'$.sessionId'),"
+            "put_payload(data,CASE WHEN kind='quotaPoints' THEN record_key END) FROM processing_display"
+        )
+        db.execute("DROP TABLE processing_display")
+
+
+def _install_count_triggers(db):
+    specs = (
+        (
+            "facts",
+            "fact_refs",
+            "(SELECT value FROM sample_sources WHERE id=NEW.source_id)",
+            "(SELECT value FROM sample_accounts WHERE id=NEW.account_id)",
+            "(SELECT kind FROM sample_records WHERE id=NEW.sample_id)",
+        ),
+        (
+            "effective",
+            "effective_refs",
+            "'effective'",
+            "(SELECT value FROM sample_accounts WHERE id=NEW.account_id)",
+            "'tokenLedger'",
+        ),
+        ("display", "display_refs", "'display:'||NEW.view", "NEW.account", "NEW.kind"),
+        ("quota_points", "quota_point_refs", "'quota:'||NEW.view", "NEW.account", "'quota'"),
+        ("scan_sources", "scan_sources", "'sources'", "NEW.home", "'files'"),
+    )
+    for table, physical, scope, account, kind in specs:
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (f"processing_{physical}",)).fetchone():
+            continue
+        db.execute(f"DROP TRIGGER IF EXISTS processing_count_{table}_insert")
+        db.execute(f"DROP TRIGGER IF EXISTS processing_count_{table}_delete")
+        db.execute(
+            f"CREATE TRIGGER processing_count_{table}_insert AFTER INSERT ON processing_{physical} BEGIN "
+            f"UPDATE processing_counts SET count=count+1 WHERE scope={scope} AND account={account} AND kind={kind}; "
+            f"INSERT INTO processing_counts SELECT {scope},{account},{kind},1 "
+            f"WHERE NOT EXISTS(SELECT 1 FROM processing_counts WHERE scope={scope} AND account={account} AND kind={kind}); END"
+        )
+        db.execute(
+            f"CREATE TRIGGER processing_count_{table}_delete AFTER DELETE ON processing_{physical} BEGIN "
+            f"UPDATE processing_counts SET count=count-1 WHERE scope={scope.replace('NEW.', 'OLD.')} "
+            f"AND account={account.replace('NEW.', 'OLD.')} AND kind={kind.replace('NEW.', 'OLD.')}; END"
+        )
+
+
+def _rebuild_counts(db):
+    db.execute("DELETE FROM processing_counts")
+    for table, scope, account, kind in (
+        ("facts", "source", "account", "kind"),
+        ("effective", "'effective'", "account", "'tokenLedger'"),
+        ("display", "'display:'||view", "account", "kind"),
+        ("quota_points", "'quota:'||view", "account", "'quota'"),
+        ("scan_sources", "'sources'", "home", "'files'"),
+    ):
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name=?", (f"processing_{table}",)).fetchone():
+            db.execute(f"INSERT OR REPLACE INTO processing_counts SELECT {scope},{account},{kind},COUNT(*) FROM processing_{table} GROUP BY 1,2,3")
+
+
 def initialize_processing_index(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with closing(samples.connect(path)) as db, db:
         db.execute("PRAGMA auto_vacuum=INCREMENTAL")
         db.execute("PRAGMA journal_mode=WAL")
-        normalized = samples.prepare(db)
+        samples.prepare(db)
+        _migrate_processing_tables(db)
         db.executescript("""
             CREATE TABLE IF NOT EXISTS processing_meta (name TEXT PRIMARY KEY, value TEXT NOT NULL);
             -- Kept empty for released migration 15, which still clears this table.
@@ -61,45 +172,117 @@ def initialize_processing_index(path: Path) -> None:
             CREATE TABLE IF NOT EXISTS processing_ledger_sessions (source TEXT NOT NULL, session TEXT NOT NULL, slot TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(source,session,slot));
             CREATE TABLE IF NOT EXISTS processing_coverage (home TEXT NOT NULL, session TEXT NOT NULL, model TEXT NOT NULL, tier TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(home,session,model,tier));
             CREATE TABLE IF NOT EXISTS processing_ledger_order (home TEXT NOT NULL, session TEXT NOT NULL, source TEXT NOT NULL, event_index INTEGER NOT NULL, PRIMARY KEY(home,session));
-            CREATE TABLE IF NOT EXISTS processing_effective (record_key TEXT PRIMARY KEY, account TEXT NOT NULL, session TEXT NOT NULL, event_at REAL, data TEXT NOT NULL);
-            CREATE INDEX IF NOT EXISTS processing_effective_account ON processing_effective(account,event_at);
+            CREATE TABLE IF NOT EXISTS processing_effective_refs (
+                record_key TEXT PRIMARY KEY,
+                account_id INTEGER NOT NULL REFERENCES sample_accounts(id),
+                session_id INTEGER NOT NULL REFERENCES sample_sessions(id),
+                event_at REAL,
+                sample_id INTEGER NOT NULL REFERENCES sample_records(id),
+                attribution TEXT
+            );
+            CREATE INDEX IF NOT EXISTS processing_effective_account ON processing_effective_refs(account_id,event_at);
+            CREATE INDEX IF NOT EXISTS processing_effective_sample ON processing_effective_refs(sample_id);
+            CREATE TRIGGER IF NOT EXISTS processing_effective_refs_delete AFTER DELETE ON processing_effective_refs BEGIN
+                INSERT OR IGNORE INTO sample_releases VALUES(OLD.sample_id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS processing_effective_refs_update AFTER UPDATE ON processing_effective_refs BEGIN
+                INSERT OR IGNORE INTO sample_releases VALUES(OLD.sample_id);
+            END;
+            CREATE VIEW IF NOT EXISTS processing_effective AS
+                SELECT e.record_key,a.value AS account,s.value AS session,e.event_at,sample_row(e.sample_id,e.attribution) AS data
+                FROM processing_effective_refs e
+                JOIN sample_accounts a ON a.id=e.account_id
+                JOIN sample_sessions s ON s.id=e.session_id;
+            CREATE TRIGGER IF NOT EXISTS processing_effective_delete INSTEAD OF DELETE ON processing_effective BEGIN
+                DELETE FROM processing_effective_refs WHERE record_key=OLD.record_key;
+            END;
             CREATE TABLE IF NOT EXISTS processing_changes (view TEXT NOT NULL, account TEXT NOT NULL, kind TEXT NOT NULL, record_key TEXT NOT NULL, event_at REAL, session TEXT NOT NULL, action TEXT NOT NULL, PRIMARY KEY(view,account,kind,record_key));
-            CREATE TABLE IF NOT EXISTS processing_display (view TEXT NOT NULL, account TEXT NOT NULL, kind TEXT NOT NULL, record_key TEXT NOT NULL, event_at REAL, data TEXT NOT NULL, PRIMARY KEY(view,kind,record_key));
-            CREATE INDEX IF NOT EXISTS processing_display_account ON processing_display(view,account,kind,event_at);
-            CREATE INDEX IF NOT EXISTS processing_display_session ON processing_display(view,account,kind,json_extract(data,'$.sessionId'));
+            CREATE TABLE IF NOT EXISTS processing_display_refs (
+                view TEXT NOT NULL,
+                account TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                record_key TEXT NOT NULL,
+                event_at REAL,
+                session_id TEXT,
+                payload_id INTEGER NOT NULL REFERENCES processing_payloads(id),
+                PRIMARY KEY(view,kind,record_key)
+            );
+            CREATE INDEX IF NOT EXISTS processing_display_account ON processing_display_refs(view,account,kind,event_at);
+            CREATE INDEX IF NOT EXISTS processing_display_session ON processing_display_refs(view,account,kind,session_id);
+            CREATE INDEX IF NOT EXISTS processing_display_payload ON processing_display_refs(payload_id);
+            CREATE TRIGGER IF NOT EXISTS processing_display_refs_delete AFTER DELETE ON processing_display_refs BEGIN
+                INSERT OR IGNORE INTO processing_payload_releases VALUES(OLD.payload_id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS processing_display_refs_update AFTER UPDATE ON processing_display_refs BEGIN
+                INSERT OR IGNORE INTO processing_payload_releases VALUES(OLD.payload_id);
+            END;
+            CREATE VIEW IF NOT EXISTS processing_display AS
+                SELECT r.view,r.account,r.kind,r.record_key,r.event_at,
+                       display_payload(p.data, CASE WHEN r.kind='quotaPoints' THEN r.record_key END) AS data
+                FROM processing_display_refs r
+                JOIN processing_payloads p ON p.id=r.payload_id;
+            CREATE TRIGGER IF NOT EXISTS processing_display_insert INSTEAD OF INSERT ON processing_display BEGIN
+                INSERT OR REPLACE INTO processing_display_refs(view,account,kind,record_key,event_at,session_id,payload_id)
+                VALUES(NEW.view,NEW.account,NEW.kind,NEW.record_key,NEW.event_at,json_extract(NEW.data,'$.sessionId'),
+                       put_payload(NEW.data, CASE WHEN NEW.kind='quotaPoints' THEN NEW.record_key END));
+            END;
+            CREATE TRIGGER IF NOT EXISTS processing_display_update INSTEAD OF UPDATE ON processing_display BEGIN
+                UPDATE processing_display_refs
+                SET view=NEW.view,account=NEW.account,kind=NEW.kind,record_key=NEW.record_key,event_at=NEW.event_at,
+                    session_id=json_extract(NEW.data,'$.sessionId'),
+                    payload_id=put_payload(NEW.data, CASE WHEN NEW.kind='quotaPoints' THEN NEW.record_key END)
+                WHERE view=OLD.view AND kind=OLD.kind AND record_key=OLD.record_key;
+            END;
+            CREATE TRIGGER IF NOT EXISTS processing_display_delete INSTEAD OF DELETE ON processing_display BEGIN
+                DELETE FROM processing_display_refs WHERE view=OLD.view AND kind=OLD.kind AND record_key=OLD.record_key;
+            END;
             CREATE TABLE IF NOT EXISTS processing_cost_ranges (view TEXT NOT NULL, account TEXT NOT NULL, kind TEXT NOT NULL, record_key TEXT NOT NULL, start REAL NOT NULL, end REAL NOT NULL, PRIMARY KEY(view,kind,record_key));
             CREATE INDEX IF NOT EXISTS processing_cost_range_end ON processing_cost_ranges(view,account,end,start);
-            CREATE TABLE IF NOT EXISTS processing_quota_points (view TEXT NOT NULL, account TEXT NOT NULL, event_at REAL NOT NULL, record_key TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(view,account,record_key));
-            CREATE INDEX IF NOT EXISTS processing_quota_order ON processing_quota_points(view,account,event_at,record_key);
+            CREATE TABLE IF NOT EXISTS processing_quota_point_refs (
+                view TEXT NOT NULL,
+                account TEXT NOT NULL,
+                event_at REAL NOT NULL,
+                record_key TEXT NOT NULL,
+                payload_id INTEGER NOT NULL REFERENCES processing_payloads(id),
+                PRIMARY KEY(view,account,record_key)
+            );
+            CREATE INDEX IF NOT EXISTS processing_quota_order ON processing_quota_point_refs(view,account,event_at,record_key);
+            CREATE INDEX IF NOT EXISTS processing_quota_payload ON processing_quota_point_refs(payload_id);
+            CREATE TRIGGER IF NOT EXISTS processing_quota_point_refs_delete AFTER DELETE ON processing_quota_point_refs BEGIN
+                INSERT OR IGNORE INTO processing_payload_releases VALUES(OLD.payload_id);
+            END;
+            CREATE TRIGGER IF NOT EXISTS processing_quota_point_refs_update AFTER UPDATE ON processing_quota_point_refs BEGIN
+                INSERT OR IGNORE INTO processing_payload_releases VALUES(OLD.payload_id);
+            END;
+            CREATE VIEW IF NOT EXISTS processing_quota_points AS
+                SELECT r.view,r.account,r.event_at,r.record_key,p.data
+                FROM processing_quota_point_refs r
+                JOIN processing_payloads p ON p.id=r.payload_id;
+            CREATE TRIGGER IF NOT EXISTS processing_quota_points_insert INSTEAD OF INSERT ON processing_quota_points BEGIN
+                INSERT OR REPLACE INTO processing_quota_point_refs(view,account,event_at,record_key,payload_id)
+                VALUES(NEW.view,NEW.account,NEW.event_at,NEW.record_key,put_payload(NEW.data, NULL));
+            END;
+            CREATE TRIGGER IF NOT EXISTS processing_quota_points_update INSTEAD OF UPDATE ON processing_quota_points BEGIN
+                UPDATE processing_quota_point_refs
+                SET view=NEW.view,account=NEW.account,event_at=NEW.event_at,record_key=NEW.record_key,
+                    payload_id=put_payload(NEW.data, NULL)
+                WHERE view=OLD.view AND account=OLD.account AND record_key=OLD.record_key;
+            END;
+            CREATE TRIGGER IF NOT EXISTS processing_quota_points_delete INSTEAD OF DELETE ON processing_quota_points BEGIN
+                DELETE FROM processing_quota_point_refs WHERE view=OLD.view AND account=OLD.account AND record_key=OLD.record_key;
+            END;
             -- Kept empty for released migration 15, which still clears this legacy table.
             CREATE TABLE IF NOT EXISTS processing_rank_nodes (scope TEXT NOT NULL, value REAL NOT NULL, priority INTEGER NOT NULL, frequency INTEGER NOT NULL, size INTEGER NOT NULL, left_value REAL, right_value REAL, PRIMARY KEY(scope,value));
             CREATE TABLE IF NOT EXISTS processing_health(source TEXT PRIMARY KEY, error TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS processing_blocks(source TEXT NOT NULL,block INTEGER NOT NULL,size INTEGER NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(source,block));
             CREATE TABLE IF NOT EXISTS processing_reparse(source TEXT PRIMARY KEY);
-            CREATE TABLE IF NOT EXISTS processing_peer_rows(source TEXT NOT NULL,record_key TEXT NOT NULL,position INTEGER NOT NULL,digest TEXT NOT NULL,PRIMARY KEY(source,record_key));
         """)
         db.execute("INSERT OR IGNORE INTO processing_meta VALUES('schemaVersion', ?)", (str(PROCESSING_SCHEMA_VERSION),))
         db.execute("CREATE INDEX IF NOT EXISTS processing_scan_active ON processing_scan_sources(home,modified_ns)")
         db.execute("CREATE TABLE IF NOT EXISTS processing_counts(scope TEXT NOT NULL,account TEXT NOT NULL,kind TEXT NOT NULL,count INTEGER NOT NULL,PRIMARY KEY(scope,account,kind))")
-        for table, scope, account, kind in (("facts", "NEW.source", "NEW.account", "NEW.kind"), ("effective", "'effective'", "NEW.account", "'tokenLedger'"),
-            ("display", "'display:'||NEW.view", "NEW.account", "NEW.kind"), ("quota_points", "'quota:'||NEW.view", "NEW.account", "'quota'"),
-            ("scan_sources", "'sources'", "NEW.home", "'files'")):
-            physical = "fact_refs" if table == "facts" and normalized else table
-            if table == "facts" and normalized:
-                scope = "(SELECT value FROM sample_sources WHERE id=NEW.source_id)"
-                account = "(SELECT value FROM sample_accounts WHERE id=NEW.account_id)"
-            db.executescript(f"""
-                CREATE TRIGGER IF NOT EXISTS processing_count_{table}_insert AFTER INSERT ON processing_{physical} BEGIN
-                    INSERT INTO processing_counts VALUES({scope},{account},{kind},1) ON CONFLICT(scope,account,kind) DO UPDATE SET count=count+1;
-                END;
-                CREATE TRIGGER IF NOT EXISTS processing_count_{table}_delete AFTER DELETE ON processing_{physical} BEGIN
-                    UPDATE processing_counts SET count=count-1 WHERE scope={scope.replace('NEW.', 'OLD.')} AND account={account.replace('NEW.', 'OLD.')} AND kind={kind.replace('NEW.', 'OLD.')};
-                END;
-            """)
+        _install_count_triggers(db)
         if db.execute("SELECT 1 FROM processing_meta WHERE name='countsInitialized'").fetchone() is None:
-            for table, scope, account, kind in (("facts", "source", "account", "kind"), ("effective", "'effective'", "account", "'tokenLedger'"),
-                ("display", "'display:'||view", "account", "kind"), ("quota_points", "'quota:'||view", "account", "'quota'"), ("scan_sources", "'sources'", "home", "'files'")):
-                db.execute(f"INSERT OR REPLACE INTO processing_counts SELECT {scope},{account},{kind},COUNT(*) FROM processing_{table} GROUP BY 1,2,3")
+            _rebuild_counts(db)
             db.execute("INSERT INTO processing_meta VALUES('countsInitialized','true')")
         if db.execute("SELECT value FROM processing_meta WHERE name='schemaVersion'").fetchone()[0] != str(PROCESSING_SCHEMA_VERSION):
             raise ValueError("Unsupported processing index schema")
@@ -230,7 +413,7 @@ class ProcessingIndex:
                 continue
             db.execute("INSERT OR REPLACE INTO processing_changes VALUES(?,?,?,?,?,?,?)", (view, account, kind, record_key(kind, row),
                 parse_timestamp(row.get("checkedAt") or row.get("occurredAt") or session.get("updatedAt")), str(session.get("sessionId") or ""),
-                "replace" if previous or duplicate or row.get("recordType") == "sessionBaseline" else "append"))
+                "replace" if previous or duplicate else "append"))
         if not source.startswith("peer:"):
             db.execute("INSERT OR REPLACE INTO processing_pending_records VALUES(?,?,?)", (record_key(kind, row), kind, data))
         self.metrics["recordsImported"] += 1
@@ -303,6 +486,7 @@ class ProcessingIndex:
         with self.transaction() as db:
             for table in ("display", "projections", "quota_points", "cost_ranges"):
                 db.execute(f"DELETE FROM processing_{table}")
+            db.execute("UPDATE remote_record_refs SET peer_position=NULL")
             for (account,) in list(db.execute("SELECT DISTINCT account FROM processing_facts")):
                 self.dirty(db, account, "explicit repair")
             for source, home, data in list(db.execute("SELECT path,home,state FROM processing_scan_sources")):
@@ -317,34 +501,24 @@ class ProcessingIndex:
         from monitor_token_ledger import _empty_session, _add_tokens
         from monitor_tokens import normalize_codex_model, sum_cost_totals
         from monitor_common import empty_cost_totals
-        if row.get("recordType") not in {"usage", "sessionBaseline"}:
+        if row.get("recordType") != "usage":
             return
         value = row.get("session") or row
         key = (source, str(value.get("sessionId") or ""), str(value.get("accountSlotId") or "unknown"))
         previous = db.execute("SELECT data FROM processing_ledger_sessions WHERE source=? AND session=? AND slot=?", key).fetchone()
         session = json.loads(previous[0]) if previous else _empty_session(row)
-        if row.get("recordType") == "sessionBaseline":
-            session = json.loads(encode(value))
-            if (row.get("sync") or {}).get("accountId"):
-                session.setdefault("usageAccountId", row["sync"]["accountId"])
-            if previous:
-                from monitor_token_ledger import token_sessions_from_ledger
-                sessions = token_sessions_from_ledger([json.loads(item[0]) for item in db.execute(
-                    "SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' AND session=? ORDER BY position", (source, key[1]))])
-                session = next((item for item in sessions if str(item.get("accountSlotId") or "unknown") == key[2]), session)
-        else:
-            occurred = row.get("occurredAt")
-            if occurred and (parse_timestamp(occurred) or 0) < (parse_timestamp(session.get("startedAt")) or float("inf")):
-                session["startedAt"] = occurred
-            if occurred and (parse_timestamp(occurred) or 0) >= (parse_timestamp(session.get("updatedAt")) or 0):
-                session["updatedAt"] = occurred
-            _add_tokens(session["tokens"], row.get("tokens"))
-            session["cost"] = sum_cost_totals(session.get("cost"), row.get("cost"))
-            model = session["byModel"].setdefault(str(row.get("rawModel") or "unknown"), {"tokens": empty_token_totals(), "cost": empty_cost_totals()})
-            _add_tokens(model["tokens"], row.get("tokens"))
-            model["cost"] = sum_cost_totals(model.get("cost"), row.get("cost"))
-            if row.get("serviceTier") == "fast":
-                _add_tokens(model.setdefault("fastTokens", empty_token_totals()), row.get("tokens"))
+        occurred = row.get("occurredAt")
+        if occurred and (parse_timestamp(occurred) or 0) < (parse_timestamp(session.get("startedAt")) or float("inf")):
+            session["startedAt"] = occurred
+        if occurred and (parse_timestamp(occurred) or 0) >= (parse_timestamp(session.get("updatedAt")) or 0):
+            session["updatedAt"] = occurred
+        _add_tokens(session["tokens"], row.get("tokens"))
+        session["cost"] = sum_cost_totals(session.get("cost"), row.get("cost"))
+        model = session["byModel"].setdefault(str(row.get("rawModel") or "unknown"), {"tokens": empty_token_totals(), "cost": empty_cost_totals()})
+        _add_tokens(model["tokens"], row.get("tokens"))
+        model["cost"] = sum_cost_totals(model.get("cost"), row.get("cost"))
+        if row.get("serviceTier") == "fast":
+            _add_tokens(model.setdefault("fastTokens", empty_token_totals()), row.get("tokens"))
         db.execute("INSERT OR REPLACE INTO processing_ledger_sessions VALUES(?,?,?,?)", (*key, encode(session)))
         totals, by_model = self.get(db, f"ledgerCost:{source}", [{}, {}])
         # Sum fixed-point contributions rather than rescanning every stored session.
@@ -362,18 +536,28 @@ class ProcessingIndex:
         from monitor_usage_sync import canonical_ledger_row, _ledger_content, content_hash, record_account_key
         from monitor_token_ledger import token_sessions_from_ledger
         previous = db.execute("SELECT account,session,event_at,data FROM processing_effective WHERE record_key=?", (key,)).fetchone()
-        rows = [canonical_ledger_row(json.loads(row[0])) for row in db.execute(
+        rows = [json.loads(row[0]) for row in db.execute(
             "SELECT data FROM processing_facts WHERE kind='tokenLedger' AND record_key=? ORDER BY source,position", (key,))]
-        rows = [row for row in rows if row is not None]
+        rows = [canonical_ledger_row(row) for row in rows if row.get("recordType") == "usage" and not any(key in row for key in ("sourceCoverage", "sourceTotals"))]
         winner = max(enumerate(rows), key=lambda item: (content_hash(_ledger_content(item[1])), item[0]))[1] if rows else None
         if previous and winner is not None and previous[3] == encode(winner):
             return
         if winner is None:
-            db.execute("DELETE FROM processing_effective WHERE record_key=?", (key,))
+            db.execute("DELETE FROM processing_effective_refs WHERE record_key=?", (key,))
         else:
             value = winner.get("session") or winner
-            db.execute("INSERT OR REPLACE INTO processing_effective VALUES(?,?,?,?,?)", (key, record_account_key(winner), str(value.get("sessionId") or ""),
-                parse_timestamp(winner.get("occurredAt") or value.get("updatedAt")), encode(winner)))
+            sample_id, attrs = samples.insert_sample(db, "tokenLedger", winner)
+            db.execute(
+                "INSERT OR REPLACE INTO processing_effective_refs VALUES(?,?,?,?,?,?)",
+                (
+                    key,
+                    samples._dimension(db, "account", record_account_key(winner)),
+                    samples._dimension(db, "session", str(value.get("sessionId") or "")),
+                    parse_timestamp(winner.get("occurredAt") or value.get("updatedAt")),
+                    sample_id,
+                    attrs,
+                ),
+            )
         affected = {(previous[0], previous[1])} if previous else set()
         if winner is not None:
             affected.add((record_account_key(winner), str((winner.get("session") or winner).get("sessionId") or "")))

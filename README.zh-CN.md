@@ -241,7 +241,6 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 | `skills/` | 私有托管技能源 | 可选的加密技能包 |
 | `usage_monitor_quota_readings.jsonl` | 完整的本地已接受额度读数 | 仅同步压缩后的派生记录 |
 | `usage_monitor_token_events.jsonl` | 追加式用量事件及其已记录成本、保留的会话基线；Token 与成本汇总的权威数据源 | 每条记录均加密同步 |
-| `usage_monitor_diagnostic_samples.jsonl` | 本地详细诊断样本 | 永不 |
 | `usage_monitor_state.json` | 运行基线和游标 | 永不 |
 | `usage_monitor_sync_cache-v4.sqlite3` | 类型化本地/远端事实、增量处理、仪表盘投影与数据块 | 不上传数据库 |
 
@@ -269,8 +268,6 @@ python codex_monitor_daemon.py --help
 | `--timeout SECONDS` | 设置单次请求超时，默认 10 秒。 |
 | `--quota-history PATH` | 覆盖逐账号额度历史 JSONL。 |
 | `--token-ledger PATH` | 覆盖追加式 Token 与已记录成本账本 JSONL。 |
-| `--sample-log PATH` | 覆盖详细诊断 JSONL。 |
-| `--sample-log-max-bytes N` | 超过该大小后压缩样本日志；默认 50 MiB，压缩目标为 80%。 |
 | `--local-only` | 只扫描本地会话日志，不访问 ChatGPT 使用量接口。 |
 | `--no-token-scan` | 禁用本地会话 Token 扫描。 |
 | `--reencrypt-cloud` | 使用当前密钥刷新随机数并验证所有 WebDAV 加密对象后退出。 |

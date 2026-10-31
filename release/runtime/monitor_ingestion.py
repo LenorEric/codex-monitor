@@ -199,7 +199,10 @@ class SourceIngestor:
                 self._refs(db, event_id, -1)
         db.execute("DELETE FROM processing_occurrences WHERE source=?", (source,))
         for event_id in events:
-            self._winner(db, event_id)
+            if db.execute("SELECT 1 FROM processing_occurrences WHERE event_id=? LIMIT 1", (event_id,)).fetchone():
+                self._winner(db, event_id)
+            else:
+                db.execute("DELETE FROM processing_scan_events WHERE event_id=? AND valid_refs<=0", (event_id,))
 
 
     @serialized
@@ -358,7 +361,7 @@ class SourceIngestor:
     @serialized
     def sync_ledger(self, path, slot, label, timeline, provenance, normalize, machine_id):
         """Commit ledger records, source checkpoints and backup output in one transaction."""
-        from monitor_token_ledger import _usage_records, _source_highwaters, reconcile_token_ledger
+        from monitor_token_ledger import _usage_records, reconcile_token_ledger
         with self.index.transaction() as db:
             reconcile = self.index.get(db, f"reconcile:{self.home}", False)
             if reconcile and db.execute("SELECT 1 FROM processing_scan_sources WHERE home=? AND (json_extract(state,'$.forceReparse')=1 OR "
@@ -377,7 +380,7 @@ class SourceIngestor:
                 if new_costs:
                     self.index.put(db, f"ledgerNotifications:{self.home}", new_costs)
                 cumulative = {}
-                _usage_records(events, _source_highwaters(updated), slot, label, timeline, cumulative)
+                _usage_records(events, slot, label, timeline, cumulative)
                 db.execute("DELETE FROM processing_coverage WHERE home=?", (self.home,))
                 db.executemany("INSERT INTO processing_coverage VALUES(?,?,?,?,?)", ((self.home, *key, encode(value)) for key, value in cumulative.items()))
                 last = {}
@@ -403,12 +406,10 @@ class SourceIngestor:
                 if late:
                     self.index.put(db, f"reconcile:{self.home}", True)
                 else:
-                    highwaters = _source_highwaters([json.loads(row[0]) for session in sessions for row in db.execute("SELECT data FROM processing_facts WHERE source=? AND session=? "
-                        "AND subtype='sessionBaseline'", ("local:tokenLedger", session))])
                     additions, replacements = [], {}
                     for event_id, data, source, index in pending:
                         event = json.loads(data)
-                        for usage in _usage_records([event], highwaters, slot, label, timeline, cumulative):
+                        for usage in _usage_records([event], slot, label, timeline, cumulative):
                             previous = db.execute("SELECT data FROM processing_facts WHERE source=? AND event_id=? LIMIT 1", ("local:tokenLedger", event_id)).fetchone()
                             if previous:
                                 previous = json.loads(previous[0])
