@@ -26,6 +26,7 @@ from cryptography.exceptions import InvalidTag
 
 from monitor_accounts import api_identity_id, atomic_write_json, auth_identity, parse_auth_bytes
 from monitor_cloud_queue import CloudOperationQueue, OperationSkipped
+from monitor_cloud_lock import CloudAccessLock, CLOUD_LOCK_PATH, CLOUD_LOCK_INIT_PATH
 from monitor_webdav_log import WebDavLog
 from monitor_common import SafeRedirectHandler, now_iso as _timestamp
 from monitor_skills import SkillError
@@ -39,8 +40,6 @@ WEBDAV_MKCOL_RETRY_SECONDS = 1
 AUTO_FETCH_INTERVAL_SECONDS = 60 * 60
 USAGE_SYNC_INTERVAL_SECONDS = 30 * 60
 USAGE_ACCOUNT_ID_DOMAIN = "codex-monitor-usage-account-v3"
-CLOUD_LOCK_PATH = "sync-lock.json"
-CLOUD_LOCK_INIT_PATH = ".sync-lock-init"
 
 
 def _serialized_cloud_operation(method):
@@ -284,140 +283,28 @@ class WebDavClient:
         self._diagnostic_secrets += (token, self.authorization)
         self.transfers = []
         self.transfer_category = "metadata"
-        self._file_lock_token = None
-        self._file_lock_deadline = 0
-        self._file_lock_refresh = 0
-        self._lock_writing = False
-        self._lock_status_failed = False
-        self._lock_owner = uuid.uuid4().hex
-        self._lock_etag = None
-        self._lock_claimed = False
-
-    def _accept_file_lock(self, body, started):
-        import xml.etree.ElementTree as ET
-        try:
-            active = ET.fromstring(body).find(".//{DAV:}activelock")
-            token = active.findtext("{DAV:}locktoken/{DAV:}href")
-            timeout = active.findtext("{DAV:}timeout")
-            if active.find("{DAV:}lockscope/{DAV:}exclusive") is None or active.findtext("{DAV:}depth") not in {"0", "infinity"} or not token or not re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s<>]+", token):
-                raise ValueError()
-            if not isinstance(timeout, str) or timeout != "Infinite" and not re.fullmatch(r"Second-[0-9]+", timeout):
-                raise ValueError()
-            seconds = float("inf") if timeout == "Infinite" else int(timeout.removeprefix("Second-"))
-            if seconds <= 60 or self._file_lock_token is not None and token != self._file_lock_token:
-                raise ValueError()
-        except (ET.ParseError, AttributeError, TypeError, ValueError) as exc:
-            raise CloudError("WebDAV must provide an exclusive file lock with an infinite timeout or a finite timeout exceeding 60 seconds", 409) from exc
-        self._file_lock_token = token
-        self._file_lock_deadline = started + seconds
-        self._file_lock_refresh = started + seconds / 2
-
-    @staticmethod
-    def _check_idle_lock_state(data):
-        try:
-            state = json.loads(data)
-        except (ValueError, UnicodeDecodeError) as exc:
-            raise CloudError("Invalid cloud lock status; preserve sync-lock.json and repair it before retrying", 409) from exc
-        if isinstance(state, dict) and state.get("owner"):
-            raise CloudError("Cloud synchronization is busy or an interrupted operation needs recovery; sync-lock.json is owned by another operation", 409, http_status=423, category="lock")
-        if not isinstance(state, dict) or type(state.get("writing")) is not int or state != {"writing": 0}:
-            raise CloudError("Cloud lock file records an interrupted write or invalid status; inspect and recover cloud data before resetting sync-lock.json to writing=0", 409)
-
-    def _ensure_lock_file(self):
-        try:
-            return self.get(CLOUD_LOCK_PATH)
-        except CloudError as exc:
-            if exc.http_status != 404:
-                raise
-        self.ensure_directories("")
-        # Jianguoyun ignores If-None-Match on PUT. Atomic MKCOL is used only for
-        # first-time provisioning, never as the operation lock or a stale-lock lease.
-        try:
-            self.request("MKCOL", CLOUD_LOCK_INIT_PATH, expected=(201,))
-        except CloudError as exc:
-            if exc.http_status in {405, 409}:
-                raise CloudError("Cloud lock file initialization is busy or needs recovery; retry after .sync-lock-init is released", 409, http_status=423, category="lock") from exc
-            raise
-        try:
-            try:
-                return self.get(CLOUD_LOCK_PATH)
-            except CloudError as exc:
-                if exc.http_status != 404:
-                    raise
-            self.put(CLOUD_LOCK_PATH, b'{"writing":0}')
-            return self.get(CLOUD_LOCK_PATH)
-        finally:
-            self.delete(CLOUD_LOCK_INIT_PATH)
+        self.access_lock = CloudAccessLock(self)
 
     def acquire_file_lock(self):
-        self._check_idle_lock_state(self._ensure_lock_file()[0])
-        started = time.monotonic()
-        try:
-            body, _, _ = self.request("LOCK", CLOUD_LOCK_PATH,
-                b'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>',
-                {"Content-Type": "application/xml", "Depth": "0", "Timeout": "Second-300"}, expected=(200,))
-        except CloudError as exc:
-            if exc.http_status == 423:
-                exc.category = "lock"
-            raise
-        try:
-            self._accept_file_lock(body, started)
-        except CloudError:
-            # A rejected lock response may still have installed a server-side lock.
-            import xml.etree.ElementTree as ET
-            try:
-                token = ET.fromstring(body).findtext(".//{DAV:}locktoken/{DAV:}href")
-                if token and re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*:[^\s<>]+", token):
-                    self.request("UNLOCK", CLOUD_LOCK_PATH, headers={"Lock-Token": f"<{token}>"}, expected=(204, 404, 409))
-            except (ET.ParseError, CloudError):
-                pass
-            raise
-        try:
-            state, self._lock_etag = self.get(CLOUD_LOCK_PATH)
-            self._check_idle_lock_state(state)
-            # Some providers grant multiple native locks to the same account. The
-            # conditional owner claim is the mutex, even for a read-only operation.
-            self._write_lock_state(0)
-            self._lock_claimed = True
-        except Exception as exc:
-            self.release_file_lock()
-            if isinstance(exc, CloudError) and exc.http_status == 412:
-                raise CloudError("Cloud lock ownership changed during acquisition; retry the operation", 409, http_status=412, category="lock") from exc
-            raise
-
-    def _write_lock_state(self, writing, release=False):
-        state = {"writing": writing} if release else {"writing": writing, "owner": self._lock_owner}
-        self._lock_etag = self.put(CLOUD_LOCK_PATH, canonical_json(state), etag=self._lock_etag)
+        self.access_lock.acquire()
 
     def release_file_lock(self):
-        if self._file_lock_token:
-            try:
-                if self._lock_claimed:
-                    self._write_lock_state(0, release=True)
-            finally:
-                try:
-                    self.request("UNLOCK", CLOUD_LOCK_PATH, headers={"Lock-Token": f"<{self._file_lock_token}>"}, expected=(204, 404, 409))
-                finally:
-                    self._file_lock_token = None
-                    self._lock_writing = False
-                    self._lock_status_failed = False
-                    self._lock_claimed = False
-                    self._lock_etag = None
+        self.access_lock.release()
 
     def _url(self, path: str = "") -> str:
         parts = [urllib.parse.quote(part, safe="") for part in f"{self.root}/{path}".strip("/").split("/") if part]
         return urllib.parse.urljoin(self.base, "/".join(parts))
 
-    def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204), output=None) -> tuple[bytes, str | None, int]:
+    def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204), output=None, *, _coordination=False) -> tuple[bytes, str | None, int]:
         if not getattr(self, "diagnostic_log", None):
-            return self._request(method, path, data, headers, expected, output)
+            return self._request(method, path, data, headers, expected, output, coordination=_coordination)
         started = time.monotonic()
-        diagnostic = {"requestId": uuid.uuid4().hex, "method": method, "url": WebDavLog.safe_url(self._url(path)), "category": self.transfer_category,
+        diagnostic = {"requestId": uuid.uuid4().hex, "method": method, "url": WebDavLog.safe_url(self._url(path)), "category": "metadata" if _coordination else self.transfer_category,
             "expectedStatuses": expected, "timeoutSeconds": 30, "conditional": bool(headers and any(key.lower() in {"if-match", "if-none-match", "if"} for key in headers)),
-            "lockHeld": bool(self._file_lock_token), "lockWriting": self._lock_writing}
+            "lockHeld": self.access_lock.claimed, "lockWriting": self.access_lock.writing}
         self.diagnostic_log.write("request_start", secrets=self._diagnostic_secrets, **diagnostic)
         try:
-            result = self._request(method, path, data, headers, expected, output, diagnostic)
+            result = self._request(method, path, data, headers, expected, output, diagnostic, coordination=_coordination)
             diagnostic.update(status=result[2], outcome="succeeded")
             return result
         except Exception as exc:
@@ -427,25 +314,29 @@ class WebDavClient:
             diagnostic["elapsedMs"] = round((time.monotonic() - started) * 1000, 3)
             self.diagnostic_log.write("request_end", secrets=self._diagnostic_secrets, **diagnostic)
 
-    def _request(self, method, path, data, headers, expected, output, diagnostic=None):
-        if self._file_lock_token and method != "UNLOCK":
-            if self._lock_status_failed and path != CLOUD_LOCK_PATH:
-                raise CloudError("Cloud lock status update failed; operation stopped before further data access", 409)
-            if time.monotonic() >= self._file_lock_deadline:
-                raise CloudError("WebDAV cloud contract lock expired; operation stopped before further data access", 409)
-            if method != "LOCK" and time.monotonic() >= min(self._file_lock_refresh, self._file_lock_deadline - 60):
-                started = time.monotonic()
-                body, _, _ = self.request("LOCK", CLOUD_LOCK_PATH, headers={"Timeout": "Second-300"}, expected=(200,))
-                self._accept_file_lock(body, started)
-            if path != CLOUD_LOCK_PATH and method in {"PUT", "DELETE", "MKCOL", "MOVE", "COPY", "PROPPATCH"} and not self._lock_writing:
-                # Arm cleanup before sending: a lost response may still mean PUT succeeded.
-                self._lock_writing = True
-                try:
-                    self._write_lock_state(1)
-                except Exception:
-                    self._lock_status_failed = True
+    def _request(self, method, path, data, headers, expected, output, diagnostic=None, coordination=False):
+        if coordination or not self.access_lock.required:
+            return self._send_request(method, path, data, headers, expected, output, diagnostic, category="metadata" if coordination else None)
+        if diagnostic is not None:
+            diagnostic["conditional"] = True
+        etag = self.access_lock.prepare(method)
+        for attempt in range(2):
+            try:
+                result = self._send_request(method, path, data, dict(headers or {}) | {"If": self.access_lock.condition(etag)}, expected, output, diagnostic)
+                self.access_lock.check()
+                return result
+            except CloudError as exc:
+                if exc.http_status != 412:
                     raise
-            headers = dict(headers or {}) | {"If": f"<{self._url(CLOUD_LOCK_PATH)}> (<{self._file_lock_token}>)"}
+                refreshed = self.access_lock.retry_etag(etag)
+                if attempt or refreshed is None:
+                    raise
+                etag = refreshed
+                if output is not None:
+                    output.seek(0)
+                    output.truncate()
+
+    def _send_request(self, method, path, data, headers, expected, output, diagnostic=None, *, category=None):
         size = len(data) if isinstance(data, bytes) else 0
         if data is not None and hasattr(data, "seek"):
             data.seek(0, 2)
@@ -454,7 +345,7 @@ class WebDavClient:
             headers = dict(headers or {}) | {"Content-Length": str(size)}
         request = urllib.request.Request(self._url(path), data=data, method=method, headers=headers or {})
         request.add_unredirected_header("Authorization", self.authorization)
-        transfer = {"method": method, "path": path, "category": self.transfer_category, "attemptedUploadBytes": size if method == "PUT" else 0, "successfulUploadBytes": 0, "downloadBytes": 0}
+        transfer = {"method": method, "path": path, "category": category or self.transfer_category, "attemptedUploadBytes": size if method == "PUT" else 0, "successfulUploadBytes": 0, "downloadBytes": 0}
         self.transfers.append(transfer)
         if diagnostic is not None:
             diagnostic["transfer"] = transfer
@@ -490,8 +381,6 @@ class WebDavClient:
             raise CloudError(f"WebDAV connection failed: {exc}", 502, category="network") from exc
         if status not in expected:
             raise CloudError(f"WebDAV {method} returned HTTP {status}", 502, http_status=status, category="protocol")
-        if self._file_lock_token and method not in {"LOCK", "UNLOCK"} and time.monotonic() >= self._file_lock_deadline:
-            raise CloudError("WebDAV cloud contract lock expired during transfer; operation stopped", 409)
         transfer["successfulUploadBytes"] = transfer["attemptedUploadBytes"]
         return body, etag, status
 
@@ -2102,6 +1991,11 @@ class CloudManager:
             return False
         return True
 
+    @staticmethod
+    def _skill_upload_failure_is_shared(exc):
+        return isinstance(exc, CloudError) and (exc.category in {"lock", "network", "configuration", "protocol"}
+            or exc.http_status in {401, 403, 408, 423, 425, 429, 500, 502, 503, 504, 507} or exc.decrypt_failed)
+
     @_serialized_cloud_operation
     def _upload_due_skills(self, names):
         if not self.config()["webdav"].get("enabled") or not self.config()["webdav"].get("skillsAutoUpload", True):
@@ -2110,15 +2004,20 @@ class CloudManager:
         try:
             self.upload_skills(names)
         except Exception as exc:
-            if len(names) == 1:
-                errors[next(iter(names))] = exc
+            if len(names) == 1 or self._skill_upload_failure_is_shared(exc):
+                errors.update(dict.fromkeys(names, exc))
             else:
                 # Each attempt rebuilds against the latest pointer and local content.
-                for name in sorted(names):
+                remaining = sorted(names)
+                for index, name in enumerate(remaining):
                     try:
                         self.upload_skills({name})
                     except Exception as failure:
                         errors[name] = failure
+                        if self._skill_upload_failure_is_shared(failure):
+                            # A shared failure also blocks the remaining skills; do not probe it once per skill.
+                            errors.update(dict.fromkeys(remaining[index + 1:], failure))
+                            break
         return {"errors": errors, "skills": sorted(names)}
 
     def maintenance_tick(self, now: float | None = None) -> dict:
@@ -2156,7 +2055,8 @@ class CloudManager:
                 if not pending or (self._observed_skill_hashes or {}).get(name) != before_hash:
                     continue
                 pending["attempts"] += 1
-                pending["nextAttemptAt"] = now + AUTO_PUSH_RETRY_SECONDS
+                pending["nextAttemptAt"] = now + (min(15 * 60, AUTO_PUSH_RETRY_SECONDS * 2 ** min(pending["attempts"] - 1, 5))
+                    if self._skill_upload_failure_is_shared(exc) else AUTO_PUSH_RETRY_SECONDS)
                 self._auto_push_failure_id += 1
                 self._auto_push_failures[name] = {"id": self._auto_push_failure_id, "skill": name, "message": str(exc)}
                 continue

@@ -243,6 +243,38 @@ class CloudQueueIntegrationTests(unittest.TestCase):
         self.assertEqual(snapshot["completed"][-1]["status"], "failed")
         json.dumps(snapshot)
 
+    def test_automatic_batch_does_not_retry_shared_failures_per_skill(self):
+        for failure in (CloudError("busy", 409, category="lock", http_status=423), CloudError("offline", 502, category="network"),
+                CloudError("unavailable", 502, category="http", http_status=503), CloudError("limited", 502, category="http", http_status=429)):
+            with self.subTest(failure=str(failure)), mock.patch.object(self.cloud, "upload_skills", side_effect=failure) as upload:
+                result = self.cloud._upload_due_skills({"alpha", "beta"})
+                upload.assert_called_once_with({"alpha", "beta"})
+                self.assertEqual(result["errors"], {"alpha": failure, "beta": failure})
+        self.assertEqual([event["phase"] for event in self.cloud.operation_queue.snapshot()["events"]], ["start", "end"] * 4)
+
+    def test_shared_failure_during_fallback_stops_remaining_skills(self):
+        failure = CloudError("unavailable", 502, category="http", http_status=503)
+        with mock.patch.object(self.cloud, "upload_skills", side_effect=(CloudError("index changed", 409), {"changed": True}, failure)) as upload:
+            result = self.cloud._upload_due_skills({"alpha", "beta", "gamma"})
+        self.assertEqual(upload.call_args_list, [mock.call({"alpha", "beta", "gamma"}), mock.call({"alpha"}), mock.call({"beta"})])
+        self.assertEqual(result["errors"], {"beta": failure, "gamma": failure})
+
+    def test_automatic_skill_batch_backs_off_shared_failures(self):
+        self.cloud._observed_skill_hashes = {"alpha": "modified", "beta": "modified"}
+        self.cloud._pending_skill_pushes = {name: {"hash": "modified", "since": 0, "nextAttemptAt": 120, "attempts": 0} for name in ("alpha", "beta")}
+        now = 120
+        with mock.patch.object(self.cloud.skills, "content_hashes", return_value={"alpha": "modified", "beta": "modified"}), \
+                mock.patch.object(self.cloud, "_auto_fetch_if_due", return_value=False), mock.patch.object(self.cloud, "_auto_usage_sync_if_due", return_value=False), \
+                mock.patch.object(self.cloud, "upload_skills", side_effect=CloudError("busy", 409, category="lock", http_status=423)) as upload:
+            for attempt, delay in enumerate((30, 60, 120, 240, 480, 900, 900), 1):
+                self.cloud.maintenance_tick(now=now)
+                self.assertEqual(upload.call_count, attempt)
+                for pending in self.cloud._pending_skill_pushes.values():
+                    self.assertEqual(pending["nextAttemptAt"], now + delay)
+                self.cloud.maintenance_tick(now=now + delay - 1)
+                self.assertEqual(upload.call_count, attempt)
+                now += delay
+
     def test_pending_local_change_is_failed_but_sync_adapter_preserves_result(self):
         result = {"cloud": {"pending": True, "error": "offline"}}
         with mock.patch.object(self.cloud, "set_skill_shared", return_value=result):

@@ -1,5 +1,5 @@
 {
-  "version": "1.5.24",
+  "version": "1.5.25",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 5633,
@@ -30,8 +30,12 @@
       "sha256": "aa28784f802b29bccfe68b410d39b3ed55df298a33f28f1e8d8e1cc354ad3838"
     },
     "monitor_cloud.py": {
-      "size": 138240,
-      "sha256": "1b05a22123318596790ddf35ef5276eef41099eb00949723449a4bef848249fd"
+      "size": 132698,
+      "sha256": "967ed404eaf2c08165503fab7256e3d96202ff2cea2c3191ebfc36c64cf00255"
+    },
+    "monitor_cloud_lock.py": {
+      "size": 13046,
+      "sha256": "82b0c8c5ba68cd7b47d22d305c67e235bf9db3e70a9ccc122572e85c76391939"
     },
     "monitor_cloud_queue.py": {
       "size": 8020,
@@ -159,7 +163,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "d0602039cb470cb64887955b711aa753df9eb2c734e8d6aac5c0938f50dcee40"
+      "sha256": "34038e4d6f9744eca17126e41cb041527ca5a914b3af5b6bbb220082c2eb7501"
     }
   }
 }

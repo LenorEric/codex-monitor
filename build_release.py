@@ -30,6 +30,7 @@ RUNTIME_FILES = (
     "monitor_backup.py",
     "monitor_dependencies.py",
     "monitor_cloud.py",
+    "monitor_cloud_lock.py",
     "monitor_cloud_queue.py",
     "monitor_webdav_log.py",
     "monitor_codex_usage.py",

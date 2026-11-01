@@ -1,4 +1,5 @@
 import json
+import re
 import shutil
 import threading
 import unittest
@@ -19,7 +20,7 @@ def lock_response(token="opaquelocktoken:test", timeout="Second-300", depth="inf
         f'<D:timeout>{timeout}</D:timeout><D:locktoken><D:href>{token}</D:href></D:locktoken></D:activelock></D:lockdiscovery></D:prop>').encode()
 
 
-class CloudContractTests(unittest.TestCase):
+class CloudContractFixture(unittest.TestCase):
     def setUp(self):
         self.root = Path.cwd() / f".test-cloud-contract-{uuid.uuid4().hex}"
         self.root.mkdir()
@@ -35,6 +36,8 @@ class CloudContractTests(unittest.TestCase):
         self.reject_unmapped_locks = False
         self.fail_idle_status = False
         self.fail_busy_status = False
+        self.ignore_tagged_etags = False
+        self.ignore_if_match = False
         self.mutex = threading.RLock()
         owner = self
 
@@ -48,7 +51,17 @@ class CloudContractTests(unittest.TestCase):
                     body = self.rfile.read(int(self.headers.get("Content-Length", 0)))
                     owner.calls.append((self.command, path, dict(self.headers)))
                     status, result, etag = 200, b"", None
-                    if self.command == "LOCK":
+                    conditions = re.findall(r"<([^>]+)>\s*\(([^)]*)\)", self.headers.get("If", ""))
+                    invalid = False
+                    for resource, condition in conditions:
+                        resource = resource.split("/root/", 1)[-1]
+                        for expected_etag in re.findall(r"\[([^]]+)\]", condition):
+                            invalid |= not owner.ignore_tagged_etags and owner.files.get(resource, (None, None))[1] != expected_etag
+                        for expected_token in re.findall(r"<([^>]+)>", condition):
+                            invalid |= expected_token not in owner.tokens
+                    if invalid:
+                        status = 412
+                    elif self.command == "LOCK":
                         if path != CLOUD_LOCK_PATH:
                             status = 403
                         elif path not in owner.files and owner.reject_unmapped_locks:
@@ -76,8 +89,6 @@ class CloudContractTests(unittest.TestCase):
                         owner.directories.add(path)
                     elif path == CLOUD_LOCK_PATH and owner.token and not any(token in self.headers.get("If", "") for token in (owner.tokens if owner.reentrant else [owner.token])) and self.command != "GET":
                         status = 423
-                    elif self.headers.get("If") and not any(token in self.headers["If"] for token in (owner.tokens if owner.reentrant else [owner.token]) if token):
-                        status = 412
                     elif self.command == "GET":
                         if path not in owner.files:
                             status = 404
@@ -86,7 +97,7 @@ class CloudContractTests(unittest.TestCase):
                     elif self.command == "PUT":
                         if path == CLOUD_LOCK_PATH and (owner.fail_idle_status and json.loads(body) == {"writing": 0} or owner.fail_busy_status and json.loads(body).get("writing") == 1):
                             status = 503
-                        elif self.headers.get("If-None-Match") == "*" and path in owner.files or self.headers.get("If-Match") and self.headers["If-Match"] != owner.files.get(path, (None, None))[1]:
+                        elif self.headers.get("If-None-Match") == "*" and path in owner.files or not owner.ignore_if_match and self.headers.get("If-Match") and self.headers["If-Match"] != owner.files.get(path, (None, None))[1]:
                             status = 412
                         else:
                             owner.revision += 1
@@ -117,6 +128,16 @@ class CloudContractTests(unittest.TestCase):
         self.server.server_close()
         self.thread.join()
 
+    def client(self):
+        client = WebDavClient(self.config)
+        def stop():
+            client.access_lock.stop.set()
+            if client.access_lock.worker:
+                client.access_lock.worker.join(3)
+                self.assertFalse(client.access_lock.worker.is_alive())
+        self.addCleanup(stop)
+        return client
+
     def manager(self, name="one"):
         manager = CloudManager(self.root / name, SimpleNamespace(), None)
         manager._config["webdav"].update(self.config)
@@ -131,6 +152,8 @@ class CloudContractTests(unittest.TestCase):
     def mark_version(self, version):
         self.files[CLOUD_DATA_CONTRACT_PATH] = json.dumps({"dataContractVersion": version}).encode(), '"contract"'
 
+
+class CloudContractTests(CloudContractFixture):
     def test_missing_marker_is_adopted_without_rewriting_existing_data(self):
         self.files["payload"] = b"old", '"payload"'
         manager = self.manager()
@@ -147,7 +170,7 @@ class CloudContractTests(unittest.TestCase):
         self.files["payload"] = b"old", '"payload"'
         with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {1: mock.Mock(side_effect=AssertionError("unexpected migration"))}):
             self.run_operation(self.manager())
-        self.assertFalse(any(method == "PUT" and path != CLOUD_LOCK_PATH for method, path, _ in self.calls))
+        self.assertFalse(any(method == "PUT" and path != CLOUD_LOCK_PATH and not path.startswith(".lock-probe-") for method, path, _ in self.calls))
 
     def test_newer_contract_blocks_reads_writes_and_overwrite_before_locking(self):
         self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION + 1)
@@ -221,20 +244,20 @@ class CloudContractTests(unittest.TestCase):
         manager.held_operation = held_operation
         self.run_operation(manager, "held_operation")
         self.assertEqual(self.files["payload"][0], b"safe")
-        self.assertEqual(sum(method == "UNLOCK" for method, _, _ in self.calls), 1)
+        self.assertEqual(sum(method == "UNLOCK" for method, _, _ in self.calls), 3)
 
     def test_lock_refresh_and_expiration_stop_access(self):
-        client = WebDavClient(self.config)
+        client = self.client()
         client.acquire_file_lock()
-        client._file_lock_refresh = 0
-        client.put("payload", b"new")
+        client.access_lock.renew()
         self.assertEqual(sum(method == "LOCK" for method, _, _ in self.calls), 2)
-        client._file_lock_deadline = 0
+        client.put("payload", b"new")
+        client.access_lock.deadline = 0
         before = len(self.calls)
         with self.assertRaisesRegex(CloudError, "expired"):
             client.get("payload")
         self.assertEqual(len(self.calls), before)
-        with self.assertRaisesRegex(CloudError, "expired"):
+        with self.assertRaisesRegex(CloudError, "unusable|expired"):
             client.release_file_lock()
         self.assertIsNone(self.token)
         self.assertEqual(json.loads(self.files[CLOUD_LOCK_PATH][0])["writing"], 1)
@@ -246,20 +269,21 @@ class CloudContractTests(unittest.TestCase):
         self.assertFalse(any(path in {"payload", "crypto.json"} for _, path, _ in self.calls))
 
     def test_lock_response_requires_exclusive_valid_file_lock(self):
-        client = WebDavClient(self.config)
-        for response in (b"bad", lock_response(timeout="Second-30"), lock_response(depth="1"), lock_response().replace(b"exclusive", b"shared")):
-            with self.subTest(response=response), self.assertRaises(CloudError):
-                client._accept_file_lock(response, 0)
+        for response in (b"bad", lock_response(timeout="Second-0"), lock_response(depth="1"), lock_response().replace(b"exclusive", b"shared")):
+            client = self.client()
+            with mock.patch.object(client.access_lock, "_request", return_value=(response, None, 200)), self.subTest(response=response), self.assertRaises(CloudError):
+                with client.access_lock._native():
+                    pass
 
     def test_read_only_operation_claims_owner_without_busy_status(self):
         self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION)
         self.files["payload"] = b"old", '"payload"'
         self.run_operation(self.manager())
-        self.assertFalse(any(method == "PUT" and path != CLOUD_LOCK_PATH for method, path, _ in self.calls))
-        self.assertEqual(sum(method == "LOCK" for method, _, _ in self.calls), 1)
+        self.assertFalse(any(method == "PUT" and path != CLOUD_LOCK_PATH and not path.startswith(".lock-probe-") for method, path, _ in self.calls))
+        self.assertEqual(sum(method == "LOCK" for method, _, _ in self.calls), 2)
         self.assertTrue(all(path == CLOUD_LOCK_PATH for method, path, _ in self.calls if method in {"LOCK", "UNLOCK"}))
         payload_headers = next(headers for method, path, headers in self.calls if path == "payload")
-        self.assertIn("/root/sync-lock.json>", payload_headers["If"])
+        self.assertIn("/root/sync-lock.json> ([", payload_headers["If"])
 
     def test_write_status_wraps_all_nested_writes_once(self):
         self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION)
@@ -276,7 +300,7 @@ class CloudContractTests(unittest.TestCase):
         self.assertTrue(all(state["writing"] == 1 and state.get("owner") for state in observed))
         self.assertEqual(json.loads(self.files[CLOUD_LOCK_PATH][0]), {"writing": 0})
         self.assertEqual(sum(method == "PUT" and path == CLOUD_LOCK_PATH for method, path, _ in self.calls), 3)
-        self.assertEqual(sum(method == "LOCK" for method, _, _ in self.calls), 1)
+        self.assertEqual(sum(method == "LOCK" for method, _, _ in self.calls), 3)
         self.assertEqual([e["phase"] for e in manager.operation_queue.snapshot()["events"]], ["start", "end"])
 
     def test_writer_excludes_both_readers_and_writers_until_cleanup(self):
@@ -345,29 +369,30 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(manager.operation_queue.snapshot()["events"][-1]["operation"]["status"], "failed")
 
     def test_busy_status_failure_blocks_caught_retry_before_payload_write(self):
-        client = WebDavClient(self.config)
+        client = self.client()
         client.acquire_file_lock()
         self.fail_busy_status = True
         try:
             with self.assertRaises(CloudError):
                 client.put("payload", b"first")
-            with self.assertRaisesRegex(CloudError, "status update failed"):
+            with self.assertRaisesRegex(CloudError, "unusable"):
                 client.put("payload", b"retry")
-            self.assertNotIn("payload", self.files)
-        finally:
-            client.release_file_lock()
-
-    def test_lost_server_lock_fences_payload_writes(self):
-        client = WebDavClient(self.config)
-        client.acquire_file_lock()
-        self.token = "opaquelocktoken:another-owner"
-        try:
-            with self.assertRaises(CloudError):
-                client.put("payload", b"stale")
             self.assertNotIn("payload", self.files)
         finally:
             with self.assertRaises(CloudError):
                 client.release_file_lock()
+
+    def test_lost_lease_fences_payload_writes(self):
+        client = self.client()
+        client.acquire_file_lock()
+        client.access_lock.prepare("PUT")
+        self.files[CLOUD_LOCK_PATH] = b'{"writing":0,"owner":"another-owner","expiresAt":9999999999}', '"replacement"'
+        with self.assertRaises(CloudError):
+            client.put("payload", b"stale")
+        self.assertNotIn("payload", self.files)
+        with self.assertRaises(CloudError):
+            client.release_file_lock()
+        self.assertEqual(json.loads(self.files[CLOUD_LOCK_PATH][0])["owner"], "another-owner")
 
     def test_overwrite_preserves_lock_file_and_contract(self):
         self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION)
@@ -383,19 +408,19 @@ class CloudContractTests(unittest.TestCase):
 
     def test_reentrant_native_locks_cannot_bypass_atomic_owner_claim(self):
         self.reentrant = True
-        first = WebDavClient(self.config)
-        second = WebDavClient(self.config)
+        first = self.client()
+        second = self.client()
         # Both saw idle before either native LOCK; rechecking under LOCK alone
         # is still racy, so interleave both reads immediately before conditional PUT.
-        original = first._write_lock_state
-        def claim_after_other(writing, release=False):
-            if not release and not first._lock_claimed:
+        original = first.access_lock._write
+        def claim_after_other(state, etag, token, deadline):
+            if not first.access_lock.claimed:
                 second.acquire_file_lock()
-            return original(writing, release)
-        with mock.patch.object(first, "_write_lock_state", side_effect=claim_after_other), self.assertRaises(CloudError) as lost:
+            return original(state, etag, token, deadline)
+        with mock.patch.object(first.access_lock, "_write", side_effect=claim_after_other), self.assertRaises(CloudError) as lost:
             first.acquire_file_lock()
         self.assertEqual(lost.exception.http_status, 412)
-        self.assertEqual(json.loads(self.files[CLOUD_LOCK_PATH][0])["owner"], second._lock_owner)
+        self.assertEqual(json.loads(self.files[CLOUD_LOCK_PATH][0])["owner"], second.access_lock.owner)
         second.put("payload", b"winner")
         second.release_file_lock()
         self.assertEqual(self.files["payload"][0], b"winner")
@@ -415,6 +440,18 @@ class CloudContractTests(unittest.TestCase):
         self.assertEqual(self.run_operation(self.manager())[0], b"retained")
         self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0]), {"dataContractVersion": monitor_migrations.CLOUD_DATA_CONTRACT_VERSION})
         self.assertEqual(self.files["payload"][0], b"retained")
+
+    def test_automatic_skill_batch_checks_busy_lock_only_once(self):
+        self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION)
+        self.files[CLOUD_LOCK_PATH] = b'{"writing":0,"owner":"another-operation"}', '"busy"'
+        manager = self.manager()
+        names = {f"skill-{index}" for index in range(16)}
+        result = manager._upload_due_skills(names)
+        self.assertEqual(set(result["errors"]), names)
+        self.assertTrue(all(error.category == "lock" for error in result["errors"].values()))
+        self.assertEqual([(method, path) for method, path, _ in self.calls], [("GET", CLOUD_DATA_CONTRACT_PATH), ("GET", CLOUD_LOCK_PATH)])
+        self.assertEqual(self.files[CLOUD_LOCK_PATH][0], b'{"writing":0,"owner":"another-operation"}')
+        self.assertEqual([event["phase"] for event in manager.operation_queue.snapshot()["events"]], ["start", "end"])
 
     def test_automatic_fetch_retries_contention_without_waiting_an_hour(self):
         manager = self.manager()
