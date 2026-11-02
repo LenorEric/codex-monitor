@@ -161,7 +161,7 @@ class CloudLockTests(CloudContractFixture):
             first.release_file_lock()
         second.release_file_lock()
 
-    def test_stale_etag_is_rejected_even_when_old_local_deadline_has_not_elapsed(self):
+    def test_replaced_owner_is_rejected_before_payload_write(self):
         first = self.client()
         first.acquire_file_lock()
         first.put("payload", b"before")
@@ -173,7 +173,7 @@ class CloudLockTests(CloudContractFixture):
         with self.assertRaises(CloudError):
             first.release_file_lock()
 
-    def test_only_renewal_conflicts_retry_and_payload_etags_are_preserved(self):
+    def test_renewal_does_not_add_payload_conditions_or_retries(self):
         client = self.client()
         client.acquire_file_lock()
         client.put("payload", b"before")
@@ -190,8 +190,9 @@ class CloudLockTests(CloudContractFixture):
         with mock.patch.object(client, "_send_request", side_effect=renew_before_send):
             client.put("payload", b"after", etag=self.files["payload"][1])
         writes = [headers for method, path, headers in self.calls[before:] if method == "PUT" and path == "payload"]
-        self.assertEqual(len(writes), 2)
-        self.assertEqual(writes[0]["If-Match"], writes[1]["If-Match"])
+        self.assertEqual(len(writes), 1)
+        self.assertNotIn("If", writes[0])
+        self.assertIn("If-Match", writes[0])
         with self.assertRaises(CloudError):
             client.put("payload", b"wrong", etag='"wrong-payload-etag"')
         self.assertEqual(self.files["payload"][0], b"after")
@@ -201,10 +202,17 @@ class CloudLockTests(CloudContractFixture):
         client = self.client()
         client.acquire_file_lock()
         client.access_lock.prepare("PUT")
-        with mock.patch.object(client, "_send_request", side_effect=CloudError("response lost", 502, category="network")) as send:
+        original = client._send_request
+        attempts = []
+        def fail_payload(method, path, *args, **kwargs):
+            if path == "payload":
+                attempts.append(method)
+                raise CloudError("response lost", 502, category="network")
+            return original(method, path, *args, **kwargs)
+        with mock.patch.object(client, "_send_request", side_effect=fail_payload):
             with self.assertRaises(CloudError):
                 client.put("payload", b"ambiguous")
-            self.assertEqual(send.call_count, 1)
+            self.assertEqual(attempts, ["PUT"])
         client.release_file_lock()
 
     def test_metadata_accounting_and_renewal_errors_do_not_leak_secrets(self):
@@ -232,23 +240,35 @@ class CloudLockTests(CloudContractFixture):
         self.assertEqual(self.files[CLOUD_LOCK_PATH], before)
         self.assertEqual(self.token, "opaquelocktoken:stranded")
 
-    def test_capability_probe_rejects_ignored_conditions_and_is_cached(self):
-        for flag in ("ignore_tagged_etags", "ignore_if_match"):
-            with self.subTest(flag=flag):
-                setattr(self, flag, True)
-                with self.assertRaisesRegex(CloudError, "must enforce"):
-                    self.client().acquire_file_lock()
+    def test_ignored_conditions_do_not_block_or_generate_probes(self):
+        self.ignore_tagged_etags = self.ignore_if_match = True
+        client = self.client()
+        client.acquire_file_lock()
+        client.put("payload", b"compatible")
+        self.assertEqual(client.get("payload")[0], b"compatible")
+        client.release_file_lock()
+        self.assertFalse(any("probe" in path for _, path, _ in self.calls))
+        self.assertEqual(self.record(), {"writing": 0})
+
+    def test_missing_etags_and_unsupported_native_lock_use_owner_lease(self):
+        self.omit_etags = True
+        for status in (405, 501):
+            with self.subTest(status=status):
+                self.native_status = status
+                client = self.client()
+                client.acquire_file_lock()
+                self.assertEqual(self.record()["owner"], client.access_lock.owner)
+                self.assertIsNone(client.put("payload", b"no etags"))
+                self.assertEqual(client.get("payload"), (b"no etags", None))
+                output = io.BytesIO()
+                self.assertIsNone(client.get_file("payload", output))
+                self.assertEqual(output.read(), b"no etags")
+                self.assertEqual(client.get_if_changed("payload", None), (b"no etags", None))
+                self.assertIsNone(client.put_file("stream", io.BytesIO(b"streamed")))
+                self.assertEqual(client.get("stream"), (b"streamed", None))
+                client.access_lock.renew()
+                client.release_file_lock()
                 self.assertEqual(self.record(), {"writing": 0})
-                self.assertFalse(any(path.startswith(".lock-probe-") for path in self.files))
-                setattr(self, flag, False)
-        first = self.client()
-        first.acquire_file_lock()
-        first.release_file_lock()
-        calls = len(self.calls)
-        second = self.client()
-        second.acquire_file_lock()
-        second.release_file_lock()
-        self.assertFalse(any(path.startswith(".lock-probe-") for _, path, _ in self.calls[calls:]))
 
     def test_background_renewal_during_blocked_request_keeps_log_correlation(self):
         entered, renewed = threading.Event(), threading.Event()

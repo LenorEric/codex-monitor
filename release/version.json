@@ -1,5 +1,5 @@
 {
-  "version": "1.5.25",
+  "version": "1.5.26",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 5633,
@@ -14,8 +14,8 @@
       "sha256": "8ceb4b9ee5adedde47b31e975c1d90c73ad27b6b165a1dcd80c7c545eb65b903"
     },
     "management.html": {
-      "size": 89878,
-      "sha256": "2eb690f18edb0e116e244783392cbcf180d9655ff8ffa42417945e01964ed67f"
+      "size": 89569,
+      "sha256": "5b24e947c6f19ba747c936fde0fce61e13741ca381af8a7c55a1560828e88aa1"
     },
     "monitor_accounts.py": {
       "size": 76764,
@@ -30,12 +30,12 @@
       "sha256": "aa28784f802b29bccfe68b410d39b3ed55df298a33f28f1e8d8e1cc354ad3838"
     },
     "monitor_cloud.py": {
-      "size": 132698,
-      "sha256": "967ed404eaf2c08165503fab7256e3d96202ff2cea2c3191ebfc36c64cf00255"
+      "size": 130812,
+      "sha256": "4b7ce146a050773c00297d260529aeedb505e923aa487158521b02c65b123051"
     },
     "monitor_cloud_lock.py": {
-      "size": 13046,
-      "sha256": "82b0c8c5ba68cd7b47d22d305c67e235bf9db3e70a9ccc122572e85c76391939"
+      "size": 11445,
+      "sha256": "44ebf8c8ad50613299aeb8ae7cec75287644746dd3c147d1676a2fe7409bc5fd"
     },
     "monitor_cloud_queue.py": {
       "size": 8020,
@@ -163,7 +163,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "34038e4d6f9744eca17126e41cb041527ca5a914b3af5b6bbb220082c2eb7501"
+      "sha256": "979e826c7fc478b70310ef8a4d4a372e320fd9414d277090636a71e1c78c871a"
     }
   }
 }

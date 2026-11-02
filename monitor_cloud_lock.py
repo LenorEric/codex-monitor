@@ -1,7 +1,6 @@
 """Recoverable operation leases; native WebDAV locks cover metadata updates only."""
 
 from contextlib import contextmanager
-import hashlib
 import json
 import re
 import threading
@@ -24,9 +23,6 @@ def lock_error(message, http_status=None):
 
 
 class CloudAccessLock:
-    _verified = set()
-    _verification_lock = threading.Lock()
-
     def __init__(self, client):
         self.client = client
         self.owner = uuid.uuid4().hex
@@ -77,8 +73,6 @@ class CloudAccessLock:
 
     def _read(self):
         body, etag, _ = self._request("GET")
-        if not etag or etag.startswith("W/"):
-            raise lock_error("Cloud lock requires strong ETags")
         return self.parse(body), etag
 
     def _ensure_file(self):
@@ -109,8 +103,15 @@ class CloudAccessLock:
         started = time.monotonic()
         token = None
         try:
-            body, _, _ = self._request("LOCK", data=b'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>',
-                headers={"Content-Type": "application/xml", "Depth": "0", "Timeout": "Second-60"}, expected=(200,))
+            try:
+                body, _, _ = self._request("LOCK", data=b'<D:lockinfo xmlns:D="DAV:"><D:lockscope><D:exclusive/></D:lockscope><D:locktype><D:write/></D:locktype></D:lockinfo>',
+                    headers={"Content-Type": "application/xml", "Depth": "0", "Timeout": "Second-60"}, expected=(200,))
+            except Exception as exc:
+                if getattr(exc, "http_status", None) not in {405, 501}:
+                    raise
+                # Servers without native LOCK can still use the cooperative owner lease.
+                yield None, float("inf")
+                return
             try:
                 active = ET.fromstring(body).find(".//{DAV:}activelock")
                 candidate = active.findtext("{DAV:}locktoken/{DAV:}href")
@@ -133,8 +134,12 @@ class CloudAccessLock:
         if time.monotonic() >= native_deadline:
             raise lock_error("Native cloud metadata lock expired before update")
         body = json.dumps(state, sort_keys=True, separators=(",", ":")).encode()
-        _, new_etag, _ = self._request("PUT", data=body, headers={"Content-Type": "application/json", "If-Match": etag,
-            "If": f"<{self.client._url(CLOUD_LOCK_PATH)}> (<{token}>)"})
+        headers = {"Content-Type": "application/json"}
+        if etag and not etag.startswith("W/"):
+            headers["If-Match"] = etag
+        if token:
+            headers["If"] = f"<{self.client._url(CLOUD_LOCK_PATH)}> (<{token}>)"
+        _, new_etag, _ = self._request("PUT", data=body, headers=headers)
         if time.monotonic() >= native_deadline:
             raise lock_error("Native cloud metadata lock expired during update")
         if not new_etag or new_etag.startswith("W/"):
@@ -160,7 +165,6 @@ class CloudAccessLock:
                     self.deadline = started + max(0, expires_at - time.time())
                     self.claimed = True
                     self._log("lease_acquired", takeover=bool(state.get("owner")))
-                self._verify_conditions()
                 self.check()
             except Exception:
                 if self.claimed:
@@ -224,50 +228,16 @@ class CloudAccessLock:
     def prepare(self, method):
         with self.mutex:
             self.check()
-            if method in MUTATING_METHODS and not self.writing:
+            if method in MUTATING_METHODS:
                 try:
-                    self._update(writing=True)
+                    if not self.writing:
+                        self._update(writing=True)
+                    else:
+                        self._owned(self._read()[0])
+                        self.check()
                 except Exception as exc:
                     self.failure = exc
                     raise
-            return self.etag
-
-    def condition(self, etag):
-        return f"<{self.client._url(CLOUD_LOCK_PATH)}> ([{etag}])"
-
-    def retry_etag(self, previous):
-        with self.mutex:
-            self.check()
-            try:
-                state, etag = self._read()
-                self._owned(state)
-                if etag != self.etag:
-                    raise lock_error("Cloud lease changed outside this operation", 423)
-            except Exception as exc:
-                self.failure = exc
-                raise
-            return self.etag if self.etag != previous else None
-
-    def _verify_conditions(self):
-        key = (self.client.base, self.client.root, hashlib.sha256(self.client.authorization.encode()).digest())
-        with self._verification_lock:
-            if key in self._verified:
-                return
-            path = ".lock-probe-" + uuid.uuid4().hex
-            headers = {"If": self.condition(self.etag), "Content-Type": "application/octet-stream"}
-            try:
-                # A lost PUT response can still have created this unique probe.
-                self._request("PUT", path, b"original", headers)
-                for invalid in ({"If": self.condition('"invalid-' + uuid.uuid4().hex + '"')}, {"If-Match": '"invalid-' + uuid.uuid4().hex + '"'}):
-                    _, _, status = self._request("PUT", path, b"rejected", headers | invalid, expected=(200, 201, 204, 412))
-                    if status != 412:
-                        raise lock_error("WebDAV must enforce tagged lease ETags and If-Match before cloud access")
-                body, _, _ = self._request("GET", path, headers=headers)
-                if body != b"original":
-                    raise lock_error("WebDAV conditional probe was modified despite rejected writes")
-            finally:
-                self._request("DELETE", path, headers=headers, expected=(200, 204, 404))
-            self._verified.add(key)
 
     def release(self):
         self.stop.set()

@@ -317,24 +317,10 @@ class WebDavClient:
     def _request(self, method, path, data, headers, expected, output, diagnostic=None, coordination=False):
         if coordination or not self.access_lock.required:
             return self._send_request(method, path, data, headers, expected, output, diagnostic, category="metadata" if coordination else None)
-        if diagnostic is not None:
-            diagnostic["conditional"] = True
-        etag = self.access_lock.prepare(method)
-        for attempt in range(2):
-            try:
-                result = self._send_request(method, path, data, dict(headers or {}) | {"If": self.access_lock.condition(etag)}, expected, output, diagnostic)
-                self.access_lock.check()
-                return result
-            except CloudError as exc:
-                if exc.http_status != 412:
-                    raise
-                refreshed = self.access_lock.retry_etag(etag)
-                if attempt or refreshed is None:
-                    raise
-                etag = refreshed
-                if output is not None:
-                    output.seek(0)
-                    output.truncate()
+        self.access_lock.prepare(method)
+        result = self._send_request(method, path, data, headers, expected, output, diagnostic)
+        self.access_lock.check()
+        return result
 
     def _send_request(self, method, path, data, headers, expected, output, diagnostic=None, *, category=None):
         size = len(data) if isinstance(data, bytes) else 0
@@ -400,16 +386,12 @@ class WebDavClient:
                             attempt=attempt + 1, maxAttempts=WEBDAV_MKCOL_MAX_ATTEMPTS, delaySeconds=WEBDAV_MKCOL_RETRY_SECONDS, status=exc.http_status, errorCategory=exc.category)
                     time.sleep(WEBDAV_MKCOL_RETRY_SECONDS)
 
-    def get(self, path: str) -> tuple[bytes, str]:
+    def get(self, path: str) -> tuple[bytes, str | None]:
         body, etag, _ = self.request("GET", path)
-        if not etag or etag.startswith("W/"):
-            raise CloudError("WebDAV requires strong ETags", 409)
         return body, etag
 
     def get_file(self, path, output):
         _, etag, _ = self.request("GET", path, output=output)
-        if not etag or etag.startswith("W/"):
-            raise CloudError("WebDAV requires strong ETags", 409)
         return etag
 
     def put_file(self, path, source, create=False):
@@ -426,19 +408,17 @@ class WebDavClient:
                         break
         return etag
 
-    def get_if_changed(self, path: str, etag: str | None) -> tuple[bytes | None, str]:
+    def get_if_changed(self, path: str, etag: str | None) -> tuple[bytes | None, str | None]:
         body, current_etag, status = self.request("GET", path, headers={"If-None-Match": etag} if etag else None, expected=(200, 304))
         if status == 304:
             return None, etag
-        if not current_etag or current_etag.startswith("W/"):
-            raise CloudError("WebDAV requires strong ETags", 409)
         return body, current_etag
 
-    def put(self, path: str, data: bytes, etag: str | None = None, create: bool = False) -> str:
+    def put(self, path: str, data: bytes, etag: str | None = None, create: bool = False) -> str | None:
         headers = {"Content-Type": "application/octet-stream"}
         if create:
             headers["If-None-Match"] = "*"
-        elif etag:
+        elif etag and not etag.startswith("W/"):
             headers["If-Match"] = etag
         _, new_etag, _ = self.request("PUT", path, data, headers)
         if not new_etag or new_etag.startswith("W/"):
@@ -448,7 +428,7 @@ class WebDavClient:
         return new_etag
 
     def delete(self, path: str, etag: str | None = None) -> None:
-        if etag:
+        if etag and not etag.startswith("W/"):
             self.request("DELETE", path, headers={"If-Match": etag}, expected=(200, 204, 404))
         else:
             self.request("DELETE", path, expected=(200, 204, 404))
@@ -871,7 +851,7 @@ class CloudManager:
             "configPath": str(self.config_path), "webdav": {key: webdav.get(key) for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")},
             "secretsConfigured": {"password": bool(webdav.get("password")), "encryptionPassphrase": bool(webdav.get("encryptionPassphraseHash"))},
             "conditionalWritesVerified": bool(self._state.get("conditionalWritesVerified")),
-            "optimisticWritesActive": not bool(self._state.get("conditionalWritesVerified")) and bool(webdav.get("allowOptimisticWrites", True)), "skills": self._state.get("skills", {}), "error": error,
+            "optimisticWritesActive": not bool(self._state.get("conditionalWritesVerified")), "skills": self._state.get("skills", {}), "error": error,
             "autoSync": {
                 "pending": bool(self._pending_skill_pushes), "pendingSkills": sorted(self._pending_skill_pushes), "attempts": max((item["attempts"] for item in self._pending_skill_pushes.values()), default=0),
                 "failure": next(reversed(self._auto_push_failures.values()), None),
@@ -1134,14 +1114,7 @@ class CloudManager:
             descriptor = json.dumps(parsed, separators=(",", ":")).encode()
             client.put("crypto.json", descriptor, create=True)
             if client.get("crypto.json")[0] != descriptor:
-                raise CloudError("WebDAV crypto descriptor conditional creation verification failed", 409)
-            try:
-                client.put("crypto.json", descriptor, create=True)
-            except CloudError as verification_error:
-                if verification_error.http_status != 412:
-                    raise
-            else:
-                raise CloudError("WebDAV server ignored conditional crypto descriptor creation", 409)
+                raise CloudError("WebDAV crypto descriptor read-back verification failed", 409)
         return client, CryptoBox(webdav["encryptionPassphraseHash"], parsed)
 
     @_serialized_cloud_operation
@@ -1233,7 +1206,7 @@ class CloudManager:
         self._state["conditionalWritesVerified"] = conditional_writes
         self._state["decryptFailure"] = None
         self._save_state()
-        return {"ok": True, "strongEtag": etag, "conditionalWrites": conditional_writes, "encryptedPayloadVerified": bool(inventory), "optimisticWrites": not conditional_writes and bool(self.config()["webdav"].get("allowOptimisticWrites", True)), "warning": None if conditional_writes else "The server ignores conditional writes; conflict prevention is best-effort.", "checks": checks}
+        return {"ok": True, "strongEtag": etag, "conditionalWrites": conditional_writes, "encryptedPayloadVerified": bool(inventory), "optimisticWrites": not conditional_writes, "warning": None if conditional_writes else "The server ignores conditional writes; conflict prevention is best-effort.", "checks": checks}
 
     @staticmethod
     def _reencrypt_object(client: WebDavClient, box: CryptoBox, path: str, purpose: str) -> None:
@@ -1500,7 +1473,6 @@ class CloudManager:
         return self.accounts.delete(account_id)
 
     def delete_account_payloads(self, key: str, expected_etag: str | None = None) -> dict:
-        self._require_conditional_writes()
         client, box = self._connection()
         state_path, revisions_path = self._account_paths(key)
         try:
@@ -1878,7 +1850,6 @@ class CloudManager:
     def _push_usage_data(self, force_full: bool = False) -> dict:
         if self._usage_data is None:
             return {"skipped": True}
-        self._require_conditional_writes()
         client, box = self._connection(True)
         try:
             return {**self._v4_publish_retry(client, box, force_full), "pushedAt": _timestamp()}
@@ -1891,7 +1862,6 @@ class CloudManager:
             return {"skipped": True}
         self._state["usage"]["lastAttemptAt"] = _timestamp()
         self._save_state()
-        self._require_conditional_writes()
         client, box = self._connection(True)
         try:
             published = self._v4_publish_retry(client, box)
@@ -2088,10 +2058,6 @@ class CloudManager:
     def new_account_key(self) -> str:
         return self._connection()[1].placeholder_account_key()
 
-    def _require_conditional_writes(self) -> None:
-        if not self._state.get("conditionalWritesVerified") and not self.config()["webdav"].get("allowOptimisticWrites", True):
-            raise CloudError("Test WebDAV conditional writes or explicitly enable optimistic writes before using cloud synchronization", 409)
-
     def _account_paths(self, key: str, revision: str | None = None) -> tuple[str, str]:
         return f"accounts/states/{key}.enc", f"accounts/revisions/{key}/{revision}.enc" if revision else f"accounts/revisions/{key}"
 
@@ -2196,13 +2162,11 @@ class CloudManager:
         return items
 
     def bind_account(self, key: str) -> tuple[dict, bytes, str]:
-        self._require_conditional_writes()
         client, box = self._connection()
         state, etag = self.account_state(key)
         return state, self._download_account_revision_with(client, box, state), etag
 
     def release_account(self, key: str, auth_data: bytes, identity: dict, label: str, ready: bool = True, key_type: str | None = None, account_type: str = "account", config_header_toml: str = "", reject_existing: bool = False) -> dict:
-        self._require_conditional_writes()
         client, box = self._connection()
         key_type = key_type or "opaque"
         payload_identity = auth_identity(parse_auth_bytes(auth_data)) if ready else identity

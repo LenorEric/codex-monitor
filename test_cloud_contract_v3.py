@@ -48,7 +48,7 @@ class CloudContractV3Tests(unittest.TestCase):
             cloud = self.manager(directory)
             store = SimpleNamespace()
             cloud._usage_data = store
-            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(SimpleNamespace(transfers=[]), object())), mock.patch.object(cloud, "_v4_publish_retry", return_value={}) as publish:
+            with mock.patch.object(cloud, "_connection", return_value=(SimpleNamespace(transfers=[]), object())), mock.patch.object(cloud, "_v4_publish_retry", return_value={}) as publish:
                 cloud._push_usage_data(True)
 
             publish.assert_called_once()

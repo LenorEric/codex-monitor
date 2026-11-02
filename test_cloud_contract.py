@@ -38,6 +38,8 @@ class CloudContractFixture(unittest.TestCase):
         self.fail_busy_status = False
         self.ignore_tagged_etags = False
         self.ignore_if_match = False
+        self.omit_etags = False
+        self.native_status = None
         self.mutex = threading.RLock()
         owner = self
 
@@ -62,7 +64,9 @@ class CloudContractFixture(unittest.TestCase):
                     if invalid:
                         status = 412
                     elif self.command == "LOCK":
-                        if path != CLOUD_LOCK_PATH:
+                        if owner.native_status:
+                            status = owner.native_status
+                        elif path != CLOUD_LOCK_PATH:
                             status = 403
                         elif path not in owner.files and owner.reject_unmapped_locks:
                             status = 404
@@ -109,7 +113,7 @@ class CloudContractFixture(unittest.TestCase):
                         status = 204
                     self.send_response(status)
                     self.send_header("Content-Length", str(len(result)))
-                    if etag:
+                    if etag and not owner.omit_etags:
                         self.send_header("ETag", etag)
                     self.end_headers()
                     self.wfile.write(result)
@@ -283,7 +287,7 @@ class CloudContractTests(CloudContractFixture):
         self.assertEqual(sum(method == "LOCK" for method, _, _ in self.calls), 2)
         self.assertTrue(all(path == CLOUD_LOCK_PATH for method, path, _ in self.calls if method in {"LOCK", "UNLOCK"}))
         payload_headers = next(headers for method, path, headers in self.calls if path == "payload")
-        self.assertIn("/root/sync-lock.json> ([", payload_headers["If"])
+        self.assertNotIn("If", payload_headers)
 
     def test_write_status_wraps_all_nested_writes_once(self):
         self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION)

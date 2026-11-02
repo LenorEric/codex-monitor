@@ -4036,7 +4036,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("prefer a trusted VPN or an HTTPS reverse proxy", html)
         self.assertNotIn('id="serverPort"', html)
         self.assertNotIn('id="machineName"', html)
-        for field in ("webdavBaseUrl", "webdavUsername", "webdavPassword", "webdavRemoteRoot", "encryptionPassphrase", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites", "newControlPassword"):
+        for field in ("webdavBaseUrl", "webdavUsername", "webdavPassword", "webdavRemoteRoot", "encryptionPassphrase", "skillsAutoUpload", "usageDataAutoSync", "newControlPassword"):
             self.assertIn(f'id="{field}"', html)
         self.assertIn('run("/api/manage/config"', html)
         self.assertIn("Leave the passphrase and its saved hash empty to disable second-layer encryption.", html)
@@ -5253,7 +5253,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 manager._connection(True)
             client.put.assert_not_called()
 
-    def test_cloud_crypto_initialization_verifies_readback_and_conditional_create(self):
+    def test_cloud_crypto_initialization_verifies_readback_without_capability_probe(self):
         manager = object.__new__(CloudManager)
         manager.config = mock.Mock(return_value={"webdav": {"enabled": True, "baseUrl": "https://dav.example/", "username": "user", "password": "secret", "encryptionPassphraseHash": passphrase_hash("passphrase", "https://dav.example/", "user")}})
 
@@ -5284,13 +5284,13 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             connected_client, connected_box = manager._connection(True)
         self.assertIs(connected_client, client)
         self.assertIs(connected_box, crypto.return_value)
-        self.assertEqual(client.put_count, 2)
+        self.assertEqual(client.put_count, 1)
 
         client = Client(enforce_condition=False)
         with mock.patch.object(manager, "_contract_client", return_value=client), mock.patch("monitor_cloud.CryptoBox") as crypto:
             crypto.descriptor.return_value = {"version": 1}
-            with self.assertRaisesRegex(CloudError, "ignored conditional"):
-                manager._connection(True)
+            self.assertIs(manager._connection(True)[0], client)
+            self.assertEqual(client.put_count, 1)
 
     def test_webdav_test_decrypts_existing_payload_before_protocol_writes(self):
         manager = object.__new__(CloudManager)
@@ -6280,23 +6280,18 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
         self.assertIn('if not client_host_is_loopback(self.client_address[0]):', source)
 
-    def test_cloud_write_gate_allows_explicit_optimistic_mode(self):
+    def test_unverified_conditional_writes_do_not_block_usage_sync(self):
         with self.account_directory() as directory:
-            skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
-            cloud = CloudManager(directory / "private", skills, None)
-            config = json.loads(cloud.config_path.read_text(encoding="utf-8"))
-            config["webdav"]["allowOptimisticWrites"] = True
-            cloud.config_path.write_text(json.dumps(config), encoding="utf-8")
-
-            cloud._require_conditional_writes()
-
-            config["webdav"]["allowOptimisticWrites"] = False
-            cloud.config_path.write_text(json.dumps(config), encoding="utf-8")
-
-            cloud._require_conditional_writes()
-            cloud = CloudManager(directory / "private", skills, None)
-            with self.assertRaises(CloudError):
-                cloud._require_conditional_writes()
+            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
+            self.addCleanup(cloud.operation_queue.close)
+            cloud._config["webdav"].update(enabled=True, allowOptimisticWrites=False)
+            cloud._state["conditionalWritesVerified"] = False
+            cloud._usage_data = object()
+            with mock.patch.object(cloud, "_connection", return_value=(SimpleNamespace(transfers=[]), object())), \
+                    mock.patch.object(cloud, "_v4_publish_retry", return_value={}) as publish, mock.patch.object(cloud, "_v4_fetch", return_value={}):
+                cloud.sync_usage_data()
+            publish.assert_called_once()
+            self.assertIsNotNone(cloud._state["usage"]["lastSuccessAt"])
 
     def test_cloud_state_normalizes_combined_snapshot_fields_for_package_migration(self):
         with self.account_directory() as directory:
@@ -6700,10 +6695,9 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             state = {"version": 1, "accountKey": "key-a", "accountId": "acct-a", "revisionId": "revision"}
             client, box = SimpleNamespace(), SimpleNamespace()
 
-            with mock.patch.object(cloud, "_require_conditional_writes") as require_writes, mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", return_value=(state, '"etag"')), mock.patch.object(cloud, "_download_account_revision_with", return_value=b'{"tokens":{}}') as download:
+            with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", return_value=(state, '"etag"')), mock.patch.object(cloud, "_download_account_revision_with", return_value=b'{"tokens":{}}') as download:
                 result = cloud.bind_account("key-a")
 
-            require_writes.assert_called_once_with()
             download.assert_called_once_with(client, box, state)
             self.assertEqual(result, (state, b'{"tokens":{}}', '"etag"'))
 
@@ -6734,7 +6728,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             box = SimpleNamespace(account_key=mock.Mock(side_effect=AssertionError("binding key must not be regenerated")), encrypt=lambda _purpose, payload: payload)
             verified = {"version": 1, "accountKey": key, "accountId": "acct-a", "email": "a@example.test", "revisionId": hashlib.sha256(auth_data).hexdigest()}
 
-            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision"), mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account"):
+            with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision"), mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account"):
                 result = cloud.release_account(key, auth_data, identity, "Account A")
 
             self.assertEqual(result["accountKey"], key)
@@ -6749,7 +6743,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             box = SimpleNamespace(account_key=mock.Mock(return_value=key), encrypt=lambda _purpose, payload: payload)
             verified = {"version": 1, "accountKey": key, "accountId": "acct-a", "revisionId": hashlib.sha256(auth_data).hexdigest()}
 
-            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision") as upload, mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account") as cache:
+            with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision") as upload, mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account") as cache:
                 result = cloud.release_account(key, auth_data, identity, "Account A")
 
             upload.assert_called_once_with(client, box, key, auth_data, identity, "opaque")
@@ -6778,7 +6772,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             box = SimpleNamespace(encrypt=lambda _purpose, payload: payload)
             verified = {"version": 1, "accountKey": identity_id, "accountId": None, "accountType": "api", "apiIdentityId": identity_id, "revisionId": hashlib.sha256(auth_data).hexdigest()}
 
-            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision"), mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account"):
+            with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision"), mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account"):
                 cloud.release_account(identity_id, auth_data, identity, "API", account_type="api", reject_existing=True)
 
             state = json.loads(client.put.call_args.args[1])
@@ -6786,7 +6780,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertNotIn("OPENAI_API_KEY", json.dumps(state))
             self.assertNotIn("boundMachineId", state)
 
-            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", return_value=(state, '"etag"')), mock.patch.object(cloud, "_download_account_revision_with", return_value=auth_data):
+            with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", return_value=(state, '"etag"')), mock.patch.object(cloud, "_download_account_revision_with", return_value=auth_data):
                 with self.assertRaises(CloudError) as raised:
                     cloud.release_account(identity_id, auth_data, identity, "API", account_type="api", reject_existing=True)
 
@@ -6824,7 +6818,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             box = SimpleNamespace(account_key=mock.Mock(), encrypt=lambda _purpose, payload: payload)
             verified = {"version": 1, "accountKey": "placeholder-key", "keyType": "opaque", "accountId": None, "ready": False, "revisionId": hashlib.sha256(b"{}").hexdigest()}
 
-            with mock.patch.object(cloud, "_require_conditional_writes"), mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision") as upload, mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account"):
+            with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "account_state", side_effect=(CloudError("WebDAV GET failed with HTTP 404", 502), (verified, '"etag"'))), mock.patch.object(cloud, "_encrypted_payloads", return_value=set()), mock.patch.object(cloud, "_upload_revision") as upload, mock.patch.object(cloud, "_cleanup_account_revisions"), mock.patch.object(cloud, "_cache_remote_account"):
                 result = cloud.release_account("placeholder-key", b"{}", {"accountId": None, "email": None}, "Empty", ready=False)
 
             upload.assert_called_once_with(client, box, "placeholder-key", b"{}", {"accountId": None, "email": None}, "opaque")
@@ -6994,7 +6988,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
             cloud._usage_data = object()
-            with mock.patch.object(cloud, "_require_conditional_writes", side_effect=CloudError("offline")):
+            with mock.patch.object(cloud, "_connection", side_effect=CloudError("offline")):
                 with self.assertRaises(CloudError):
                     cloud.sync_usage_data()
 
