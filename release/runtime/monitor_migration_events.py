@@ -143,55 +143,15 @@ def migrate_event_only(paths):
         write_json(paths["cloud_state"], state)
 
 
-def rollback_cloud_event_only(client):
-    from monitor_cloud import CloudError
-    manager = getattr(client, "_migration_manager", None)
-    if manager is None:
-        return
-    for filename in manager._optional_remote_list(client, "migrations/contract-5"):
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}\.enc", filename) is None:
-            raise CloudError("Invalid event migration backup", 409)
-        original = client.get(f"migrations/contract-5/{filename}")[0]
-        path = manager._v4_head_path(filename[:-4])
-        current, etag = client.get(path)
-        if current != original:
-            client.put(path, original, etag=etag)
-            if client.get(path)[0] != original:
-                raise CloudError("Event migration rollback verification failed", 409)
+def finish_cloud_event_migration(client):
+    """Discard obsolete backup artifacts without restoring cloud contents."""
+    client.delete("migrations/contract-4")
 
 
 def migrate_cloud_event_only(client):
-    try:
-        _convert_cloud_event_only(client)
-    except Exception:
-        rollback_cloud_event_only(client)
-        raise
-
-
-def finish_cloud_event_migration(client):
-    """After the contract commits, remove rollback roots and unreferenced old payloads."""
-    from monitor_cloud import CryptoBox
-    manager = getattr(client, "_migration_manager", None)
-    if manager is None:
-        return
-    machines = set()
-    for contract in (4, 5):
-        for filename in manager._optional_remote_list(client, f"migrations/contract-{contract}"):
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,128}\.enc", filename):
-                machines.add(filename[:-4])
-    if not machines:
-        return
-    box = CryptoBox(manager.config()["webdav"]["encryptionPassphraseHash"], json.loads(client.get("crypto.json")[0]))
-    for machine in machines:
-        manager._v4_gc(client, box, machine, manager._v4_head(client, box, machine)[0])
-        for contract in (4, 5):
-            if f"{machine}.enc" in manager._optional_remote_list(client, f"migrations/contract-{contract}"):
-                client.delete(f"migrations/contract-{contract}/{machine}.enc")
-
-
-def _convert_cloud_event_only(client):
     from monitor_cloud import CloudError, CryptoBox
     from monitor_usage_sync import v4_logical_hash
+    from monitor_migrations import convert_reset_timestamps
     try:
         descriptor = client.get("crypto.json")[0]
     except CloudError as exc:
@@ -202,7 +162,11 @@ def _convert_cloud_event_only(client):
     if manager is None:
         raise CloudError("Event migration requires the configured monitor", 409)
     box = CryptoBox(manager.config()["webdav"]["encryptionPassphraseHash"], json.loads(descriptor))
-    client.ensure_directories("migrations/contract-5")
+    import sqlite3
+    import time
+    from monitor_streaming import logical_hash_sorted
+    from monitor_usage_packs import HistoricalPackWriter, UsageObjectReader
+    today = v4_period(time.time())[:10]
     for filename in manager._optional_remote_list(client, "usage/v4/heads"):
         if not filename.endswith(".enc"):
             continue
@@ -212,63 +176,76 @@ def _convert_cloud_event_only(client):
         head, etag = manager._v4_head(client, box, machine)
         catalog = manager._v4_catalog(client, box, machine, head)
         affected = set()
-        def entries(day, reference):
-            manifest = manager._v4_day_manifest(client, box, machine, day, reference)
-            for part, digest in manifest["parts"].items():
-                rows = manager._v4_data(client, box, machine, day, part, digest)
-                try:
-                    yield from rows
-                finally:
-                    if hasattr(rows, "close"):
-                        rows.close()
-        # Baselines can cover events in a different day partition.
-        for day, reference in catalog.items():
-            for entry in entries(day, reference):
-                record = entry.get("record", {})
-                if record.get("kind") == "tokenLedger" and _retired(record.get("row", {})):
-                    affected.add(_session_identity(record["row"]))
-        updated_catalog = dict(catalog)
-        for day, reference in catalog.items():
-            records, changed = [], False
-            for entry in entries(day, reference):
-                record = entry.get("record", {})
-                row = record.get("row", {})
+        # SQLite owns and removes this temporary database when the connection closes.
+        with closing(sqlite3.connect("")) as db:
+            db.execute("CREATE TABLE records (record_key TEXT PRIMARY KEY, day TEXT NOT NULL, period TEXT NOT NULL, data BLOB NOT NULL)")
+            with UsageObjectReader(manager, client, box, machine, validate=False) as reader:
+                for day, reference in sorted(catalog.items()):
+                    for entry in reader.entries(day, reference):
+                        validate_v4_envelope(entry, machine)
+                        if entry["collectionPeriod"][:10] != day:
+                            raise CloudError("Migrated record has the wrong collection date", 409)
+                        db.execute("INSERT INTO records VALUES(?,?,?,?)", (entry["recordKey"], day, entry["collectionPeriod"], canonical_json(entry)))
+                        record = entry.get("record", {})
+                        if record.get("kind") == "tokenLedger" and _retired(record.get("row", {})):
+                            affected.add(_session_identity(record["row"]))
+            for day, reference in catalog.items():
+                entries = (json.loads(data) for data, in db.execute("SELECT data FROM records WHERE day=? ORDER BY record_key", (day,)))
+                if logical_hash_sorted(entries) != reference["logicalHash"]:
+                    raise CloudError("Migrated usage day digest does not match its records", 409)
+            # A retained source can affect legacy events in any other day partition.
+            for key, data in db.execute("SELECT record_key,data FROM records"):
+                entry = json.loads(data)
+                record, row = entry["record"], entry["record"].get("row", {})
                 if record.get("kind") == "tokenLedger" and (_session_identity(row) in affected or not _current_event(row)):
-                    changed = True
+                    db.execute("DELETE FROM records WHERE record_key=?", (key,))
                     continue
+                record = convert_reset_timestamps(record)
                 if record.get("kind") == "quota" and "compaction" in row:
-                    record = record | {"row": {key: value for key, value in row.items() if key != "compaction"}}
+                    record = record | {"row": {name: value for name, value in record["row"].items() if name != "compaction"}}
+                if record != entry["record"]:
                     entry = entry | {"record": record, "contentSha256": content_hash(record)}
-                    changed = True
-                records.append(entry)
-            if not changed:
+                    db.execute("UPDATE records SET data=? WHERE record_key=?", (canonical_json(entry), key))
+            db.execute("CREATE INDEX chronological_records ON records(period,record_key)")
+            days = [day for day, in db.execute("SELECT DISTINCT day FROM records ORDER BY day")]
+            hashes = {day: logical_hash_sorted(json.loads(data) for data, in db.execute("SELECT data FROM records WHERE day=? ORDER BY record_key", (day,))) for day in days}
+            with HistoricalPackWriter(manager, client, box, machine) as writer:
+                for day, data in db.execute("SELECT day,data FROM records WHERE day<? ORDER BY period,record_key", (today,)):
+                    writer.add(day, json.loads(data), data)
+                updated_catalog = {day: reference | {"logicalHash": hashes[day]} for day, reference in writer.finish().items()}
+            active, manifests = None, {}
+            for day in (day for day in days if day >= today):
+                parts = {}
+                periods = [period for period, in db.execute("SELECT DISTINCT period FROM records WHERE day=? ORDER BY period", (day,))] if day == today else ["bulk"]
+                for period in periods:
+                    query, params = ("SELECT data FROM records WHERE day=? ORDER BY record_key", (day,)) if period == "bulk" else (
+                        "SELECT data FROM records WHERE period=? ORDER BY record_key", (period,))
+                    parts[period] = manager._put_usage_payload(client, box, "v4/data", machine,
+                        {"version": 1, "machineId": machine, "day": day, "partId": period, "records": [json.loads(data) for data, in db.execute(query, params)]})[0]
+                layout = "parts" if day == today else "bulk"
+                manifest = {"version": 1, "machineId": machine, "day": day, "layout": layout, "logicalHash": hashes[day], "parts": parts}
+                manifests[day] = manifest
+                digest = manager._put_usage_payload(client, box, "v4/days", machine, manifest)[0]
+                reference = {"manifestId": digest, "logicalHash": hashes[day], "layout": layout}
+                if day == today:
+                    active = {"day": day, **reference}
+                else:
+                    updated_catalog[day] = reference
+            old_historical = {day: reference for day, reference in catalog.items() if reference["layout"] != "parts"}
+            final_catalog = updated_catalog | ({active["day"]: {key: value for key, value in active.items() if key != "day"}} if active else {})
+            if updated_catalog == old_historical and active == head.get("activeDay"):
+                manager._v4_gc(client, box, machine, head, catalog=final_catalog, manifests=manifests)
                 continue
-            if not records:
-                updated_catalog.pop(day, None)
-                continue
-            records.sort(key=lambda row: row["recordKey"])
-            digest = manager._put_usage_payload(client, box, "v4/data", machine, {"version": 1, "machineId": machine, "day": day, "partId": "bulk", "records": records})[0]
-            logical = v4_logical_hash(records)
-            digest = manager._put_usage_payload(client, box, "v4/days", machine, {"version": 1, "machineId": machine, "day": day, "layout": "bulk", "logicalHash": logical, "parts": {"bulk": digest}})[0]
-            updated_catalog[day] = {"manifestId": digest, "logicalHash": logical, "layout": "bulk"}
-        if updated_catalog == catalog:
-            continue
-        months = {month: manager._put_usage_payload(client, box, "v4/months", machine,
-            {"version": 1, "machineId": machine, "month": month, "days": {day: ref for day, ref in updated_catalog.items() if day[:7] == month}})[0] for month in sorted({day[:7] for day in updated_catalog})}
-        path, backup = manager._v4_head_path(machine), f"migrations/contract-5/{machine}.enc"
-        original = client.get(path)[0]
-        try:
-            client.get(backup)
-        except CloudError as exc:
-            if exc.http_status != 404:
-                raise
-            client.put(backup, original, create=True)
-            if client.get(backup)[0] != original:
-                raise CloudError("Event migration backup verification failed", 409)
-        data = box.encrypt(f"usage-v4-head:{machine}", canonical_json(head | {"generation": head["generation"] + 1, "months": months, "activeDay": None}))
-        client.put(path, data, etag=etag)
-        if client.get(path)[0] != data:
-            raise CloudError("Event migration head verification failed", 409)
+            months = {}
+            for month in sorted({day[:7] for day in updated_catalog}):
+                refs = {day: ref for day, ref in updated_catalog.items() if day[:7] == month}
+                value = {"version": 2 if any(ref["layout"] == "packed" for ref in refs.values()) else 1, "machineId": machine, "month": month, "days": refs}
+                months[month] = manager._put_usage_payload(client, box, "v4/months", machine, value)[0]
+                manager._v4_month_cache[(machine, months[month])] = value
+            updated = head | {"generation": head["generation"] + 1, "months": months, "activeDay": active}
+            manager._v4_write_head(client, box, updated, etag)
+            manager._v4_gc(client, box, machine, updated, catalog=final_catalog, manifests=manifests)
+
 
 def validate_source_coverage(coverage):
     if not isinstance(coverage, dict):

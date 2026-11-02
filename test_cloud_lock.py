@@ -4,7 +4,7 @@ import threading
 from unittest import mock
 
 import monitor_cloud_lock
-from monitor_cloud import CloudError
+from monitor_cloud import CloudError, CryptoBox
 from monitor_cloud_lock import CLOUD_LOCK_PATH
 from monitor_webdav_log import WebDavLog
 from test_cloud_contract import CloudContractFixture
@@ -161,17 +161,39 @@ class CloudLockTests(CloudContractFixture):
             first.release_file_lock()
         second.release_file_lock()
 
-    def test_replaced_owner_is_rejected_before_payload_write(self):
+    def test_replaced_owner_is_rejected_on_renewal_before_further_access(self):
         first = self.client()
         first.acquire_file_lock()
         first.put("payload", b"before")
         self.files[CLOUD_LOCK_PATH] = json.dumps({"writing": 0, "owner": "replacement", "expiresAt": self.clock.wall + 300}).encode(), '"replacement"'
         with self.assertRaisesRegex(CloudError, "ownership changed"):
+            first.access_lock.renew()
+        before = len(self.calls)
+        with self.assertRaisesRegex(CloudError, "unusable"):
             first.put("payload", b"stale")
+        self.assertEqual(len(self.calls), before)
         self.assertIsNotNone(first.access_lock.failure)
         self.assertEqual(self.files["payload"][0], b"before")
         with self.assertRaises(CloudError):
             first.release_file_lock()
+
+    def test_payload_batch_uses_operation_lease_without_per_file_lock_requests(self):
+        client = self.client()
+        client.acquire_file_lock()
+        try:
+            client.put("one", b"one")
+            before = len(self.calls)
+            client.get("one")
+            client.put("two", b"two")
+            client.get("two")
+            client.ensure_directories("batch")
+            client.list("batch")
+            client.delete("one")
+            self.assertEqual([(method, path) for method, path, _ in self.calls[before:]],
+                [("GET", "one"), ("PUT", "two"), ("GET", "two"), ("MKCOL", "batch"), ("PROPFIND", "batch"), ("DELETE", "one")])
+            self.assertTrue(all(path == CLOUD_LOCK_PATH for method, path, _ in self.calls if method in {"LOCK", "UNLOCK"}))
+        finally:
+            client.release_file_lock()
 
     def test_renewal_does_not_add_payload_conditions_or_retries(self):
         client = self.client()
@@ -198,7 +220,7 @@ class CloudLockTests(CloudContractFixture):
         self.assertEqual(self.files["payload"][0], b"after")
         client.release_file_lock()
 
-    def test_network_failures_do_not_retry_mutations(self):
+    def test_network_failures_retry_same_local_payload_with_bounded_attempts(self):
         client = self.client()
         client.acquire_file_lock()
         client.access_lock.prepare("PUT")
@@ -206,14 +228,66 @@ class CloudLockTests(CloudContractFixture):
         attempts = []
         def fail_payload(method, path, *args, **kwargs):
             if path == "payload":
-                attempts.append(method)
+                attempts.append((method, args[0]))
                 raise CloudError("response lost", 502, category="network")
             return original(method, path, *args, **kwargs)
         with mock.patch.object(client, "_send_request", side_effect=fail_payload):
             with self.assertRaises(CloudError):
                 client.put("payload", b"ambiguous")
-            self.assertEqual(attempts, ["PUT"])
+            self.assertEqual(attempts, [("PUT", b"ambiguous")] * 3)
         client.release_file_lock()
+
+    def test_successful_uploads_without_etags_have_no_readback(self):
+        self.omit_etags = True
+        client = self.client()
+        client.acquire_file_lock()
+        try:
+            client.access_lock.prepare("PUT")
+            before = len(self.calls)
+            client.put("payload", b"accepted")
+            client.put_file("stream", io.BytesIO(b"streamed"))
+            self.assertEqual([(method, path) for method, path, _ in self.calls[before:]], [("PUT", "payload"), ("PUT", "stream")])
+        finally:
+            client.release_file_lock()
+
+    def test_lost_upload_response_retries_identical_bytes_without_get(self):
+        client = self.client()
+        client.acquire_file_lock()
+        try:
+            client.access_lock.prepare("PUT")
+            original = client._send_request
+            uploads = []
+            def lose_response(method, path, data, headers, *args, **kwargs):
+                result = original(method, path, data, headers, *args, **kwargs)
+                if path == "stream" and method == "PUT":
+                    data.seek(0)
+                    uploads.append(data.read())
+                    if len(uploads) == 1:
+                        raise CloudError("response lost", 502, category="network")
+                return result
+            before = len(self.calls)
+            with mock.patch.object(client, "_send_request", side_effect=lose_response):
+                client.put_file("stream", io.BytesIO(b"retry the complete file"), create=True)
+            self.assertEqual(uploads, [b"retry the complete file"] * 2)
+            self.assertEqual([(method, path) for method, path, _ in self.calls[before:]], [("PUT", "stream")] * 2)
+            self.assertEqual(self.files["stream"][0], b"retry the complete file")
+        finally:
+            client.release_file_lock()
+
+    def test_business_uploads_do_not_get_the_uploaded_objects(self):
+        client = self.client()
+        client.acquire_file_lock()
+        try:
+            client.access_lock.prepare("PUT")
+            before = len(self.calls)
+            manager = self.manager()
+            box = CryptoBox("", CryptoBox.descriptor(""))
+            manager._upload_revision(client, box, "account", b"{}", {"accountId": "account"}, "opaque")
+            manager._upload_skill_package(client, box, b"skill bytes", "a" * 64)
+            manager._put_usage_payload(client, box, "v4/data", "machine", {"version": 1, "machineId": "machine", "day": "2030-01-01", "partId": "bulk", "records": []})
+            self.assertFalse(any(method == "GET" for method, _, _ in self.calls[before:]))
+        finally:
+            client.release_file_lock()
 
     def test_metadata_accounting_and_renewal_errors_do_not_leak_secrets(self):
         client = self.client()

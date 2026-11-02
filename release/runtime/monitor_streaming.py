@@ -1,6 +1,7 @@
 """Bounded spooling for canonical usage payloads and dashboard snapshots."""
 
 import base64
+from array import array
 import hashlib
 import heapq
 import json
@@ -36,18 +37,32 @@ class RecordSpool(Records):
     def __init__(self):
         self.file = tempfile.TemporaryFile()
         self.count = 0
+        self.offsets = array("Q")
 
     def __iter__(self):
         return self.rows()
 
     def append(self, row):
-        self.file.write(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+        self.append_encoded(json.dumps(row, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode())
+
+    def append_encoded(self, data):
+        self.offsets.append(self.file.tell())
+        self.file.write(data + b"\n")
         self.count += 1
 
     def rows(self):
-        self.file.seek(0)
-        for line in self.file:
+        for line in self.encoded_rows():
             yield json.loads(line)
+
+    def encoded_rows(self, offset=0, count=None):
+        if offset < 0 or offset > self.count or count is not None and (count < 0 or offset + count > self.count):
+            raise ValueError("Usage record range is outside its pack")
+        self.file.seek(self.offsets[offset] if offset < self.count else 0, 0)
+        for _ in range(self.count - offset if count is None else count):
+            yield self.file.readline().rstrip(b"\n")
+
+    def range_rows(self, offset, count):
+        return (json.loads(line) for line in self.encoded_rows(offset, count))
 
     def __len__(self):
         return self.count
@@ -68,6 +83,13 @@ def json_chunks(value, *, sort_keys=True):
             yield json.dumps(key, ensure_ascii=False).encode() + b":"
             yield from json_chunks(value[key], sort_keys=sort_keys)
         yield b"}"
+    elif isinstance(value, RecordSpool):
+        yield b"["
+        for position, encoded in enumerate(value.encoded_rows()):
+            if position:
+                yield b","
+            yield encoded
+        yield b"]"
     elif isinstance(value, (list, tuple, Records)):
         yield b"["
         for position, row in enumerate(value):
@@ -312,7 +334,7 @@ def decode_payload(box, purpose, source, expected_id):
                 break
             reader.expect(b",")
         reader.finish()
-        if value.get("version") != 1:
+        if type(value.get("version")) is not int or value["version"] not in (1, 2):
             raise ValueError("Unsupported usage payload")
         return value
 

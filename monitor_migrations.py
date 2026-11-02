@@ -1,6 +1,6 @@
 """Own local/cloud data contracts, ordered upgrades, journal recovery and old-format conversion.
 
-Released steps are immutable. Local 20 includes independent quota storage and event-only history; cloud 5 removes legacy token history. Frozen historical codecs remain separate implementation
+Released steps are immutable. Local 20 includes independent quota storage and event-only history; cloud 4 converts reset timestamps and removes legacy token history. Frozen historical codecs remain separate implementation
 helpers; application modules only invoke the entry points here.
 """
 
@@ -24,7 +24,7 @@ import monitor_sample_store as samples
 DATA_CONTRACT_VERSION = 20
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
-CLOUD_DATA_CONTRACT_VERSION = 5
+CLOUD_DATA_CONTRACT_VERSION = 4
 CLOUD_DATA_CONTRACT_PATH = "data-contract.json"
 
 
@@ -656,6 +656,9 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
 
 def _run_data_migration(migration, paths: dict[str, Path], version: int, state_path: Path, journal_path: Path) -> None:
     protected_paths = {"processing_index": paths["processing_index"]} if version == 19 else paths
+    if version == 15:
+        # Historical display/diagnostic logs are not inputs or outputs of v15.
+        protected_paths = {name: path for name, path in paths.items() if name not in {"history", "sample_log", "legacy_sample_log"}}
     existing = {name for name, path in protected_paths.items() if path.exists()}
     backups = {}
     try:
@@ -837,8 +840,7 @@ def _migrate_cloud_to_v3(client):
     migrate_cloud_formats(client, getattr(client, "_migration_manager", None))
 
 
-CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3, 4: lambda client: migrate_cloud_reset_timestamps(client),
-    5: lambda client: __import__("monitor_migration_events").migrate_cloud_event_only(client)}
+CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3, 4: lambda client: __import__("monitor_migration_events").migrate_cloud_event_only(client)}
 
 
 def read_cloud_contract(client):
@@ -869,20 +871,12 @@ def ensure_cloud_contract(client):
         if version not in CLOUD_DATA_MIGRATIONS:
             raise CloudError(f"Missing cloud data migration {version}; cloud access is blocked", 409)
         CLOUD_DATA_MIGRATIONS[version](client)
-        try:
-            etag = client.put(CLOUD_DATA_CONTRACT_PATH, canonical_json({"dataContractVersion": version}), etag=etag, create=etag is None)
-            if read_cloud_contract(client)[0] != version:
-                raise CloudError("Cloud migration commit verification failed", 409)
-        except Exception:
-            if version == 4 and read_cloud_contract(client)[0] < version:
-                rollback_cloud_reset_timestamps(client)
-            if version == 5 and read_cloud_contract(client)[0] < version:
-                __import__("monitor_migration_events").rollback_cloud_event_only(client)
-            raise
-    if CLOUD_DATA_CONTRACT_VERSION >= 3:
-        finish_cloud_format_migration(client)
-    if CLOUD_DATA_CONTRACT_VERSION >= 5:
-        __import__("monitor_migration_events").finish_cloud_event_migration(client)
+        etag = client.put(CLOUD_DATA_CONTRACT_PATH, canonical_json({"dataContractVersion": version}), etag=etag)
+        if version == 3:
+            finish_cloud_format_migration(client)
+        if version == 4:
+            __import__("monitor_migration_events").finish_cloud_event_migration(client)
+
 
 
 DEFAULT_DATA_FILES = (
@@ -1188,12 +1182,7 @@ def migrate_local_formats(paths, codex_home=None):
         if result.get("usageAccountId"):
             result["usageAccountId"] = converter.account(result["usageAccountId"], result.get("accountSlotId"))
         return result
-    if paths["history"].exists():
-        rows = [convert_tree(json.loads(line)) for line in paths["history"].read_text(encoding="utf-8").splitlines() if line.strip()]
-        atomic_write_bytes(paths["history"], b"".join(canonical_json(row) + b"\n" for row in rows), private=True)
-    if paths["sample_log"].exists():
-        rows = [convert_tree(json.loads(line)) for line in paths["sample_log"].read_text(encoding="utf-8").splitlines() if line.strip()]
-        atomic_write_bytes(paths["sample_log"], b"".join(canonical_json(row) + b"\n" for row in rows), private=True)
+    # Preserve retired history and diagnostic logs verbatim; neither feeds the conversion.
     if paths["runtime_state"].exists():
         write_json(paths["runtime_state"], convert_tree(read_json(paths["runtime_state"])))
     event_ids = {}
@@ -1350,7 +1339,7 @@ def migrate_local_formats(paths, codex_home=None):
 
 
 def migrate_cloud_formats(client, manager):
-    """Convert under the existing WebDAV operation lock, with retryable originals."""
+    """Convert under one operation lease; accepted uploads are final."""
     from monitor_cloud import CloudError, CryptoBox
     from monitor_usage_sync import canonical_json, content_hash, record_key, v4_logical_hash, v4_period, v4_record_envelope
     from monitor_migration_events import validate_v4_envelope
@@ -1374,193 +1363,144 @@ def migrate_cloud_formats(client, manager):
         parsed["version"] = 3
     box = CryptoBox(verifier, parsed)
     converter = FormatConverter(manager.accounts.manifest if manager.accounts else {}, manager._state, config, manager.machine_id)
-    # Back up each mutable root before replacing it. Immutable source payloads are
-    # retained until every new root has been verified and the contract commits.
-    journal_path = "migrations/contract-3/journal.json"
-    client.ensure_directories("migrations/contract-3")
-    journal_bytes, journal_etag = optional(journal_path)
-    journal = json.loads(box.decrypt("contract-3-journal", journal_bytes)) if journal_bytes else {}
     import re
-    if not isinstance(journal, dict) or any(path not in {"crypto.json", "skills/current.enc"} and re.fullmatch(r"(?:usage/v4/heads|accounts/states)/[A-Za-z0-9_-]{1,128}\.enc", path) is None for path in journal):
-        raise ValueError("Invalid cloud migration journal")
-    def save_journal():
-        nonlocal journal_etag
-        journal_etag = client.put(journal_path, box.encrypt("contract-3-journal", canonical_json(journal)), etag=journal_etag, create=journal_etag is None)
-    def replace(path, data):
-        old, etag = optional(path)
-        if old == data:
-            return
-        if path not in journal:
-            journal[path] = base64.b64encode(old).decode() if old is not None else None
-            save_journal()
-        client.put(path, data, etag=etag, create=etag is None)
-        if client.get(path)[0] != data:
-            raise CloudError("Cloud migration read-back verification failed", 409)
-    try:
-        # Account credentials provide authoritative identities even for accounts
-        # absent from this machine. Remember their old usage aliases during this
-        # conversion only, without guessing based on display labels.
-        for filename in manager._optional_remote_list(client, "accounts/states"):
-            if not filename.endswith(".enc"):
-                continue
-            account_key = filename[:-4]
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", account_key) is None:
-                raise ValueError("Invalid migrated cloud account key")
-            path = f"accounts/states/{filename}"
-            account_state = json.loads(box.decrypt(f"account-state:{account_key}", client.get(path)[0]))
-            if account_state.get("accountKey") != account_key or account_state.get("version") != 1:
-                raise ValueError("Invalid historical cloud account state")
-            if account_state.get("ready", True):
-                from monitor_accounts import auth_identity, parse_auth_bytes, api_identity_id
-                data = manager._download_account_revision_with(client, box, account_state)
-                identity = auth_identity(parse_auth_bytes(data))
-                account_type = identity["accountType"]
-                alias = FormatConverter({"accounts": [{"id": account_key, "identity": identity, "accountType": account_type}]}, {}, config, manager.machine_id)
-                converter.aliases.update(alias.aliases)
-                account_state["accountType"] = account_type
-                if account_type == "api":
-                    account_state["apiIdentityId"] = api_identity_id(identity)
-            if account_state.get("configHeader"):
-                import tomlkit
-                if not account_state.get("configHeaderToml"):
-                    account_state["configHeaderToml"] = tomlkit.dumps(account_state["configHeader"])
-            account_state.pop("configHeader", None)
-            account_state.setdefault("configHeaderToml", "")
-            replace(path, box.encrypt(f"account-state:{account_key}", canonical_json(account_state)))
-        # Monolithic skill snapshots become the current per-skill packages.
-        pointer_bytes, _ = optional("skills/current.enc")
-        if pointer_bytes:
-            pointer = json.loads(box.decrypt("skills-pointer", pointer_bytes))
+    # Account credentials provide authoritative identities even for accounts
+    # absent from this machine. Remember their old usage aliases during this
+    # conversion only, without guessing based on display labels.
+    for filename in manager._optional_remote_list(client, "accounts/states"):
+        if not filename.endswith(".enc"):
+            continue
+        account_key = filename[:-4]
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", account_key) is None:
+            raise ValueError("Invalid migrated cloud account key")
+        path = f"accounts/states/{filename}"
+        account_bytes, account_etag = client.get(path)
+        account_state = json.loads(box.decrypt(f"account-state:{account_key}", account_bytes))
+        if account_state.get("accountKey") != account_key or account_state.get("version") != 1:
+            raise ValueError("Invalid historical cloud account state")
+        if account_state.get("ready", True):
+            from monitor_accounts import auth_identity, parse_auth_bytes, api_identity_id
+            data = manager._download_account_revision_with(client, box, account_state)
+            identity = auth_identity(parse_auth_bytes(data))
+            account_type = identity["accountType"]
+            alias = FormatConverter({"accounts": [{"id": account_key, "identity": identity, "accountType": account_type}]}, {}, config, manager.machine_id)
+            converter.aliases.update(alias.aliases)
+            account_state["accountType"] = account_type
+            if account_type == "api":
+                account_state["apiIdentityId"] = api_identity_id(identity)
+        if account_state.get("configHeader"):
+            import tomlkit
+            if not account_state.get("configHeaderToml"):
+                account_state["configHeaderToml"] = tomlkit.dumps(account_state["configHeader"])
+        account_state.pop("configHeader", None)
+        account_state.setdefault("configHeaderToml", "")
+        client.put(path, box.encrypt(f"account-state:{account_key}", canonical_json(account_state)), etag=account_etag)
+    # Monolithic skill snapshots become the current per-skill packages.
+    pointer_bytes, pointer_etag = optional("skills/current.enc")
+    if pointer_bytes:
+        pointer = json.loads(box.decrypt("skills-pointer", pointer_bytes))
+        if pointer.get("version") == 1:
+            snapshot_id = pointer["snapshotId"]
+            data = box.decrypt(f"skills-snapshot:{snapshot_id}", client.get(f"skills/snapshots/{snapshot_id}.enc")[0])
+            client.ensure_directories("skills/packages")
+            packages = {name: manager._upload_skill_package(client, box, data, manager.skills.skill_package_hash(data)) for name, data in manager.skills.split_snapshot(data).items()}
+            pointer = {"version": 2, "packages": packages, "updatedAt": pointer.get("updatedAt")}
+            client.put("skills/current.enc", box.encrypt("skills-pointer", canonical_json(pointer)), etag=pointer_etag)
+        elif pointer.get("version") != 2:
+            raise ValueError("Unknown cloud skill format")
+    old_machines = {name[:-4] for name in manager._optional_remote_list(client, "usage/machines") if name.endswith(".enc")}
+    machines = old_machines | {name[:-4] for name in manager._optional_remote_list(client, "usage/v4/heads") if name.endswith(".enc")}
+    for machine in sorted(machines):
+        import re
+        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", machine) is None:
+            raise ValueError("Invalid migrated machine ID")
+        head, head_etag = manager._v4_head(client, box, machine)
+        catalog = manager._v4_catalog(client, box, machine, head)
+        days = {}
+        for day, reference in catalog.items():
+            manifest = manager._v4_day_manifest(client, box, machine, day, reference)
+            for part, digest in manifest["parts"].items():
+                entries = manager._v4_data(client, box, machine, day, part, digest)
+                try:
+                    for entry in entries:
+                        record = converter.record(entry["record"], machine)
+                        if record is not None:
+                            key = record_key(record["kind"], record["row"])
+                            value = v4_record_envelope(machine, key, record, entry["collectionPeriod"])
+                            validate_v4_envelope(value, machine)
+                            days.setdefault(day, {})[key] = value
+                finally:
+                    if hasattr(entries, "close"):
+                        entries.close()
+        if machine in old_machines:
+            pointer = json.loads(box.decrypt(f"usage-pointer:{machine}", client.get(f"usage/machines/{machine}.enc")[0]))
+            if pointer.get("machineId") != machine:
+                raise ValueError("Old usage pointer owner mismatch")
+            operations = []
             if pointer.get("version") == 1:
-                snapshot_id = pointer["snapshotId"]
-                data = box.decrypt(f"skills-snapshot:{snapshot_id}", client.get(f"skills/snapshots/{snapshot_id}.enc")[0])
-                client.ensure_directories("skills/packages")
-                packages = {name: manager._upload_skill_package(client, box, data, manager.skills.skill_package_hash(data)) for name, data in manager.skills.split_snapshot(data).items()}
-                pointer = {"version": 2, "packages": packages, "updatedAt": pointer.get("updatedAt")}
-                replace("skills/current.enc", box.encrypt("skills-pointer", canonical_json(pointer)))
-            elif pointer.get("version") != 2:
-                raise ValueError("Unknown cloud skill format")
-        old_machines = {name[:-4] for name in manager._optional_remote_list(client, "usage/machines") if name.endswith(".enc")}
-        machines = old_machines | {name[:-4] for name in manager._optional_remote_list(client, "usage/v4/heads") if name.endswith(".enc")}
-        for machine in sorted(machines):
-            import re
-            if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", machine) is None:
-                raise ValueError("Invalid migrated machine ID")
-            head, _ = manager._v4_head(client, box, machine)
-            catalog = manager._v4_catalog(client, box, machine, head)
-            days = {}
-            for day, reference in catalog.items():
-                manifest = manager._v4_day_manifest(client, box, machine, day, reference)
-                for part, digest in manifest["parts"].items():
-                    entries = manager._v4_data(client, box, machine, day, part, digest)
-                    try:
-                        for entry in entries:
-                            record = converter.record(entry["record"], machine)
-                            if record is not None:
-                                key = record_key(record["kind"], record["row"])
-                                value = v4_record_envelope(machine, key, record, entry["collectionPeriod"])
-                                validate_v4_envelope(value, machine)
-                                days.setdefault(day, {})[key] = value
-                    finally:
-                        if hasattr(entries, "close"):
-                            entries.close()
-            if machine in old_machines:
-                pointer = json.loads(box.decrypt(f"usage-pointer:{machine}", client.get(f"usage/machines/{machine}.enc")[0]))
-                if pointer.get("machineId") != machine:
-                    raise ValueError("Old usage pointer owner mismatch")
-                operations = []
-                if pointer.get("version") == 1:
-                    checkpoint = manager._download_usage_payload(client, box, "checkpoints", machine, pointer["checkpointId"])
-                    operations = [{"action": "upsert", **record} for record in checkpoint.get("records", [])]
-                    chunks, seen, chunk_id = [], set(), pointer.get("headChunkId")
-                    while chunk_id:
-                        if chunk_id in seen:
-                            raise ValueError("Cyclic old usage chain")
-                        seen.add(chunk_id)
-                        chunk = manager._download_usage_payload(client, box, "chunks", machine, chunk_id)
-                        chunks.append(chunk)
-                        chunk_id = chunk.get("parentChunkId")
-                    for chunk in reversed(chunks):
-                        operations.extend(chunk.get("operations", []))
-                elif pointer.get("version") == 2:
-                    for digest in pointer["packs"].values():
-                        pack = manager._download_usage_payload(client, box, "packs", machine, digest)
-                        operations.extend({"action": "upsert", **entry} for entry in pack["records"])
+                checkpoint = manager._download_usage_payload(client, box, "checkpoints", machine, pointer["checkpointId"])
+                operations = [{"action": "upsert", **record} for record in checkpoint.get("records", [])]
+                chunks, seen, chunk_id = [], set(), pointer.get("headChunkId")
+                while chunk_id:
+                    if chunk_id in seen:
+                        raise ValueError("Cyclic old usage chain")
+                    seen.add(chunk_id)
+                    chunk = manager._download_usage_payload(client, box, "chunks", machine, chunk_id)
+                    chunks.append(chunk)
+                    chunk_id = chunk.get("parentChunkId")
+                for chunk in reversed(chunks):
+                    operations.extend(chunk.get("operations", []))
+            elif pointer.get("version") == 2:
+                for digest in pointer["packs"].values():
+                    pack = manager._download_usage_payload(client, box, "packs", machine, digest)
+                    operations.extend({"action": "upsert", **entry} for entry in pack["records"])
+            else:
+                raise ValueError("Unknown cloud usage format")
+            records = {}
+            for operation in operations:
+                if operation["action"] == "delete":
+                    records.pop(operation["key"], None)
+                elif operation["action"] == "upsert":
+                    records[operation["key"]] = operation["record"]
                 else:
-                    raise ValueError("Unknown cloud usage format")
-                records = {}
-                for operation in operations:
-                    if operation["action"] == "delete":
-                        records.pop(operation["key"], None)
-                    elif operation["action"] == "upsert":
-                        records[operation["key"]] = operation["record"]
-                    else:
-                        raise ValueError("Invalid historical operation")
-                for source in records.values():
-                    record = converter.record(source, machine)
-                    if record is None:
-                        continue
-                    row = record.get("row") or {}
-                    event = row.get("checkedAt") or row.get("occurredAt") or (row.get("session") or {}).get("updatedAt")
-                    period = v4_period(parse_timestamp(event) or time.time())
-                    key = record_key(record["kind"], row)
-                    value = v4_record_envelope(machine, key, record, period)
-                    validate_v4_envelope(value, machine)
-                    days.setdefault(period[:10], {}).setdefault(key, value)
-            new_catalog = {}
-            for path in ("usage/v4/heads", f"usage/v4/data/{machine}", f"usage/v4/days/{machine}", f"usage/v4/months/{machine}"):
-                client.ensure_directories(path)
-            for day, records in sorted(days.items()):
-                entries = sorted(records.values(), key=lambda row: row["recordKey"])
-                data_id, _ = manager._put_usage_payload(client, box, "v4/data", machine, {"version": 1, "machineId": machine, "day": day, "partId": "bulk", "records": entries})
-                logical = v4_logical_hash(entries)
-                manifest = {"version": 1, "machineId": machine, "day": day, "layout": "bulk", "logicalHash": logical, "parts": {"bulk": data_id}}
-                manifest_id, _ = manager._put_usage_payload(client, box, "v4/days", machine, manifest)
-                new_catalog[day] = {"manifestId": manifest_id, "logicalHash": logical, "layout": "bulk"}
-            months = {}
-            for month in sorted({day[:7] for day in new_catalog}):
-                months[month] = manager._put_usage_payload(client, box, "v4/months", machine, {"version": 1, "machineId": machine, "month": month, "days": {day: ref for day, ref in new_catalog.items() if day[:7] == month}})[0]
-            updated = {"version": 4, "machineId": machine, "generation": (head or {}).get("generation", 0) + 1, "months": months, "activeDay": None}
-            replace(manager._v4_head_path(machine), box.encrypt(f"usage-v4-head:{machine}", canonical_json(updated)))
-        replace("crypto.json", canonical_json(CryptoBox.descriptor(verifier)))
-    except Exception as exc:
-        # Keep the journal if rollback fails; a retry uses the same retained originals.
-        rollback_errors = []
-        for path, original in reversed(list(journal.items())):
-            try:
-                current, etag = optional(path)
-                data = base64.b64decode(original, validate=True) if original is not None else None
-                if current == data:
+                    raise ValueError("Invalid historical operation")
+            for source in records.values():
+                record = converter.record(source, machine)
+                if record is None:
                     continue
-                if data is None:
-                    client.delete(path, etag=etag)
-                else:
-                    client.put(path, data, etag=etag, create=etag is None)
-            except Exception:
-                rollback_errors.append(path)
-        if rollback_errors:
-            raise CloudError("Cloud migration failed and rollback is pending for: " + ", ".join(rollback_errors), 409) from exc
-        raise
+                row = record.get("row") or {}
+                event = row.get("checkedAt") or row.get("occurredAt") or (row.get("session") or {}).get("updatedAt")
+                period = v4_period(parse_timestamp(event) or time.time())
+                key = record_key(record["kind"], row)
+                value = v4_record_envelope(machine, key, record, period)
+                validate_v4_envelope(value, machine)
+                days.setdefault(period[:10], {}).setdefault(key, value)
+        new_catalog = {}
+        for path in ("usage/v4/heads", f"usage/v4/data/{machine}", f"usage/v4/days/{machine}", f"usage/v4/months/{machine}"):
+            client.ensure_directories(path)
+        for day, records in sorted(days.items()):
+            entries = sorted(records.values(), key=lambda row: row["recordKey"])
+            data_id, _ = manager._put_usage_payload(client, box, "v4/data", machine, {"version": 1, "machineId": machine, "day": day, "partId": "bulk", "records": entries})
+            logical = v4_logical_hash(entries)
+            manifest = {"version": 1, "machineId": machine, "day": day, "layout": "bulk", "logicalHash": logical, "parts": {"bulk": data_id}}
+            manifest_id, _ = manager._put_usage_payload(client, box, "v4/days", machine, manifest)
+            new_catalog[day] = {"manifestId": manifest_id, "logicalHash": logical, "layout": "bulk"}
+        months = {}
+        for month in sorted({day[:7] for day in new_catalog}):
+            months[month] = manager._put_usage_payload(client, box, "v4/months", machine, {"version": 1, "machineId": machine, "month": month, "days": {day: ref for day, ref in new_catalog.items() if day[:7] == month}})[0]
+        updated = {"version": 4, "machineId": machine, "generation": (head or {}).get("generation", 0) + 1, "months": months, "activeDay": None}
+        client.put(manager._v4_head_path(machine), box.encrypt(f"usage-v4-head:{machine}", canonical_json(updated)), etag=head_etag)
+    client.put("crypto.json", canonical_json(CryptoBox.descriptor(verifier)), etag=descriptor_etag)
 
 
 def finish_cloud_format_migration(client):
     from monitor_cloud import CloudError
-    journal = "migrations/contract-3/journal.json"
-    try:
-        client.get(journal)
-    except CloudError as exc:
-        if exc.http_status == 404:
-            return
-        raise
-    # All data is reachable through verified current roots and the contract marker
-    # has committed. A failed cleanup leaves the journal so the next access retries.
-    for path in ("usage/machines", "usage/packs", "usage/chunks", "usage/checkpoints", "skills/snapshots"):
+    for path in ("usage/machines", "usage/packs", "usage/chunks", "usage/checkpoints", "skills/snapshots", "migrations/contract-3"):
         try:
             client.delete(path)
         except CloudError as exc:
             if exc.http_status != 404:
                 raise
-    client.delete(journal)
 
 
 def _migrate_config_files(private_root, config_path, state_path, machine_path) -> None:
@@ -1819,103 +1759,3 @@ def migrate_reset_timestamps(paths):
         state = read_json(paths["cloud_state"])
         state["usageV4"] = {"remote": {}, "localHeadEtag": None, "transferByMonth": state.get("usageV4", {}).get("transferByMonth", {})}
         write_json(paths["cloud_state"], state)
-
-
-def migrate_cloud_reset_timestamps(client):
-    try:
-        _convert_cloud_reset_timestamps(client)
-    except Exception:
-        rollback_cloud_reset_timestamps(client)
-        raise
-
-
-def rollback_cloud_reset_timestamps(client):
-    from monitor_cloud import CloudError
-    manager = getattr(client, "_migration_manager", None)
-    if manager is None:
-        return
-    for filename in manager._optional_remote_list(client, "migrations/contract-4"):
-        import re
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}\.enc", filename) is None:
-            raise CloudError("Invalid cloud timestamp migration backup", 409)
-        original = client.get(f"migrations/contract-4/{filename}")[0]
-        path = manager._v4_head_path(filename[:-4])
-        current, etag = client.get(path)
-        if current != original:
-            client.put(path, original, etag=etag)
-            if client.get(path)[0] != original:
-                raise CloudError("Cloud timestamp migration rollback verification failed", 409)
-
-
-def _convert_cloud_reset_timestamps(client):
-    """Publish new immutable payloads, committing each head after verification.
-
-    Originals remain reachable through retained heads in the migration journal.
-    Failures restore mutable heads; immutable original payloads remain retained.
-    """
-    from monitor_cloud import CloudError, CryptoBox
-    from monitor_usage_sync import canonical_json, content_hash, v4_logical_hash
-    try:
-        descriptor = client.get("crypto.json")[0]
-    except CloudError as exc:
-        if exc.http_status == 404:
-            return
-        raise
-    manager = getattr(client, "_migration_manager", None)
-    if manager is None:
-        raise CloudError("Cloud timestamp migration requires the configured monitor", 409)
-    box = CryptoBox(manager.config()["webdav"]["encryptionPassphraseHash"], json.loads(descriptor))
-    client.ensure_directories("migrations/contract-4")
-    for filename in manager._optional_remote_list(client, "usage/v4/heads"):
-        if not filename.endswith(".enc"):
-            continue
-        machine = filename[:-4]
-        import re
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", machine) is None:
-            raise CloudError("Invalid cloud timestamp migration machine ID", 409)
-        head, etag = manager._v4_head(client, box, machine)
-        catalog = manager._v4_catalog(client, box, machine, head)
-        updated_catalog = dict(catalog)
-        for day, reference in catalog.items():
-            manifest = manager._v4_day_manifest(client, box, machine, day, reference)
-            records, changed = [], False
-            for part, digest in manifest["parts"].items():
-                entries = manager._v4_data(client, box, machine, day, part, digest)
-                try:
-                    for entry in entries:
-                        record = convert_reset_timestamps(entry["record"])
-                        changed |= record != entry["record"]
-                        records.append(entry | {"record": record, "contentSha256": content_hash(record)})
-                finally:
-                    if hasattr(entries, "close"):
-                        entries.close()
-            if not changed:
-                continue
-            records.sort(key=lambda row: row["recordKey"])
-            digest, _ = manager._put_usage_payload(client, box, "v4/data", machine, {"version": 1, "machineId": machine, "day": day, "partId": "bulk", "records": records})
-            logical = v4_logical_hash(records)
-            manifest = {"version": 1, "machineId": machine, "day": day, "layout": "bulk", "logicalHash": logical, "parts": {"bulk": digest}}
-            digest, _ = manager._put_usage_payload(client, box, "v4/days", machine, manifest)
-            updated_catalog[day] = {"manifestId": digest, "logicalHash": logical, "layout": "bulk"}
-        if updated_catalog == catalog:
-            continue
-        months = {}
-        for month in sorted({day[:7] for day in updated_catalog}):
-            months[month] = manager._put_usage_payload(client, box, "v4/months", machine,
-                {"version": 1, "machineId": machine, "month": month, "days": {day: ref for day, ref in updated_catalog.items() if day[:7] == month}})[0]
-        path = manager._v4_head_path(machine)
-        original = client.get(path)[0]
-        backup = f"migrations/contract-4/{machine}.enc"
-        try:
-            client.get(backup)
-        except CloudError as exc:
-            if exc.http_status != 404:
-                raise
-            client.put(backup, original, create=True)
-            if client.get(backup)[0] != original:
-                raise CloudError("Cloud timestamp migration backup verification failed", 409)
-        updated = head | {"generation": head["generation"] + 1, "months": months, "activeDay": None}
-        data = box.encrypt(f"usage-v4-head:{machine}", canonical_json(updated))
-        client.put(path, data, etag=etag)
-        if client.get(path)[0] != data:
-            raise CloudError("Cloud timestamp migration head verification failed", 409)

@@ -1288,7 +1288,7 @@ class AccountManager:
         try:
             cloud.delete_account_payloads(account_key, etag)
         except Exception as exc:
-            raise AccountError(f"The credential profile is safely stored locally, but its cloud payload could not be removed; restart the monitor to retry cleanup: {exc}", getattr(exc, "status", 500)) from exc
+            raise AccountError(f"The credential profile is safely stored locally, but its cloud payload could not be removed; retry cloud deletion explicitly: {exc}", getattr(exc, "status", 500)) from exc
         if record_transition:
             cloud.clear_account_transition()
         self.error = None

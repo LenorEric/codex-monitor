@@ -168,7 +168,7 @@ class TimestampMigrationTests(unittest.TestCase):
         self.assertEqual(self.paths[1].read_bytes(), original)
         self.assertEqual(self.migrate(), [])
 
-    def test_cloud_conversion_retains_original_head_and_retries_after_failure(self):
+    def test_cloud_conversion_keeps_uploaded_head_and_retries_after_failure(self):
         cloud = CloudManager(self.root, SimpleNamespace(), None)
         self.addCleanup(cloud.operation_queue.close)
         client = MemoryWebDav()
@@ -193,8 +193,8 @@ class TimestampMigrationTests(unittest.TestCase):
             return put(path, data, **kwargs)
         with mock.patch.object(client, "put", side_effect=fail), self.assertRaisesRegex(CloudError, "interrupted"):
             migrations.ensure_cloud_contract(client)
-        self.assertEqual(client.get("migrations/contract-4/machine-a.enc")[0], original)
-        self.assertEqual(client.get(path)[0], original)
+        self.assertNotIn("migrations/contract-4/machine-a.enc", client.files)
+        self.assertNotEqual(client.get(path)[0], original)
         migrations.ensure_cloud_contract(client)
         head, _ = cloud._v4_head(client, box, "machine-a")
         catalog = cloud._v4_catalog(client, box, "machine-a", head)

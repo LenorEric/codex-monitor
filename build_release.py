@@ -49,6 +49,7 @@ RUNTIME_FILES = (
     "monitor_sample_store.py",
     "monitor_projection.py",
     "monitor_streaming.py",
+    "monitor_usage_packs.py",
     "monitor_skills.py",
     "monitor_session_refresh.py",
     "monitor_token_ledger.py",

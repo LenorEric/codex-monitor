@@ -5348,13 +5348,13 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertEqual(result["checks"][1], {"name": "Encrypted data decryption", "status": "skipped", "detail": "No encrypted cloud payload exists yet."})
 
 
-    def test_webdav_put_uses_verified_get_etag_when_put_omits_it(self):
+    def test_webdav_put_accepts_success_without_etag_or_readback(self):
         client = object.__new__(WebDavClient)
         client.request = mock.Mock(return_value=(b"", None, 201))
         client.get = mock.Mock(return_value=(b"content", '"strong-etag"'))
 
-        self.assertEqual(client.put("test.bin", b"content", create=True), '"strong-etag"')
-        client.get.assert_called_once_with("test.bin")
+        self.assertIsNone(client.put("test.bin", b"content", create=True))
+        client.get.assert_not_called()
 
     def test_webdav_conditional_get_reuses_unchanged_etag(self):
         client = object.__new__(WebDavClient)
@@ -5509,7 +5509,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                         raise CloudError("cleanup failed", 502)
 
             client = Client()
-            cloud._cleanup_account_revisions(client, SimpleNamespace(decrypt=lambda _purpose, payload, *_args: payload), key, {"old", "current", "older"})
+            cloud._cleanup_account_revisions(client, SimpleNamespace(decrypt=lambda _purpose, payload, *_args: payload), key, {"old", "current", "older"}, "current")
 
             self.assertEqual(set(client.deleted), {f"accounts/revisions/{key}/old.enc", f"accounts/revisions/{key}/older.enc"})
 
@@ -6140,7 +6140,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(new_box.decrypt("skill-package:package", stored["skills/packages/package.enc"]), b"skill data")
             self.assertEqual(new_box.decrypt("account-state:account", stored["accounts/states/account.enc"]), b"account data")
 
-    def test_failed_passphrase_rotation_restores_remote_payloads_and_rejects_config(self):
+    def test_failed_passphrase_rotation_keeps_uploaded_payloads_without_rollback(self):
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
             old_hash = passphrase_hash("old passphrase", "https://example.test", "user")
@@ -6177,13 +6177,15 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "server": cloud._config["server"], "controlPassword": "",
                 "webdav": {**{key: cloud._config["webdav"][key] for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")}, "password": "", "encryptionPassphrase": "new passphrase"},
             }
-            with mock.patch.object(cloud, "_contract_client", return_value=Client()), self.assertRaisesRegex(CloudError, "Passphrase update failed"):
+            with mock.patch.object(cloud, "_contract_client", return_value=Client()), self.assertRaisesRegex(CloudError, "simulated upload failure"):
                 cloud.update_config(values)
 
-            self.assertEqual(stored, original)
+            self.assertNotEqual(stored["skills/packages/first.enc"], original["skills/packages/first.enc"])
+            self.assertEqual(stored["skills/packages/second.enc"], original["skills/packages/second.enc"])
+            self.assertEqual(stored["crypto.json"], original["crypto.json"])
             self.assertEqual(json.loads(cloud.config_path.read_text(encoding="utf-8"))["webdav"]["encryptionPassphraseHash"], old_hash)
 
-    def test_cloud_reencrypt_refreshes_and_verifies_every_payload_type(self):
+    def test_cloud_reencrypt_uploads_without_fetching_for_verification(self):
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
             encryption_hash = passphrase_hash("passphrase", "https://example.test", "user")
@@ -6215,8 +6217,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 result = cloud.reencrypt_remote_data()
 
             self.assertEqual(result["reencrypted"], len(purposes))
-            self.assertEqual(result["fetch"], {"verified": True})
-            fetch.assert_called_once_with()
+            self.assertNotIn("fetch", result)
+            fetch.assert_not_called()
             for path, purpose in purposes.items():
                 self.assertNotEqual(stored[path], original[path])
                 self.assertEqual(box.decrypt(purpose, stored[path]), path.encode())
@@ -6607,7 +6609,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             cloud.begin_account_transition.assert_called_once_with("bind", accountId=bound["id"], accountKey="key-a", revisionId=hashlib.sha256(data).hexdigest(), etag='"etag"')
             cloud.clear_account_transition.assert_not_called()
 
-    def test_recovered_bind_deletes_only_the_committed_profile_payload(self):
+    def test_recovered_bind_preserves_cloud_payload_without_replaying_delete(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             data = json.dumps(self.account_auth("acct-a", "refresh-a")).encode()
@@ -6621,7 +6623,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             with mock.patch.object(cloud, "delete_account_payloads", return_value={"deleted": True}) as delete:
                 self.assertEqual(cloud.recover_account_transition(), "bind")
 
-            delete.assert_called_once_with("profile-key", '"etag"')
+            delete.assert_not_called()
             self.assertIsNone(cloud._state["pendingAccountOperation"])
 
     def test_recovered_legacy_api_bind_preserves_both_verified_copies(self):
@@ -6644,7 +6646,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertTrue(manager._account_path("ppl-pro").exists())
             self.assertIsNone(cloud._state["pendingAccountOperation"])
 
-    def test_recovered_legacy_api_bind_restores_a_cloud_copy_if_old_cleanup_deleted_it(self):
+    def test_recovered_legacy_api_bind_does_not_restore_cloud_copy(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
@@ -6659,11 +6661,11 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 self.assertEqual(cloud.recover_account_transition(), "bind")
 
             delete.assert_not_called()
-            self.assertEqual(release.call_args.args[:4], ("legacy-api", data, auth_identity(parse_auth_bytes(data)), "Current account"))
-            self.assertEqual(release.call_args.kwargs["account_type"], "api")
+            release.assert_not_called()
+            self.assertTrue(manager._account_path("ppl-pro").exists())
             self.assertIsNone(cloud._state["pendingAccountOperation"])
 
-    def test_recovered_precommit_bind_reuses_the_recorded_local_slot(self):
+    def test_recovered_precommit_bind_does_not_replay_cloud_operation(self):
         with self.account_directory() as directory:
             accounts = SimpleNamespace(lock=threading.RLock(), manifest={"accounts": []}, bind_cloud_account=mock.Mock())
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), accounts)
@@ -6671,7 +6673,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
             self.assertEqual(cloud.recover_account_transition(), "bind")
 
-            accounts.bind_cloud_account.assert_called_once_with(cloud, "profile-key", record_transition=False, intended_account_id="intended-slot")
+            accounts.bind_cloud_account.assert_not_called()
             self.assertIsNone(cloud._state["pendingAccountOperation"])
 
     def test_usage_sync_identity_uses_id_token_hash_and_ignores_managed_label(self):

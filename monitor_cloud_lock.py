@@ -93,8 +93,8 @@ class CloudAccessLock:
             except Exception as exc:
                 if getattr(exc, "http_status", None) != 404:
                     raise
-            self._request("PUT", data=b'{"writing":0}', headers={"Content-Type": "application/json"})
-            return self._read()
+            _, etag, _ = self._request("PUT", data=b'{"writing":0}', headers={"Content-Type": "application/json"})
+            return {"writing": 0}, etag
         finally:
             self._request("DELETE", CLOUD_LOCK_INIT_PATH, expected=(200, 204, 404))
 
@@ -142,10 +142,6 @@ class CloudAccessLock:
         _, new_etag, _ = self._request("PUT", data=body, headers=headers)
         if time.monotonic() >= native_deadline:
             raise lock_error("Native cloud metadata lock expired during update")
-        if not new_etag or new_etag.startswith("W/"):
-            verified, new_etag = self._read()
-            if verified != state:
-                raise lock_error("Cloud lock update read-back verification failed")
         return new_etag
 
     def acquire(self):
@@ -232,9 +228,8 @@ class CloudAccessLock:
                 try:
                     if not self.writing:
                         self._update(writing=True)
-                    else:
-                        self._owned(self._read()[0])
-                        self.check()
+                    # The operation lease protects every payload request. Remote
+                    # ownership is checked on renewal/release, not on each write.
                 except Exception as exc:
                     self.failure = exc
                     raise

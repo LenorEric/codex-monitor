@@ -26,6 +26,10 @@
 
 # Persistent data contracts
 
+- Cloud data migrations must consolidate historical usage into chronological packs during final publication; do not upload intermediate per-day files merely to repack them afterward.
+- Count uncompressed canonical UTF-8 JSON bytes. Seal a pack after appending a complete record makes it exceed 75,000,000 bytes, and place subsequent records in the next pack.
+- Preserve daily logical hashes when record contents are unchanged. Packing alone must not invalidate verified client caches or rebuild projections.
+- Resolve references across all dates and months, and retain each shared pack until no live reference remains.
 - Update the data contract only when existing locally or cloud-saved data needs conversion, cleanup, or rebuilding because its persisted representation or meaning changes, including formats, schemas, field meanings, filenames, or derived data.
 - Changes solely to reader/writer code, modules, libraries, or access methods do not require a contract update when existing saved data remains valid without modification. Transport-only client/server changes do not require a bump.
 - Keep at most one unreleased migration: if the latest released contract is N, the pending target is N+1. Create it for the first persistent-contract change; merge all further unreleased changes into that same migration instead of incrementing again.

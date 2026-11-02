@@ -741,7 +741,8 @@ class UsageDataStore:
                 previous = db.execute("SELECT logical_hash, layout_json FROM remote_days WHERE machine_id=? AND day=?", (machine_id, day)).fetchone()
                 old_parts = json.loads(previous[1]) if previous else {}
                 if force or previous is None or previous[0] != manifest["logicalHash"]:
-                    changed = set(parts) if force or "bulk" in parts or "bulk" in old_parts else {part for part, digest in parts.items() if old_parts.get(part) != digest}
+                    replace_day = force or not old_parts or "bulk" in parts or "bulk" in old_parts or manifest.get("layout") == "packed"
+                    changed = set(parts) if replace_day else {part for part, digest in parts.items() if old_parts.get(part) != digest}
                     if set(downloaded) != changed:
                         raise ValueError("Downloaded usage parts do not match the changed day manifest")
                     device_id = samples._dimension(db, "device", machine_id)
@@ -752,8 +753,11 @@ class UsageDataStore:
                             (device_id, day),
                         )
                     }
-                    for part in (set(old_parts) - set(parts)) | changed:
-                        db.execute("DELETE FROM remote_records WHERE machine_id=? AND day=? AND part_id=?", (machine_id, day, part))
+                    if replace_day:
+                        db.execute("DELETE FROM remote_records WHERE machine_id=? AND day=?", (machine_id, day))
+                    else:
+                        for part in (set(old_parts) - set(parts)) | changed:
+                            db.execute("DELETE FROM remote_records WHERE machine_id=? AND day=? AND part_id=?", (machine_id, day, part))
                     for part, entries in downloaded.items():
                         for entry in entries:
                             validate_v4_envelope(entry, machine_id)
@@ -771,7 +775,8 @@ class UsageDataStore:
                 elif downloaded:
                     raise ValueError("Unchanged usage day unexpectedly downloaded payloads")
                 db.execute("INSERT INTO remote_origins(machine_id) VALUES(?) ON CONFLICT DO NOTHING", (machine_id,))
-                db.execute("INSERT INTO remote_days(machine_id, day, logical_hash, layout_json) VALUES(?,?,?,?) ON CONFLICT(machine_id, day) DO UPDATE SET logical_hash=excluded.logical_hash, layout_json=excluded.layout_json", (machine_id, day, manifest["logicalHash"], canonical_json(parts).decode()))
+                db.execute("INSERT INTO remote_days(machine_id, day, logical_hash, layout_json) VALUES(?,?,?,?) ON CONFLICT(machine_id, day) DO UPDATE SET logical_hash=excluded.logical_hash, layout_json=excluded.layout_json",
+                    (machine_id, day, manifest["logicalHash"], "{}" if manifest.get("layout") == "packed" else canonical_json(parts).decode()))
             self.refresh_peer_partition(machine_id, day)
 
     def v4_remove_days(self, machine_id: str, days: set[str]) -> None:

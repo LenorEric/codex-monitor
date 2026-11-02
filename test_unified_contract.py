@@ -107,6 +107,26 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertFalse((self.root / "config.json").exists())
         self.assertEqual(self.migrate(), [15])
 
+    def test_v15_does_not_open_retired_history_or_diagnostic_logs(self):
+        self.paths[4] = self.root / "usage_monitor_diagnostic_samples.jsonl"
+        retired = {self.paths[0], self.paths[4], self.root / "usage_monitor_samples.jsonl"}
+        for path in retired:
+            path.write_bytes(b'{"checkedAt":0}\n\x00broken diagnostic tail\xff')
+        self.paths[1].write_text(json.dumps(self.quota()) + "\n", encoding="utf-8")
+        open_path = Path.open
+
+        def guard(path, *args, **kwargs):
+            if path in retired:
+                raise AssertionError(f"Migration opened retired log: {path}")
+            return open_path(path, *args, **kwargs)
+
+        with mock.patch.object(Path, "open", guard):
+            self.assertEqual(self.migrate(), [15])
+            self.assertEqual(self.migrate(), [])
+        for path in retired:
+            self.assertEqual(path.read_bytes(), b'{"checkedAt":0}\n\x00broken diagnostic tail\xff')
+        self.assertEqual(json.loads(self.paths[1].read_text())["sync"]["accountId"], self.current)
+
     def test_runtime_rejects_old_ledger_and_identity(self):
         self.paths[3].write_text(json.dumps(self.baseline()) + "\n", encoding="utf-8")
         with self.assertRaises(ValueError):
@@ -216,11 +236,11 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertEqual(set(catalog), {"2026-07-15"})
         reference = catalog["2026-07-15"]
         manifest = cloud._v4_day_manifest(client, box, "machine-b", "2026-07-15", reference)
-        rows = cloud._v4_data(client, box, "machine-b", "2026-07-15", "bulk", manifest["parts"]["bulk"])
+        rows = list(cloud._v4_data(client, box, "machine-b", "2026-07-15", "bulk", manifest["parts"]["bulk"]))
         self.assertTrue(rows[0]["record"]["row"]["sync"]["accountId"].startswith("v3:"))
         self.assertNotIn("usage/machines/machine-b.enc", client.files)
 
-    def test_encrypted_cloud_failure_restores_roots_and_retries(self):
+    def test_encrypted_cloud_failure_retains_uploaded_roots_and_retries(self):
         from monitor_cloud import CloudError
         from monitor_migrations import ensure_cloud_contract
         from monitor_skills import SkillManager
@@ -250,7 +270,7 @@ class UnifiedContractTests(unittest.TestCase):
             return original_put(path, data, **kwargs)
         with mock.patch.object(client, "put", side_effect=fail), self.assertRaisesRegex(CloudError, "simulated"):
             ensure_cloud_contract(client)
-        self.assertEqual(client.get("skills/current.enc")[0], pointer)
+        self.assertNotEqual(client.get("skills/current.enc")[0], pointer)
         self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 2)
         ensure_cloud_contract(client)
         migrated = json.loads(box.decrypt("skills-pointer", client.get("skills/current.enc")[0]))

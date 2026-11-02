@@ -118,7 +118,7 @@ class EventOnlyTests(unittest.TestCase):
         client._migration_manager = manager
         box = CryptoBox("", CryptoBox.descriptor(""))
         client.put("crypto.json", json.dumps(box.descriptor("")).encode())
-        client.put("data-contract.json", b'{"dataContractVersion":4}')
+        client.put("data-contract.json", b'{"dataContractVersion":3}')
         days = {}
         rows = [("2030-01-01", self.baseline()), ("2030-01-02", self.usage()), ("2030-01-03", self.usage("valid") | {"sessionId": "other"})]
         if quota is not None:
@@ -142,32 +142,39 @@ class EventOnlyTests(unittest.TestCase):
         monitor_migrations.ensure_cloud_contract(client)
         head = manager._v4_head(client, box, "machine")[0]
         self.assertEqual(set(manager._v4_catalog(client, box, "machine", head)), {"2030-01-03"})
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 5)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
         self.assertNotIn(manager._usage_payload_path("v4/data", "machine", obsolete), client.files)
-        self.assertNotIn("migrations/contract-5/machine.enc", client.files)
+        self.assertNotIn("migrations/contract-4/machine.enc", client.files)
         monitor_migrations.ensure_cloud_contract(client)
         self.assertEqual(manager._v4_head(client, box, "machine")[0], head)
 
-    def test_cloud_removes_quota_compaction_and_rehashes_envelopes(self):
+    def test_cloud_converts_reset_timestamps_and_removes_compaction_in_one_publish(self):
         from monitor_usage_sync import add_record_provenance
         quota = add_record_provenance("quota", {"checkedAt": "2030-01-04T00:00:00Z",
-            "windows": {"5h": {"usedPercent": 25, "resetAt": None, "plan": "plus"}},
+            "windows": {"5h": {"usedPercent": 25, "resetAt": "2030-01-04T05:00:00Z", "plan": "plus"}},
             "compaction": {"continuousFrom": "2030-01-03T23:00:00Z", "omittedSamples": 12}}, "machine", "v3:a")
         manager, client, box = self.cloud(quota)
-        monitor_migrations.ensure_cloud_contract(client)
+        with mock.patch.object(client, "put", wraps=client.put) as put:
+            monitor_migrations.ensure_cloud_contract(client)
+        self.assertEqual(sum(call.args[0] == manager._v4_head_path("machine") for call in put.call_args_list), 1)
+        self.assertEqual(sum(call.args[0] == "data-contract.json" for call in put.call_args_list), 1)
         head = manager._v4_head(client, box, "machine")[0]
         catalog = manager._v4_catalog(client, box, "machine", head)
         manifest = manager._v4_day_manifest(client, box, "machine", "2030-01-04", catalog["2030-01-04"])
         rows = list(manager._v4_data(client, box, "machine", "2030-01-04", "bulk", manifest["parts"]["bulk"]))
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["record"]["row"], {key: value for key, value in quota.items() if key != "compaction"})
+        self.assertEqual(rows[0]["record"]["row"], monitor_migrations.convert_reset_timestamps({key: value for key, value in quota.items() if key != "compaction"}))
+        self.assertIsInstance(rows[0]["record"]["row"]["windows"]["5h"]["resetAt"], (int, float))
         self.assertEqual(rows[0]["contentSha256"], content_hash(rows[0]["record"]))
         self.assertEqual(manifest["logicalHash"], v4_logical_hash(rows))
         monitor_migrations.ensure_cloud_contract(client)
         self.assertEqual(manager._v4_head(client, box, "machine")[0], head)
 
-    def test_cloud_marker_failure_restores_head_for_retry(self):
-        manager, client, box = self.cloud()
+    def test_cloud_marker_failure_retains_uploaded_head_without_rollback(self):
+        from monitor_usage_sync import add_record_provenance
+        quota = add_record_provenance("quota", {"checkedAt": "2030-01-04T00:00:00Z",
+            "windows": {"5h": {"usedPercent": 25, "resetAt": "2030-01-04T05:00:00Z", "plan": "plus"}}}, "machine", "v3:a")
+        manager, client, box = self.cloud(quota)
         original = client.get(manager._v4_head_path("machine"))[0]
         put = client.put
         def fail(path, data, **kwargs):
@@ -176,10 +183,10 @@ class EventOnlyTests(unittest.TestCase):
             return put(path, data, **kwargs)
         with mock.patch.object(client, "put", side_effect=fail), self.assertRaisesRegex(CloudError, "marker unavailable"):
             monitor_migrations.ensure_cloud_contract(client)
-        self.assertEqual(client.get(manager._v4_head_path("machine"))[0], original)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
+        self.assertNotEqual(client.get(manager._v4_head_path("machine"))[0], original)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 3)
         monitor_migrations.ensure_cloud_contract(client)
-        self.assertEqual(set(manager._v4_catalog(client, box, "machine", manager._v4_head(client, box, "machine")[0])), {"2030-01-03"})
+        self.assertEqual(set(manager._v4_catalog(client, box, "machine", manager._v4_head(client, box, "machine")[0])), {"2030-01-03", "2030-01-04"})
 
 
 if __name__ == "__main__":

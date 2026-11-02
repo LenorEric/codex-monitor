@@ -184,7 +184,7 @@ class UsageV4Tests(unittest.TestCase):
         monthly = author._state["usageV4"]["transferByMonth"]
         self.assertGreater(monthly[next(iter(monthly))]["backfill"]["successfulUploadBytes"], 0)
 
-    def test_etag_conflict_restarts_from_latest_head(self):
+    def test_etag_conflict_is_reported_without_restarting_publication(self):
         author, quota = self.device("author")
         self.append(quota, author.machine_id, "one", "2030-01-01T00:01:00Z")
         with mock.patch("monitor_cloud.time.time", return_value=moment("2030-01-01T00:31:00Z")):
@@ -199,6 +199,10 @@ class UsageV4Tests(unittest.TestCase):
             return put(path, data, etag, create)
 
         with mock.patch.object(self.client, "put", side_effect=conflict), mock.patch("monitor_cloud.time.time", return_value=moment("2030-01-01T00:41:00Z")):
+            with mock.patch.object(author, "_v4_head", wraps=author._v4_head) as read_head, self.assertRaises(CloudError) as error:
+                author.sync_usage_data()
+            self.assertEqual(error.exception.http_status, 412)
+            self.assertEqual(read_head.call_count, 1)
             self.assertEqual(author.sync_usage_data()["published"]["partsUploaded"], 1)
         self.assertEqual(len(rejected), 1)
 

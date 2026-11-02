@@ -392,6 +392,8 @@ class CloudContractTests(CloudContractFixture):
         client.access_lock.prepare("PUT")
         self.files[CLOUD_LOCK_PATH] = b'{"writing":0,"owner":"another-owner","expiresAt":9999999999}', '"replacement"'
         with self.assertRaises(CloudError):
+            client.access_lock.renew()
+        with self.assertRaises(CloudError):
             client.put("payload", b"stale")
         self.assertNotIn("payload", self.files)
         with self.assertRaises(CloudError):
