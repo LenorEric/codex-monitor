@@ -242,6 +242,19 @@ class AutoUpdateTests(unittest.TestCase):
 
             self.assertEqual(result, {"currentVersion": "1.5.0", "latestVersion": "1.5.0", "updated": False})
 
+    def test_download_and_validation_failures_preserve_old_runtime_and_version(self):
+        for failure in (OSError("download failure"), b"damaged", b'{"version":"1.5.2","dataContractVersion":2}\n'):
+            with self.subTest(failure=failure), temporary_directory() as runtime:
+                (runtime / "monitor.py").write_bytes(b"old")
+                (runtime / "version.json").write_text('{"version":"1.5.0"}', encoding="utf-8")
+                metadata = failure if isinstance(failure, bytes) and failure.startswith(b"{") else b'{"version":"1.5.1","dataContractVersion":2}\n'
+                updater = AutoUpdater(runtime, lambda: True, lambda: None)
+                with mock.patch.object(updater, "_read", side_effect=[b"new", failure]), self.assertRaises((OSError, AutoUpdateError)):
+                    updater._install(None, "1.5.1", {"monitor.py": descriptor(b"new"), "version.json": descriptor(metadata)})
+                self.assertEqual((runtime / "monitor.py").read_bytes(), b"old")
+                self.assertEqual(installed_version(runtime), "1.5.0")
+                self.assertFalse(list(runtime.glob(".codex-monitor-update-*")))
+
     def test_restart_request_runs_callback_once(self):
         with temporary_directory() as runtime:
             restarted = []
@@ -254,7 +267,7 @@ class AutoUpdateTests(unittest.TestCase):
             self.assertTrue(updater.restart_requested)
             self.assertEqual(restarted, [True])
 
-    def test_replacement_failure_rolls_back_already_replaced_files(self):
+    def test_replacement_failure_preserves_already_replaced_files(self):
         with temporary_directory() as runtime:
             (runtime / "first.py").write_bytes(b"old-first")
             (runtime / "blocked.py").mkdir()
@@ -263,8 +276,21 @@ class AutoUpdateTests(unittest.TestCase):
             opener = Opener({RUNTIME_FILE_URL.format(name=name): data for name, data in files.items()})
             with self.assertRaises(AutoUpdateError):
                 updater._install(opener, "1.5.1", {name: descriptor(data) for name, data in files.items()})
-            self.assertEqual((runtime / "first.py").read_bytes(), b"old-first")
+            self.assertEqual((runtime / "first.py").read_bytes(), b"new-first")
             self.assertTrue((runtime / "blocked.py").is_dir())
+
+    def test_dependency_failure_keeps_new_runtime_and_version(self):
+        with temporary_directory() as runtime:
+            (runtime / "monitor.py").write_bytes(b"old")
+            (runtime / "version.json").write_text('{"version":"1.5.0"}', encoding="utf-8")
+            files = {"monitor.py": b"new", "version.json": b'{"version":"1.5.1","dataContractVersion":2}\n'}
+            updater = AutoUpdater(runtime, lambda: True, lambda: None)
+            opener = Opener({RUNTIME_FILE_URL.format(name=name): data for name, data in files.items()})
+            with mock.patch.object(monitor_auto_update, "install_dependencies", side_effect=RuntimeError("dependency failure")), self.assertRaisesRegex(RuntimeError, "dependency failure"):
+                updater._install(opener, "1.5.1", {name: descriptor(data) for name, data in files.items()})
+            self.assertEqual((runtime / "monitor.py").read_bytes(), b"new")
+            self.assertEqual(installed_version(runtime), "1.5.1")
+            self.assertFalse(list(runtime.glob(".codex-monitor-update-*")))
 
     def test_installer_never_runs_migration_with_old_loaded_modules(self):
         with temporary_directory() as temporary:

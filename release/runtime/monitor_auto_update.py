@@ -199,10 +199,8 @@ class AutoUpdater:
 
     def _install(self, opener, version: str, files: dict[str, dict]) -> None:
         work_root = self.runtime_dir / f".codex-monitor-update-{uuid.uuid4().hex}"
-        staging, backup = work_root / "staging", work_root / "backup"
+        staging = work_root / "staging"
         staging.mkdir(parents=True)
-        backup.mkdir()
-        replaced = []
         try:
             for number, (name, descriptor) in enumerate(files.items(), 1):
                 print(f"Downloading and verifying update file {number}/{len(files)}: {name}", flush=True)
@@ -216,29 +214,13 @@ class AutoUpdater:
                     raise AutoUpdateError("Runtime version metadata does not match the release manifest")
             except (FileNotFoundError, UnicodeDecodeError, json.JSONDecodeError) as exc:
                 raise AutoUpdateError("Runtime version metadata is missing or invalid") from exc
+            # All downloads and validation finish before installation; installation errors never restore older files.
             for name in [name for name in files if name != "version.json"] + ["version.json"]:
                 target = self.runtime_dir / name
                 if target.is_symlink() or target.exists() and not target.is_file():
                     raise AutoUpdateError(f"Runtime target is not a regular file: {name}")
-                if target.exists():
-                    shutil.copy2(target, backup / name)
                 os.replace(staging / name, target)
-                replaced.append(name)
             install_dependencies(self.runtime_dir)
-        except Exception:
-            rollback_errors = []
-            for name in reversed(replaced):
-                target, saved = self.runtime_dir / name, backup / name
-                try:
-                    if saved.exists():
-                        os.replace(saved, target)
-                    else:
-                        target.unlink(missing_ok=True)
-                except OSError as exc:
-                    rollback_errors.append(f"{name}: {exc}")
-            if rollback_errors:
-                raise AutoUpdateError(f"Update failed and rollback was incomplete: {'; '.join(rollback_errors)}")
-            raise
         finally:
             shutil.rmtree(work_root, ignore_errors=True)
 
