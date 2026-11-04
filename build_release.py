@@ -45,6 +45,7 @@ RUNTIME_FILES = (
     "monitor_ingestion.py",
     "monitor_quota.py",
     "monitor_sampling.py",
+    "monitor_quota_runs.py",
     "monitor_processing.py",
     "monitor_sample_store.py",
     "monitor_projection.py",

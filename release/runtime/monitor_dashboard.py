@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 
 import base64
-import bisect
 import copy
 import gzip
 import hashlib
@@ -9,7 +8,6 @@ import hmac
 import http.server
 import ipaddress
 import json
-import math
 import os
 import secrets
 import sys
@@ -19,7 +17,7 @@ import time
 import urllib.parse
 import urllib.request
 import webbrowser
-from datetime import datetime, timezone
+from datetime import datetime
 from http.cookies import SimpleCookie
 from pathlib import Path
 
@@ -27,16 +25,16 @@ from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_
 from monitor_auto_update import AUTO_UPDATE_RESTART, AutoUpdater, installed_version
 from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
 from monitor_cloud_queue import OperationSkipped
-from monitor_common import DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, RESET_TIME_JITTER_SECONDS, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
+from monitor_common import DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_device_auth import DeviceAuthManager
 from monitor_events import (
-    allocate_model_delta_events, compact_delta_event, hydrate_delta_state_from_events,
-    print_special_events, process_sample_delta_events, valid_delta_cost_rate, delta_state_needs_hydration,
+    historical_console_events, hydrate_delta_state_from_events,
+    print_special_events, process_sample_delta_events, delta_state_needs_hydration,
 )
 from monitor_quota import fetch_usage
 from monitor_history import (
     collect_usage_sample, default_dashboard_cache_path,
-    make_history_sample, normalize_quota_history_row, quota_history_row_from_sample, replace_account_label, reset_runtime_baselines, write_state,
+    make_history_sample, normalize_quota_history_row, replace_account_label, reset_runtime_baselines, write_state,
 )
 from monitor_skills import SkillError, SkillManager
 from monitor_session_refresh import refresh_session
@@ -55,8 +53,6 @@ SESSION_REFRESH_SUCCESS_TOLERANCE_SECONDS = 10
 SESSION_REFRESH_WINDOW_SECONDS = {"5h": 5 * 60 * 60, "7d": 7 * 24 * 60 * 60}
 CONTROL_COOKIE_NAME = "codex_monitor_control"
 CONTROL_COOKIE_MAX_AGE_SECONDS = 30 * 24 * 60 * 60
-DASHBOARD_DISPLAY_CACHE_GAP_SECONDS = 4 * 60 * 60
-DASHBOARD_DISPLAY_CACHE_MAINTENANCE_SECONDS = 60
 DASHBOARD_GZIP_MIN_BYTES = 1024
 SENSITIVE_DASHBOARD_FIELDS = {
     "access_token", "account_id", "accountId", "apiIdentityId", "_apiIdentityId", "authIdentity", "baseUrl", "boundMachineId", "configPath", "email", "encryptionPassphrase", "fingerprint", "id_token", "identity",
@@ -262,34 +258,6 @@ def dashboard_cloud_status(status: dict) -> dict:
         },
     }
 
-def dashboard_usage_account_id(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> str:
-    return str(row.get("usageAccountId") or (row.get("sync") or {}).get("accountId") or (slot_usage_accounts or {}).get(str(row.get("accountSlotId") or "")) or row.get("accountSlotId") or row.get("accountLabel") or "unknown")
-
-def dashboard_quota_point(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> dict:
-    from monitor_sampling import quota_point
-    return quota_point(row, slot_usage_accounts)
-
-
-def dashboard_quota_points(rows: list[dict], slot_usage_accounts: dict[str, str] | None = None) -> list[dict]:
-    from monitor_sampling import sample_rows
-    return sample_rows(rows, slot_usage_accounts)
-
-
-def dashboard_token_session(row: dict, slot_usage_accounts: dict[str, str] | None = None) -> dict:
-    return {
-        "sessionId": row.get("sessionId"),
-        "startedAt": row.get("startedAt"),
-        "updatedAt": row.get("updatedAt") or row.get("startedAt"),
-        "accountSlotId": row.get("accountSlotId"),
-        "accountLabel": row.get("accountLabel"),
-        "usageAccountId": dashboard_usage_account_id(row, slot_usage_accounts),
-        "byModel": {
-            model: {"usageTokens": value.get("tokens") or {}, "cost": value.get("cost") or empty_cost_totals()}
-            for model, value in (row.get("byModel") or {}).items()
-            if isinstance(value, dict)
-        },
-    }
-
 def format_remaining_time(seconds: float) -> str:
     seconds = max(0, int(seconds))
     days, seconds = divmod(seconds, 24 * 60 * 60)
@@ -348,183 +316,6 @@ def dashboard_display(sample: dict | None, now: float | None = None) -> dict:
 def _dashboard_revision(value) -> str:
     return hashlib.sha256(json.dumps(dashboard_safe_json(value), sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")).hexdigest()[:20]
 
-def _dashboard_display_timestamp(value: dict) -> float | None:
-    if not isinstance(value, dict):
-        return None
-    timestamp = coerce_float(value.get("timestamp"))
-    return timestamp if timestamp is not None else parse_timestamp(value.get("checkedAt"))
-
-def _dashboard_display_sort_key(value: dict) -> tuple:
-    timestamp = _dashboard_display_timestamp(value)
-    return timestamp is None, timestamp or 0, str(value.get("usageAccountId") or value.get("accountSlotId") or value.get("accountLabel") or "")
-
-def dashboard_compact_quota_points(points: list[dict], now: float | None = None) -> list[dict]:
-    # Quota values and rejection boundaries are exact at every display resolution.
-    return sorted(points, key=_dashboard_display_sort_key)
-
-
-def _dashboard_display_next_maintenance_at(quota_points: list[dict], cost_usage: dict[str, list[dict]], now: float) -> float | None:
-    return None
-
-
-def _same_cost_usage_cycle(previous: dict, current: dict, label: str) -> bool:
-    left, right = previous[label], current[label]
-    if previous["timestamp"] is None or current["timestamp"] is None or not 0 < current["timestamp"] - previous["timestamp"] <= DASHBOARD_DISPLAY_CACHE_GAP_SECONDS:
-        return False
-    if left.get("continuous") is None or right.get("continuous") is None or left.get("plan") != right.get("plan"):
-        return False
-    left_reset, right_reset = parse_timestamp(left.get("resetAt")), parse_timestamp(right.get("resetAt"))
-    return left_reset is None and right_reset is None or left_reset is not None and right_reset is not None and abs(left_reset - right_reset) <= RESET_TIME_JITTER_SECONDS
-
-def dashboard_cost_usage(quota_points: list[dict], ledger: list[dict], slot_usage_accounts: dict[str, str] | None = None) -> dict[str, list[dict]]:
-    from monitor_interpretation import multiplier as quota_multiplier
-    usage_events = {}
-    for row in ledger:
-        if row.get("recordType") != "usage" or (timestamp := parse_timestamp(row.get("occurredAt"))) is None:
-            continue
-        account_id = dashboard_usage_account_id(row, slot_usage_accounts)
-        cost = coerce_float((row.get("cost") or {}).get("totalCostUsd"))
-        if cost is None or cost < 0:
-            continue
-        usage_events.setdefault(account_id, []).append((timestamp, str(row.get("billingModel") or row.get("rawModel") or "unknown"), cost))
-    for rows in usage_events.values():
-        rows.sort(key=lambda value: (value[0], value[1]))
-    result = {"fiveHour": [], "sevenDay": []}
-    for output_name, label in (("fiveHour", "fiveHour"), ("sevenDay", "sevenDay")):
-        accounts = {}
-        for point in quota_points:
-            if point.get("resetWindow") and point["resetWindow"] != label:
-                continue
-            accounts.setdefault(point["usageAccountId"], []).append(point)
-        for account_id, points in accounts.items():
-            points.sort(key=lambda point: point["timestamp"] if point["timestamp"] is not None else float("inf"))
-            account_events = usage_events.get(account_id, [])
-            event_times = [event[0] for event in account_events]
-            for previous, current in zip(points, points[1:]):
-                if not _same_cost_usage_cycle(previous, current, label):
-                    continue
-                multiplier = current[label].get("multiplier", quota_multiplier(current[label].get("plan") or "plus", current["timestamp"]))
-                start = {"timestamp": previous["timestamp"], "usage": previous[label]["continuous"] * multiplier}
-                end = {"timestamp": current["timestamp"], "usage": current[label]["continuous"] * multiplier,
-                    "accountSlotId": current.get("accountSlotId"), "accountLabel": current.get("accountLabel"), "plan": current[label].get("plan") or "plus", "planMultiplier": multiplier}
-                delta = end["usage"] - start["usage"]
-                if delta <= 0:
-                    continue
-                by_model = {}
-                for _, model, cost in account_events[bisect.bisect_left(event_times, start["timestamp"]):bisect.bisect_left(event_times, end["timestamp"])]:
-                    by_model[model] = round(by_model.get(model, 0.0) + cost, 8)
-                total_cost = round(sum(by_model.values()), 8)
-                result[output_name].append({
-                    "window": "5h" if label == "fiveHour" else "7d", "checkedAt": datetime.fromtimestamp(end["timestamp"], timezone.utc).isoformat().replace("+00:00", "Z"), "timestamp": end["timestamp"],
-                    "startedAt": datetime.fromtimestamp(start["timestamp"], timezone.utc).isoformat().replace("+00:00", "Z"), "endedAt": datetime.fromtimestamp(end["timestamp"], timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "startUsagePercent": round(start["usage"], 8), "endUsagePercent": round(end["usage"], 8), "deltaPercent": round(delta, 8), "totalCostUsd": total_cost,
-                    "costByModelUsd": by_model, "costPer100PercentUsd": round(total_cost / delta * 100, 8), "accountSlotId": end.get("accountSlotId"), "accountLabel": end.get("accountLabel"),
-                    "usageAccountId": account_id, "plan": end["plan"], "planMultiplier": end["planMultiplier"],
-                })
-    for values in result.values():
-        values.sort(key=lambda row: (row["timestamp"], row["usageAccountId"]))
-    return result
-
-def dashboard_cost_usage_delta_events(cost_usage: dict[str, list[dict]]) -> list[dict]:
-    events = []
-    for collection, label in (("fiveHour", "5h"), ("sevenDay", "7d")):
-        for point in cost_usage.get(collection) or []:
-            delta_percent = coerce_float(point.get("deltaPercent")) or 0.0
-            delta_cost = coerce_float(point.get("totalCostUsd")) or 0.0
-            if not valid_delta_cost_rate(delta_percent, delta_cost):
-                continue
-            common = {
-                "checkedAt": point.get("checkedAt"), "window": label,
-                "accountSlotId": point.get("accountSlotId"), "accountLabel": point.get("accountLabel"),
-                "usageAccountId": point.get("usageAccountId"), "plan": point.get("plan"),
-                "planMultiplier": point.get("planMultiplier"),
-            }
-            model_events = allocate_model_delta_events(common, delta_percent, delta_cost, point.get("costByModelUsd") or {}, {})
-            events.extend(compact_delta_event(event) for event in model_events)
-    return events
-
-def dashboard_cost_time(ledger: list[dict], slot_usage_accounts: dict[str, str] | None = None) -> list[dict]:
-    rows = []
-    for event in ledger:
-        timestamp = parse_timestamp(event.get("occurredAt"))
-        cost = coerce_float((event.get("cost") or {}).get("totalCostUsd"))
-        if event.get("recordType") != "usage" or timestamp is None or cost is None or not math.isfinite(cost) or cost < 0:
-            continue
-        account = dashboard_usage_account_id(event, slot_usage_accounts)
-        model = str(event.get("rawModel") or event.get("billingModel") or "unknown")
-        rows.append({"_key": _dashboard_row_key("costTime", (account, event.get("eventId") or _dashboard_revision(event))),
-            "timestamp": timestamp, "usageAccountId": account, "accountSlotId": event.get("accountSlotId"), "accountLabel": event.get("accountLabel"),
-            "costByModelUsd": {model: cost}, "totalCostUsd": cost})
-    return sorted(rows, key=lambda row: (row["timestamp"], row["_key"]))
-
-
-def _dashboard_display_data(quota_history: list[dict], token_ledger: list[dict], accounts: dict, now: float | None = None, *, processed_quota: list[dict] | None = None) -> dict:
-    now = time.time() if now is None else now
-    slot_usage_accounts = {str(account.get("id")): str(account.get("usageAccountId")) for account in accounts.get("items", []) if account.get("id") and account.get("usageAccountId")}
-    active = next((item for item in accounts.get("items", []) if item.get("id") == accounts.get("activeAccountId")), None)
-    quota_points = [] if active and active.get("isApiAccount") else (dashboard_quota_points(quota_history, slot_usage_accounts) if processed_quota is None else processed_quota)
-    cost_usage = dashboard_cost_usage(quota_points, token_ledger, slot_usage_accounts)
-    token_sessions = token_sessions_from_ledger(token_ledger)
-    account_labels = {str(account["id"]): account["label"] for account in accounts.get("items", []) if account.get("id") and account.get("label")}
-    for session in token_sessions:
-        if str(session.get("accountSlotId")) in account_labels:
-            session["accountLabel"] = account_labels[str(session["accountSlotId"])]
-    return {
-        "quotaPoints": _dashboard_key_rows("quota", dashboard_compact_quota_points(quota_points, now)),
-        "tokenSessions": _dashboard_key_rows("token", [dashboard_token_session(row, slot_usage_accounts) for row in token_sessions]),
-        "costTime": dashboard_cost_time(token_ledger, slot_usage_accounts),
-        "costUsage": {name: _dashboard_key_rows("costUsage", values) for name, values in cost_usage.items()},
-        "historyStats": {
-            "quotaRows": len(quota_history), "tokenLedgerRows": len(token_ledger),
-            "fiveHourCostUsagePoints": len(cost_usage["fiveHour"]), "sevenDayCostUsagePoints": len(cost_usage["sevenDay"]),
-        },
-        "nextMaintenanceAt": _dashboard_display_next_maintenance_at(quota_points, cost_usage, now),
-    }
-
-def _dashboard_row_key(kind: str, identity) -> str:
-    return f"{kind}:{_dashboard_revision(identity)}"
-
-def _dashboard_key_rows(kind: str, rows: list[dict]) -> list[dict]:
-    identities = []
-    for row in rows:
-        if kind == "quota":
-            identity = (row.get("usageAccountId"), row.get("checkedAt"))
-            if row.get("resetWindow"):
-                identity += (row["resetWindow"],)
-        elif kind == "token":
-            identity = (row.get("usageAccountId"), row.get("sessionId"))
-        elif kind == "costUsage":
-            identity = (row.get("window"), row.get("usageAccountId"), row.get("startedAt"), row.get("endedAt"))
-        else:
-            identity = (
-                row.get("window"), row.get("usageAccountId") or row.get("accountSlotId"), row.get("model"),
-                row.get("mergedFrom") or row.get("checkedAt"), row.get("mergedTo") or row.get("checkedAt"),
-                coerce_float(row.get("deltaPercent")), coerce_float(row.get("deltaCostUsd")),
-            )
-        identities.append(identity)
-    occurrences = {}
-    keyed = []
-    for row, identity in zip(rows, identities):
-        ordinal = occurrences.get(identity, 0)
-        occurrences[identity] = ordinal + 1
-        keyed.append(row | {"_key": _dashboard_row_key(kind, (identity, ordinal))})
-    return keyed
-
-
-def dashboard_transfer_view(display: dict | None) -> dict:
-    display = display or {}
-    return {
-        "quotaPoints": display.get("quotaPoints") or [],
-        "tokenSessions": display.get("tokenSessions") or [],
-        "costTime": display.get("costTime") or [],
-        "costUsage": {
-            "fiveHour": (display.get("costUsage") or {}).get("fiveHour") or [],
-            "sevenDay": (display.get("costUsage") or {}).get("sevenDay") or [],
-        },
-        "historyStats": display.get("historyStats") or {},
-    }
-
-
 class UsageDashboardState:
     def __init__(self, args, opener: urllib.request.OpenerDirector | None):
         self.args = args
@@ -547,6 +338,7 @@ class UsageDashboardState:
             self.args.quota_history, self.args.token_ledger, self.cloud.machine_id, self.cloud.usage_account_id, self.lock, self.cloud.local_usage_account,
             getattr(self.args, "usage_sync_cache", None), self.cloud.usage_account_revision,
         )
+        self.usage_data.backup.enabled = lambda: self.cloud.config().get("saveJsonl", True) is True
         self.args.usage_sync_cache = self.usage_data.cache_path
         self.args.source_ingestor = self.usage_data.sources
         print("Startup: initializing usage processing and dashboard stores...", flush=True)
@@ -643,8 +435,7 @@ class UsageDashboardState:
             from monitor_sampling import stored_points
             with self.usage_data.index.transaction() as db:
                 quota_points = stored_points(db, "local")
-            historical_cost_usage = dashboard_cost_usage(quota_points, local_ledger, slot_usage_accounts)
-            hydrate_delta_state_from_events(self.console_event_state, dashboard_cost_usage_delta_events(historical_cost_usage))
+            hydrate_delta_state_from_events(self.console_event_state, historical_console_events(quota_points, local_ledger, slot_usage_accounts))
         # Seeding lastSample establishes a baseline; it must not count the previous run's final delta twice.
         reset_runtime_baselines(self.console_event_state)
         previous_sample = self.runtime_state.get("lastSample")
@@ -670,7 +461,7 @@ class UsageDashboardState:
         return self.device_auth.regenerate(active["id"])
 
     def _record_quota_sample_locked(self, sample: dict) -> None:
-        """Commit raw readings directly; only SQLite decisions update live quota status."""
+        """Sample once and persist quota runs; reuse that decision for live status."""
         sample["sync"] = sample.get("sync") or {"version": 1, "originMachineId": self.cloud.machine_id, "accountId": self.cloud.usage_account_id(sample.get("accountSlotId"))}
         sample["sync"] = add_record_provenance("quota", sample, self.cloud.machine_id, sample["sync"]["accountId"])["sync"]
         raw_windows = copy.deepcopy(sample.get("windows") or {})
@@ -680,8 +471,7 @@ class UsageDashboardState:
         from monitor_sampling import WINDOWS, accepted_windows
         with self.usage_data.index.transaction() as db:
             state = self.usage_data.index.get(db, f"samplingState:local:{record_account_key(sample)}", {"windows": {}})
-            point = db.execute("SELECT data FROM processing_sampled_quota WHERE view='local' AND account=? AND record_key=?", (record_account_key(sample), sample["checkedAt"])).fetchone()
-        point = json.loads(point[0]) if point else {}
+            point = self.usage_data.index.get(db, f"quotaObservation:{record_account_key(sample)}", {})
         sample["windows"], sample["rejectedWindows"] = accepted_windows(state["windows"]), {}
         for name, (label, _) in WINDOWS.items():
             if (raw_windows.get(label, {}).get("usedPercent") is not None
@@ -775,26 +565,11 @@ class UsageDashboardState:
         with self._dashboard_build_lock:
             with self.lock:
                 accounts = self._dashboard_accounts_locked()
-            result = self.projector.refresh(accounts, now, force)
-            if result is None:
-                with self.usage_data.index.transaction() as db:
-                    deadlines = [json.loads(row[0]).get("nextMaintenanceAt") for row in db.execute("SELECT data FROM processing_projections")]
-                next_maintenance = min((value for value in deadlines if value is not None), default=None)
-            else:
-                next_maintenance = result["nextMaintenanceAt"]
-            with self.lock:
-                self._dashboard_next_maintenance = next_maintenance
-            return result is not None
-
-    def dashboard_cache_wait_seconds(self, now: float | None = None) -> float:
-        now = time.time() if now is None else now
-        with self.lock:
-            next_maintenance = getattr(self, "_dashboard_next_maintenance", None)
-        return 1
+            return self.projector.refresh(accounts, now, force) is not None
 
     def run_dashboard_cache_maintenance(self) -> None:
         while self.running:
-            self.dashboard_cache_event.wait(self.dashboard_cache_wait_seconds())
+            self.dashboard_cache_event.wait(1)
             self.dashboard_cache_event.clear()
             with self._dashboard_signal_lock:
                 cloud_refresh = self._dashboard_cloud_pending
@@ -804,7 +579,7 @@ class UsageDashboardState:
                         self.refresh_dashboard_cache()
                 if hasattr(self, "delivery"):
                     self.delivery.cloud_pending |= cloud_refresh
-                    self.delivery.prepare(projector=self.projector, status=self.status_payload())
+                    self.delivery.prepare(status=self.status_payload())
                     self.usage_data.backup.flush()
                     self.usage_data.index.maintain_disk_space()
             except Exception as exc:

@@ -191,22 +191,20 @@ def collect_codex_session_files(home: Path) -> list[Path]:
     return sorted(files)
 
 def parse_token_usage(value: dict) -> dict | None:
-    if not isinstance(value, dict):
+    if not isinstance(value, dict) or "input_tokens" not in value or "output_tokens" not in value:
         return None
-    input_details = value.get("input_tokens_details") or value.get("input_token_details") or value.get("prompt_tokens_details") or {}
-    if not isinstance(input_details, dict):
-        input_details = {}
-    result = {
-        "input": int(value.get("input_tokens") or value.get("prompt_tokens") or 0),
-        "cachedInput": int(value.get("cached_input_tokens") or value.get("cache_read_input_tokens") or input_details.get("cached_tokens") or input_details.get("cache_read_tokens") or 0),
-        "cacheWriteInput": int(value.get("cache_write_input_tokens") or value.get("cache_creation_input_tokens") or value.get("cache_write_tokens") or input_details.get("cache_write_tokens") or input_details.get("cache_creation_tokens") or 0),
-        "output": int(value.get("output_tokens") or value.get("completion_tokens") or 0),
+    if any(not isinstance(count, int) or isinstance(count, bool) or count < 0
+        for count in (value.get(key, 0) for key in ("input_tokens", "cached_input_tokens", "cache_write_input_tokens", "output_tokens"))):
+        return None
+    # CLI turn.completed usage can omit cache counters; session records use the same canonical names.
+    return {
+        "input": value["input_tokens"],
+        "cachedInput": value.get("cached_input_tokens", 0),
+        "cacheWriteInput": value.get("cache_write_input_tokens", 0),
+        "output": value["output_tokens"],
     }
-    return result
 
-def token_delta(previous: dict | None, current: dict) -> dict:
-    if previous is None:
-        return current.copy()
+def token_delta(previous: dict, current: dict) -> dict:
     return {
         "input": max(0, current["input"] - previous["input"]),
         "cachedInput": max(0, current["cachedInput"] - previous["cachedInput"]),
@@ -256,19 +254,12 @@ def sum_cost_totals(*values: dict | None) -> dict:
             result[key] = round(result[key] + (value.get(key) or 0.0), 8)
     return result
 
-def _codex_session_identity(payload: dict, path: Path) -> tuple[str, bool]:
-    thread_id = payload.get("id") or payload.get("thread_id") or payload.get("threadId") or payload.get("session_id") or payload.get("sessionId") or path.stem
-    parent_id = payload.get("session_id") or payload.get("sessionId")
-    source = payload.get("source") or {}
-    carries_history = bool(payload.get("forked_from_id") or isinstance(source, dict) and source.get("subagent") or parent_id and parent_id != thread_id)
-    return str(thread_id), carries_history
-
 def _session_totals() -> dict:
     return empty_token_totals()
 
 def _new_codex_file_state(path: Path, identity: tuple[int, int]) -> dict:
     return {
-        "identity": identity, "size": 0, "mtimeNs": 0, "offset": 0, "partial": b"", "unterminatedComplete": False, "lineIndex": 0, "sessionId": path.stem, "carriesHistory": False,
+        "identity": identity, "size": 0, "mtimeNs": 0, "offset": 0, "partial": b"", "unterminatedComplete": False, "lineIndex": 0, "sessionId": "",
         "previousTotal": None, "currentModel": "unknown", "currentServiceTier": "default", "eventIndex": 0, "events": [], "invalidLines": False, "hasSessionMeta": False,
     }
 
@@ -289,7 +280,10 @@ def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> Non
             return
         event_type = event.get("type")
         if event_type == "session_meta":
-            state["sessionId"], state["carriesHistory"] = _codex_session_identity(event.get("payload") or {}, path)
+            if not isinstance((event.get("payload") or {}).get("id"), str) or not event["payload"]["id"]:
+                state["invalidLines"] = True
+                return
+            state["sessionId"] = event["payload"]["id"]
             state["hasSessionMeta"] = True
             return
     if "\"event_msg\"" not in line and "\"turn_context\"" not in line or "\"event_msg\"" in line and "\"token_count\"" not in line:
@@ -303,7 +297,7 @@ def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> Non
     event_type = event.get("type")
     if event_type == "turn_context":
         payload = event.get("payload") or {}
-        model = payload.get("model") or (payload.get("info") or {}).get("model")
+        model = payload.get("model")
         if isinstance(model, str) and model:
             state["currentModel"] = normalize_codex_model(model)
         service_tier = (payload.get("thread_settings") or {}).get("service_tier") or payload.get("service_tier")
@@ -316,31 +310,15 @@ def _consume_codex_session_line(state: dict, path: Path, raw_line: bytes) -> Non
     if payload.get("type") != "token_count" or not isinstance(payload.get("info"), dict):
         return
     info = payload["info"]
-    model = info.get("model") or info.get("model_name") or payload.get("model")
-    if isinstance(model, str) and model:
-        state["currentModel"] = normalize_codex_model(model)
-    service_tier = info.get("service_tier") or payload.get("service_tier")
-    if service_tier is not None:
-        state["currentServiceTier"] = normalize_service_tier(service_tier)
-    cumulative = None
-    if isinstance(info.get("total_token_usage"), dict):
-        current = parse_token_usage(info["total_token_usage"])
-        if current is None:
-            return
-        cumulative = current
-        if state["previousTotal"] is None or any(current[key] < state["previousTotal"][key] for key in current):
-            delta = parse_token_usage(info.get("last_token_usage")) if isinstance(info.get("last_token_usage"), dict) else None
-            if delta is None:
-                delta = parse_token_usage({}) if state["carriesHistory"] else current.copy()
-        else:
-            delta = token_delta(state["previousTotal"], current)
-        state["previousTotal"] = current
-    elif isinstance(info.get("last_token_usage"), dict):
-        delta = parse_token_usage(info["last_token_usage"])
-        if delta is None:
-            return
-    else:
+    cumulative = parse_token_usage(info.get("total_token_usage"))
+    delta = parse_token_usage(info.get("last_token_usage"))
+    if cumulative is None or delta is None:
+        state["invalidLines"] = True
         return
+    # First observations and counter rollbacks use the supplied increment, never inherited totals.
+    if state["previousTotal"] is not None and all(cumulative[key] >= state["previousTotal"][key] for key in cumulative):
+        delta = token_delta(state["previousTotal"], cumulative)
+    state["previousTotal"] = cumulative
     delta["cachedInput"] = min(delta["cachedInput"], delta["input"])
     delta["cacheWriteInput"] = min(delta["cacheWriteInput"], delta["input"] - delta["cachedInput"])
     if delta["input"] == 0 and delta["cachedInput"] == 0 and delta["cacheWriteInput"] == 0 and delta["output"] == 0:
@@ -437,7 +415,7 @@ def _scan_codex_token_events_unlocked(home: Path) -> tuple[list[dict], int, floa
         source_files.add(source_file)
         complete_sessions.add(state["sessionId"])
         for cached_event in state["events"]:
-            identity = [state["sessionId"], cached_event["checkedAt"], cached_event["cumulative"] or cached_event["tokens"]]
+            identity = [state["sessionId"], cached_event["checkedAt"], cached_event["cumulative"]]
             event_id = f'{state["sessionId"]}:{hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]}'
             if event_id in seen_event_ids:
                 continue

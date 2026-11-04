@@ -154,6 +154,8 @@ class EventOnlyTests(unittest.TestCase):
             "windows": {"5h": {"usedPercent": 25, "resetAt": "2030-01-04T05:00:00Z", "plan": "plus"}},
             "compaction": {"continuousFrom": "2030-01-03T23:00:00Z", "omittedSamples": 12}}, "machine", "v3:a")
         manager, client, box = self.cloud(quota)
+        previous_head = manager._v4_head(client, box, "machine")[0]
+        previous_hash = manager._v4_catalog(client, box, "machine", previous_head)["2030-01-04"]["logicalHash"]
         with mock.patch.object(client, "put", wraps=client.put) as put:
             monitor_migrations.ensure_cloud_contract(client)
         self.assertEqual(sum(call.args[0] == manager._v4_head_path("machine") for call in put.call_args_list), 1)
@@ -166,7 +168,7 @@ class EventOnlyTests(unittest.TestCase):
         self.assertEqual(rows[0]["record"]["row"], monitor_migrations.convert_reset_timestamps({key: value for key, value in quota.items() if key != "compaction"}))
         self.assertIsInstance(rows[0]["record"]["row"]["windows"]["5h"]["resetAt"], (int, float))
         self.assertEqual(rows[0]["contentSha256"], content_hash(rows[0]["record"]))
-        self.assertEqual(manifest["logicalHash"], v4_logical_hash(rows))
+        self.assertEqual(manifest.get("logicalHash"), previous_hash)
         monitor_migrations.ensure_cloud_contract(client)
         self.assertEqual(manager._v4_head(client, box, "machine")[0], head)
 

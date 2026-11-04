@@ -14,11 +14,10 @@ import uuid
 from collections import defaultdict
 from contextlib import closing
 from pathlib import Path
-from types import SimpleNamespace
 
 import monitor_sample_store as samples
 from monitor_delivery import DashboardDelivery, encoded
-from monitor_interpretation import chart_rows, token_row, valid_intervals
+from monitor_interpretation import token_row
 from monitor_live import send_bulk, serve_live
 from monitor_processing import ProcessingIndex
 
@@ -83,6 +82,7 @@ def isolated(source, directory):
     with closing(samples.connect(source.resolve().as_uri() + "?mode=ro", uri=True)) as db:
         db.execute("BEGIN")
         quota = list(db.execute("SELECT view,account,event_at,record_key,data FROM processing_quota_points"))
+        facts = list(db.execute("SELECT source,position,data FROM processing_facts WHERE kind='tokenLedger' ORDER BY source,position"))
         for account, data in db.execute("SELECT account,data FROM processing_facts WHERE kind='tokenLedger' AND source NOT LIKE 'peer:%' ORDER BY account,event_at,record_key"):
             ledger["local"][account].append(json.loads(data))
         for account, data in db.execute("SELECT account,data FROM processing_effective ORDER BY account,event_at,record_key"):
@@ -90,6 +90,8 @@ def isolated(source, directory):
     index = ProcessingIndex(directory / "benchmark.sqlite3")
     with index.transaction() as db:
         db.executemany("INSERT INTO processing_quota_points VALUES(?,?,?,?,?)", quota)
+        for source_name, position, data in facts:
+            index.fact(db, source_name, position, "tokenLedger", json.loads(data))
         for view in ledger:
             db.executemany("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", [(view, account) for account in ledger[view]])
     delivery = DashboardDelivery(index)
@@ -97,9 +99,8 @@ def isolated(source, directory):
         status = read("http://127.0.0.1:8765/api/status")[0]
     except OSError:
         status = {"accounts": {"items": []}}
-    projector = SimpleNamespace(_datasets=lambda db, view, account: ([], ledger[view][account]), store=SimpleNamespace(token_ledger_path=directory / "ledger"))
     prepare_started = time.perf_counter()
-    delivery.prepare(projector=projector, status=status, force=True)
+    delivery.prepare(status=status, force=True)
     preparation_ms = (time.perf_counter() - prepare_started) * 1000
     source_ms = (prepare_started - started) * 1000
 
@@ -111,11 +112,11 @@ def isolated(source, directory):
         row = next(row for row in reversed(ledger["local"][account]) if token_row(row) and (row.get("cost") or {}).get("totalCostUsd", 0) > 0) | {"eventId": uuid.uuid4().hex, "occurredAt": time.time()}
         key = record_key("tokenLedger", row)
         with index.transaction() as db:
-            index.fact(db, str(projector.store.token_ledger_path.resolve()), 0, "tokenLedger", row)
+            index.fact(db, "local:tokenLedger", 0, "tokenLedger", row)
             for view in ("local", "merged"):
                 db.execute("INSERT OR IGNORE INTO delivery_work VALUES(?,?,?,?)", (view, account, "tokenLedger", key))
                 db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", (view, account))
-        delivery.prepare(projector=projector, status=status)
+        delivery.prepare(status=status)
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_args):

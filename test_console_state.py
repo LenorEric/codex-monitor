@@ -35,8 +35,8 @@ class ConsoleStateTests(unittest.TestCase):
         state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
         state.usage_data = SimpleNamespace(index=self.index, datasets=mock.Mock(side_effect=AssertionError("warm startup replayed history")) if history_forbidden else mock.Mock(return_value=([], [])))
         state.runtime_state = {"lastSample": event_sample("2030-01-01T01:00:00Z", five_hour=20, cost=20)} if previous else {}
-        costs = {"fiveHour": [{"checkedAt": "2030-01-01T00:00:00Z", "deltaPercent": 7, "totalCostUsd": 14, "costByModelUsd": {"model-a": 14}}], "sevenDay": []}
-        with mock.patch.object(monitor_dashboard, "dashboard_accounts", return_value={"items": []}), mock.patch.object(monitor_dashboard, "dashboard_cost_usage", return_value=costs):
+        events = [{"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "model": "model-a", "deltaPercent": 7, "deltaCostUsd": 14}]
+        with mock.patch.object(monitor_dashboard, "dashboard_accounts", return_value={"items": []}), mock.patch.object(monitor_dashboard, "historical_console_events", return_value=events):
             state.restore_console_event_state()
         return state
 
@@ -78,6 +78,23 @@ class ConsoleStateTests(unittest.TestCase):
         self.assertTrue(delta_state_needs_hydration(cached))
         state = self.startup(cached)
         self.assertEqual(state.console_event_state["windows"]["5h"]["models"]["model-a"]["cumulativeCostUsd"], 14)
+
+    def test_history_recovery_shares_nearest_attribution_and_isolates_accounts(self):
+        from monitor_events import historical_console_events, hydrate_delta_state_from_events
+        from test_delivery import point
+        points = [point(stamp, value) | {"usageAccountId": account} for account in ("a", "b") for stamp, value in ((0, 10), (100, 11), (200, 11), (300, 12))]
+        ledger = [{"recordType": "usage", "eventId": str(index), "occurredAt": stamp, "usageAccountId": account, "rawModel": model, "cost": {"totalCostUsd": cost}}
+            for index, (stamp, account, model, cost) in enumerate(((-10, "a", "m1", 1), (150, "a", "m1", 2), (180, "a", "m2", 3), (400, "a", "m2", 4), (150, "b", "m1", 20), (901, "a", "m1", 100)))]
+        events = historical_console_events(points, ledger)
+        state = {}
+        hydrate_delta_state_from_events(state, events)
+        for window in ("5h", "7d"):
+            self.assertEqual(state["windows"][window]["cumulativeCostUsd"], 30)
+            self.assertEqual(state["windows"][window]["cumulativePercent"], 3)
+            first = [event for event in events if event["usageAccountId"] == "a" and event["window"] == window and event["model"] == "m1"]
+            self.assertEqual(len(first), 1)
+            self.assertEqual(first[0]["deltaCostUsd"], 3)
+        self.assertEqual(historical_console_events([points[0]], ledger), [])
 
     def test_incremental_unavailable_window_retains_totals_and_rebases_on_return(self):
         state = {}

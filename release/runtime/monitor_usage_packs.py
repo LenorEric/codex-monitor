@@ -1,4 +1,4 @@
-"""Physical usage packs; daily logical identities remain independent of packing."""
+"""Physical usage packs and object-reference based downloads."""
 
 from contextlib import AbstractContextManager
 
@@ -51,57 +51,45 @@ class HistoricalPackWriter(AbstractContextManager):
 
 class UsageObjectReader(AbstractContextManager):
     """One decode per physical object; ranges seek directly into disk-backed rows."""
-    def __init__(self, manager, client, box, machine, validate=True):
+    def __init__(self, manager, client, box, machine):
         self.manager, self.client, self.box, self.machine = manager, client, box, machine
-        self.cache, self.downloaded, self.validate = {}, 0, validate
+        self.cache, self.downloaded = {}, 0
 
     def payload(self, digest):
         if digest not in self.cache:
             from monitor_cloud import CloudError
-            from monitor_usage_sync import validate_v4_envelope
+            from monitor_usage_sync import require_usage_fields
             value = self.manager._download_usage_payload(self.client, self.box, "v4/data", self.machine, digest)
+            try:
+                require_usage_fields(value, version=int, machineId=str, records=(list, RecordSpool))
+            except ValueError as exc:
+                if isinstance(value.get("records"), RecordSpool):
+                    value["records"].close()
+                raise CloudError("Invalid usage data fields", 409) from exc
             self.cache[digest] = value
-            rows = value.get("records")
-            if value.get("machineId") != self.machine or not isinstance(rows, (list, RecordSpool)):
-                raise CloudError("Invalid usage pack owner or records", 409)
-            if value["version"] == 2:
-                previous, keys = None, set()
-                for entry in rows:
-                    if self.validate:
-                        validate_v4_envelope(entry, self.machine)
-                    order = entry["collectionPeriod"], entry["recordKey"]
-                    if previous is not None and order <= previous or entry["recordKey"] in keys:
-                        raise CloudError("Usage pack records are duplicated or out of order", 409)
-                    previous = order
-                    keys.add(entry["recordKey"])
-            elif len(rows) > 100000:
-                raise CloudError("Invalid usage v4 data part", 409)
             self.downloaded += 1
         return self.cache[digest]
 
     def entries(self, day, reference):
-        from monitor_cloud import CloudError
         if reference["layout"] == "packed":
             def rows():
                 for segment in reference["segments"]:
                     value = self.payload(segment["payloadId"])
                     offset, count = segment["recordOffset"], segment["recordCount"]
-                    if value["version"] != 2 or offset + count > len(value["records"]):
-                        raise CloudError("Usage pack reference is outside its object", 409)
-                    selected = value["records"].range_rows(offset, count) if isinstance(value["records"], RecordSpool) else value["records"][offset:offset + count]
-                    for entry in selected:
-                        if entry["collectionPeriod"][:10] != day:
-                            raise CloudError("Usage pack reference has the wrong date", 409)
-                        yield entry
+                    start, stop, _ = slice(offset, offset + count).indices(len(value["records"]))
+                    yield from value["records"].range_rows(start, max(0, stop - start)) if isinstance(value["records"], RecordSpool) else value["records"][start:stop]
             return Records(rows)
         manifest = self.manager._v4_day_manifest(self.client, self.box, self.machine, day, reference)
         return Records(lambda: (entry for part, digest in manifest["parts"].items() for entry in self.part(day, part, digest)))
 
     def part(self, day, part, digest):
         from monitor_cloud import CloudError
+        from monitor_usage_sync import require_usage_fields
         value = self.payload(digest)
-        if value["version"] != 1 or value.get("day") != day or value.get("partId") != part:
-            raise CloudError("Invalid usage v4 data part", 409)
+        try:
+            require_usage_fields(value, day=str, partId=str)
+        except ValueError as exc:
+            raise CloudError("Invalid usage v4 data part fields", 409) from exc
         return value["records"]
 
     def __exit__(self, *args):

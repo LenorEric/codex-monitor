@@ -67,7 +67,7 @@ class SQLiteAuthorityTests(unittest.TestCase):
         restarted.record_ledger([self.ledger("event-2")])
         self.assertEqual(len(restarted.datasets()[0]), 2)
         self.assertEqual(len(restarted.datasets()[1]), 2)
-        self.assertTrue(self.store.quota_path.read_bytes().startswith(b"invalid backup\n"))
+        self.assertEqual([json.loads(line) for line in self.store.quota_path.read_text().splitlines()], restarted.datasets()[0])
 
     def test_failed_database_commit_never_appends_backup_or_changes_sampling(self):
         self.store.record_quota(self.quota())
@@ -80,7 +80,7 @@ class SQLiteAuthorityTests(unittest.TestCase):
         self.assertEqual(len(self.store.datasets()[0]), 2)
 
     def test_log_failure_keeps_database_live_and_retries_from_queue_after_restart(self):
-        with mock.patch.object(monitor_backup, "append_backup", side_effect=OSError("read-only archive")):
+        with mock.patch.object(monitor_backup, "append_backup", side_effect=OSError("read-only archive")), mock.patch.object(monitor_backup, "replace_quota_backup", side_effect=OSError("read-only archive")):
             self.store.record_quota(self.quota())
             self.store.record_ledger([self.ledger()])
             self.assertEqual(tuple(map(len, self.store.datasets())), (1, 1))
@@ -113,7 +113,7 @@ class SQLiteAuthorityTests(unittest.TestCase):
             if Path(path) == self.store.quota_path:
                 raise OSError("quota log unavailable")
             append(path, rows)
-        with mock.patch.object(monitor_backup, "append_backup", side_effect=unavailable):
+        with mock.patch.object(monitor_backup, "append_backup", side_effect=unavailable), mock.patch.object(monitor_backup, "replace_quota_backup", side_effect=OSError("quota snapshot unavailable")):
             self.store.record_quota(self.quota())
             self.store.record_ledger([self.ledger()])
             self.assertEqual([json.loads(line) for line in self.store.token_ledger_path.read_bytes().splitlines() if line.strip()], self.store.datasets()[1])
@@ -137,19 +137,17 @@ class SQLiteAuthorityTests(unittest.TestCase):
         self.assertEqual(self.store.token_ledger_path.read_bytes(), before_removal)
         self.assertEqual(self.store.index.ledger_cost()[0]["totalCostUsd"], 0)
 
-    def test_backup_append_preserves_torn_tail_and_separates_new_records(self):
+    def test_quota_snapshot_replaces_torn_tail_from_authoritative_database(self):
         self.store.quota_path.write_bytes(b'{"torn":')
         self.store.record_quota(self.quota())
         lines = self.store.quota_path.read_bytes().splitlines()
-        self.assertEqual(lines[0], b'{"torn":')
-        self.assertEqual([json.loads(line) for line in lines[1:] if line.strip()], self.store.datasets()[0])
-        self.assertTrue(self.store.quota_path.read_bytes().startswith(b'{"torn":'))
+        self.assertEqual([json.loads(line) for line in lines if line.strip()], self.store.datasets()[0])
 
-    def test_repeated_quota_is_archived_without_duplicating_database_record(self):
+    def test_repeated_quota_does_not_duplicate_snapshot_or_database_record(self):
         self.store.record_quota(self.quota())
         self.store.record_quota(self.quota())
         self.assertEqual(len(self.store.datasets()[0]), 1)
-        self.assertEqual(len([line for line in self.store.quota_path.read_bytes().splitlines() if line.strip()]), 2)
+        self.assertEqual(len([line for line in self.store.quota_path.read_bytes().splitlines() if line.strip()]), 1)
 
     def test_dataset_reads_do_not_attempt_backup_delivery(self):
         self.store.record_quota(self.quota())
@@ -179,7 +177,7 @@ class SQLiteAuthorityTests(unittest.TestCase):
         self.assertEqual(relocated.datasets(), expected)
         relocated.record_quota(self.quota(1, 11))
         self.assertEqual(len(self.store.datasets()[0]), 2)
-        self.assertEqual(len([line for line in relocated.quota_path.read_bytes().splitlines() if line.strip()]), 1)
+        self.assertEqual(len([line for line in relocated.quota_path.read_bytes().splitlines() if line.strip()]), 2)
 
     def test_v19_sql_conversion_is_journaled_and_ignores_additional_backup_records(self):
         self.store.record_quota(self.quota())

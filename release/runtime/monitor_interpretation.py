@@ -7,6 +7,8 @@ from collections import defaultdict
 from monitor_common import parse_timestamp
 
 MONEY = 100_000_000
+ATTRIBUTION_RULE_VERSION = 2
+MAX_ATTRIBUTION_DISTANCE_SECONDS = 10 * 60
 WINDOWS = (("5h", "fiveHour"), ("7d", "sevenDay"))
 PRO_CUTOVER = 1793232000  # 2026-10-29T00:00:00Z
 
@@ -32,6 +34,8 @@ def usage_runs(points, window):
     name = dict(WINDOWS)[window]
     result = []
     for point in points:
+        if "runWindows" in point and name not in point["runWindows"]:
+            continue
         if point.get("resetWindow") not in (None, name):
             continue
         stamp = point.get("timestamp")
@@ -43,10 +47,10 @@ def usage_runs(points, window):
             percent = None
         plan = value.get("plan", "plus")
         factor = value.get("multiplier", multiplier(plan, stamp))
-        row = [str(point.get("_key") or f"{stamp}:{point.get('resetWindow', '')}"), stamp, stamp, percent, factor, 1,
+        row = [str(point.get("_key") or f"{stamp}:{point.get('resetWindow', '')}"), value.get("firstAt", stamp), value.get("lastAt", stamp), percent, factor, 1,
             parse_timestamp(value.get("resetAt")), plan]
         previous = result[-1] if result else None
-        if previous and percent is not None and previous[3:5] == row[3:5] and previous[6] == row[6] and not point.get("resetWindow"):
+        if not value.get("storedRun") and previous and percent is not None and previous[3:5] == row[3:5] and previous[6] == row[6] and not point.get("resetWindow"):
             previous[2] = stamp
             continue
         if previous and connected(previous, row, window):
@@ -71,7 +75,8 @@ def nearest(intervals, stamp, ends=None):
         return None
     index = bisect.bisect_right(ends if ends is not None else [row[2] for row in intervals], stamp)
     candidates = range(max(0, index - 1), min(len(intervals), index + 1))
-    return min(candidates, key=lambda i: (max(intervals[i][1] - stamp, stamp - intervals[i][2], 0), intervals[i][1]))
+    index = min(candidates, key=lambda i: (max(intervals[i][1] - stamp, stamp - intervals[i][2], 0), intervals[i][1]))
+    return index if max(intervals[index][1] - stamp, stamp - intervals[index][2], 0) <= MAX_ATTRIBUTION_DISTANCE_SECONDS else None
 
 
 def weighted(rows):

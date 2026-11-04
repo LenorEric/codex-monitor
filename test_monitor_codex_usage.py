@@ -78,6 +78,10 @@ from monitor_codex_usage import (
 )
 
 
+def token_count_info(total):
+    return {"total_token_usage": total, "last_token_usage": total}
+
+
 def usage_records_from_sessions(sessions):
     # Build current event fixtures; the application no longer reads session baselines.
     return [{"schemaVersion": 2, "recordType": "usage", "eventId": f"{session['sessionId']}:{model}", "sessionId": session["sessionId"],
@@ -2636,11 +2640,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(sample["costByModel"]["gpt-5.5"]["totalCostUsd"], 5)
         self.assertEqual(sample["cost"]["totalCostUsd"], 9)
 
-    def test_parse_token_usage_accepts_cache_write_fields(self):
+    def test_parse_token_usage_uses_canonical_fields(self):
         self.assertEqual(parse_token_usage({"input_tokens": 100, "cached_input_tokens": 20, "cache_write_input_tokens": 30, "output_tokens": 10}), {"input": 100, "cachedInput": 20, "cacheWriteInput": 30, "output": 10})
-        self.assertEqual(parse_token_usage({"input_tokens": 100, "cache_creation_input_tokens": 40}), {"input": 100, "cachedInput": 0, "cacheWriteInput": 40, "output": 0})
-        self.assertEqual(parse_token_usage({"input_tokens": 100, "input_tokens_details": {"cache_write_tokens": 50}}), {"input": 100, "cachedInput": 0, "cacheWriteInput": 50, "output": 0})
-        self.assertEqual(parse_token_usage({"prompt_tokens": 100, "completion_tokens": 10, "prompt_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 30}}), {"input": 100, "cachedInput": 20, "cacheWriteInput": 30, "output": 10})
+        self.assertEqual(parse_token_usage({"input_tokens": 100, "output_tokens": 10}), {"input": 100, "cachedInput": 0, "cacheWriteInput": 0, "output": 10})
+        self.assertEqual(parse_token_usage({"input_tokens": 0, "output_tokens": 0, "prompt_tokens": 100, "completion_tokens": 10, "cache_creation_input_tokens": 40}), {"input": 0, "cachedInput": 0, "cacheWriteInput": 0, "output": 0})
+        self.assertIsNone(parse_token_usage({"prompt_tokens": 100, "completion_tokens": 10}))
 
     def test_codex_session_scan_records_cumulative_deltas_by_session_and_model(self):
         with self.account_directory() as directory:
@@ -2649,8 +2653,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
             rows = [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "session-a", "session_id": "session-a"}},
                 {"timestamp": "2030-01-01T00:00:01Z", "type": "turn_context", "payload": {"model": "openai/gpt-5.5-2030-01-01"}},
-                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "cached_input_tokens": 40, "cache_write_tokens": 2, "output_tokens": 10}}}},
-                {"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 150, "cached_input_tokens": 80, "cache_write_tokens": 5, "output_tokens": 20}}}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 100, "cached_input_tokens": 40, "cache_write_input_tokens": 2, "output_tokens": 10})}},
+                {"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 150, "cached_input_tokens": 80, "cache_write_input_tokens": 5, "output_tokens": 20})}},
             ]
             (session_dir / "rollout.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
@@ -2674,9 +2678,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
             rows = [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "session-fast", "session_id": "session-fast"}},
                 {"timestamp": "2030-01-01T00:00:01Z", "type": "turn_context", "payload": {"model": "gpt-5.5", "thread_settings": {"service_tier": "default"}}},
-                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 10}}}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 100, "output_tokens": 10})}},
                 {"timestamp": "2030-01-01T00:01:01Z", "type": "turn_context", "payload": {"model": "gpt-5.5", "thread_settings": {"service_tier": "fast"}}},
-                {"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 150, "output_tokens": 20}}}},
+                {"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 150, "output_tokens": 20})}},
             ]
             (session_dir / "rollout.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
@@ -2698,7 +2702,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             path = session_dir / "stable.jsonl"
             path.write_text("\n".join(json.dumps(row) for row in [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "stable"}},
-                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "output_tokens": 2}}}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 10, "output_tokens": 2})}},
             ]) + "\n", encoding="utf-8")
             expected = monitor_tokens.scan_codex_token_usage(directory)
 
@@ -2715,11 +2719,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
             path = session_dir / "append.jsonl"
             path.write_text("\n".join(json.dumps(row) for row in [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "append"}},
-                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "output_tokens": 2}}}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 10, "output_tokens": 2})}},
             ]) + "\n", encoding="utf-8")
             monitor_tokens.scan_codex_token_usage(directory)
             offset = path.stat().st_size
-            appended = (json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 25, "output_tokens": 5}}}}) + "\n").encode()
+            appended = (json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 25, "output_tokens": 5})}}) + "\n").encode()
             with path.open("ab") as stream:
                 stream.write(appended)
             positions, read_sizes = [], []
@@ -2758,8 +2762,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
             session_dir = directory / "sessions" / "2030" / "01" / "01"
             session_dir.mkdir(parents=True)
             path = session_dir / "growing.jsonl"
-            path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "growing"}}) + "\n" + json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 10, "output_tokens": 2}}}}) + "\n", encoding="utf-8")
-            appended = (json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 20, "output_tokens": 4}}}}) + "\n").encode()
+            path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "growing"}}) + "\n" + json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 10, "output_tokens": 2})}}) + "\n", encoding="utf-8")
+            appended = (json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 20, "output_tokens": 4})}}) + "\n").encode()
             original_open, grew = Path.open, []
 
             class GrowingStream:
@@ -2797,7 +2801,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             def token_line(value):
                 return (json.dumps({
                     "timestamp": f"2030-01-01T00:0{value // 10}:00Z", "type": "event_msg",
-                    "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": value, "output_tokens": value // 5}}},
+                    "payload": {"type": "token_count", "info": token_count_info({"input_tokens": value, "output_tokens": value // 5})},
                 }) + "\n").encode()
             path.write_bytes(json.dumps({"type": "session_meta", "payload": {"id": "continuously-growing"}}).encode() + b"\n" + token_line(10))
             original_open, appended_values = Path.open, []
@@ -2837,7 +2841,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             session_dir.mkdir(parents=True)
             path = session_dir / "partial.jsonl"
             metadata = json.dumps({"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "partial"}}).encode() + b"\n"
-            token_line = json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 13, "output_tokens": 3}}}}).encode()
+            token_line = json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 13, "output_tokens": 3})}}).encode()
             path.write_bytes(metadata + token_line[:len(token_line) // 2])
 
             self.assertEqual(monitor_tokens.scan_codex_token_usage(directory)["totals"]["requests"], 0)
@@ -2853,14 +2857,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
             session_dir = directory / "sessions" / "2030" / "01" / "01"
             session_dir.mkdir(parents=True)
             path = session_dir / "final.jsonl"
-            path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "final"}}) + "\n" + json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 11, "output_tokens": 2}}}}), encoding="utf-8")
+            path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "final"}}) + "\n" + json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 11, "output_tokens": 2})}}), encoding="utf-8")
 
             usage = monitor_tokens.scan_codex_token_usage(directory)
 
             self.assertEqual(usage["totals"]["inputTokens"], 11)
             self.assertEqual(usage["totals"]["requests"], 1)
             with path.open("a", encoding="utf-8") as stream:
-                stream.write("\n" + json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 15, "output_tokens": 3}}}}) + "\n")
+                stream.write("\n" + json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 15, "output_tokens": 3})}}) + "\n")
 
             usage = monitor_tokens.scan_codex_token_usage(directory)
 
@@ -2873,7 +2877,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             session_dir.mkdir(parents=True)
             (session_dir / "keyword.jsonl").write_text(json.dumps({"type": "session_meta", "payload": {"id": "keyword"}}) + "\n" + json.dumps({
                 "timestamp": "2030-01-01T00:01:00Z", "type": "event_msg",
-                "payload": {"type": "token_count", "note": "session_meta thread_settings_applied", "info": {"last_token_usage": {"input_tokens": 9, "output_tokens": 2}}},
+                "payload": {"type": "token_count", "note": "session_meta thread_settings_applied", "info": token_count_info({"input_tokens": 9, "output_tokens": 2})},
             }) + "\n", encoding="utf-8")
 
             usage = monitor_tokens.scan_codex_token_usage(directory)
@@ -2888,13 +2892,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
             path = session_dir / "changed.jsonl"
             rows = [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "original", "padding": "x" * 500}},
-                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 10}}}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 100, "output_tokens": 10})}},
             ]
             path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
             monitor_tokens.scan_codex_token_usage(directory)
             truncated = [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "truncated"}},
-                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 7, "output_tokens": 1}}}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 7, "output_tokens": 1})}},
             ]
             path.write_text("\n".join(json.dumps(row) for row in truncated) + "\n", encoding="utf-8")
 
@@ -2903,7 +2907,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             replacement = path.with_suffix(".replacement")
             replaced = [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "replaced"}},
-                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 19, "output_tokens": 4}}}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 19, "output_tokens": 4})}},
             ]
             replacement.write_text("\n".join(json.dumps(row) for row in replaced) + "\n", encoding="utf-8")
             os.replace(replacement, path)
@@ -2916,7 +2920,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             session_dir = directory / "sessions" / "2030" / "01" / "01"
             session_dir.mkdir(parents=True)
             path = session_dir / "deleted.jsonl"
-            path.write_text(json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"last_token_usage": {"input_tokens": 8, "output_tokens": 2}}}}) + "\n", encoding="utf-8")
+            path.write_text(json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 8, "output_tokens": 2})}}) + "\n", encoding="utf-8")
             self.assertEqual(monitor_tokens.scan_codex_token_usage(directory)["filesScanned"], 1)
 
             path.unlink()
@@ -2934,14 +2938,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
             initial = [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "child", "session_id": "parent"}},
                 {"timestamp": "2030-01-01T00:00:01Z", "type": "turn_context", "payload": {"model": "gpt-5.5", "thread_settings": {"service_tier": "default"}}},
-                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 100, "output_tokens": 10}}}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 100, "output_tokens": 10})}},
                 {"timestamp": "2030-01-01T00:01:01Z", "type": "event_msg", "payload": {"type": "thread_settings_applied"}},
             ]
             path.write_text("\n".join(json.dumps(row) for row in initial) + "\n", encoding="utf-8")
             monitor_tokens.scan_codex_token_usage(directory)
             appended = [
                 {"timestamp": "2030-01-01T00:01:02Z", "type": "turn_context", "payload": {"model": "gpt-5.5", "thread_settings": {"service_tier": "fast"}}},
-                {"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": {"total_token_usage": {"input_tokens": 140, "output_tokens": 20}}}},
+                {"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 140, "output_tokens": 20})}},
             ]
             with path.open("a", encoding="utf-8") as stream:
                 stream.write("\n".join(json.dumps(row) for row in appended) + "\n")
@@ -3615,18 +3619,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(html.count('axisTickPosition('), 4)
         self.assertEqual(html.count('drawXAxisTickLabels('), 3)
 
-    def test_dashboard_payload_exposes_usage_tokens_without_exposing_token_fields(self):
-        session = {
-            "sessionId": "session-a", "startedAt": "2030-01-01T00:00:00Z", "updatedAt": "2030-01-01T00:01:00Z", "accountSlotId": "account-a", "accountLabel": "Account A",
-            "tokens": {"inputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}, "byModel": {"gpt-5.5": {"tokens": {"inputTokens": 123, "outputTokens": 45}, "cost": {"totalCostUsd": 0.5}}},
-        }
-        accounts = {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "Account A"}]}
-        payload = monitor_dashboard.dashboard_safe_json(monitor_dashboard._dashboard_display_data([], usage_records_from_sessions([monitor_history.normalize_token_session_row(session)]), monitor_dashboard.dashboard_account_status(accounts)))
-
-        model = payload["tokenSessions"][0]["byModel"]["gpt-5.5"]
-        self.assertEqual(model["usageTokens"], {"inputTokens": 123, "freshInputTokens": 123, "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 45, "totalTokens": 168, "requests": 0})
-        self.assertEqual(model["cost"]["totalCostUsd"], 0.5)
-        self.assertNotIn('"tokens"', json.dumps(payload))
 
     def test_dashboard_status_payload_uses_only_current_in_memory_state(self):
         sample = {
@@ -3671,45 +3663,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.account_statuses["b"]["windows"]["5h"]["usedPercent"] = 80
         self.assertNotEqual(state.status_payload()["revision"], payload["revision"])
 
-    def test_dashboard_display_keeps_exact_points_at_every_age(self):
-        now = 100 * 24 * 60 * 60
-
-        def point(age_days, index):
-            timestamp = now - age_days * 24 * 60 * 60 + index * 60
-            return {
-                "checkedAt": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(), "timestamp": timestamp, "accountSlotId": "account-a", "compactedFrom": None,
-                "fiveHour": {"raw": index, "continuous": index}, "sevenDay": {"raw": index, "continuous": index},
-            }
-
-        points = [point(2, index) for index in range(5)] + [point(4, index) for index in range(9)] + [point(10, index) for index in range(17)] + [point(40, index) for index in range(33)]
-        compacted = monitor_dashboard.dashboard_compact_quota_points(points, now)
-
-        self.assertEqual(len(compacted), len(points))
-        self.assertEqual(len([item for item in compacted if item["timestamp"] >= now - 3 * 24 * 60 * 60]), 5)
-        self.assertTrue(all(item.get("compactedFrom") is None for item in compacted[-5:]))
-        self.assertTrue(all(item.get("compactedFrom") is None for item in compacted))
-
-    def test_dashboard_display_compaction_does_not_bridge_a_real_gap(self):
-        now = 100 * 24 * 60 * 60
-        timestamps = [now - 10 * 24 * 60 * 60 + index * 60 for index in range(6)] + [now - 10 * 24 * 60 * 60 + 5 * 60 * 60 + index * 60 for index in range(6)]
-        points = [
-            {
-                "checkedAt": datetime.fromtimestamp(timestamp, timezone.utc).isoformat(), "timestamp": timestamp, "accountSlotId": "account-a", "compactedFrom": None,
-                "fiveHour": {"raw": index, "continuous": index}, "sevenDay": {"raw": index, "continuous": index},
-            }
-            for index, timestamp in enumerate(timestamps)
-        ]
-
-        compacted = monitor_dashboard.dashboard_compact_quota_points(points, now)
-
-        self.assertEqual(len(compacted), len(points))
-        self.assertIsNone(compacted[0]["compactedFrom"])
-        self.assertIsNone(compacted[1]["compactedFrom"])
-        self.assertGreater(compacted[6]["timestamp"] - compacted[5]["timestamp"], monitor_dashboard.DASHBOARD_DISPLAY_CACHE_GAP_SECONDS)
 
 
-    def test_exact_quota_points_need_no_ageing_maintenance(self):
-        self.assertIsNone(monitor_dashboard._dashboard_display_next_maintenance_at([], {"fiveHour": [], "sevenDay": []}, 0))
+
 
 
     def test_dashboard_exposes_independent_local_and_merged_data_views(self):
@@ -3724,15 +3680,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('async getDashboard()', extension)
         self.assertNotIn("getCodexUsageSeries", extension)
 
-    def test_dashboard_local_view_uses_only_local_quota_tokens_and_cost(self):
-        local_quota = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 1}}}
-        merged_quota = {"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 2}}}
-        local_session = {"sessionId": "local", "tokens": {}, "byModel": {}}
-        payload = monitor_dashboard._dashboard_display_data([local_quota], usage_records_from_sessions([monitor_history.normalize_token_session_row(local_session)]), {"activeAccountId": "a", "awaitingLogin": False, "items": [{"id": "a", "label": "A"}]})
-
-        self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 1)
-        self.assertEqual(payload["tokenSessions"][0]["sessionId"], "local")
-        self.assertNotIn("<span class=\"rate\">Merged</span>", dashboard_html())
 
     def test_extension_loads_live_dashboard_with_bundled_fallback(self):
         extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
@@ -4076,19 +4023,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_quota_history_sample_does_not_require_cost_or_trusted_delta_baseline(self):
         sample = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 42}, "7d": {"usedPercent": 61}}}
 
-        row = monitor_history.quota_history_row_from_sample(sample)
+        row = monitor_history.quota_history_rows_from_sample(sample)[0]
 
         self.assertEqual(row["windows"]["5h"]["usedPercent"], 42.0)
         self.assertEqual(row["windows"]["5h"]["plan"], "plus")
         self.assertNotIn("cost", row)
 
-    def test_quota_history_merge_preserves_known_plan_over_legacy_duplicate(self):
-        known = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 42, "plan": "plus"}}}
-        legacy = {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 42}}}
-
-        merged = monitor_history.merge_quota_history_rows([known, legacy])
-
-        self.assertEqual(merged[0]["windows"]["5h"]["plan"], "plus")
 
     def test_poll_persists_raw_ledger_and_quota(self):
         source = Path(monitor_dashboard.__file__).read_text(encoding="utf-8")
@@ -4096,21 +4036,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn("reconcile_token_ledger(", poll)
         self.assertIn("self._record_quota_sample_locked(sample)", poll)
 
-    def test_dashboard_projection_returns_quota_points_for_all_accounts(self):
-        accounts = {"awaitingLogin": False, "activeAccountId": "account-a", "items": [{"id": "account-a", "label": "Account A"}, {"id": "account-b", "label": "Account B"}]}
-        quota_history = [
-                {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "account-a", "accountLabel": "Account A", "windows": {"5h": {"usedPercent": 12, "resetAt": None, "plan": "plus"}}},
-                {"checkedAt": "2030-01-01T00:01:30Z", "accountSlotId": "account-b", "accountLabel": "Account B", "windows": {"7d": {"usedPercent": 34, "resetAt": None}}, "compaction": {"continuousFrom": "2029-12-31T12:00:00Z", "omittedSamples": 3}},
-            ]
-
-        payload = monitor_dashboard._dashboard_display_data(quota_history, [], accounts)
-
-        self.assertNotIn("quotaHistoryPath", payload)
-        self.assertEqual([point["accountSlotId"] for point in payload["quotaPoints"]], ["account-a", "account-b"])
-        self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["raw"], 12.0)
-        self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["continuous"], 12.0)
-        self.assertEqual(payload["quotaPoints"][0]["fiveHour"]["plan"], "plus")
-        self.assertNotIn("compactedFrom", payload["quotaPoints"][1])
 
 
     def test_usage_time_filter_rebases_same_account_on_subscription_change(self):
@@ -4120,7 +4045,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     rows = [{"checkedAt": f"2030-01-01T00:{index:02}:00Z", "accountSlotId": "a", "windows": {
                         label: {"usedPercent": value, "resetAt": "2030-01-05T00:00:00Z", "plan": "pro" if index == 0 else "plus"},
                     }} for index, value in enumerate(values)]
-                    self.assertEqual([point[output]["continuous"] for point in monitor_dashboard.dashboard_quota_points(rows)], values)
+                    self.assertEqual([point[output]["continuous"] for point in __import__("monitor_sampling").sample_rows(rows)], values)
 
 
     def test_usage_time_filter_learns_a_legitimate_fast_rate_from_history(self):
@@ -4129,26 +4054,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
             for minute in range(11)
         ]
 
-        points = monitor_dashboard.dashboard_quota_points(rows)
+        points = __import__("monitor_sampling").sample_rows(rows)
 
         self.assertEqual([point["fiveHour"]["continuous"] for point in points], [minute * 8 for minute in range(11)])
 
 
-    def test_dashboard_payload_removes_sensitive_account_and_sample_data(self):
-        accounts = {"activeAccountId": "local-a", "awaitingLogin": False, "items": [{"id": "local-a", "label": "Account A", "email": "private@example.test", "ready": True, "active": True, "accountKey": "cloud-key"}]}
-        sample = {
-            "checkedAt": "2030-01-01T00:00:00Z", "activeAccountSlotId": "local-a", "windows": {"5h": {"usedPercent": 12, "resetAt": None, "path": "rate_limit.primary"}}, "cost": {},
-            "remoteUsage": {"rawResponse": {"email": "private@example.test", "account_id": "acct-secret", "user_id": "user-secret"}, "authIdentity": {"account_id": "acct-secret"}},
-            "tokenUsage": {"totals": {"requests": 1}},
-        }
-        payload = monitor_dashboard.dashboard_safe_json({"status": {"sample": monitor_dashboard.dashboard_sample(sample), "accounts": monitor_dashboard.dashboard_account_status(accounts)}, "views": {"local": monitor_dashboard._dashboard_display_data([], [], accounts)}})
-        serialized = json.dumps(payload)
-
-        self.assertIn("Account A", serialized)
-        self.assertIn("local-a", serialized)
-        for sensitive in ("private@example.test", "acct-secret", "user-secret", "rawResponse", "authIdentity", "tokenUsage", "rate_limit.primary"):
-            self.assertNotIn(sensitive, serialized)
-        self.assertEqual(monitor_dashboard.dashboard_safe_json({"password": True, "email": "private@example.test", "tokens": {"refresh_token": "secret"}}), {"password": True})
 
     def test_dashboard_groups_duplicate_profiles_by_usage_identity_and_last_used_label(self):
         status = {
@@ -6905,15 +6815,14 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             for row in rows:
                 store.record_quota(row)
             records, present = store.snapshot()
-            full_records, full_present = store.snapshot(necessary_only=False)
 
             self.assertEqual([record["row"]["checkedAt"] for record in records.values()], [row["checkedAt"] for row in rows])
             self.assertTrue(all("compaction" not in record["row"] for record in records.values()))
             self.assertEqual(present, set(records))
-            self.assertEqual([record["row"]["checkedAt"] for record in full_records.values()], [row["checkedAt"] for row in rows])
-            self.assertEqual(full_present, set(full_records))
             self.assertNotIn("Managed name", json.dumps(records))
-            self.assertEqual([row["checkedAt"] for row in monitor_history.load_quota_history(quota)], [row["checkedAt"] for row in rows])
+            local = monitor_history.load_quota_history(quota)
+            self.assertEqual(len(local), 3)
+            self.assertTrue(all(row["quotaRunVersion"] == 1 for row in local))
 
     def test_usage_quota_plateau_appends_without_removing_middle_rows(self):
         with self.account_directory() as directory:
@@ -7048,62 +6957,19 @@ def with_auth_identity(row, account_id):
 
 
 class RawCostUsageTests(unittest.TestCase):
-    def test_adjacent_sample_periods_use_exact_event_timestamps(self):
-        quota = []
-        for minute, percent in ((10, 5), (12, 8), (14, 8), (16, 10)):
-            quota.append({
-                "checkedAt": f"2030-01-01T00:{minute:02d}:00Z", "accountSlotId": "a", "accountLabel": "A",
-                "windows": {"5h": {"usedPercent": percent, "resetAt": "2030-01-01T05:00:00Z", "plan": "plus"}},
-            })
-        ledger = [
-            {"schemaVersion": 1, "recordType": "usage", "eventId": f"s:{index}", "sessionId": "s", "occurredAt": timestamp, "rawModel": model, "billingModel": model, "accountSlotId": "a", "tokens": {}, "cost": {"totalCostUsd": cost}}
-            for index, (timestamp, model, cost) in enumerate((("2030-01-01T00:11:00Z", "a", 2), ("2030-01-01T00:13:00Z", "b", 3), ("2030-01-01T00:15:00Z", "a", 100)), 1)
-        ]
-        result = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "v3:usage-a"}), ledger, {"a": "v3:usage-a"})["fiveHour"]
-        self.assertEqual(len(result), 2)
-        self.assertEqual([(row["startedAt"], row["endedAt"], row["checkedAt"]) for row in result], [
-            ("2030-01-01T00:10:00Z", "2030-01-01T00:12:00Z", "2030-01-01T00:12:00Z"),
-            ("2030-01-01T00:14:00Z", "2030-01-01T00:16:00Z", "2030-01-01T00:16:00Z")])
-        self.assertEqual([(row["deltaPercent"], row["totalCostUsd"], row["costByModelUsd"]) for row in result], [(3.0, 2.0, {"a": 2.0}), (2.0, 100.0, {"a": 100.0})])
 
-    def test_adjacent_interval_includes_start_and_excludes_end(self):
-        quota = [{"checkedAt": timestamp, "accountSlotId": "a", "windows": {
-            label: {"usedPercent": percent, "resetAt": "2030-01-02T00:00:00Z", "plan": "plus"} for label in ("5h", "7d")}}
-            for timestamp, percent in (("2030-01-01T10:00:00Z", 20), ("2030-01-01T10:01:30Z", 21), ("2030-01-01T10:03:00Z", 22))]
-        ledger = [{"recordType": "usage", "occurredAt": timestamp, "accountSlotId": "a", "rawModel": "m", "cost": {"totalCostUsd": cost}}
-            for timestamp, cost in (("2030-01-01T09:59:59Z", 100), ("2030-01-01T10:00:00Z", 1),
-                ("2030-01-01T10:01:29Z", 2), ("2030-01-01T10:01:30Z", 4), ("2030-01-01T10:03:00Z", 200))]
-        result = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota), ledger)
-        for label in ("fiveHour", "sevenDay"):
-            self.assertEqual([row["totalCostUsd"] for row in result[label]], [3, 4])
-            self.assertEqual([row["deltaPercent"] for row in result[label]], [1, 1])
-            self.assertEqual([row["costPer100PercentUsd"] for row in result[label]], [300, 400])
-            self.assertEqual([row["checkedAt"] for row in result[label]], [quota[1]["checkedAt"], quota[2]["checkedAt"]])
 
     def test_raw_ledger_deduplicates_same_logical_event(self):
         base = {"schemaVersion": 2, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z", "rawModel": "m", "billingModel": "m", "serviceTier": "default", "tokens": monitor_common.empty_token_totals(), "cost": monitor_common.empty_cost_totals() | {"totalCostUsd": 1}}
         first = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "a"}, "machine-a", "v3:usage-a")
         second = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "b"}, "machine-b", "v3:usage-a")
-        merged, conflicts = monitor_usage_sync.merge_token_ledger_rows([first, second])
-        self.assertEqual((len(merged), conflicts), (1, []))
+        merged = monitor_usage_sync.merge_token_ledger_rows([first, second])
+        self.assertEqual(merged, [first])
         operation = {"action": "upsert", "key": monitor_usage_sync.record_key("tokenLedger", first), "record": {"kind": "tokenLedger", "row": first}}
         monitor_usage_sync.validate_sync_operation(operation)
         with self.assertRaises(ValueError):
             monitor_usage_sync.validate_sync_operation(operation | {"record": {"kind": "token", "row": first}})
 
-    def test_plan_normalization_and_cycle_breaks(self):
-        quota = [
-            {"checkedAt": f"2030-01-01T00:{minute:02d}:00Z", "accountSlotId": "a", "accountLabel": "A", "windows": {"5h": {"usedPercent": percent, "resetAt": reset, "plan": plan}}}
-            for minute, percent, reset, plan in (
-                (0, 1, "2030-01-01T05:00:00Z", "pro"), (2, 2, "2030-01-01T05:00:00Z", "pro"), (4, 3, "2030-01-01T05:00:00Z", "pro"),
-                (6, 4, "2030-01-01T05:00:00Z", "plus"), (8, 5, "2030-01-01T05:00:00Z", "plus"),
-                (10, 1, "2030-01-01T10:00:00Z", "plus"), (12, 2, "2030-01-01T10:00:00Z", "plus"),
-            )
-        ]
-        points = monitor_dashboard.dashboard_cost_usage(monitor_dashboard.dashboard_quota_points(quota, {"a": "v3:usage-a"}), [], {"a": "v3:usage-a"})["fiveHour"]
-        self.assertEqual(len(points), 4)
-        self.assertEqual((points[0]["startUsagePercent"], points[0]["endUsagePercent"], points[0]["deltaPercent"]), (10.0, 20.0, 10.0))
-        self.assertEqual(points[0]["costPer100PercentUsd"], 0.0)
 
 
     def test_dashboard_uses_weighted_model_attribution_and_average_dense_points(self):

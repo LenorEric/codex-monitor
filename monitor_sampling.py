@@ -1,4 +1,4 @@
-"""Deterministic quota sampling; raw history is immutable, decisions live in SQLite."""
+"""Sample legacy facts and consume canonical quota runs with saved decisions."""
 
 import json
 import math
@@ -24,26 +24,41 @@ def defer_refresh():
         _refresh_deferred.reset(token)
 
 
-def quota_point(row, slot_usage_accounts=None):
+def quota_point(row):
     from monitor_history import normalize_plan_type
     point = {
         "checkedAt": row.get("checkedAt"), "timestamp": parse_timestamp(row.get("checkedAt")),
         "accountSlotId": row.get("accountSlotId"), "accountLabel": row.get("accountLabel"),
-        "usageAccountId": str(row.get("usageAccountId") or (row.get("sync") or {}).get("accountId") or (slot_usage_accounts or {}).get(str(row.get("accountSlotId") or "")) or row.get("accountSlotId") or row.get("accountLabel") or "unknown"),
+        "usageAccountId": str(row.get("usageAccountId") or (row.get("sync") or {}).get("accountId") or row.get("accountSlotId") or row.get("accountLabel") or "unknown"),
     }
+    if row.get("quotaRunVersion") == 1:
+        from monitor_usage_sync import record_key
+        point["_key"] = record_key("quota", row)
     for name, (label, _) in WINDOWS.items():
         window = (row.get("windows") or {}).get(label) or {}
         raw = None if window.get("unavailable") else coerce_float(window.get("usedPercent"))
         plan = normalize_plan_type(window.get("plan"))
         from monitor_interpretation import multiplier
         point[name] = {"raw": raw, "continuous": raw, "resetAt": window.get("resetAt"), "plan": "plus" if plan == "unknown" else plan, "multiplier": multiplier(plan, point["timestamp"] or 0)}
+        if row.get("quotaRunVersion") == 1 and label in (row.get("windows") or {}):
+            point[name].update({key: window[key] for key in ("continuous", "multiplier", "firstAt", "lastAt", "resetBoundary")})
+            point[name]["storedRun"] = True
+            point.setdefault("runWindows", []).append(name)
+            if window["resetBoundary"]:
+                point["resetWindow"] = name
     return point
 
 
 def sample_point(point, state, reset_points=None):
     """Advance only this observation. Rejected observations are never reconsidered."""
     for name, (_, period) in WINDOWS.items():
+        if "runWindows" in point and name not in point["runWindows"]:
+            continue
         window = point[name]
+        if window.get("storedRun"):
+            from monitor_quota_runs import restore_window
+            restore_window(point, name, window, state)
+            continue
         raw, timestamp = window["raw"], point["timestamp"]
         if raw is None or not math.isfinite(raw) or not 0 <= raw <= 100 or timestamp is None:
             window["continuous"] = None
@@ -74,16 +89,18 @@ def accepted_windows(state):
         for name, (label, _) in WINDOWS.items() if name in state}
 
 
-def sample_rows(rows, slot_usage_accounts=None, states=None):
-    """Reference replay, also used for correction rebuilds. Merge duplicate observations first."""
+def sample_rows(rows, states=None):
+    """Replay legacy observations; restore run decisions without sampling them again."""
     merged = {}
     for row in rows:
-        point = quota_point(row, slot_usage_accounts)
-        key = point["usageAccountId"], point["checkedAt"]
+        point = quota_point(row)
+        key = point["usageAccountId"], point["checkedAt"], point.get("resetWindow"), point.get("_key")
         if key in merged:
             for name in WINDOWS:
                 if point[name]["raw"] is None:
                     point[name] = merged[key][name]
+            if "runWindows" in point and "runWindows" in merged[key]:
+                point["runWindows"] = sorted(set(point["runWindows"] + merged[key]["runWindows"]))
         merged[key] = point
     states = {} if states is None else states
     points = sorted(merged.values(), key=lambda point: (point["timestamp"] is None, point["timestamp"] or 0, point["checkedAt"] or "", point["usageAccountId"]))
@@ -94,7 +111,7 @@ def sample_rows(rows, slot_usage_accounts=None, states=None):
 
 
 def point_key(point):
-    return f"{point['checkedAt']}:reset:{point['resetWindow']}" if point.get("resetWindow") else point["checkedAt"]
+    return point.get("_key") or (f"{point['checkedAt']}:reset:{point['resetWindow']}" if point.get("resetWindow") else point["checkedAt"])
 
 
 def initialize(db):
@@ -168,7 +185,7 @@ def changed(db, account, views=("local", "merged"), key=""):
 
 
 def refresh(db, index):
-    """Commit decisions and state in the same transaction as raw fact/checkpoint changes."""
+    """Commit point/run projections in the same transaction as fact/checkpoint changes."""
     if _refresh_deferred.get():
         return
     from monitor_processing import encode
@@ -182,9 +199,11 @@ def refresh(db, index):
         if not rebuild:
             for key in keys:
                 rows.extend(json.loads(row[0]) for row in db.execute("SELECT data FROM processing_facts WHERE kind='quota' AND account=? AND record_key=?" + source_filter + " ORDER BY source,position", (account, key)))
-            points = sample_rows(rows)
-            # An overlap, replacement or duplicate timestamp requires replay from retained facts.
-            rebuild = any(point["timestamp"] is None or point["timestamp"] <= state["timestamp"] for point in points)
+            # Canonical runs restore saved decisions and never require legacy overlap sampling.
+            if any(row.get("quotaRunVersion") != 1 for row in rows):
+                points = sample_rows(rows)
+                # An overlap, replacement or duplicate timestamp requires replay from retained facts.
+                rebuild = any(not point.get("runWindows") and (point["timestamp"] is None or point["timestamp"] <= state["timestamp"]) for point in points)
         if rebuild:
             rows = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_facts WHERE kind='quota' AND account=?" + source_filter + " ORDER BY source,position", (account,))]
             state = {"timestamp": -1, "windows": {}}
@@ -196,7 +215,7 @@ def refresh(db, index):
             payload_id = samples.put_payload(db, encode(point))
             db.execute("INSERT OR REPLACE INTO processing_sampled_quota_refs VALUES(?,?,?,?,?)", (view, account, point_key(point), point["timestamp"], payload_id))
             if point["timestamp"] is not None:
-                state["timestamp"] = point["timestamp"]
+                state["timestamp"] = max(state["timestamp"], point["timestamp"], *[point[name].get("lastAt", point["timestamp"]) for name in WINDOWS])
         index.put(db, state_key, state)
         db.execute("DELETE FROM processing_sampling_changes WHERE view=? AND account=?", (view, account))
 

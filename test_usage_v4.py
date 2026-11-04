@@ -102,10 +102,36 @@ class UsageV4Tests(unittest.TestCase):
             consolidated = author.sync_usage_data()
             read_back = reader.sync_usage_data()
         self.assertEqual(consolidated["published"]["partsUploaded"], 1)
-        self.assertEqual(read_back["fetched"]["payloadsDownloaded"], 0)
+        self.assertEqual(read_back["fetched"]["payloadsDownloaded"], 1)
         self.assertEqual(reader._usage_data.v4_cached_days(author.machine_id)["2030-01-01"]["logicalHash"], old_digest)
         self.assertEqual(len([path for path in self.client.files if path.startswith(f"usage/v4/data/{author.machine_id}/")]), 1)
         self.assertFalse(any(path.startswith("usage/machines/") for path in self.client.files))
+
+    def test_local_run_extension_keeps_published_day_unchanged(self):
+        author, quota = self.device("author")
+        reader, _ = self.device("reader")
+        self.append(quota, author.machine_id, "one", "2030-01-01T00:01:00Z")
+        with mock.patch("monitor_cloud.time.time", return_value=moment("2030-01-01T00:31:00Z")):
+            author.sync_usage_data()
+            reader.sync_usage_data()
+        before = reader._usage_data._v4_remote_cache()[0]
+        old_day = reader._usage_data.v4_cached_days(author.machine_id)["2030-01-01"]
+        self.append(quota, author.machine_id, "two", "2030-01-02T00:01:00Z")
+        with mock.patch("monitor_cloud.time.time", return_value=moment("2030-01-02T00:02:00Z")):
+            author.sync_usage_data()
+            reader.sync_usage_data()
+        self.assertEqual(reader._usage_data.v4_cached_days(author.machine_id)["2030-01-01"]["logicalHash"], old_day["logicalHash"])
+        after = reader._usage_data._v4_remote_cache()[0]
+        self.assertEqual(len(after), 1)  # The current half-hour remains unpublished.
+        self.assertEqual(after, before)
+        self.assertEqual(len(author._usage_data.index.rows("quota")), 1)
+        with mock.patch("monitor_cloud.time.time", return_value=moment("2030-01-02T00:31:00Z")):
+            author.sync_usage_data()
+            reader.sync_usage_data()
+        after = reader._usage_data._v4_remote_cache()[0]
+        self.assertEqual(len(after), 2)
+        self.assertIn(before[0], after)
+        self.assertTrue(all("quotaRunVersion" not in item["record"]["row"] for item in after))
 
     def test_failed_head_commit_preserves_previous_publication(self):
         author, quota = self.device("author")
@@ -230,7 +256,7 @@ class UsageV4Tests(unittest.TestCase):
         envelope = {"kind": "futureMetric", "schemaVersion": 3, "recordKey": "futureMetric:one", "sourceMachineId": "future-client", "collectionPeriod": "2030-01-01T00:00Z", "eventAt": record["eventAt"], "contentSha256": content_hash(record), "record": record, "futureEnvelopeField": 7}
         manifest = {"day": "2030-01-01", "logicalHash": v4_logical_hash([envelope]), "parts": {"bulk": "a" * 64}}
         reader._usage_data.v4_apply_day("future-client", manifest, {"bulk": [envelope]})
-        self.assertEqual(reader._usage_data.v4_cached_days("future-client")["2030-01-01"]["logicalHash"], manifest["logicalHash"])
+        self.assertEqual(reader._usage_data.v4_cached_days("future-client")["2030-01-01"]["logicalHash"], "")
         self.assertEqual(reader._usage_data.datasets("merged"), ([], []))
 
     def test_direct_quota_writes_publish_and_log_rewrite_does_not_reconcile(self):

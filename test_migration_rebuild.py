@@ -37,6 +37,99 @@ class MigrationRebuildTests(unittest.TestCase):
         with self.store.index.transaction() as db:
             return {table: list(db.execute("SELECT * FROM processing_" + table)) for table in ("dirty", "changes", "sampling_changes")}
 
+    def test_retired_display_cleanup_preserves_delivery_and_quota_and_retries(self):
+        from monitor_delivery import DashboardDelivery
+        delivery = DashboardDelivery(self.store.index)
+        delivery.prepare(1893456000, {"accounts": self.accounts})
+        with self.store.index.transaction() as db:
+            db.execute("INSERT INTO processing_display VALUES('local','v3:a','costUsage:fiveHour','old',0,'{}')")
+            db.execute("INSERT INTO processing_cost_ranges VALUES('local','v3:a','costUsage:fiveHour','old',0,1)")
+            db.execute("CREATE TRIGGER delivery_processing_display_delete AFTER DELETE ON processing_display_refs BEGIN INSERT OR IGNORE INTO delivery_dirty VALUES(OLD.view,OLD.account); END")
+            db.execute("UPDATE processing_projections SET data=?", (json.dumps({"historyStats": {}, "nextMaintenanceAt": 1}),))
+            self.store.index.put(db, "displayStats:local", {})
+            self.store.index.put(db, "displayRevision", 10)
+            tables = ("processing_facts", "processing_sampled_quota", "processing_quota_points", "delivery_charts", "delivery_tokens", "delivery_journal", "delivery_snapshot", "processing_dirty", "delivery_dirty")
+            before = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in tables}
+        state, journal = self.root / "cleanup-state.json", self.root / "cleanup-journal.json"
+        state.write_text('{"dataContractVersion":20}')
+        def interrupted(paths):
+            migrations._migrate_history_to_v21(paths)
+            raise RuntimeError("interrupted")
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            migrations._run_data_migration(interrupted, self.paths, 21, state, journal)
+        with self.store.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_display").fetchone()[0], 1)
+        for _ in range(2):
+            migrations._run_data_migration(migrations._migrate_history_to_v21, self.paths, 21, state, journal)
+            with self.store.index.transaction() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_display").fetchone()[0], 0)
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_cost_ranges").fetchone()[0], 0)
+                self.assertIsNone(self.store.index.get(db, "displayRevision"))
+                self.assertIsNone(self.store.index.get(db, "displayStats:local"))
+                for table, rows in before.items():
+                    self.assertEqual(db.execute(f"SELECT * FROM {table}").fetchall(), rows, table)
+            with mock.patch.object(sampling, "sample_rows", side_effect=AssertionError("cleanup replayed sampling")):
+                self.assertIsNone(self.projector.refresh(self.accounts, 1893456001))
+
+    def test_v21_requests_only_delivery_rebuild_after_success(self):
+        from monitor_delivery import DashboardDelivery
+        delivery = DashboardDelivery(self.store.index)
+        delivery.prepare(1893456000, {"accounts": self.accounts})
+        with self.store.index.transaction() as db:
+            before = {table: db.execute(f"SELECT * FROM {table}").fetchall() for table in ("processing_facts", "processing_sampled_quota", "processing_quota_points", "delivery_runs", "delivery_tokens")}
+        with mock.patch.object(sampling, "sample_rows", side_effect=AssertionError("attribution migration replayed sampling")):
+            self.assertEqual(self.migrate(20, {21: migrations._migrate_history_to_v21}), [21])
+            self.assertIsNone(self.projector.refresh(self.accounts, 1893456001))
+        with self.store.index.transaction() as db:
+            for table, rows in before.items():
+                self.assertEqual(db.execute(f"SELECT * FROM {table}").fetchall(), rows, table)
+            self.assertEqual(set(db.execute("SELECT view,account FROM delivery_dirty")), {("local", "v3:a"), ("merged", "v3:a")})
+            self.assertEqual(set(db.execute("SELECT kind FROM delivery_work")), {("attribution",)})
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM delivery_snapshot").fetchone()[0], 0)
+            self.assertIsNone(self.store.index.get(db, "migrationRebuildPending"))
+
+    def test_v21_preserves_saved_event_selection_despite_new_merge_rule(self):
+        from monitor_delivery import DashboardDelivery
+        from monitor_usage_sync import record_key
+        from test_sync_contract_v3 import usage_row
+        import monitor_sample_store as samples
+        local = usage_row(account="v3:a", cost=1)
+        remote = usage_row(machine="remote", account="v3:a", cost=9)
+        key = record_key("tokenLedger", local)
+        with self.store.index.transaction() as db:
+            self.store.index.fact(db, "local:tokenLedger", 0, "tokenLedger", local)
+            self.store.index.fact(db, "peer:remote", 0, "tokenLedger", remote)
+            sample_id, attrs = samples.insert_sample(db, "tokenLedger", remote)
+            db.execute("UPDATE processing_effective_refs SET sample_id=?,attribution=? WHERE record_key=?", (sample_id, attrs, key))
+            self.store.index._rebuild_merged_session(db, "v3:a", "session-a")
+        delivery = DashboardDelivery(self.store.index)
+        delivery.prepare(1893456000, {"accounts": self.accounts})
+        with self.store.index.transaction() as db:
+            facts = db.execute("SELECT * FROM processing_facts ORDER BY source,position").fetchall()
+            # Simulate a previously published delivery cache using the old remote winner.
+            db.execute("UPDATE delivery_tokens SET cost=900000000 WHERE view='merged' AND account='v3:a'")
+        for _ in range(2):
+            migrations._migrate_history_to_v21(self.paths)
+            migrations._apply_migration_rebuild(self.paths)
+            self.projector.refresh(self.accounts, 1893456001)
+            delivery.prepare(1893456001, {"accounts": self.accounts})
+            with self.store.index.transaction() as db:
+                self.assertEqual(json.loads(db.execute("SELECT data FROM processing_effective WHERE record_key=?", (key,)).fetchone()[0]), remote)
+                self.assertEqual(db.execute("SELECT cost FROM delivery_tokens WHERE view='merged' AND account='v3:a'").fetchall(), [(900000000,)])
+                self.assertEqual(db.execute("SELECT * FROM processing_facts ORDER BY source,position").fetchall(), facts)
+
+    def test_delivery_only_request_combines_with_full_sampling_request(self):
+        migrations.request_migration_rebuild(self.paths, "attribution", delivery_only=True)
+        migrations.request_migration_rebuild(self.paths, "sampling", sampling=True)
+        with self.store.index.transaction() as db:
+            pending = self.store.index.get(db, "migrationRebuildPending")
+            self.assertTrue(pending["projection"])
+            self.assertTrue(pending["sampling"])
+        migrations._apply_migration_rebuild(self.paths)
+        queued = self.queues()
+        self.assertEqual(len(queued["dirty"]), 2)
+        self.assertEqual(len(queued["sampling_changes"]), 2)
+
     def test_identity_migration_preserves_results_without_rebuild(self):
         with self.store.index.transaction() as db:
             before = list(db.execute("SELECT * FROM processing_display"))
@@ -102,7 +195,7 @@ class MigrationRebuildTests(unittest.TestCase):
                 self.migrate(17, {18: first, 19: fail})
             replay.assert_not_called()
         with self.store.index.transaction() as db:
-            self.assertEqual(self.store.index.get(db, "migrationRebuildPending"), {"reasons": ["changed interpretation"], "sampling": True})
+            self.assertEqual(self.store.index.get(db, "migrationRebuildPending"), {"reasons": ["changed interpretation"], "sampling": True, "projection": True})
         with mock.patch.object(sampling, "sample_rows", wraps=sampling.sample_rows) as replay:
             self.assertEqual(self.migrate(18, {19: lambda paths: None}), [19])
             self.assertEqual(replay.call_count, 2)

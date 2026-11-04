@@ -1,10 +1,12 @@
 # Dashboard bulk and live delivery
 
-The backend interpretation layer is independent of canonical records, cloud records, and SQL storage. HTTP has no explicit protocol version. Local contract 18 is pending against released contract 17; the cloud remains contract 4.
+The backend interpretation layer is independent of canonical records, cloud records, and SQL storage. HTTP has no explicit protocol version. Local contract 21 is pending against released contract 20; the cloud remains contract 4.
 
 ## Pipeline and preparation
 
 API responses and session logs produce raw evidence. Preprocessing creates local canonical entries, which are published to cloud storage. Processing local entries creates Local; processing local entries plus mapped remote entries creates Merged. Interpretation consumes those views and prepares display data during ingestion/background work. Cloud records never enter local recorder files.
+
+New quota observations are sampled once before canonical storage. Each account/window stores a point or a run with first/last observation timestamps, percentage, resolved multiplier, reset metadata and its saved acceptance decision. Compatible observations extend the last run in place. Interpretation reads these bounds directly instead of collapsing them again. Older point histories remain readable and are not replayed merely to apply this storage optimization. Publication is independent: its existing point records and contract-4 format remain unchanged. Each new observation is staged for publication under its original identity; extending a local run never edits a previously published point. Local processing consumes runs, while the publication index retains the original point records needed by the existing sync protocol. Quota backup files are atomic local-run snapshots; token backups remain append-only.
 
 The typed delivery_runs, delivery_tokens, delivery_charts, and delivery_members tables store account/window/time data and interval attribution. delivery_work tracks affected source identities. Token-only updates refresh the closest affected chart intervals, while changed quota recomputes the affected account’s continuity and memberships. Prepared state and delivery_journal entries commit together. Serialization and compression happen after that commit and outside the ingestion writer lock.
 
@@ -39,7 +41,7 @@ Only consecutive accepted observations with identical processed percentage, mult
 
 A cost interval needs connected endpoints, increasing time, valid/increasing usage, and an unchanged effective plan/multiplier. There is no additional reset-within-60-seconds eligibility test. Token groups split at the union of 5h/7d interval boundaries and nearest-interval assignments. Per-model/tier tokens and costs sum exactly at the existing eight-decimal monetary precision. Their timestamp is the nearest-integer cost-weighted original timestamp; zero-cost groups use the arithmetic mean. API bulk history uses fixed UTC minute groups. An OpenAI account with no valid intervals keeps independent events.
 
-Each event belongs to the containing interval, otherwise the closest interval by distance to its bounds, independently for each window; ties choose the earlier interval. Pending/unattributable costs stay visible. New token events arrive immediately; later quota can reassign chart attribution without recounting tokens. Historical session-only totals remain in legacy and do not acquire fabricated cost-event timestamps.
+Each event belongs to the containing interval, otherwise the closest interval by distance to its bounds only when that distance is at most 600 seconds, independently for each window; ties choose the earlier interval. Costs farther away remain unassigned and are retained in token totals and Cost vs Time. Pending/unattributable costs stay visible. New token events arrive immediately; later quota can reassign chart attribution without recounting tokens. Historical session-only totals remain in legacy and do not acquire fabricated cost-event timestamps.
 
 ## Live channels and recovery
 

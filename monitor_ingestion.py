@@ -296,7 +296,7 @@ class SourceIngestor:
                     for (event_id,) in db.execute("SELECT event_id FROM processing_occurrences WHERE source=?", (source,)):
                         self._refs(db, event_id, 1 if valid else -1)
                 for event in updated.pop("events"):
-                    identity = [updated["sessionId"], event["checkedAt"], event["cumulative"] or event["tokens"]]
+                    identity = [updated["sessionId"], event["checkedAt"], event["cumulative"]]
                     event_id = f'{updated["sessionId"]}:{hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]}'
                     self.metrics["eventsHashed"] += 1
                     value = {"eventId": event_id, "sessionId": updated["sessionId"], "sourceFile": Path(source).name,
@@ -375,7 +375,7 @@ class SourceIngestor:
                 source_files = [Path(row[0]).name for row in db.execute("SELECT path FROM processing_scan_sources WHERE home=? AND valid=1", (self.home,))]
                 rows = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' ORDER BY position", ("local:tokenLedger",))]
                 updated, new_costs = reconcile_token_ledger(rows, events, slot, label, timeline, provenance, source_files, machine_id)
-                self.index.write_records(db, "tokenLedger", updated, replace=True, backup_path=path)
+                self.index.write_records(db, "tokenLedger", updated, replace=True, backup_path=path if self.store.backup.enabled() else None)
                 # Notify after commit; persist the callback batch for retry on failure.
                 if new_costs:
                     self.index.put(db, f"ledgerNotifications:{self.home}", new_costs)
@@ -423,7 +423,7 @@ class SourceIngestor:
                             elif usage != previous:
                                 replacements[event_id] = usage
                         last[event["sessionId"]] = [source, index]
-                    self.index.write_records(db, "tokenLedger", [normalize(row) for row in replacements.values()] + [normalize(row) for row in additions], backup_path=path)
+                    self.index.write_records(db, "tokenLedger", [normalize(row) for row in replacements.values()] + [normalize(row) for row in additions], backup_path=path if self.store.backup.enabled() else None)
                     db.executemany("UPDATE processing_scan_events SET ledger_done=1 WHERE event_id=?", ((row[0],) for row in pending))
                     db.executemany("INSERT OR REPLACE INTO processing_coverage VALUES(?,?,?,?,?)", ((self.home, *key, encode(value)) for key, value in cumulative.items()))
                     db.executemany("INSERT OR REPLACE INTO processing_ledger_order VALUES(?,?,?,?)", ((self.home, key, *value) for key, value in last.items()))

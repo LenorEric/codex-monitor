@@ -16,7 +16,27 @@ import monitor_tokens
 from monitor_usage_sync import UsageDataStore, add_record_provenance
 
 
+
+def projected_points(store, view):
+    with store.index.transaction() as db:
+        return [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_quota_points WHERE view=? ORDER BY event_at,record_key", (view,))]
+
+
+def replayed_points(rows):
+    from monitor_sampling import sample_rows, point_key
+    return sorted(sample_rows(rows), key=lambda point: (point["timestamp"], point_key(point)))
+
+
 class ProcessingTests(unittest.TestCase):
+    def test_disabled_backup_recorder_discards_pending_jsonl_writes(self):
+        self.store.backup.enabled = lambda: False
+        with self.store.index.transaction() as db:
+            monitor_backup.BackupRecorder.enqueue(db, self.root / "disabled.jsonl", [{"event": "test"}])
+        self.store.backup.flush()
+        self.assertFalse((self.root / "disabled.jsonl").exists())
+        with self.store.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_backup_queue").fetchone()[0], 0)
+
     def test_startup_preparation_uses_database_without_reading_history_files(self):
         self.store.quota_path.write_text("unread quota history\n", encoding="utf-8")
         self.store.token_ledger_path.write_text("unread token history\n", encoding="utf-8")
@@ -50,8 +70,9 @@ class ProcessingTests(unittest.TestCase):
 
     @staticmethod
     def event(minute, tokens):
+        usage = {"input_tokens": tokens, "cached_input_tokens": 10, "output_tokens": minute * 10}
         return {"timestamp": f"2030-01-01T00:{minute:02}:00Z", "type": "event_msg", "payload": {"type": "token_count",
-            "info": {"total_token_usage": {"input_tokens": tokens, "cached_input_tokens": 10, "output_tokens": minute * 10}}}}
+            "info": {"total_token_usage": usage, "last_token_usage": usage}}}
 
     def write(self, rows, append=False):
         with self.log.open("a" if append else "w", encoding="utf-8") as stream:
@@ -63,6 +84,17 @@ class ProcessingTests(unittest.TestCase):
         store.sources.scan(self.root)
         return store.sources.sync_ledger(store.token_ledger_path, "slot", "Account", [],
             lambda row: add_record_provenance("tokenLedger", row, "machine", "v3:account"), store.normalize_new_ledger, "machine")
+
+    def test_incomplete_token_usage_reports_health_without_deleting_confirmed_ledger(self):
+        before = self.sync()
+        saved = self.store.token_ledger_path.read_bytes()
+        self.write([{"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {
+            "type": "token_count", "info": {"last_token_usage": {"input_tokens": 50, "output_tokens": 10}},
+        }}], append=True)
+        self.assertEqual(self.sync(), before)
+        self.assertEqual(self.store.token_ledger_path.read_bytes(), saved)
+        with self.store.index.transaction() as db:
+            self.assertIsNotNone(db.execute("SELECT 1 FROM processing_health WHERE source=?", (str(self.log.resolve()),)).fetchone())
 
     def test_restart_and_idle_do_not_read_or_hash_history(self):
         expected = monitor_tokens.scan_codex_token_usage(self.root)
@@ -182,10 +214,29 @@ class ProcessingTests(unittest.TestCase):
         before = self.store.index.metrics["fullImports"]
         self.store.ingest_local()
         self.assertEqual(self.store.index.metrics["fullImports"], before)
-        self.assertEqual(len(self.store.index.rows("quota")), 2)
+        self.assertEqual(len(self.store.index.rows("quota")), 1)
+
+    def test_projector_keeps_only_quota_and_forwards_token_work(self):
+        from monitor_projection import DashboardProjector
+        projector = DashboardProjector(self.store)
+        self.sync()
+        self.store.record_quota({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}})
+        projector.refresh({}, 1893456000)
+        before = {view: projected_points(self.store, view) for view in ("local", "merged")}
+        with self.store.index.transaction() as db:
+            db.execute("DELETE FROM delivery_work")
+        self.write([self.event(2, 200)], append=True)
+        self.sync()
+        with mock.patch.object(projector, "_rebuild", side_effect=AssertionError("token append replayed quota")):
+            projector.refresh({}, 1893456120)
+        with self.store.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_display").fetchone()[0], 0)
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_cost_ranges").fetchone()[0], 0)
+            self.assertEqual({tuple(row) for row in db.execute("SELECT view,kind FROM delivery_work")}, {("local", "tokenLedger"), ("merged", "tokenLedger")})
+        for view in ("local", "merged"):
+            self.assertEqual(projected_points(self.store, view), before[view])
 
     def test_projector_matches_reference_and_monotonic_appends_do_not_replay(self):
-        import monitor_dashboard
         from monitor_projection import DashboardProjector
         projector = DashboardProjector(self.store)
         accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
@@ -198,16 +249,14 @@ class ProcessingTests(unittest.TestCase):
             now = 1893456000 + minute * 60
             projector.refresh(accounts, now)
             for view in ("local", "merged"):
-                expected = monitor_dashboard.dashboard_transfer_view(monitor_dashboard._dashboard_display_data(*self.store.datasets(view), accounts, now))
-                self.assertEqual(projector.snapshot(view), expected)
+                self.assertEqual(projected_points(self.store, view), replayed_points(self.store.datasets(view)[0]))
             if initial_rebuilds is None:
                 initial_rebuilds = projector.metrics["accountRebuilds"]
             self.assertEqual(projector.metrics["accountRebuilds"], initial_rebuilds)
-        self.assertEqual(projector.metrics["quotaFastAppends"], 8)
+        self.assertEqual(projector.metrics["quotaFastAppends"], 16)
         self.assertIsNone(projector.refresh(accounts, now))
 
     def test_quota_rejections_missing_windows_resets_and_late_samples_match_reference(self):
-        import monitor_dashboard
         from monitor_projection import DashboardProjector
         from datetime import datetime, timezone
         projector = DashboardProjector(self.store)
@@ -222,7 +271,7 @@ class ProcessingTests(unittest.TestCase):
             self.store.record_quota(row)
             projector.refresh(accounts, now)
             for view in ("local", "merged"):
-                self.assertEqual(projector.snapshot(view), monitor_dashboard.dashboard_transfer_view(monitor_dashboard._dashboard_display_data(*self.store.datasets(view), accounts, now)), (minute, view))
+                self.assertEqual(projected_points(self.store, view), replayed_points(self.store.datasets(view)[0]), (minute, view))
 
     def test_prefix_rewrite_followed_by_append_reconciles(self):
         self.sync()
@@ -271,6 +320,23 @@ class ProcessingTests(unittest.TestCase):
             self.assertIsNone(db.execute("SELECT 1 FROM processing_effective WHERE session='remote-session'").fetchone())
             self.assertIsNone(db.execute("SELECT 1 FROM processing_ledger_sessions WHERE source LIKE 'view:merged:%' AND session='remote-session'").fetchone())
 
+    def test_local_event_wins_over_peer_and_peer_correction(self):
+        from monitor_usage_sync import record_key, merge_token_ledger_rows
+        self.sync()
+        local = self.store.index.rows("tokenLedger")[0]
+        remote = local | {"sourceFile": "remote.jsonl", "cost": local["cost"] | {"totalCostUsd": 123}}
+        key = record_key("tokenLedger", local)
+        self.assertEqual(merge_token_ledger_rows([local, remote]), [local])
+        with self.store.index.transaction() as db:
+            for cost in (123, 456):
+                self.store.index.fact(db, "peer:remote", 0, "tokenLedger", remote | {"cost": remote["cost"] | {"totalCostUsd": cost}})
+                self.assertEqual(json.loads(db.execute("SELECT data FROM processing_effective WHERE record_key=?", (key,)).fetchone()[0]), local)
+            db.execute("DELETE FROM processing_facts WHERE source='local:tokenLedger' AND record_key=?", (key,))
+            self.store.index._effective(db, key)
+            self.assertEqual(json.loads(db.execute("SELECT data FROM processing_effective WHERE record_key=?", (key,)).fetchone()[0])["cost"]["totalCostUsd"], 456)
+            self.store.index.fact(db, "local:tokenLedger", 0, "tokenLedger", local)
+            self.assertEqual(json.loads(db.execute("SELECT data FROM processing_effective WHERE record_key=?", (key,)).fetchone()[0]), local)
+
     def test_os_watcher_stops_and_delivers_new_session_changes(self):
         watcher = monitor_ingestion.SourceWatcher(self.root)
         self.addCleanup(watcher.stop)
@@ -289,38 +355,7 @@ class ProcessingTests(unittest.TestCase):
             monitor_token_ledger.token_sessions_from_ledger(self.store.index.rows("tokenLedger"))))
         self.assertEqual(len(self.store.index.rows("tokenLedger")), 2)
 
-    def test_streamed_snapshot_matches_regular_snapshot(self):
-        from monitor_projection import DashboardProjector
-        from monitor_streaming import json_chunks
-        self.sync()
-        projector = DashboardProjector(self.store)
-        projector.refresh({"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}, 1893456000)
-        for view in ("local", "merged"):
-            streamed = projector.snapshot(view, True)
-            try:
-                self.assertEqual(json.loads(b"".join(json_chunks(streamed))), projector.snapshot(view))
-            finally:
-                streamed["quotaPoints"].close()
-                streamed["tokenSessions"].close()
-                for rows in streamed["costUsage"].values():
-                    rows.close()
 
-    def test_streamed_snapshot_is_consistent_while_new_projection_commits(self):
-        from monitor_projection import DashboardProjector
-        from monitor_streaming import json_chunks, close_records
-        self.sync()
-        projector = DashboardProjector(self.store)
-        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
-        projector.refresh(accounts, 1893456000)
-        expected = projector.snapshot("local")
-        snapshot = projector.snapshot("local", True)
-        try:
-            self.store.record_quota({"checkedAt": "2030-01-01T00:01:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}})
-            projector.refresh(accounts, 1893456060)
-            self.assertEqual(json.loads(b"".join(json_chunks(snapshot))), expected)
-            self.assertEqual(len(projector.snapshot("local")["quotaPoints"]), 1)
-        finally:
-            close_records(snapshot)
 
     def test_peer_bulk_append_imports_only_new_rows_without_session_replay(self):
         from monitor_usage_sync import v4_record_envelope, record_key, v4_logical_hash

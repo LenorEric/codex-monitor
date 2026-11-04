@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
-"""Write-only recorder logs. SQLite owns pending delivery and authoritative data."""
+"""Quota snapshots and append-only token backups; SQLite owns pending delivery."""
 
 import json
 import os
 import sys
 import threading
 from pathlib import Path
+
+
+def replace_quota_backup(path, body):
+    from monitor_common import atomic_write_bytes
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_bytes(Path(path), body.encode("utf-8"))
 
 
 def append_backup(path, rows):
@@ -28,8 +34,8 @@ def append_backup(path, rows):
 
 
 class BackupRecorder:
-    def __init__(self, index):
-        self.index, self.lock, self.error = index, threading.RLock(), None
+    def __init__(self, index, enabled=lambda: True):
+        self.index, self.enabled, self.lock, self.error = index, enabled, threading.RLock(), None
 
     @staticmethod
     def enqueue(db, path, rows):
@@ -38,6 +44,10 @@ class BackupRecorder:
     def flush(self):
         with self.lock:
             with self.index.transaction() as db:
+                if not self.enabled():
+                    db.execute("DELETE FROM processing_backup_queue")
+                    self.error = None
+                    return
                 paths = [row[0] for row in db.execute("SELECT DISTINCT path FROM processing_backup_queue ORDER BY path")]
             errors = []
             for path in paths:
@@ -47,7 +57,12 @@ class BackupRecorder:
                     if not pending:
                         break
                     try:
-                        append_backup(path, [json.loads(row[1]) for row in pending])
+                        if any(json.loads(row[1]).get("quotaRunSnapshot") is True for row in pending):
+                            with self.index.transaction() as db:
+                                body = "".join(data + "\n" for (data,) in db.execute("SELECT data FROM processing_facts WHERE source='local:quota' ORDER BY position"))
+                            replace_quota_backup(path, body)
+                        else:
+                            append_backup(path, [json.loads(row[1]) for row in pending])
                     except OSError as exc:
                         errors.append(f"{path}: {exc}")
                         break  # One unavailable log must not block the other logs.

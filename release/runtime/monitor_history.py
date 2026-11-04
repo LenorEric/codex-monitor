@@ -151,21 +151,13 @@ def normalize_quota_history_row(row: dict) -> dict | None:
     }
     if isinstance(row.get("sync"), dict):
         normalized["sync"] = row["sync"]
+    if "quotaRunVersion" in row:
+        from monitor_quota_runs import validate_run
+        validate_run(row)
+        normalized["quotaRunVersion"] = row["quotaRunVersion"]
+        normalized["windows"] = {label: dict(window) for label, window in row["windows"].items()}
     return normalized
 
-def quota_history_row_from_sample(sample: dict) -> dict | None:
-    if not isinstance(sample, dict):
-        return None
-    rejected_windows = sample.get("rejectedWindows") if isinstance(sample.get("rejectedWindows"), dict) else None
-    if rejected_windows is None and (sample.get("usingPreviousWindows") or (sample.get("remoteUsage") or {}).get("accepted") is False):
-        return None
-    return normalize_quota_history_row({
-        "checkedAt": sample.get("checkedAt") if rejected_windows is not None else sample.get("percentCheckedAt") or sample.get("checkedAt"),
-        "accountSlotId": sample.get("accountSlotId"),
-        "accountLabel": sample.get("accountLabel"),
-        "windows": rejected_windows if rejected_windows is not None else sample.get("windows") or {},
-        "sync": sample.get("sync"),
-    })
 
 def quota_history_rows_from_sample(sample: dict) -> list[dict]:
     """Keep independently refreshed windows at their actual observation times."""
@@ -204,23 +196,6 @@ def load_quota_history(path: Path) -> list[dict]:
             raise
         rows = parse_history_rows(content[:content.rfind(b"\n") + 1].decode("utf-8"))
     return [normalized for row in rows if (normalized := normalize_quota_history_row(row)) is not None]
-
-
-def merge_quota_history_rows(rows: list[dict]) -> list[dict]:
-    merged = {}
-    for row in rows:
-        normalized = normalize_quota_history_row(row)
-        if normalized is None:
-            continue
-        key = (normalized["checkedAt"], normalized["accountSlotId"])
-        if key in merged:
-            windows = merged[key]["windows"] | normalized["windows"]
-            for label in merged[key]["windows"].keys() & normalized["windows"].keys():
-                if normalized["windows"][label]["plan"] == "unknown" and merged[key]["windows"][label]["plan"] != "unknown":
-                    windows[label] = normalized["windows"][label] | {"plan": merged[key]["windows"][label]["plan"]}
-            normalized = normalized | {"windows": windows}
-        merged[key] = normalized
-    return sorted(merged.values(), key=lambda row: (parse_timestamp(row["checkedAt"]) is None, parse_timestamp(row["checkedAt"]) or 0, row["accountSlotId"]))
 
 
 def is_delta_event_row(row: dict) -> bool:
@@ -379,20 +354,6 @@ def format_history_row(row: dict) -> str:
         "}",
     ])
     return "\n".join(lines)
-
-def load_state(path: Path) -> dict:
-    try:
-        with path.open("r", encoding="utf-8") as f:
-            data = json.load(f)
-            if not isinstance(data, dict):
-                return {}
-            if isinstance((data.get("tokenUsage") or {}).get("totals"), dict):
-                data["tokenUsage"]["totals"] = normalize_saved_token_totals(data["tokenUsage"]["totals"])
-            if isinstance((data.get("lastSample") or {}).get("tokenDelta"), dict):
-                data["lastSample"]["tokenDelta"] = normalize_saved_token_totals(data["lastSample"]["tokenDelta"])
-            return data
-    except (FileNotFoundError, json.JSONDecodeError):
-        return {}
 
 def write_state(path: Path, state: dict) -> None:
     _atomic_write_bytes(path, (json.dumps(compact_monitor_state(state), ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))

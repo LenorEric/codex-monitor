@@ -31,7 +31,7 @@ from monitor_webdav_log import WebDavLog
 from monitor_common import SafeRedirectHandler, now_iso as _timestamp
 from monitor_skills import SkillError
 from monitor_migrations import CLOUD_DATA_CONTRACT_PATH, read_cloud_contract, ensure_cloud_contract
-from monitor_usage_sync import canonical_json, content_hash, v4_logical_hash, v4_period, validate_sync_operation
+from monitor_usage_sync import canonical_json, content_hash, v4_period, validate_sync_operation, require_usage_fields
 
 AUTO_PUSH_STABLE_SECONDS = 5
 AUTO_PUSH_RETRY_SECONDS = 30
@@ -612,6 +612,7 @@ class CloudManager:
                 "version": 1, "control": {"password": "", "passwordHash": "", "passwordSalt": "", "cookieSecret": secrets.token_urlsafe(32)},
                 "server": {"host": "0.0.0.0"},
                 "autoUpdate": {"enabled": False},
+                "saveJsonl": True,
                 "webdav": {
                     "enabled": False, "baseUrl": "https://dav.jianguoyun.com/dav/", "username": "", "password": "", "remoteRoot": "codex-switch-sync", "encryptionPassphrase": "", "encryptionPassphraseHash": "",
                     "skillsAutoUpload": True, "usageDataAutoSync": True, "allowOptimisticWrites": True,
@@ -638,7 +639,7 @@ class CloudManager:
         if not isinstance(config, dict):
             raise CloudError("Unsupported WebDAV config", 500)
         webdav, control, server, auto_update = config.get("webdav"), config.get("control"), config.get("server"), config.get("autoUpdate")
-        if (config.get("version") != 1 or not isinstance(webdav, dict) or not isinstance(control, dict) or not isinstance(server, dict) or not isinstance(auto_update, dict) or not isinstance(auto_update.get("enabled"), bool) or control.get("password") != "" or webdav.get("encryptionPassphrase") != ""
+        if (config.get("version") != 1 or not isinstance(config.get("saveJsonl", True), bool) or not isinstance(webdav, dict) or not isinstance(control, dict) or not isinstance(server, dict) or not isinstance(auto_update, dict) or not isinstance(auto_update.get("enabled"), bool) or control.get("password") != "" or webdav.get("encryptionPassphrase") != ""
                 or not isinstance(control.get("passwordHash"), str) or len(control["passwordHash"]) > 1024 or not isinstance(control.get("passwordSalt"), str)
                 or not isinstance(control.get("cookieSecret"), str) or len(control["cookieSecret"]) < 32):
             raise CloudError("Unsupported WebDAV config", 500)
@@ -670,6 +671,7 @@ class CloudManager:
         return {
             "server": {"host": config["server"]["host"]},
             "autoUpdate": {"enabled": config["autoUpdate"]["enabled"]},
+            "saveJsonl": config.get("saveJsonl", True),
             "webdav": {key: webdav.get(key) for key in ("enabled", "baseUrl", "username", "remoteRoot", "skillsAutoUpload", "usageDataAutoSync", "allowOptimisticWrites")},
             "secretsConfigured": {"password": bool(webdav.get("password")), "encryptionPassphrase": bool(webdav.get("encryptionPassphraseHash")), "controlPassword": control_password_is_configured(config["control"])},
         }
@@ -734,6 +736,7 @@ class CloudManager:
             raise CloudError("Invalid automatic update config")
         config = {
             **current,
+            "saveJsonl": values.get("saveJsonl", current.get("saveJsonl", True)) is True,
             "server": {"host": validate_server_host(values["server"].get("host"))},
             "autoUpdate": {"enabled": auto_update_values.get("enabled") is True},
             "control": {**current["control"], "password": ""},
@@ -1459,19 +1462,6 @@ class CloudManager:
     def _v4_head_path(machine_id: str) -> str:
         return f"usage/v4/heads/{machine_id}.enc"
 
-    @staticmethod
-    def _v4_valid_hash(value) -> bool:
-        return isinstance(value, str) and len(value) == 64 and all(character in "0123456789abcdef" for character in value)
-
-    @staticmethod
-    def _v4_valid_day(value) -> bool:
-        if not isinstance(value, str) or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
-            return False
-        try:
-            return datetime.strptime(value, "%Y-%m-%d").strftime("%Y-%m-%d") == value
-        except ValueError:
-            return False
-
     def _v4_head(self, client: WebDavClient, box: CryptoBox, machine_id: str) -> tuple[dict | None, str | None]:
         client.transfer_category = "metadata"
         try:
@@ -1484,11 +1474,14 @@ class CloudManager:
             head = json.loads(box.decrypt(f"usage-v4-head:{machine_id}", encrypted, 1024 * 1024))
         except (ValueError, TypeError) as exc:
             raise CloudError("Invalid usage v4 head", 409) from exc
-        if not isinstance(head, dict) or head.get("version") != 4 or head.get("machineId") != machine_id or not isinstance(head.get("generation"), int) or isinstance(head["generation"], bool) or head["generation"] < 1 or not isinstance(head.get("months"), dict) or any(not isinstance(month, str) or not re.fullmatch(r"\d{4}-\d{2}", month) or not self._v4_valid_hash(digest) for month, digest in head["months"].items()):
-            raise CloudError("Invalid usage v4 head", 409)
-        active = head.get("activeDay")
-        if active is not None and (not isinstance(active, dict) or not self._v4_valid_day(active.get("day")) or not self._v4_valid_hash(active.get("manifestId")) or not self._v4_valid_hash(active.get("logicalHash")) or active.get("layout") != "parts"):
-            raise CloudError("Invalid usage v4 active day", 409)
+        try:
+            require_usage_fields(head, version=int, machineId=str, generation=int, months=dict, activeDay=(dict, type(None)))
+            if any(type(month) is not str or type(digest) is not str for month, digest in head["months"].items()):
+                raise ValueError("Invalid usage month reference types")
+            if head["activeDay"] is not None:
+                require_usage_fields(head["activeDay"], day=str, manifestId=str, layout=str)
+        except ValueError as exc:
+            raise CloudError("Invalid usage v4 head fields", 409) from exc
         return head, etag
 
     def _v4_catalog(self, client: WebDavClient, box: CryptoBox, machine_id: str, head: dict | None) -> dict[str, dict]:
@@ -1500,36 +1493,25 @@ class CloudManager:
             if cache_key not in self._v4_month_cache:
                 client.transfer_category = "metadata"
                 value = self._download_usage_payload(client, box, "v4/months", machine_id, payload_id)
-                if value.get("version") not in (1, 2) or value.get("machineId") != machine_id or value.get("month") != month or not isinstance(value.get("days"), dict):
-                    raise CloudError("Invalid usage v4 month index", 409)
-                for day, reference in value["days"].items():
-                    if not self._v4_valid_day(day) or day[:7] != month or not isinstance(reference, dict) or not self._v4_valid_hash(reference.get("logicalHash")):
-                        raise CloudError("Invalid usage v4 day reference", 409)
-                    if reference.get("layout") == "packed":
-                        if value["version"] != 2 or not isinstance(reference.get("segments"), list) or not reference["segments"]:
-                            raise CloudError("Invalid usage pack segments", 409)
-                        for segment in reference["segments"]:
-                            if (not isinstance(segment, dict) or not self._v4_valid_hash(segment.get("payloadId"))
-                                    or type(segment.get("recordOffset")) is not int or segment["recordOffset"] < 0
-                                    or type(segment.get("recordCount")) is not int or segment["recordCount"] < 1):
-                                raise CloudError("Invalid usage pack range", 409)
-                    elif reference.get("layout") != "bulk" or not self._v4_valid_hash(reference.get("manifestId")):
-                        raise CloudError("Invalid usage v4 day reference", 409)
+                try:
+                    require_usage_fields(value, version=int, machineId=str, month=str, days=dict)
+                    for day, reference in value["days"].items():
+                        if type(day) is not str:
+                            raise ValueError("Invalid usage day key type")
+                        require_usage_fields(reference, layout=str)
+                        if reference["layout"] == "packed":
+                            require_usage_fields(reference, segments=list)
+                            for segment in reference["segments"]:
+                                require_usage_fields(segment, payloadId=str, recordOffset=int, recordCount=int)
+                        else:
+                            require_usage_fields(reference, manifestId=str)
+                except ValueError as exc:
+                    raise CloudError("Invalid usage v4 month fields", 409) from exc
                 self._v4_month_cache[cache_key] = value
             catalog.update(self._v4_month_cache[cache_key]["days"])
         if head.get("activeDay"):
             day = head["activeDay"]["day"]
-            if day in catalog:
-                raise CloudError("Usage v4 day has duplicate references", 409)
-            catalog[day] = {key: head["activeDay"][key] for key in ("manifestId", "logicalHash", "layout")}
-        ranges = {}
-        for reference in catalog.values():
-            for segment in reference.get("segments", []):
-                ranges.setdefault(segment["payloadId"], []).append((segment["recordOffset"], segment["recordOffset"] + segment["recordCount"]))
-        for intervals in ranges.values():
-            ordered = sorted(intervals)
-            if any(left[1] > right[0] for left, right in zip(ordered, ordered[1:])):
-                raise CloudError("Usage pack references overlap", 409)
+            catalog[day] = {key: value for key, value in head["activeDay"].items() if key != "day"}
         return catalog
 
     def _v4_day_manifest(self, client: WebDavClient, box: CryptoBox, machine_id: str, day: str, reference: dict) -> dict:
@@ -1537,10 +1519,13 @@ class CloudManager:
             return {**reference, "version": 2, "machineId": machine_id, "day": day, "parts": {"bulk": reference}}
         client.transfer_category = "metadata"
         value = self._download_usage_payload(client, box, "v4/days", machine_id, reference["manifestId"])
-        parts = value.get("parts")
-        if value.get("version") != 1 or value.get("machineId") != machine_id or value.get("day") != day or value.get("logicalHash") != reference["logicalHash"] or value.get("layout") != reference["layout"] or not isinstance(parts, dict) or not parts or any(not isinstance(part, str) or not self._v4_valid_hash(digest) or part != "bulk" and (not re.fullmatch(r"\d{4}-\d{2}-\d{2}T(?:[01]\d|2[0-3]):(?:00|30)Z", part) or part[:10] != day) for part, digest in parts.items()) or (value["layout"] == "bulk") != (set(parts) == {"bulk"}):
-            raise CloudError("Invalid usage v4 day manifest", 409)
-        return value
+        try:
+            require_usage_fields(value, version=int, machineId=str, day=str, layout=str, parts=dict)
+            if any(type(part) is not str or type(digest) is not str for part, digest in value["parts"].items()):
+                raise ValueError("Invalid usage part reference types")
+        except ValueError as exc:
+            raise CloudError("Invalid usage v4 day manifest fields", 409) from exc
+        return value | {"day": day}
 
     def _v4_data(self, client: WebDavClient, box: CryptoBox, machine_id: str, day: str, part: str, payload_id: str, category: str = "payload") -> list[dict]:
         client.transfer_category = category
@@ -1551,8 +1536,10 @@ class CloudManager:
             return Records(lambda: iter(reader.entries(day, payload_id)), lambda: reader.__exit__())
         value = self._download_usage_payload(client, box, "v4/data", machine_id, payload_id)
         from monitor_streaming import RecordSpool
-        if value.get("version") != 1 or value.get("machineId") != machine_id or value.get("day") != day or value.get("partId") != part or not isinstance(value.get("records"), (list, RecordSpool)) or len(value["records"]) > 100000:
-            raise CloudError("Invalid usage v4 data part", 409)
+        try:
+            require_usage_fields(value, version=int, machineId=str, day=str, partId=str, records=(list, RecordSpool))
+        except ValueError as exc:
+            raise CloudError("Invalid usage v4 data part fields", 409) from exc
         return value["records"]
 
     def _v4_write_head(self, client: WebDavClient, box: CryptoBox, head: dict, etag: str | None) -> str:
@@ -1564,18 +1551,16 @@ class CloudManager:
         parts = {period: entries for period, entries in content["parts"].items() if period < current_period}
         if not parts:
             return None
-        from monitor_streaming import Records, sorted_records, logical_hash_sorted
+        from monitor_streaming import Records, sorted_records
         streamed = any(isinstance(rows, Records) for rows in parts.values())
         entries = sorted_records(parts) if streamed else [entry for records in parts.values() for entry in records]
         layout = "parts" if day == current_period[:10] else "bulk"
         payloads = ({period: {"version": 1, "machineId": machine_id, "day": day, "partId": period, "records": records} for period, records in parts.items()} if layout == "parts" else {"bulk": {"version": 1, "machineId": machine_id, "day": day, "partId": "bulk", "records": entries if streamed else sorted(entries, key=lambda entry: entry["recordKey"])}})
-        return {"day": day, "layout": layout, "logicalHash": logical_hash_sorted(entries) if streamed else v4_logical_hash(entries), "payloads": payloads}
+        return {"day": day, "layout": layout, "payloads": payloads}
 
     @staticmethod
     def _decode_usage_payload(box: CryptoBox, purpose: str, encrypted: bytes, expected_id: str) -> dict:
         compressed = box.decrypt(purpose, encrypted)
-        if hashlib.sha256(compressed).hexdigest() != expected_id:
-            raise CloudError("Usage payload identity check failed", 409)
         try:
             decoder = zlib.decompressobj()
             uncompressed = decoder.decompress(compressed, 600 * 1024 * 1024 + 1)
@@ -1584,7 +1569,7 @@ class CloudManager:
             value = json.loads(uncompressed)
         except (ValueError, json.JSONDecodeError, zlib.error) as exc:
             raise CloudError("Invalid usage payload", 409) from exc
-        if not isinstance(value, dict) or type(value.get("version")) is not int or value["version"] not in (1, 2):
+        if not isinstance(value, dict) or type(value.get("version")) is not int:
             raise CloudError("Unsupported usage payload", 409)
         return value
 
@@ -1627,11 +1612,9 @@ class CloudManager:
         return self._decode_usage_payload(box, f"usage-{kind}:{machine_id}:{payload_id}", encrypted, payload_id)
 
     def _v4_publish(self, client: WebDavClient, box: CryptoBox, force_full: bool = False) -> dict:
-        from monitor_usage_packs import UsageObjectReader
-        with UsageObjectReader(self, client, box, self.machine_id) as reader:
-            return self._v4_publish_objects(client, box, reader, force_full)
+        return self._v4_publish_objects(client, box, force_full)
 
-    def _v4_publish_objects(self, client, box, reader, force_full):
+    def _v4_publish_objects(self, client, box, force_full):
         machine_id = self.machine_id
         for path in ("usage/v4/heads", f"usage/v4/months/{machine_id}", f"usage/v4/days/{machine_id}", f"usage/v4/data/{machine_id}"):
             client.ensure_directories(path)
@@ -1646,10 +1629,7 @@ class CloudManager:
         uploaded, changed_days, consolidated = 0, set(), False
         for day, source in sorted(desired.items(), reverse=True):
             previous = old_catalog.get(day)
-            if previous and previous["logicalHash"] == source["logicalHash"] and (previous["layout"] == source["layout"] or previous["layout"] == "packed"):
-                if force_full:
-                    if v4_logical_hash(list(reader.entries(day, previous))) != previous["logicalHash"]:
-                        raise CloudError("Usage day logical digest does not match downloaded records", 409)
+            if previous and previous["layout"] == "packed" and day not in claims:
                 continue
             old_manifest = self._v4_day_manifest(client, box, machine_id, day, previous) if previous and previous["layout"] != "packed" else None
             consolidated |= bool(previous and previous["layout"] == "parts" and source["layout"] == "bulk")
@@ -1663,11 +1643,15 @@ class CloudManager:
                     client.transfer_category = "consolidation" if source["layout"] == "bulk" and previous and previous["layout"] == "parts" else "backfill" if previous is None and day < now_period[:10] else "payload"
                     self._put_usage_payload(client, box, "v4/data", machine_id, value)
                     uploaded += 1
-            manifest = {"version": 1, "machineId": machine_id, "day": day, "layout": source["layout"], "logicalHash": source["logicalHash"], "parts": parts}
+            if old_manifest is not None and old_manifest["layout"] == source["layout"] and old_manifest["parts"] == parts:
+                continue
+            manifest = {"version": 1, "machineId": machine_id, "day": day, "layout": source["layout"], "parts": parts}
+            if previous and "logicalHash" in previous:
+                manifest["logicalHash"] = previous["logicalHash"]
             published_manifests[day] = manifest
             client.transfer_category = "metadata"
             manifest_id, _ = self._put_usage_payload(client, box, "v4/days", machine_id, manifest)
-            catalog[day] = {"manifestId": manifest_id, "logicalHash": source["logicalHash"], "layout": source["layout"]}
+            catalog[day] = {key: manifest[key] for key in ("layout", "logicalHash") if key in manifest} | {"manifestId": manifest_id}
             changed_days.add(day)
         for day in old_catalog.keys() & removed:
             catalog.pop(day)
@@ -1736,8 +1720,6 @@ class CloudManager:
             if not item["name"].endswith(".enc"):
                 continue
             machine_id = item["name"][:-4]
-            if not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", machine_id):
-                continue
             if machine_id == self.machine_id or not force_full and item.get("etag") and remote.get(machine_id) == item["etag"] and self._usage_data.v4_cached_days(machine_id):
                 continue
             for attempt in range(2):
@@ -1750,7 +1732,8 @@ class CloudManager:
                     from monitor_usage_packs import UsageObjectReader
                     with UsageObjectReader(self, client, box, machine_id) as reader:
                         for day, reference in sorted(catalog.items()):
-                            if not force_full and cached.get(day, {}).get("logicalHash") == reference["logicalHash"]:
+                            identity = {key: value for key, value in reference.items() if key != "logicalHash"}
+                            if not force_full and cached.get(day, {}).get("reference") == identity:
                                 continue
                             manifest = self._v4_day_manifest(client, box, machine_id, day, reference)
                             client.transfer_category = "backfill" if day < _timestamp()[:10] and day not in cached else "payload"
@@ -1758,10 +1741,10 @@ class CloudManager:
                             if reference["layout"] == "packed":
                                 payloads = {"bulk": reader.entries(day, reference)}
                             else:
-                                required = set(manifest["parts"]) if force_full or not old_parts or "bulk" in manifest["parts"] or "bulk" in old_parts else {
+                                required = set(manifest["parts"]) if force_full else {
                                     part for part, payload_id in manifest["parts"].items() if old_parts.get(part) != payload_id}
                                 payloads = {part: reader.part(day, part, manifest["parts"][part]) for part in sorted(required)}
-                            self._usage_data.v4_apply_day(machine_id, manifest, payloads, force_full)
+                            self._usage_data.v4_apply_day(machine_id, manifest, payloads, force_full, reference=identity)
                         downloaded += reader.downloaded
                     self._usage_data.v4_remove_days(machine_id, set(cached) - set(catalog))
                     remote[machine_id] = etag

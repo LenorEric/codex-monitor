@@ -37,7 +37,8 @@ class LocalContractV4Tests(unittest.TestCase):
             self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [9])
             with index.transaction() as db:
                 self.assertEqual(db.execute("SELECT event_at FROM processing_display").fetchone()[0], 1893456000)
-                self.assertIsNotNone(db.execute("SELECT 1 FROM delivery_dirty WHERE view='local' AND account='a'").fetchone())
+                # Updating a retired display row no longer schedules current delivery work.
+                self.assertIsNone(db.execute("SELECT 1 FROM delivery_dirty WHERE view='local' AND account='a'").fetchone())
             self.assertEqual(quota.read_bytes(), b'{"original":"quota"}\n')
             self.assertEqual(ledger.read_bytes(), b'{"original":"ledger"}\n')
             self.assertEqual(monitor_migrations.migrate_history_data(*args, usage_sync_cache_path=cache, target_version=9), [])

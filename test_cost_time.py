@@ -3,11 +3,9 @@ import unittest
 from unittest import mock
 
 import monitor_migrations
-import test_delivery
 import test_processing
 from monitor_migrations import DATA_MIGRATION_STATE_FILENAME, migrate_history_data
-from monitor_dashboard import dashboard_cost_time
-from monitor_delivery import DAY
+from monitor_delivery import DAY, DashboardDelivery
 from monitor_projection import DashboardProjector
 
 
@@ -18,12 +16,18 @@ class CostTimeProcessingTests(unittest.TestCase):
     write = test_processing.ProcessingTests.write
     sync = test_processing.ProcessingTests.sync
 
+    def tokens(self, view):
+        delivery = DashboardDelivery(self.store.index)
+        delivery.prepare(1893542602, {"accounts": {"items": []}}, force=True)
+        with self.store.index.transaction() as db:
+            return delivery._tokens(db, view, "v3:account")
+
     def test_same_session_crosses_midnight_and_incremental_append_does_not_rebuild(self):
         accounts = {"items": [{"id": "slot", "label": "Account", "usageAccountId": "account"}]}
         self.sync()
         projector = DashboardProjector(self.store)
         projector.refresh(accounts, 1893456100)
-        first = projector.snapshot("local")["costTime"]
+        first = self.tokens("local")
         self.assertEqual(len(first), 1)
         event = self.event(2, 200)
         event["timestamp"] = "2030-01-02T00:02:00Z"
@@ -31,24 +35,24 @@ class CostTimeProcessingTests(unittest.TestCase):
         self.sync()
         with mock.patch.object(projector, "_rebuild", side_effect=AssertionError("append rebuilt account")):
             projector.refresh(accounts, 1893542600)
-        local, merged = projector.snapshot("local"), projector.snapshot("merged")
-        self.assertEqual(local["costTime"], merged["costTime"])
-        self.assertEqual(len(local["costTime"]), 2)
-        self.assertGreater(local["costTime"][1]["timestamp"] - local["costTime"][0]["timestamp"], DAY)
-        self.assertAlmostEqual(sum(row["totalCostUsd"] for row in local["costTime"]), local["tokenSessions"][0]["byModel"]["gpt-5.5"]["cost"]["totalCostUsd"])
+        local, merged = self.tokens("local"), self.tokens("merged")
+        self.assertEqual(local, merged)
+        self.assertEqual(len(local), 2)
+        self.assertGreater(local[1][1] - local[0][1], DAY)
+        self.assertAlmostEqual(sum(row[-1] for row in local) / 100000000, self.store.index.ledger_cost()[0]["totalCostUsd"])
         # Importing the same event from a second source must not double merged cost.
         ledger = self.store.index.rows("tokenLedger")
         with self.store.index.transaction() as db:
             for position, row in enumerate(ledger):
                 self.store.index.fact(db, "peer:duplicate", position, "tokenLedger", row)
         projector.refresh(accounts, 1893542601)
-        self.assertEqual(projector.snapshot("merged")["costTime"], merged["costTime"])
+        self.assertEqual(self.tokens("merged"), merged)
 
     def test_migration_rebuilds_from_facts_preserves_parser_state_and_is_retryable(self):
         self.sync()
         projector = DashboardProjector(self.store)
         projector.refresh({}, 1893456100)
-        before = projector.snapshot("local")["costTime"]
+        before = self.tokens("local")
         with self.store.index.transaction() as db:
             saved = {table: list(db.execute(f"SELECT * FROM {table}")) for table in ("processing_scan_sources", "processing_scan_events", "processing_effective")}
         # Point migration at the same index path used by this test store.
@@ -65,7 +69,7 @@ class CostTimeProcessingTests(unittest.TestCase):
             raise RuntimeError("interrupted")
         with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {10: interrupted}), self.assertRaisesRegex(RuntimeError, "interrupted"):
             migrate()
-        self.assertEqual(projector.snapshot("local")["costTime"], before)
+        self.assertEqual(self.tokens("local"), before)
         self.assertEqual(json.loads(state.read_text())["dataContractVersion"], 9)
         self.assertEqual(migrate(), [10])
         self.assertEqual(self.store.token_ledger_path.read_bytes(), ledger)
@@ -74,5 +78,5 @@ class CostTimeProcessingTests(unittest.TestCase):
                 self.assertEqual(list(db.execute(f"SELECT * FROM {table}")), rows)
             self.assertEqual(db.execute("SELECT COUNT(*) FROM processing_display").fetchone()[0], 0)
         projector.refresh({}, 1893456100)
-        self.assertEqual(projector.snapshot("local")["costTime"], before)
+        self.assertEqual(self.tokens("local"), before)
         self.assertEqual(migrate(), [])

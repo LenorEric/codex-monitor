@@ -197,6 +197,7 @@ def initialize_processing_index(path: Path) -> None:
                 DELETE FROM processing_effective_refs WHERE record_key=OLD.record_key;
             END;
             CREATE TABLE IF NOT EXISTS processing_changes (view TEXT NOT NULL, account TEXT NOT NULL, kind TEXT NOT NULL, record_key TEXT NOT NULL, event_at REAL, session TEXT NOT NULL, action TEXT NOT NULL, PRIMARY KEY(view,account,kind,record_key));
+            -- Empty compatibility schema for released display migrations; runtime uses delivery_* instead.
             CREATE TABLE IF NOT EXISTS processing_display_refs (
                 view TEXT NOT NULL,
                 account TEXT NOT NULL,
@@ -390,7 +391,13 @@ class ProcessingIndex:
         data = encode(row)
         if previous and previous[1] == data:
             return False
-        if previous:
+        extension = False
+        if kind == "quota" and row.get("quotaRunVersion") == 1 and previous:
+            old = json.loads(previous[1])
+            extension = old.get("quotaRunVersion") == 1 and all(
+                label in old["windows"] and window | {"lastAt": old["windows"][label]["lastAt"]} == old["windows"][label]
+                and window["lastAt"] >= old["windows"][label]["lastAt"] for label, window in row["windows"].items())
+        if previous and not extension:
             self.dirty(db, previous[0], "record correction", views=("merged",) if source.startswith("peer:") else ("local", "merged"))
         account = record_account_key(row)
         duplicate = db.execute("SELECT 1 FROM processing_facts WHERE source=? AND kind=? AND record_key=? LIMIT 1", (source, kind, record_key(kind, row))).fetchone()
@@ -413,8 +420,8 @@ class ProcessingIndex:
                 continue
             db.execute("INSERT OR REPLACE INTO processing_changes VALUES(?,?,?,?,?,?,?)", (view, account, kind, record_key(kind, row),
                 parse_timestamp(row.get("checkedAt") or row.get("occurredAt") or session.get("updatedAt")), str(session.get("sessionId") or ""),
-                "replace" if previous or duplicate else "append"))
-        if not source.startswith("peer:"):
+                "extend" if extension else "replace" if previous or duplicate else "append"))
+        if not source.startswith("peer:") and not (kind == "quota" and row.get("quotaRunVersion") == 1):
             db.execute("INSERT OR REPLACE INTO processing_pending_records VALUES(?,?,?)", (record_key(kind, row), kind, data))
         self.metrics["recordsImported"] += 1
         return True
@@ -446,7 +453,8 @@ class ProcessingIndex:
                     continue
                 self.dirty(db, record_account_key(json.loads(data)), "record removal")
                 db.execute("DELETE FROM processing_facts WHERE source=? AND position=?", (source, position))
-                db.execute("INSERT OR REPLACE INTO processing_pending_records VALUES(?,?,NULL)", (key, kind))
+                if kind != "quota" or json.loads(data).get("quotaRunVersion") != 1:
+                    db.execute("INSERT OR REPLACE INTO processing_pending_records VALUES(?,?,NULL)", (key, kind))
                 if kind == "tokenLedger":
                     self._effective(db, key)
                 changed = corrected = True
@@ -533,13 +541,13 @@ class ProcessingIndex:
         self.put(db, f"ledgerCost:{source}", [totals, by_model])
 
     def _effective(self, db, key):
-        from monitor_usage_sync import canonical_ledger_row, _ledger_content, content_hash, record_account_key
+        from monitor_usage_sync import canonical_ledger_row, record_account_key
         from monitor_token_ledger import token_sessions_from_ledger
         previous = db.execute("SELECT account,session,event_at,data FROM processing_effective WHERE record_key=?", (key,)).fetchone()
         rows = [json.loads(row[0]) for row in db.execute(
             "SELECT data FROM processing_facts WHERE kind='tokenLedger' AND record_key=? ORDER BY source,position", (key,))]
         rows = [canonical_ledger_row(row) for row in rows if row.get("recordType") == "usage" and not any(key in row for key in ("sourceCoverage", "sourceTotals"))]
-        winner = max(enumerate(rows), key=lambda item: (content_hash(_ledger_content(item[1])), item[0]))[1] if rows else None
+        winner = rows[0] if rows else None  # ORDER BY source puts local:tokenLedger before peer:*.
         if previous and winner is not None and previous[3] == encode(winner):
             return
         if winner is None:

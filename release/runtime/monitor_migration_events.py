@@ -50,7 +50,7 @@ def migrate_event_only(paths):
     import monitor_sample_store as samples
     from monitor_processing import ProcessingIndex, initialize_processing_index
     from monitor_token_ledger import _usage_records
-    from monitor_usage_sync import initialize_v4_cache, v4_logical_hash
+    from monitor_usage_sync import initialize_v4_cache
     initialize_v4_cache(paths["processing_index"])
     initialize_processing_index(paths["processing_index"])
     with closing(samples.connect(paths["processing_index"])) as db, db:
@@ -106,9 +106,6 @@ def migrate_event_only(paths):
         for account, in db.execute("SELECT DISTINCT account FROM processing_facts").fetchall():
             for view in ("local", "merged"):
                 db.execute("INSERT OR REPLACE INTO processing_dirty VALUES(?,?,?)", (view, account, "event-only migration"))
-        for machine, day in db.execute("SELECT machine_id,day FROM remote_days").fetchall():
-            entries = [json.loads(data) for (data,) in db.execute("SELECT record_json FROM remote_records WHERE machine_id=? AND day=?", (machine, day))]
-            db.execute("UPDATE remote_days SET logical_hash=?,layout_json='{}' WHERE machine_id=? AND day=?", (v4_logical_hash(entries), machine, day))
         # Hashes describe the complete transport record, not only its shared sample.
         for key, data in db.execute("SELECT record_key,record_json FROM local_records").fetchall():
             db.execute("UPDATE local_record_refs SET content_hash=? WHERE record_key=?", (content_hash(json.loads(data)), key))
@@ -150,7 +147,6 @@ def finish_cloud_event_migration(client):
 
 def migrate_cloud_event_only(client):
     from monitor_cloud import CloudError, CryptoBox
-    from monitor_usage_sync import v4_logical_hash
     from monitor_migrations import convert_reset_timestamps
     try:
         descriptor = client.get("crypto.json")[0]
@@ -164,7 +160,6 @@ def migrate_cloud_event_only(client):
     box = CryptoBox(manager.config()["webdav"]["encryptionPassphraseHash"], json.loads(descriptor))
     import sqlite3
     import time
-    from monitor_streaming import logical_hash_sorted
     from monitor_usage_packs import HistoricalPackWriter, UsageObjectReader
     today = v4_period(time.time())[:10]
     for filename in manager._optional_remote_list(client, "usage/v4/heads"):
@@ -179,20 +174,14 @@ def migrate_cloud_event_only(client):
         # SQLite owns and removes this temporary database when the connection closes.
         with closing(sqlite3.connect("")) as db:
             db.execute("CREATE TABLE records (record_key TEXT PRIMARY KEY, day TEXT NOT NULL, period TEXT NOT NULL, data BLOB NOT NULL)")
-            with UsageObjectReader(manager, client, box, machine, validate=False) as reader:
+            with UsageObjectReader(manager, client, box, machine) as reader:
                 for day, reference in sorted(catalog.items()):
                     for entry in reader.entries(day, reference):
                         validate_v4_envelope(entry, machine)
-                        if entry["collectionPeriod"][:10] != day:
-                            raise CloudError("Migrated record has the wrong collection date", 409)
                         db.execute("INSERT INTO records VALUES(?,?,?,?)", (entry["recordKey"], day, entry["collectionPeriod"], canonical_json(entry)))
                         record = entry.get("record", {})
                         if record.get("kind") == "tokenLedger" and _retired(record.get("row", {})):
                             affected.add(_session_identity(record["row"]))
-            for day, reference in catalog.items():
-                entries = (json.loads(data) for data, in db.execute("SELECT data FROM records WHERE day=? ORDER BY record_key", (day,)))
-                if logical_hash_sorted(entries) != reference["logicalHash"]:
-                    raise CloudError("Migrated usage day digest does not match its records", 409)
             # A retained source can affect legacy events in any other day partition.
             for key, data in db.execute("SELECT record_key,data FROM records"):
                 entry = json.loads(data)
@@ -208,11 +197,11 @@ def migrate_cloud_event_only(client):
                     db.execute("UPDATE records SET data=? WHERE record_key=?", (canonical_json(entry), key))
             db.execute("CREATE INDEX chronological_records ON records(period,record_key)")
             days = [day for day, in db.execute("SELECT DISTINCT day FROM records ORDER BY day")]
-            hashes = {day: logical_hash_sorted(json.loads(data) for data, in db.execute("SELECT data FROM records WHERE day=? ORDER BY record_key", (day,))) for day in days}
+            legacy_hashes = {day: {"logicalHash": reference["logicalHash"]} for day, reference in catalog.items() if "logicalHash" in reference}
             with HistoricalPackWriter(manager, client, box, machine) as writer:
                 for day, data in db.execute("SELECT day,data FROM records WHERE day<? ORDER BY period,record_key", (today,)):
                     writer.add(day, json.loads(data), data)
-                updated_catalog = {day: reference | {"logicalHash": hashes[day]} for day, reference in writer.finish().items()}
+                updated_catalog = {day: reference | legacy_hashes.get(day, {}) for day, reference in writer.finish().items()}
             active, manifests = None, {}
             for day in (day for day in days if day >= today):
                 parts = {}
@@ -223,10 +212,10 @@ def migrate_cloud_event_only(client):
                     parts[period] = manager._put_usage_payload(client, box, "v4/data", machine,
                         {"version": 1, "machineId": machine, "day": day, "partId": period, "records": [json.loads(data) for data, in db.execute(query, params)]})[0]
                 layout = "parts" if day == today else "bulk"
-                manifest = {"version": 1, "machineId": machine, "day": day, "layout": layout, "logicalHash": hashes[day], "parts": parts}
+                manifest = {"version": 1, "machineId": machine, "day": day, "layout": layout, "parts": parts} | legacy_hashes.get(day, {})
                 manifests[day] = manifest
                 digest = manager._put_usage_payload(client, box, "v4/days", machine, manifest)[0]
-                reference = {"manifestId": digest, "logicalHash": hashes[day], "layout": layout}
+                reference = {"manifestId": digest, "layout": layout} | legacy_hashes.get(day, {})
                 if day == today:
                     active = {"day": day, **reference}
                 else:
@@ -316,18 +305,16 @@ def validate_sync_operation(operation: dict) -> None:
 
 
 def validate_v4_envelope(entry: dict, machine_id: str) -> None:
-    if not isinstance(entry, dict) or entry.get("sourceMachineId") != machine_id or not isinstance(entry.get("recordKey"), str) or not entry["recordKey"] or len(entry["recordKey"]) > 512 or not isinstance(entry.get("kind"), str) or not entry["kind"] or not isinstance(entry.get("schemaVersion"), int) or isinstance(entry["schemaVersion"], bool) or entry["schemaVersion"] < 1 or not isinstance(entry.get("record"), dict) or entry["record"].get("kind") != entry["kind"] or entry.get("contentSha256") != content_hash(entry["record"]) or not isinstance(entry.get("collectionPeriod"), str) or parse_timestamp(entry["collectionPeriod"]) is None or v4_period(parse_timestamp(entry["collectionPeriod"])) != entry["collectionPeriod"]:
-        raise ValueError("Invalid usage v4 record envelope")
-    if entry["kind"] in {"quota", "tokenLedger"}:
-        validate_sync_operation({"action": "upsert", "key": entry["recordKey"], "record": entry["record"]})
-        if sync_meta(entry["record"]["row"]).get("originMachineId") != machine_id or entry["schemaVersion"] != entry["record"]["row"].get("schemaVersion", 1) or entry.get("eventAt") != v4_record_envelope(machine_id, entry["recordKey"], entry["record"])["eventAt"]:
-            raise ValueError("Usage v4 record owner or schema does not match its envelope")
-    else:
-        _validate_sync_value(entry["record"])
-        if len(canonical_json(entry["record"])) > MAX_SYNC_RECORD_BYTES:
-            raise ValueError("Unknown synchronized usage record is too large")
-        if entry.get("eventAt") is not None and (not isinstance(entry["eventAt"], str) or parse_timestamp(entry["eventAt"]) is None):
-            raise ValueError("Unknown synchronized usage record has an invalid event time")
+    from monitor_usage_sync import require_usage_fields, validate_v4_envelope as validate_download
+    require_usage_fields(entry, sourceMachineId=str, recordKey=str, kind=str, schemaVersion=int,
+        record=dict, collectionPeriod=str, eventAt=(str, type(None)))
+    require_usage_fields(entry["record"], kind=str)
+    if entry["record"]["kind"] == "tokenLedger":
+        require_usage_fields(entry["record"], row=dict)
+        if entry["record"]["row"].get("recordType") == "sessionBaseline":
+            require_usage_fields(entry["record"]["row"], session=dict, sync=dict)
+            return
+    validate_download(entry, machine_id)
 
 
 

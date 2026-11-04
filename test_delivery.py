@@ -45,6 +45,10 @@ class InterpretationTests(unittest.TestCase):
         self.assertFalse(connected(base, ["b", 14401, 14401, 11, 1], "5h"))
         self.assertFalse(connected(base, ["b", 3600, 3600, 16, 1], "7d"))
 
+    def test_interval_eligibility_preserves_plan_boundaries_and_normalized_delta(self):
+        runs = usage_runs([point(0, 1, plan="pro"), point(100, 2, plan="pro"), point(200, 3, plan="plus"), point(300, 4, plan="plus")], "5h")
+        self.assertEqual([row[3:] for row in valid_intervals(runs)], [[20, 20], [1, 1]])
+
     def test_union_of_window_boundaries(self):
         intervals = {"5h": [["a", 0, 3, 1, 1], ["b", 3, 7, 1, 1]], "7d": [["c", 2, 6, 1, 1]]}
         events = [[str(t), t, "m", "default", 1, 2, 3, 4, 10] for t in (.5, 1, 2.5, 4, 5, 6.5)]
@@ -59,6 +63,23 @@ class InterpretationTests(unittest.TestCase):
         self.assertEqual(nearest(intervals, 16), 1)
         self.assertEqual(nearest(intervals, -100), 0)
         self.assertEqual(nearest(intervals, 100), 1)
+
+    def test_nearest_limits_distance_to_bounds_inclusively(self):
+        intervals = [["a", 1000, 2000], ["b", 4000, 5000]]
+        for stamp, expected in ((399, None), (400, 0), (1500, 0), (2600, 0), (2601, None), (3000, None), (3399, None), (3400, 1), (5600, 1), (5601, None)):
+            with self.subTest(stamp=stamp):
+                self.assertEqual(nearest(intervals, stamp), expected)
+                self.assertEqual(nearest(intervals, stamp, [2000, 5000]), expected)
+        self.assertEqual(nearest([["long", 0, 10000]], 5000), 0)
+        self.assertEqual(nearest([["a", 0, 100], ["b", 1300, 1400]], 700), 0)
+        self.assertIsNone(nearest([], 0))
+
+    def test_distant_costs_remain_in_token_totals_with_independent_windows(self):
+        intervals = {"5h": [["a", 1000, 1100, 1, 1]], "7d": [["b", 0, 10000, 1, 1]]}
+        events = [[str(t), t, "m", "default", 1, 0, 0, 0, 100] for t in (399, 400, 1050, 1700, 1701, 5000)]
+        self.assertEqual(sum(model[1] for row in chart_rows(events, intervals["5h"]) for model in row[6]), 300)
+        self.assertEqual(sum(model[1] for row in chart_rows(events, intervals["7d"]) for model in row[6]), 600)
+        self.assertEqual(sum(model[-1] for row in aggregate_tokens(events, intervals) for model in row[2]), 600)
 
     def test_flat_and_outside_costs_are_never_lost(self):
         events = [[str(t), t, "m", "default", 1, 0, 0, 0, 100] for t in (-10, 5, 15, 25, 50)]
@@ -83,14 +104,13 @@ class DeliveryTests(unittest.TestCase):
         self.index = ProcessingIndex(self.directory / "index.sqlite3")
         self.delivery = DashboardDelivery(self.index)
         self.events = []
-        self.projector = SimpleNamespace(_datasets=lambda *args: ([], self.events), store=SimpleNamespace(token_ledger_path=self.directory / "ledger"))
 
     def quota(self, stamp, value=10, view="local"):
         with self.index.transaction() as db:
             db.execute("INSERT OR REPLACE INTO processing_quota_points VALUES(?,?,?,?,?)", (view, "a", stamp, str(stamp), json.dumps(point(stamp, value))))
 
     def prepare(self, now=1000, **kwargs):
-        self.delivery.prepare(now, self.projector, {"accounts": {"items": []}}, **kwargs)
+        self.delivery.prepare(now, {"accounts": {"items": []}}, **kwargs)
         return json.loads(self.delivery.bulk(False))
 
     def test_bulk_has_both_views_and_no_protocol_number(self):
@@ -120,6 +140,24 @@ class DeliveryTests(unittest.TestCase):
         self.assertNotEqual(self.prepare(1004)["epoch"], bulk["epoch"])
         self.assertIsNone(self.delivery.replay(bulk["epoch"], bulk["cursors"]))
 
+    def test_local_event_replaces_already_delivered_remote_event(self):
+        from test_sync_contract_v3 import usage_row
+        remote = usage_row(machine="remote", account="v3:a", cost=9)
+        local = usage_row(account="v3:a", cost=1)
+        with self.index.transaction() as db:
+            self.index.fact(db, "peer:remote", 0, "tokenLedger", remote)
+            db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES('merged','v3:a')")
+        bulk = self.prepare()
+        with self.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT cost FROM delivery_tokens WHERE view='merged' AND account='v3:a'").fetchall(), [(900000000,)])
+            self.index.fact(db, "local:tokenLedger", 0, "tokenLedger", local)
+            self.assertEqual(json.loads(db.execute("SELECT data FROM processing_effective WHERE account='v3:a'").fetchone()[0])["cost"]["totalCostUsd"], 1)
+            db.execute("INSERT OR IGNORE INTO delivery_work SELECT view,account,kind,record_key FROM processing_changes")
+            db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT view,account FROM processing_dirty")
+        self.assertNotEqual(self.prepare(1002)["epoch"], bulk["epoch"])
+        with self.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT cost FROM delivery_tokens WHERE view='merged' AND account='v3:a'").fetchall(), [(100000000,)])
+
     def test_journal_expiry_requests_bulk(self):
         self.quota(10);bulk = self.prepare()
         self.quota(100);self.prepare(1002)
@@ -129,7 +167,7 @@ class DeliveryTests(unittest.TestCase):
     def test_idle_and_bulk_requests_do_not_reinterpret_history(self):
         self.quota(10);self.prepare()
         with mock.patch.object(self.delivery, "_account", side_effect=AssertionError("replay")):
-            self.assertFalse(self.delivery.prepare(1002, self.projector))
+            self.assertFalse(self.delivery.prepare(1002))
             self.assertTrue(self.delivery.bulk())
 
     def test_runtime_initialization_does_not_create_legacy_delivery_schema(self):
@@ -169,7 +207,6 @@ class DeliveryTests(unittest.TestCase):
         state._dashboard_signal_lock = threading.Lock()
         state._dashboard_cloud_pending = False
         state.dashboard_cache_event = threading.Event()
-        state.dashboard_cache_wait_seconds = lambda: 0
         state.status_payload = lambda: {}
         state.projector = None
         state.usage_data = SimpleNamespace(index=SimpleNamespace(maintain_disk_space=lambda: None), backup=SimpleNamespace(flush=lambda: None))
@@ -191,9 +228,11 @@ class DeliveryTests(unittest.TestCase):
         self.events = [{"schemaVersion": 2, "recordType": "usage", "eventId": "first", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z",
             "rawModel": "gpt-5.5", "tokens": empty_token_totals() | {"freshInputTokens": 10}, "cost": empty_cost_totals() | {"totalCostUsd": 1},
             "accountSlotId": "slot", "accountLabel": "Account", "sync": {"version": 1, "originMachineId": "m", "accountId": "a"}}]
+        with self.index.transaction() as db:
+            self.index.fact(db, "local:tokenLedger", 0, "tokenLedger", self.events[0])
         self.quota(1893456000, 10);self.quota(1893456100, 11)
         bulk = self.prepare()
-        event = self.events[0] | {"eventId": "new", "occurredAt": "2030-01-01T01:00:00Z"}
+        event = self.events[0] | {"eventId": "new", "occurredAt": "2030-01-01T00:11:40Z"}
         with self.index.transaction() as db:
             self.index.fact(db, "local:tokenLedger", 0, "tokenLedger", event)
             db.execute("INSERT INTO delivery_work VALUES('local','a','tokenLedger',?)", (record_key("tokenLedger", event),))
@@ -206,6 +245,63 @@ class DeliveryTests(unittest.TestCase):
         # New spending outside the increasing interval attaches to the preceding interval.
         charts = [row for row in packets if row["channel"] == "chart:5h"][0]["data"]["set"]
         self.assertEqual(charts[0][6][0][1], 200000000)
+
+    def test_distant_live_cost_is_retained_and_later_quota_can_attribute_it(self):
+        from monitor_usage_sync import record_key
+        self.quota(1000, 10);self.quota(1100, 11)
+        bulk = self.prepare()
+        event = {"schemaVersion": 2, "recordType": "usage", "eventId": "distant", "sessionId": "s", "occurredAt": 1701,
+            "rawModel": "m", "tokens": empty_token_totals(), "cost": empty_cost_totals() | {"totalCostUsd": 1},
+            "sync": {"version": 1, "originMachineId": "m", "accountId": "a"}}
+        with self.index.transaction() as db:
+            self.index.fact(db, "local:tokenLedger", 0, "tokenLedger", event)
+            db.execute("INSERT INTO delivery_work VALUES('local','a','tokenLedger',?)", (record_key("tokenLedger", event),))
+            db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES('local','a')")
+        self.prepare(1002)
+        packets = self.delivery.replay(bulk["epoch"], bulk["cursors"])
+        self.assertEqual([row["channel"] for row in packets], ["tokens"])
+        with self.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT interval_5h,interval_7d FROM delivery_token_refs WHERE view='local'").fetchone(), (None, None))
+            self.assertEqual(db.execute("SELECT SUM(cost) FROM delivery_tokens WHERE view='local'").fetchone()[0], 100000000)
+        self.quota(1800, 12)
+        self.prepare(1004)
+        with self.index.transaction() as db:
+            self.assertTrue(all(db.execute("SELECT interval_5h,interval_7d FROM delivery_token_refs WHERE view='local'").fetchone()))
+            for window in ("5h", "7d"):
+                rows = [json.loads(row[0]) for row in db.execute("SELECT models FROM delivery_charts WHERE view='local' AND window=?", (window,))]
+                self.assertEqual(sum(model[1] for row in rows for model in row), 100000000)
+
+    def test_rule_upgrade_recalculates_stored_attribution_without_sampling(self):
+        import monitor_interpretation
+        self.quota(1000, 10);self.quota(1100, 11)
+        event = {"schemaVersion": 2, "recordType": "usage", "eventId": "old-distant", "sessionId": "s", "occurredAt": 1701, "rawModel": "m",
+            "tokens": empty_token_totals(), "cost": empty_cost_totals() | {"totalCostUsd": 1}, "sync": {"version": 1, "originMachineId": "m", "accountId": "a"}}
+        with self.index.transaction() as db:
+            self.index.fact(db, "local:tokenLedger", 0, "tokenLedger", event)
+        with mock.patch.object(monitor_interpretation, "MAX_ATTRIBUTION_DISTANCE_SECONDS", float("inf")):
+            old_bulk = self.prepare()
+        with self.index.transaction() as db:
+            tokens = db.execute("SELECT * FROM delivery_tokens").fetchall()
+            db.execute("UPDATE delivery_meta SET value='1' WHERE name='attributionRule'")
+            from monitor_usage_sync import record_key
+            queued = event | {"eventId": "queued", "occurredAt": 1100}
+            self.index.fact(db, "local:tokenLedger", 1, "tokenLedger", queued)
+            db.execute("INSERT OR IGNORE INTO delivery_work VALUES('local','a','tokenLedger',?)", (record_key("tokenLedger", queued),))
+        with mock.patch("monitor_sampling.sample_rows", side_effect=AssertionError("rule upgrade replayed sampling")):
+            self.index = ProcessingIndex(self.index.path)
+            self.delivery = DashboardDelivery(self.index)
+            self.assertIsNone(self.delivery.snapshot)
+            rebuilt = self.prepare(1002)
+            self.assertNotEqual(rebuilt["epoch"], old_bulk["epoch"])
+            self.assertIsNone(self.delivery.replay(old_bulk["epoch"], old_bulk["cursors"]))
+        with self.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT * FROM delivery_tokens WHERE id='old-distant'").fetchall(), tokens)
+            self.assertEqual(db.execute("SELECT interval_5h,interval_7d FROM delivery_token_refs WHERE view='local' AND id='old-distant'").fetchone(), (None, None))
+            self.assertEqual(db.execute("SELECT SUM(cost) FROM delivery_tokens WHERE view='local'").fetchone()[0], 200000000)
+            self.assertTrue(all(json.loads(row[0]) == [["m", 100000000, 1.0]] for row in db.execute("SELECT models FROM delivery_charts")))
+        # The rebuilt snapshot is reused on subsequent startups.
+        self.index = ProcessingIndex(self.index.path)
+        self.assertIsNotNone(DashboardDelivery(self.index).snapshot)
 
     @unittest.skipUnless(shutil.which("node"), "Node.js is required")
     def test_real_http_bulk_and_websocket_replay(self):

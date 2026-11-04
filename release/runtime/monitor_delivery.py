@@ -10,7 +10,7 @@ from contextlib import closing
 
 import monitor_sample_store as samples
 from monitor_common import parse_timestamp
-from monitor_interpretation import WINDOWS, aggregate_tokens, chart_rows, token_row, usage_runs, valid_intervals
+from monitor_interpretation import ATTRIBUTION_RULE_VERSION, WINDOWS, aggregate_tokens, chart_rows, token_row, usage_runs, valid_intervals
 
 DAY = 86400
 JOURNAL_BYTES = 64 * 1024 * 1024
@@ -237,7 +237,9 @@ def initialize_delivery(db):
             DELETE FROM delivery_token_refs WHERE view=OLD.view AND account=OLD.account AND id=OLD.id;
         END;
     """)
-    for name, table in (("processing_quota_points", "processing_quota_point_refs"), ("processing_display", "processing_display_refs")):
+    for action in ("insert", "update", "delete"):
+        db.execute(f"DROP TRIGGER IF EXISTS delivery_processing_display_{action}")
+    for name, table in (("processing_quota_points", "processing_quota_point_refs"),):
         target = table if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() else name
         for action, ref in (("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")):
             db.execute(f"DROP TRIGGER IF EXISTS delivery_{name}_{action.lower()}")
@@ -250,8 +252,23 @@ def initialize_delivery(db):
         db.execute("INSERT OR IGNORE INTO delivery_meta VALUES(?, '0')", (stream,))
     if not db.execute("SELECT 1 FROM delivery_meta WHERE name='initialized'").fetchone():
         db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT DISTINCT view,account FROM processing_quota_points")
-        db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT DISTINCT view,account FROM processing_display")
+        db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT 'local',account FROM processing_facts UNION SELECT 'merged',account FROM processing_facts")
         db.execute("INSERT INTO delivery_meta VALUES('initialized','1')")
+
+    if db.execute("SELECT value FROM delivery_meta WHERE name='attributionRule'").fetchone() != (str(ATTRIBUTION_RULE_VERSION),):
+        request_attribution_rebuild(db)
+
+
+def request_attribution_rebuild(db):
+    """Recalculate memberships/charts from retained tokens without replaying quota sampling."""
+    db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT view,account FROM delivery_accounts UNION SELECT view,account FROM delivery_token_refs UNION SELECT view,account FROM processing_quota_points")
+    # Force full attribution while preserving queued token additions.
+    db.execute("INSERT OR IGNORE INTO delivery_work SELECT view,account,'attribution',? FROM delivery_dirty", (str(ATTRIBUTION_RULE_VERSION),))
+    db.execute("DELETE FROM delivery_snapshot")
+    # Bulk token grouping also changes; reconnecting clients must replace their old aggregates.
+    db.execute("UPDATE delivery_meta SET value=? WHERE name='epoch'", (uuid.uuid4().hex,))
+    db.execute("DELETE FROM delivery_journal")
+    db.execute("INSERT OR REPLACE INTO delivery_meta VALUES('attributionRule',?)", (str(ATTRIBUTION_RULE_VERSION),))
 
 
 def numeric_state(value):
@@ -310,16 +327,19 @@ class DashboardDelivery:
     def _tokens(db, view, account):
         return [list(row) for row in db.execute("SELECT id,at,model,tier,fresh,cached,output,cache_write,cost FROM delivery_tokens WHERE view=? AND account=? ORDER BY at,id", (view, account))]
 
-    def _account(self, db, projector, view, account, now):
+    def _account(self, db, view, account, now):
         existing = db.execute("SELECT legacy,label FROM delivery_accounts WHERE view=? AND account=?", (view, account)).fetchone()
         work = list(db.execute("SELECT kind,record_key FROM delivery_work WHERE view=? AND account=?", (view, account)))
         events = []
         label = existing[1] if existing else "Unknown"
         if existing is None or self.cloud_pending:
-            if projector is not None:
-                _, events = projector._datasets(db, view, account)
+            events = [json.loads(data) for source, data in db.execute("SELECT source,data FROM processing_facts WHERE account=? AND kind='tokenLedger' ORDER BY source,position", (account,))
+                if source == "local:tokenLedger" or view == "merged" and source.startswith("peer:")]
+            if view == "merged":
+                from monitor_usage_sync import merge_token_ledger_rows
+                events = merge_token_ledger_rows(events)
             label = next((row.get("accountLabel") or (row.get("session") or {}).get("accountLabel") for row in reversed(events) if row.get("accountLabel") or (row.get("session") or {}).get("accountLabel")), label)
-        elif projector is not None:
+        else:
             for kind, key in work:
                 if kind != "tokenLedger":
                     continue
@@ -342,7 +362,13 @@ class DashboardDelivery:
         additions, added_rows = [], []
         for event in events:
             row = token_row(event)
-            if row is not None and not db.execute("SELECT 1 FROM delivery_token_refs WHERE view=? AND account=? AND id=?", (view, account, row[0])).fetchone():
+            if row is None:
+                continue
+            previous = db.execute("SELECT id,at,model,tier,fresh,cached,output,cache_write,cost FROM delivery_token_payloads WHERE account=? AND id=?", (account, row[0])).fetchone()
+            if previous is not None and previous != tuple(row):
+                db.execute("DELETE FROM delivery_tokens WHERE view=? AND account=? AND id=?", (view, account, row[0]))
+                self.force_epoch = True
+            if previous != tuple(row) or not db.execute("SELECT 1 FROM delivery_token_refs WHERE view=? AND account=? AND id=?", (view, account, row[0])).fetchone():
                 db.execute("INSERT INTO delivery_tokens VALUES(?,?,?,?,?,?,?,?,?,?,?)", (view, account, *row))
                 additions.append([row[0], row[1], [[row[2], row[3], *row[4:]]]])
                 added_rows.append(row)
@@ -371,7 +397,7 @@ class DashboardDelivery:
                 if (latest[6] if latest else None) != (previous[6] if previous else None):
                     self._packet(db, view, "quota:" + window, account, [latest[6] if latest else None], now)
             intervals[window] = valid_intervals(runs)
-        fast_tokens = existing is not None and not self.cloud_pending and work and all(kind == "tokenLedger" for kind, _ in work)
+        fast_tokens = existing is not None and not self.cloud_pending and not self.force_epoch and work and all(kind == "tokenLedger" for kind, _ in work)
         tokens = None if fast_tokens else self._tokens(db, view, account)
         for window, values in intervals.items():
             from monitor_interpretation import nearest
@@ -423,18 +449,18 @@ class DashboardDelivery:
         db.execute("DELETE FROM delivery_dirty WHERE view=? AND account=?", (view, account))
         self.metrics["accountsPrepared"] += 1
 
-    def prepare(self, now=None, projector=None, status=None, force=False):
+    def prepare(self, now=None, status=None, force=False):
         with self.lock:
-            return self._prepare(now, projector, status, force)
+            return self._prepare(now, status, force)
 
-    def _prepare(self, now=None, projector=None, status=None, force=False):
+    def _prepare(self, now=None, status=None, force=False):
         now = time.time() if now is None else now
         started = time.perf_counter()
         with self.index.transaction() as db:
             self.force_epoch = False
             cursors = self.cursors(db)
             for view, account in list(db.execute("SELECT view,account FROM delivery_dirty")):
-                self._account(db, projector, view, account, now)
+                self._account(db, view, account, now)
             if status is not None:
                 from monitor_dashboard import dashboard_safe_json
                 state = numeric_state(dashboard_safe_json(status))

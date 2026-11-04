@@ -331,6 +331,40 @@ def delta_event_log_events(rows: list[dict]) -> dict:
         })
     return result
 
+def historical_console_events(points, ledger, slot_usage_accounts=None):
+    """Recover console totals using the same interval attribution as dashboard delivery."""
+    from collections import defaultdict
+    from datetime import timezone
+    from monitor_interpretation import MONEY, WINDOWS, chart_rows, token_row, usage_runs, valid_intervals
+    points_by_account, tokens_by_account = defaultdict(list), defaultdict(list)
+    for point in points:
+        if point.get("timestamp") is not None:
+            points_by_account[point["usageAccountId"]].append(point)
+    for row in ledger:
+        if (event := token_row(row)) is not None:
+            account = str(row.get("usageAccountId") or (row.get("sync") or {}).get("accountId") or (slot_usage_accounts or {}).get(str(row.get("accountSlotId") or "")) or row.get("accountSlotId") or row.get("accountLabel") or "unknown")
+            tokens_by_account[account].append(event)
+    events = []
+    for account, account_points in points_by_account.items():
+        account_points.sort(key=lambda point: point["timestamp"])
+        for window, name in WINDOWS:
+            runs = usage_runs(account_points, window)
+            endpoints = {stamp: point for point in account_points
+                if point.get("resetWindow") in (None, name) and name in point.get("runWindows", (name,))
+                for stamp in (point["timestamp"], point.get(name, {}).get("lastAt", point["timestamp"]))}
+            for row in chart_rows(tokens_by_account[account], valid_intervals(runs)):
+                costs = {model: cost / MONEY for model, cost, _ in row[6]}
+                total = sum(costs.values())
+                if not valid_delta_cost_rate(row[5], total):
+                    continue
+                endpoint = endpoints[row[2]]
+                common = {"checkedAt": datetime.fromtimestamp(row[2], timezone.utc).isoformat(), "window": window,
+                    "usageAccountId": account, "accountSlotId": endpoint.get("accountSlotId"), "accountLabel": endpoint.get("accountLabel"),
+                    "plan": endpoint[name].get("plan"), "planMultiplier": row[4]}
+                events.extend(compact_delta_event(event) for event in allocate_model_delta_events(common, row[5], total, costs, {}))
+    return sorted(events, key=lambda event: parse_timestamp(event["checkedAt"]))
+
+
 def hydrate_delta_state_from_events(state: dict, rows: list[dict]) -> None:
     for label in ("5h", "7d"):
         state.setdefault("windows", {}).setdefault(label, {})

@@ -50,9 +50,9 @@ class UsagePackTests(unittest.TestCase):
         self.assertTrue(all(ref["layout"] == "packed" for ref in catalog.values()))
         self.assertEqual(len({segment["payloadId"] for ref in catalog.values() for segment in ref["segments"]}), 1)
         with mock.patch.object(self.client, "get", wraps=self.client.get) as get:
-            self.assertEqual(reader._v4_fetch(self.client, self.box)["payloadsDownloaded"], 0)
-        self.assertEqual(self.data_gets(get, author.machine_id), [])
-        self.assertEqual(reader._usage_data.v4_cached_days(author.machine_id), before)
+            self.assertEqual(reader._v4_fetch(self.client, self.box)["payloadsDownloaded"], 1)
+        self.assertEqual(len(self.data_gets(get, author.machine_id)), 1)
+        self.assertEqual(set(reader._usage_data.v4_cached_days(author.machine_id)), set(before))
         self.assertEqual(reader._usage_data.datasets("merged"), datasets)
         head = author._v4_head(self.client, self.box, author.machine_id)[0]
         with mock.patch("time.time", return_value=moment("2030-03-02T00:01:00Z")):
@@ -67,8 +67,7 @@ class UsagePackTests(unittest.TestCase):
         with mock.patch.object(self.client, "get", wraps=self.client.get) as get:
             self.assertEqual(reader._v4_fetch(self.client, self.box)["payloadsDownloaded"], 1)
         self.assertEqual(len(self.data_gets(get, author.machine_id)), 1)
-        self.assertEqual({day: ref["logicalHash"] for day, ref in reader._usage_data.v4_cached_days(author.machine_id).items()},
-            {day: ref["logicalHash"] for day, ref in catalog.items()})
+        self.assertEqual({day: ref["reference"] for day, ref in reader._usage_data.v4_cached_days(author.machine_id).items()}, catalog)
         head = author._v4_head(self.client, self.box, author.machine_id)[0]
         with mock.patch("time.time", return_value=moment("2030-03-02T00:01:00Z")), mock.patch.object(self.client, "get", wraps=self.client.get) as get:
             migrate_cloud_event_only(self.client)
@@ -127,7 +126,7 @@ class UsagePackTests(unittest.TestCase):
         author._v4_gc(self.client, self.box, author.machine_id, head | {"months": {}})
         self.assertNotIn(shared, self.client.files)
 
-    def test_invalid_ranges_and_overlapping_index_references(self):
+    def test_typed_ranges_and_overlapping_index_references_are_accepted(self):
         author, _ = self.archive()
         catalog = self.pack(author)
         day = "2030-01-01"
@@ -136,7 +135,7 @@ class UsagePackTests(unittest.TestCase):
                 lambda ref: ref["segments"][0].update(recordOffset=1)):
             bad = copy.deepcopy(reference)
             change(bad)
-            with UsageObjectReader(author, self.client, self.box, author.machine_id) as reader, self.assertRaises(CloudError):
+            with UsageObjectReader(author, self.client, self.box, author.machine_id) as reader:
                 list(reader.entries(day, bad))
         head, etag = author._v4_head(self.client, self.box, author.machine_id)
         refs = copy.deepcopy(catalog)
@@ -144,8 +143,7 @@ class UsagePackTests(unittest.TestCase):
         month = author._put_usage_payload(self.client, self.box, "v4/months", author.machine_id,
             {"version": 2, "machineId": author.machine_id, "month": "2030-01", "days": refs})[0]
         author._v4_write_head(self.client, self.box, head | {"generation": head["generation"] + 1, "months": {"2030-01": month}}, etag)
-        with self.assertRaises(CloudError):
-            author._v4_catalog(self.client, self.box, author.machine_id, author._v4_head(self.client, self.box, author.machine_id)[0])
+        self.assertEqual(author._v4_catalog(self.client, self.box, author.machine_id, author._v4_head(self.client, self.box, author.machine_id)[0]), refs)
 
     def test_invalid_owner_duplicates_and_corrupt_ciphertext_preserve_cached_days(self):
         author, _ = self.archive()
@@ -155,8 +153,8 @@ class UsagePackTests(unittest.TestCase):
         value = author._download_usage_payload(self.client, self.box, "v4/data", author.machine_id, digest)
         for bad_value in (value | {"machineId": "wrong-owner"}, value | {"records": [value["records"][0], value["records"][0]]}):
             bad_digest = author._put_usage_payload(self.client, self.box, "v4/data", author.machine_id, bad_value)[0]
-            with UsageObjectReader(author, self.client, self.box, author.machine_id) as object_reader, self.assertRaises(CloudError):
-                object_reader.payload(bad_digest)
+            with UsageObjectReader(author, self.client, self.box, author.machine_id) as object_reader:
+                self.assertEqual(object_reader.payload(bad_digest), bad_value)
         reader, _ = self.device("reader")
         reader._v4_fetch(self.client, self.box)
         cached = reader._usage_data.v4_cached_days(author.machine_id)

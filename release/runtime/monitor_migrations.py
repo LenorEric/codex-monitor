@@ -21,7 +21,7 @@ from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 20
+DATA_CONTRACT_VERSION = 21
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 CLOUD_DATA_CONTRACT_VERSION = 4
@@ -32,11 +32,12 @@ class MigrationError(RuntimeError):
     pass
 
 
-def request_migration_rebuild(paths: dict[str, Path], reason: str, *, sampling: bool = False) -> None:
+def request_migration_rebuild(paths: dict[str, Path], reason: str, *, sampling: bool = False, delivery_only: bool = False) -> None:
     """Explicitly queue one rebuild for the final representation of a cascade.
 
     The request commits with the migration's protected database, so an interrupted
-    later step does not lose it. Representation-only steps need not request one.
+    later step does not lose it. delivery_only preserves quota sampling/projections;
+    a full or sampling request in the same cascade takes precedence.
     """
     if "processing_index" not in paths or not paths["processing_index"].exists():
         return  # A fresh store has no derived results to preserve.
@@ -44,9 +45,10 @@ def request_migration_rebuild(paths: dict[str, Path], reason: str, *, sampling: 
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_meta'").fetchone():
             return
         row = db.execute("SELECT value FROM processing_meta WHERE name='migrationRebuildPending'").fetchone()
-        pending = json.loads(row[0]) if row else {"reasons": [], "sampling": False}
+        pending = json.loads(row[0]) if row else {"reasons": [], "sampling": False, "projection": False}
         if reason not in pending["reasons"]:
             pending["reasons"].append(reason)
+        pending["projection"] = pending.get("projection", True) or not delivery_only or sampling
         pending["sampling"] |= sampling
         db.execute("INSERT OR REPLACE INTO processing_meta VALUES('migrationRebuildPending',?)", (json.dumps(pending),))
 
@@ -62,10 +64,13 @@ def _apply_migration_rebuild(paths: dict[str, Path]) -> None:
         if row is None:
             return
         pending = json.loads(row[0])
-        for view in ("local", "merged"):
+        for view in ("local", "merged") if pending.get("projection", True) else ():
             db.execute("INSERT OR REPLACE INTO processing_dirty SELECT ?,account,? FROM processing_facts GROUP BY account", (view, "; ".join(pending["reasons"])))
             if pending["sampling"] and db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_sampling_changes'").fetchone():
                 db.execute("INSERT OR IGNORE INTO processing_sampling_changes SELECT ?,account,'' FROM processing_facts WHERE kind='quota' GROUP BY account", (view,))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_meta'").fetchone():
+            from monitor_delivery import request_attribution_rebuild
+            request_attribution_rebuild(db)
         db.execute("DELETE FROM processing_meta WHERE name='migrationRebuildPending'")
 
 
@@ -564,6 +569,26 @@ def _migrate_history_to_v20(paths: dict[str, Path]) -> None:
     __import__("monitor_migration_events").migrate_event_only(paths)
 
 
+def _migrate_history_to_v21(paths: dict[str, Path]) -> None:
+    """Retire duplicate projections and queue bounded-distance cost attribution."""
+    if not paths["processing_index"].exists():
+        return
+    with closing(samples.connect(paths["processing_index"])) as db, db:
+        # Released migrations still use the empty compatibility schema.
+        for action in ("insert", "update", "delete"):
+            db.execute(f"DROP TRIGGER IF EXISTS delivery_processing_display_{action}")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_display'").fetchone():
+            db.execute("DELETE FROM processing_display")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_cost_ranges'").fetchone():
+            db.execute("DELETE FROM processing_cost_ranges")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_projections'").fetchone():
+            db.execute("UPDATE processing_projections SET data='{}'")
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_meta'").fetchone():
+            db.execute("DELETE FROM processing_meta WHERE name='displayRevision' OR name LIKE 'displayStats:%'")
+
+    request_migration_rebuild(paths, "ten-minute cost attribution limit", delivery_only=True)
+
+
 DATA_MIGRATIONS = {
     1: _migrate_history_to_v1,
     2: _migrate_history_to_v2,
@@ -585,6 +610,7 @@ DATA_MIGRATIONS = {
     18: _with_migration_rebuild(_migrate_history_to_v18, "quota reset boundaries and delivery format", sampling=True),
     19: _migrate_history_to_v19,
     20: _with_migration_rebuild(_migrate_history_to_v20, "event-only and independent quota storage migration"),
+    21: _migrate_history_to_v21,
 }
 
 

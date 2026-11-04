@@ -76,9 +76,8 @@ class SyncContractV3Tests(unittest.TestCase):
         with self.assertRaises(ValueError):
             canonical_ledger_row(legacy)
         canonical = canonical_ledger_row(converter.row("tokenLedger", legacy))
-        merged, conflicts = merge_token_ledger_rows([canonical])
+        merged = merge_token_ledger_rows([canonical])
         self.assertEqual(canonical, merged[0])
-        self.assertEqual(conflicts, [])
         self.assertEqual(canonical["cost"]["totalCostUsd"], 1.25)
         self.assertFalse({"pricingId", "pricingBasis", "sourceTotals"} & set(canonical))
         self.assertFalse({"recordId", "localOnly"} & set(canonical["sync"]))

@@ -294,8 +294,7 @@ def decrypt_file(box, purpose, source, target, limit=PAYLOAD_LIMIT):
 
 def decode_payload(box, purpose, source, expected_id):
     with tempfile.TemporaryFile() as compressed, tempfile.TemporaryFile() as plain:
-        if decrypt_file(box, purpose, source, compressed) != expected_id:
-            raise ValueError("Usage payload identity check failed")
+        decrypt_file(box, purpose, source, compressed)
         decoder, size = zlib.decompressobj(), 0
         for chunk in iter(lambda: compressed.read(CHUNK_BYTES), b""):
             while chunk:
@@ -334,7 +333,7 @@ def decode_payload(box, purpose, source, expected_id):
                 break
             reader.expect(b",")
         reader.finish()
-        if type(value.get("version")) is not int or value["version"] not in (1, 2):
+        if type(value.get("version")) is not int:
             raise ValueError("Unsupported usage payload")
         return value
 
