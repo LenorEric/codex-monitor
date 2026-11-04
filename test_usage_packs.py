@@ -34,7 +34,7 @@ class UsagePackTests(unittest.TestCase):
 
     def pack(self, author):
         with mock.patch("time.time", return_value=moment("2030-03-02T00:01:00Z")):
-            ensure_cloud_contract(self.client)
+            ensure_cloud_contract(self.client, target_version=4)
         return author._v4_catalog(self.client, self.box, author.machine_id, author._v4_head(self.client, self.box, author.machine_id)[0])
 
     def data_gets(self, get, machine):
@@ -88,7 +88,7 @@ class UsagePackTests(unittest.TestCase):
             return get(name)
         with mock.patch.object(self.client, "get", side_effect=checked_get), mock.patch.object(self.client, "put", side_effect=tracked_put), \
                 mock.patch("time.time", return_value=moment("2030-03-02T00:01:00Z")):
-            ensure_cloud_contract(self.client)
+            ensure_cloud_contract(self.client, target_version=4)
         self.assertTrue(any(name.startswith("usage/v4/data/") for name in written))
 
     def test_threshold_split_keeps_the_crossing_record_and_tail(self):

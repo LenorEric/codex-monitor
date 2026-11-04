@@ -199,7 +199,7 @@ class DeliveryTests(unittest.TestCase):
             self.assertEqual(db.execute("SELECT name FROM sqlite_master WHERE name GLOB 'dashboard_*'").fetchall(), [])
             self.assertIsNotNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_snapshot'").fetchone())
 
-    def test_cloud_signal_during_preparation_is_consumed_by_next_projection(self):
+    def test_cloud_signal_during_preparation_is_consumed_by_next_preparation(self):
         from monitor_dashboard import UsageDashboardState
         state = UsageDashboardState.__new__(UsageDashboardState)
         state.running = True
@@ -208,18 +208,15 @@ class DeliveryTests(unittest.TestCase):
         state._dashboard_cloud_pending = False
         state.dashboard_cache_event = threading.Event()
         state.status_payload = lambda: {}
-        state.projector = None
-        state.usage_data = SimpleNamespace(index=SimpleNamespace(maintain_disk_space=lambda: None), backup=SimpleNamespace(flush=lambda: None))
+        state.usage_data = SimpleNamespace(index=SimpleNamespace(maintain_disk_space=lambda: None))
         observed = []
-        def project():
+        def prepare(**kwargs):
             if not observed:
                 state._signal_dashboard_cache("cloud")
-        def prepare(**kwargs):
             observed.append(state.delivery.cloud_pending)
             state.delivery.cloud_pending = False
             state.running = len(observed) < 2
         state.delivery = SimpleNamespace(cloud_pending=False, prepare=prepare)
-        state.refresh_dashboard_cache = project
         state.run_dashboard_cache_maintenance()
         self.assertEqual(observed, [False, True])
 

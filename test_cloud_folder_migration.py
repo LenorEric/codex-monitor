@@ -67,10 +67,10 @@ class CloudFolderMigrationTests(unittest.TestCase):
 
     def test_ordered_upgrade_merges_old_and_partial_v4_without_resurrecting_orphans(self):
         self.seed()
-        ensure_cloud_contract(self.client)
+        ensure_cloud_contract(self.client, target_version=4)
         self.assert_final()
         before = self.manager._v4_head(self.client, self.box, "machine")[0]
-        ensure_cloud_contract(self.client)
+        ensure_cloud_contract(self.client, target_version=4)
         self.assertEqual(self.manager._v4_head(self.client, self.box, "machine")[0], before)
 
     def test_pack_upload_failure_preserves_sources_and_retries_from_contract_three(self):
@@ -81,10 +81,10 @@ class CloudFolderMigrationTests(unittest.TestCase):
                 raise CloudError("simulated pack failure")
             return put(name, source, **kwargs)
         with mock.patch.object(self.client, "put_file", side_effect=fail), self.assertRaisesRegex(CloudError, "simulated pack"):
-            ensure_cloud_contract(self.client)
+            ensure_cloud_contract(self.client, target_version=4)
         self.assertEqual(json.loads(self.client.get("data-contract.json")[0])["dataContractVersion"], 3)
         self.assertEqual(len(self.manager._v4_catalog(self.client, self.box, "machine", self.manager._v4_head(self.client, self.box, "machine")[0])), 2)
-        ensure_cloud_contract(self.client)
+        ensure_cloud_contract(self.client, target_version=4)
         self.assert_final()
 
     def test_transport_rejects_escaping_paths_root_deletion_and_stale_writes(self):

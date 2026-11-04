@@ -6,7 +6,7 @@ import monitor_migrations
 import test_processing
 from monitor_migrations import DATA_MIGRATION_STATE_FILENAME, migrate_history_data
 from monitor_delivery import DAY, DashboardDelivery
-from monitor_projection import DashboardProjector
+from test_support_projection import DashboardProjector
 
 
 class CostTimeProcessingTests(unittest.TestCase):

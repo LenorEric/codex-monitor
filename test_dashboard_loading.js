@@ -19,13 +19,13 @@ test("reset baselines stay in their window and sort before simultaneous observat
     assert.equal(h.run("costTimeUsageSeries(61,62)[1].points[0].sevenDay.continuous"), 12);
 });
 
-test("nearby cost points chain across horizontal gaps up to 20px", () => {
+test("nearby cost points chain across horizontal gaps up to 10px", () => {
     const h = harness();
-    h.run(`mergePoints=[0,20,35,36,56,77,97].map((timestamp,index)=>({timestamp,costPer100PercentUsd:index%2?1000:1,deltaPercent:1,deltaCostUsd:1}));
+    h.run(`mergePoints=[0,10,17,18,28,39,49].map((timestamp,index)=>({timestamp,costPer100PercentUsd:index%2?1000:1,deltaPercent:1,deltaCostUsd:1}));
         mergeMetrics={plotWidth:100,minTime:0,maxTime:100,minDistance:denseMergeMetrics('scatter5h',mergePoints).minDistance};
         mergedPoints=mergeDenseDeltaEvents(mergePoints,mergeMetrics)`);
-    assert.equal(h.run("mergeMetrics.minDistance"), 20);
-    assert.deepEqual(JSON.parse(h.run("JSON.stringify(mergedPoints.map(point=>point.rawKeys))")), [["0", "20", "35", "36", "56"], ["77", "97"]]);
+    assert.equal(h.run("mergeMetrics.minDistance"), 10);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(mergedPoints.map(point=>point.rawKeys))")), [["0", "10", "17", "18", "28"], ["39", "49"]]);
     assert.equal(h.run("mergedPoints.reduce((sum,point)=>sum+point.deltaPercent,0)"), 7);
     assert.equal(h.run("mergedPoints.reduce((sum,point)=>sum+point.deltaCostUsd,0)"), 7);
 });

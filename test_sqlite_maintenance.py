@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 import monitor_migrations
-import monitor_processing
+import monitor_sqlite
 from monitor_migrations import _migrate_history_to_v13
 from monitor_processing import ProcessingIndex
 from monitor_usage_sync import initialize_v4_cache
@@ -56,7 +56,7 @@ class SQLiteMaintenanceTests(unittest.TestCase):
             free = db.execute("PRAGMA freelist_count").fetchone()[0]
         self.assertEqual(index.maintain_disk_space(), 0)  # Below the default 100 MiB threshold.
         index._vacuum_check_at = 0
-        with mock.patch.object(monitor_processing, "VACUUM_FREE_BYTES", 4096), mock.patch.object(monitor_processing, "VACUUM_BATCH_PAGES", 8):
+        with mock.patch.object(monitor_sqlite, "VACUUM_FREE_BYTES", 4096), mock.patch.object(monitor_sqlite, "VACUUM_BATCH_PAGES", 8):
             with closing(sqlite3.connect(self.path)) as writer:
                 writer.execute("BEGIN IMMEDIATE")
                 self.assertEqual(index.maintain_disk_space(), 0)
@@ -75,7 +75,7 @@ class SQLiteMaintenanceTests(unittest.TestCase):
     def test_ratio_threshold_and_index_lock_skip(self):
         self.fill(2)
         index = ProcessingIndex(self.path)
-        with mock.patch.object(monitor_processing, "VACUUM_FREE_BYTES", 0), mock.patch.object(monitor_processing, "VACUUM_FREE_RATIO", 1):
+        with mock.patch.object(monitor_sqlite, "VACUUM_FREE_BYTES", 0), mock.patch.object(monitor_sqlite, "VACUUM_FREE_RATIO", 1):
             self.assertEqual(index.maintain_disk_space(), 0)
         entered, release = threading.Event(), threading.Event()
         def hold():
@@ -98,7 +98,7 @@ class SQLiteMaintenanceTests(unittest.TestCase):
         with closing(sqlite3.connect(self.path)) as reader:
             reader.execute("BEGIN")
             self.assertEqual(reader.execute("SELECT count(*) FROM preserved").fetchone()[0], 10)
-            with mock.patch.object(monitor_processing, "VACUUM_FREE_BYTES", 0):
+            with mock.patch.object(monitor_sqlite, "VACUUM_FREE_BYTES", 0):
                 self.assertGreater(index.maintain_disk_space(), 0)
             self.assertEqual(reader.execute("SELECT count(*) FROM preserved").fetchone()[0], 10)
             reader.rollback()
@@ -106,7 +106,7 @@ class SQLiteMaintenanceTests(unittest.TestCase):
     def test_existing_none_database_is_not_rebuilt_during_live_maintenance(self):
         self.fill()
         index = ProcessingIndex(self.path)
-        with mock.patch.object(monitor_processing, "VACUUM_FREE_BYTES", 0):
+        with mock.patch.object(monitor_sqlite, "VACUUM_FREE_BYTES", 0):
             self.assertEqual(index.maintain_disk_space(), 0)
         with closing(sqlite3.connect(self.path)) as db:
             self.assertEqual(db.execute("PRAGMA auto_vacuum").fetchone()[0], 0)

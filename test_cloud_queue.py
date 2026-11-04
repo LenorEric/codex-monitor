@@ -220,9 +220,9 @@ class CloudQueueIntegrationTests(unittest.TestCase):
 
     def test_remote_revision_and_restore_snapshot_are_revalidated(self):
         self.cloud.accounts = SimpleNamespace(lock=threading.RLock(), manifest={"accounts": []})
-        with mock.patch.object(self.cloud, "account_state", return_value=({"revisionId": "new"}, '"new"')):
+        with mock.patch.object(self.cloud, "account_state", return_value=({"authSha256": "new"}, '"new"')):
             with self.assertRaises(OperationSkipped):
-                self.cloud.validate_queued_action("bind_local_account", {"accountKey": "key"}, {"etag": '"old"', "state": {"revisionId": "old"}})
+                self.cloud.validate_queued_action("bind_local_account", {"accountKey": "key"}, {"etag": '"old"', "state": {"authSha256": "old"}})
         with mock.patch.object(self.cloud, "_remote_snapshot", return_value=(b"data", "new", '"etag"')):
             with self.assertRaises(OperationSkipped):
                 self.cloud.validate_queued_action("restore_skills", {"snapshotId": "old"})

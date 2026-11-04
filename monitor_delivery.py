@@ -239,7 +239,8 @@ def initialize_delivery(db):
     """)
     for action in ("insert", "update", "delete"):
         db.execute(f"DROP TRIGGER IF EXISTS delivery_processing_display_{action}")
-    for name, table in (("processing_quota_points", "processing_quota_point_refs"),):
+    canonical = bool(db.execute("SELECT 1 FROM sqlite_master WHERE name='canonical_records'").fetchone())
+    for name, table in (() if canonical else (("processing_quota_points", "processing_quota_point_refs"),)):
         target = table if db.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone() else name
         for action, ref in (("INSERT", "NEW"), ("UPDATE", "NEW"), ("DELETE", "OLD")):
             db.execute(f"DROP TRIGGER IF EXISTS delivery_{name}_{action.lower()}")
@@ -251,8 +252,11 @@ def initialize_delivery(db):
     for stream in ("local", "merged", "state"):
         db.execute("INSERT OR IGNORE INTO delivery_meta VALUES(?, '0')", (stream,))
     if not db.execute("SELECT 1 FROM delivery_meta WHERE name='initialized'").fetchone():
-        db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT DISTINCT view,account FROM processing_quota_points")
-        db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT 'local',account FROM processing_facts UNION SELECT 'merged',account FROM processing_facts")
+        if canonical:
+            db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT DISTINCT view,account FROM canonical_records")
+        else:
+            db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT DISTINCT view,account FROM processing_quota_points")
+            db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT 'local',account FROM processing_facts UNION SELECT 'merged',account FROM processing_facts")
         db.execute("INSERT INTO delivery_meta VALUES('initialized','1')")
 
     if db.execute("SELECT value FROM delivery_meta WHERE name='attributionRule'").fetchone() != (str(ATTRIBUTION_RULE_VERSION),):
@@ -261,7 +265,8 @@ def initialize_delivery(db):
 
 def request_attribution_rebuild(db):
     """Recalculate memberships/charts from retained tokens without replaying quota sampling."""
-    db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT view,account FROM delivery_accounts UNION SELECT view,account FROM delivery_token_refs UNION SELECT view,account FROM processing_quota_points")
+    source = "canonical_records" if db.execute("SELECT 1 FROM sqlite_master WHERE name='canonical_records'").fetchone() else "processing_quota_points"
+    db.execute(f"INSERT OR IGNORE INTO delivery_dirty SELECT view,account FROM delivery_accounts UNION SELECT view,account FROM delivery_token_refs UNION SELECT view,account FROM {source}")
     # Force full attribution while preserving queued token additions.
     db.execute("INSERT OR IGNORE INTO delivery_work SELECT view,account,'attribution',? FROM delivery_dirty", (str(ATTRIBUTION_RULE_VERSION),))
     db.execute("DELETE FROM delivery_snapshot")
@@ -332,7 +337,12 @@ class DashboardDelivery:
         work = list(db.execute("SELECT kind,record_key FROM delivery_work WHERE view=? AND account=?", (view, account)))
         events = []
         label = existing[1] if existing else "Unknown"
-        if existing is None or self.cloud_pending:
+        if getattr(self.index, "canonical", False):
+            events = [json.loads(data) for data, in db.execute("SELECT data FROM canonical_records WHERE view=? AND kind='tokenLedger' AND account=? "
+                "AND (? OR record_key IN (SELECT record_key FROM delivery_work WHERE view=? AND account=? AND kind='tokenLedger')) ORDER BY first,record_key",
+                (view, account, existing is None or self.cloud_pending or not work, view, account))]
+            label = next((row.get("accountLabel") for row in reversed(events) if row.get("accountLabel")), label)
+        elif existing is None or self.cloud_pending:
             events = [json.loads(data) for source, data in db.execute("SELECT source,data FROM processing_facts WHERE account=? AND kind='tokenLedger' ORDER BY source,position", (account,))
                 if source == "local:tokenLedger" or view == "merged" and source.startswith("peer:")]
             if view == "merged":
@@ -349,7 +359,8 @@ class DashboardDelivery:
                     rows = db.execute("SELECT data FROM processing_facts WHERE source=? AND kind='tokenLedger' AND account=? AND record_key=?", ("local:tokenLedger", account, key))
                 events.extend(json.loads(row[0]) for row in rows)
         if existing is None:
-            point = db.execute("SELECT data FROM processing_quota_points WHERE view=? AND account=? ORDER BY event_at DESC LIMIT 1", (view, account)).fetchone()
+            point = db.execute("SELECT data FROM canonical_records WHERE view=? AND account=? AND kind='quota' ORDER BY last DESC LIMIT 1" if getattr(self.index, "canonical", False)
+                else "SELECT data FROM processing_quota_points WHERE view=? AND account=? ORDER BY event_at DESC LIMIT 1", (view, account)).fetchone()
             if point:
                 label = json.loads(point[0]).get("accountLabel") or label
             self._packet(db, view, "account", account, {"label": label}, now)
@@ -378,7 +389,11 @@ class DashboardDelivery:
         for window, _ in WINDOWS:
             old = self._runs(db, view, account, window)
             if existing is None or not work or any(kind == "quota" for kind, _ in work):
-                points = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_quota_points WHERE view=? AND account=? ORDER BY event_at,record_key", (view, account))]
+                if getattr(self.index, "canonical", False):
+                    from monitor_sampling import quota_point
+                    points = [quota_point(json.loads(data)) for data, in db.execute("SELECT data FROM canonical_records WHERE view=? AND account=? AND kind='quota' ORDER BY first,record_key", (view, account))]
+                else:
+                    points = [json.loads(row[0]) for row in db.execute("SELECT data FROM processing_quota_points WHERE view=? AND account=? ORDER BY event_at,record_key", (view, account))]
                 label = next((row["accountLabel"] for row in reversed(points) if row.get("accountLabel")), label)
                 runs = usage_runs(points, window)
             else:

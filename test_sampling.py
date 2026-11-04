@@ -159,7 +159,7 @@ class SamplingStorageTests(unittest.TestCase):
 
     def test_reset_projection_costs_restart_correction_and_migration(self):
         import monitor_migrations
-        from monitor_projection import DashboardProjector
+        from test_support_projection import DashboardProjector
         from monitor_interpretation import chart_rows, token_row, usage_runs, valid_intervals
         from test_processing import projected_points
         rows = [reading(0, 90, seven=10), reading(120, 10, seven=12, reset=1893531600)]
@@ -190,15 +190,15 @@ class SamplingStorageTests(unittest.TestCase):
             migration(paths)
             raise RuntimeError("migration interrupted")
         with mock.patch.dict(monitor_migrations.DATA_MIGRATIONS, {17: interrupted}), self.assertRaisesRegex(RuntimeError, "migration interrupted"):
-            monitor_migrations.migrate_history_data(*args)
+            monitor_migrations.migrate_history_data(*args, target_version=21)
         self.assertEqual(self.store.quota_path.read_bytes(), original)
         self.assertEqual(self.points(), expected)
-        self.assertEqual(monitor_migrations.migrate_history_data(*args), [17, 18, 19, 20, 21])
+        self.assertEqual(monitor_migrations.migrate_history_data(*args, target_version=21), [17, 18, 19, 20, 21])
         self.assertEqual(self.store.quota_path.read_bytes(), original)
         self.store.index = ProcessingIndex(self.store.v4_cache_path)
         self.store.ingest_local()
         self.assertEqual(self.points(), expected)
-        self.assertEqual(monitor_migrations.migrate_history_data(*args), [])
+        self.assertEqual(monitor_migrations.migrate_history_data(*args, target_version=21), [])
         # Removing the reset in a corrected source must remove its derived zero point too.
         rows[1]["windows"]["5h"]["resetAt"] = rows[0]["windows"]["5h"]["resetAt"]
         for row in rows:
@@ -219,7 +219,7 @@ class SamplingStorageTests(unittest.TestCase):
             self.assertEqual([run[1:] for run in usage_runs(self.points(), window)], [run[1:] for run in usage_runs(sample_rows(rows), window)])
         self.assertEqual(len(self.points()), 6)
         self.assertEqual(sorted(point["resetWindow"] for point in self.points() if point.get("resetWindow")), ["fiveHour", "sevenDay"])
-        from monitor_projection import DashboardProjector
+        from test_support_projection import DashboardProjector
         projector = DashboardProjector(self.store)
         projector.refresh({"items": []}, 1893513600)
         from test_processing import projected_points

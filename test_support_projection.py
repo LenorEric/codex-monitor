@@ -1,9 +1,10 @@
+"""Frozen pre-canonical projector for released-layout migration fixtures only."""
 #!/usr/bin/env python3
 """Prepare account-scoped quota points and forward ingestion work to delivery."""
 
 import json
 
-from monitor_processing import encode
+from monitor_sqlite import encode
 
 PROJECTION_RULE_VERSION = 1
 

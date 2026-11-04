@@ -25,7 +25,7 @@ from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_
 from monitor_auto_update import AUTO_UPDATE_RESTART, AutoUpdater, installed_version
 from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
 from monitor_cloud_queue import OperationSkipped
-from monitor_common import DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
+from monitor_common import DEFAULT_RETRY_LIMIT, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_device_auth import DeviceAuthManager
 from monitor_events import (
     historical_console_events, hydrate_delta_state_from_events,
@@ -39,7 +39,7 @@ from monitor_history import (
 from monitor_skills import SkillError, SkillManager
 from monitor_session_refresh import refresh_session
 from monitor_token_ledger import default_token_ledger_path, token_cost_snapshot, token_sessions_from_ledger
-from monitor_usage_sync import UsageDataStore, add_record_provenance
+from monitor_usage_sync import add_record_provenance
 
 DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
 MANAGEMENT_HTML_PATH = Path(__file__).with_name("management.html")
@@ -254,6 +254,7 @@ def dashboard_cloud_status(status: dict) -> dict:
         },
         "usageSync": {
             "lastSuccessAt": usage_sync.get("lastSuccessAt"), "nextAttemptInSeconds": usage_sync.get("nextAttemptInSeconds"),
+            **{key: usage_sync.get(key) for key in ("pendingRecords", "oldestBufferedAt", "nextUploadAt")},
             "failure": {"message": "Automatic usage synchronization failed"} if usage_sync.get("failure") else None,
         },
     }
@@ -334,19 +335,19 @@ class UsageDashboardState:
         self.skills = SkillManager(args.codex_home, getattr(args, "data_home", None) or args.auth.parent / ".codex-switch", getattr(args, "gemini_skills", None))
         self.cloud = CloudManager(self.skills.private_root, self.skills, self.accounts)
         self.accounts.cloud = self.cloud
-        self.usage_data = UsageDataStore(
+        from monitor_canonical import CanonicalDataStore
+        self.usage_data = CanonicalDataStore(
             self.args.quota_history, self.args.token_ledger, self.cloud.machine_id, self.cloud.usage_account_id, self.lock, self.cloud.local_usage_account,
-            getattr(self.args, "usage_sync_cache", None), self.cloud.usage_account_revision,
+            getattr(self.args, "usage_sync_cache", None),
         )
-        self.usage_data.backup.enabled = lambda: self.cloud.config().get("saveJsonl", True) is True
+        self.args.raw_quota_log = getattr(args, "raw_quota_log", None) or data_home / "usage_monitor_quota_api_responses.jsonl"
+        self.args.save_raw_quota_responses = lambda: self.cloud.config().get("saveRawQuotaResponses", False)
+        self.args.raw_quota_response_callback = self._record_raw_quota_response
+        self._raw_quota_log_lock = threading.Lock()
         self.args.usage_sync_cache = self.usage_data.cache_path
         self.args.source_ingestor = self.usage_data.sources
         print("Startup: initializing usage processing and dashboard stores...", flush=True)
-        self.usage_data.initialize_processing(ingest=False)
-        self.usage_data.initialize_v4_index(ingest=False)
         self.usage_data.sources.on_new_cost = self.accounts.promote_active_slot_on_cost
-        from monitor_projection import DashboardProjector
-        self.projector = DashboardProjector(self.usage_data)
         from monitor_delivery import DashboardDelivery
         self.delivery = DashboardDelivery(self.usage_data.index)
         self.cloud.configure_usage_sync(self.usage_data)
@@ -388,7 +389,6 @@ class UsageDashboardState:
         self.session_refresh_suppressed_reset_at = {}
         self.external_auth_validation_threads = set()
         self.external_auth_validation_fingerprints = set()
-        self._dashboard_build_lock = threading.Lock()
         self.dashboard_cache_event.set()
         print("Startup: restoring runtime state and reconciling live authentication...", flush=True)
         with self.usage_data.index.transaction() as db:
@@ -432,9 +432,9 @@ class UsageDashboardState:
             _, local_ledger = self.usage_data.datasets("local")
             console_accounts = dashboard_accounts(self)
             slot_usage_accounts = {str(account["id"]): str(account["usageAccountId"]) for account in console_accounts["items"]}
-            from monitor_sampling import stored_points
+            from monitor_sampling import quota_point
             with self.usage_data.index.transaction() as db:
-                quota_points = stored_points(db, "local")
+                quota_points = [quota_point(json.loads(data)) for data, in db.execute("SELECT data FROM canonical_records WHERE view='local' AND kind='quota' ORDER BY first,record_key")]
             hydrate_delta_state_from_events(self.console_event_state, historical_console_events(quota_points, local_ledger, slot_usage_accounts))
         # Seeding lastSample establishes a baseline; it must not count the previous run's final delta twice.
         reset_runtime_baselines(self.console_event_state)
@@ -466,7 +466,6 @@ class UsageDashboardState:
         sample["sync"] = add_record_provenance("quota", sample, self.cloud.machine_id, sample["sync"]["accountId"])["sync"]
         raw_windows = copy.deepcopy(sample.get("windows") or {})
         self.usage_data.record_quota(sample)
-        self.usage_data.ingest_local()
         from monitor_usage_sync import record_account_key
         from monitor_sampling import WINDOWS, accepted_windows
         with self.usage_data.index.transaction() as db:
@@ -482,6 +481,17 @@ class UsageDashboardState:
         sample["percentCheckedAt"] = max((window["percentCheckedAt"] for window in sample["windows"].values()), default=None)
         if sample.get("remoteUsage") is not None:
             sample["remoteUsage"]["accepted"] = not sample["rejectedWindows"]
+
+    def _record_raw_quota_response(self, response, status, account_id):
+        if not getattr(self.args, "save_raw_quota_responses", lambda: False)():
+            return
+        try:
+            with self._raw_quota_log_lock:
+                self.args.raw_quota_log.parent.mkdir(parents=True, exist_ok=True)
+                with self.args.raw_quota_log.open("a", encoding="utf-8") as output:
+                    output.write(json.dumps({"capturedAt": int(time.time()), "accountId": account_id, "status": status, "response": response}, ensure_ascii=False, separators=(",", ":")) + "\n")
+        except OSError as exc:
+            print(f"Raw quota response logging failed: {exc}", file=sys.stderr, flush=True)
 
     def _update_account_status_locked(self, account_id: str | None, sample: dict) -> bool:
         row = normalize_quota_history_row(sample)
@@ -548,7 +558,7 @@ class UsageDashboardState:
                 account_sample = last_sample if account["id"] == accounts["activeAccountId"] else self._active_account_status_locked(accounts, account["id"])
                 account_statuses[account["id"]] = {"lastSample": dashboard_sample(account_sample), "display": dashboard_display(account_sample)}
             control_password_configured = control_password_is_configured(self.cloud.config()["control"]) if hasattr(self, "cloud") else True
-            processing = {"ingestion": dict(self.usage_data.index.metrics), "projection": dict(self.projector.metrics)} if hasattr(self, "projector") else None
+            processing = {"ingestion": dict(self.usage_data.index.metrics), "projection": {}} if hasattr(self, "usage_data") else None
             return {
                 "revision": _dashboard_revision({"sample": sample, "accountStatuses": {key: value["lastSample"] for key, value in account_statuses.items()}, "accounts": accounts, "error": self.last_error, "controlPasswordConfigured": control_password_configured, **({"processing": processing} if processing else {})}),
                 "controlPasswordConfigured": control_password_configured,
@@ -560,13 +570,6 @@ class UsageDashboardState:
             }
 
 
-    def refresh_dashboard_cache(self, force: bool = False, now: float | None = None) -> bool:
-        now = time.time() if now is None else now
-        with self._dashboard_build_lock:
-            with self.lock:
-                accounts = self._dashboard_accounts_locked()
-            return self.projector.refresh(accounts, now, force) is not None
-
     def run_dashboard_cache_maintenance(self) -> None:
         while self.running:
             self.dashboard_cache_event.wait(1)
@@ -575,12 +578,9 @@ class UsageDashboardState:
                 cloud_refresh = self._dashboard_cloud_pending
                 self._dashboard_cloud_pending = False
             try:
-                with self.lock:
-                        self.refresh_dashboard_cache()
                 if hasattr(self, "delivery"):
                     self.delivery.cloud_pending |= cloud_refresh
                     self.delivery.prepare(status=self.status_payload())
-                    self.usage_data.backup.flush()
                     self.usage_data.index.maintain_disk_space()
             except Exception as exc:
                 if cloud_refresh:
@@ -623,7 +623,6 @@ class UsageDashboardState:
                 with self.lock:
                     self.args.token_capture_snapshot = token_usage
                     self.runtime_state.update({"tokenUsage": token_usage, "cost": cost, "costByModel": by_model})
-                    self.usage_data.ingest_local()
                     self._signal_dashboard_cache()
             except Exception as exc:
                 print(f"Token capture failed: {exc}", file=sys.stderr, flush=True)
@@ -678,7 +677,7 @@ class UsageDashboardState:
                     lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
                     token_usage.get("sourceFiles"), self.cloud.machine_id,
                 )
-                self.usage_data.record_ledger(rows, replace=True)
+                self.usage_data.record_ledger(rows)
                 for row in new_costs:
                     self.accounts.promote_active_slot_on_cost(row)
                 token_sessions = token_sessions_from_ledger(rows)
@@ -695,7 +694,6 @@ class UsageDashboardState:
             sample.pop("costDeltaByModel", None)
             self.runtime_state.update({"tokenUsage": token_usage or None, "cost": sample.get("cost") or empty_cost_totals(), "costByModel": sample.get("costByModel") or {}, "lastSample": sample, "updatedAt": sample.get("checkedAt")})
             self._write_runtime_state_locked()
-            self.usage_data.ingest_local()
             self._signal_dashboard_cache()
             self.last_sample = sample
             self._update_account_status_locked(account_status["activeAccountId"], sample)
@@ -717,7 +715,7 @@ class UsageDashboardState:
                 raise UsageError("recorded credentials changed during token refresh")
             expected_fingerprint = auth_fingerprint(data)
 
-        debug = {}
+        debug = {"_response_callback": self._record_raw_quota_response}
         output = fetch_usage(
             auth, self.opener, None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials,
         )
@@ -771,7 +769,6 @@ class UsageDashboardState:
                 print(f"Inactive account usage polling failed for {credential['label']!r}: {exc}", file=sys.stderr, flush=True)
         if polled:
             with self.lock:
-                self.usage_data.ingest_local()
                 self._signal_dashboard_cache()
         return polled
 
@@ -840,7 +837,7 @@ class UsageDashboardState:
                 raise UsageError("recorded credentials changed during token refresh")
             expected_fingerprint = auth_fingerprint(data)
 
-        debug = {}
+        debug = {"_response_callback": self._record_raw_quota_response}
         output = fetch_usage(
             auth, self.opener, auth_path if credential["active"] else None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT),
             auth_lock=self.accounts.lock if credential["active"] else None, refreshed_callback=commit_refreshed_credentials,
@@ -1082,7 +1079,7 @@ class UsageDashboardState:
                     expected_fingerprint = auth_fingerprint(data)
 
                 auth = json.loads(external_update["data"].decode("utf-8"))
-                debug = {}
+                debug = {"_response_callback": self._record_raw_quota_response}
                 output = fetch_usage(auth, self.opener, None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials)
                 data = (json.dumps(auth, indent=2) + "\n").encode("utf-8")
                 if not self.accounts.commit_polled_credentials(external_update["id"], expected_fingerprint, data):
@@ -1616,8 +1613,8 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
     token_thread = None
     source_watcher = None
     print("Startup: starting token capture, quota polling, session refresh, dashboard, cloud, and configuration workers...", flush=True)
-    if hasattr(state, "projector") and not getattr(args, "no_token_scan", True):
-        from monitor_ingestion import SourceWatcher
+    if hasattr(state, "usage_data") and not getattr(args, "no_token_scan", True):
+        from monitor_sources import SourceWatcher
         try:
             source_watcher = SourceWatcher(args.codex_home)
             state.usage_data.sources.source_watcher = source_watcher

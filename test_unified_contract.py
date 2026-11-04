@@ -229,8 +229,8 @@ class UnifiedContractTests(unittest.TestCase):
         digest, _ = cloud._put_usage_payload(client, box, "packs", "machine-b", {"version": 1, "machineId": "machine-b", "packId": "pack", "records": [{"key": "old", "record": record}]})
         client.put("usage/machines/machine-b.enc", box.encrypt("usage-pointer:machine-b", json.dumps({"version": 2, "machineId": "machine-b", "packs": {"pack": digest}}).encode()))
         from monitor_migrations import ensure_cloud_contract
-        ensure_cloud_contract(client)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], updates.CLOUD_DATA_CONTRACT_VERSION)
+        ensure_cloud_contract(client, target_version=4)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
         head, _ = cloud._v4_head(client, box, "machine-b")
         catalog = cloud._v4_catalog(client, box, "machine-b", head)
         self.assertEqual(set(catalog), {"2026-07-15"})
@@ -269,16 +269,16 @@ class UnifiedContractTests(unittest.TestCase):
                 raise CloudError("simulated commit failure")
             return original_put(path, data, **kwargs)
         with mock.patch.object(client, "put", side_effect=fail), self.assertRaisesRegex(CloudError, "simulated"):
-            ensure_cloud_contract(client)
+            ensure_cloud_contract(client, target_version=4)
         self.assertNotEqual(client.get("skills/current.enc")[0], pointer)
         self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 2)
-        ensure_cloud_contract(client)
+        ensure_cloud_contract(client, target_version=4)
         migrated = json.loads(box.decrypt("skills-pointer", client.get("skills/current.enc")[0]))
         self.assertEqual(migrated["version"], 2)
         package = migrated["packages"]["demo"]
         self.assertEqual(skills.inspect_snapshot(cloud._download_skill_package(client, box, "demo", package))[1]["demo"]["SKILL.md"], b"Retain this skill")
         self.assertEqual(json.loads(client.get("crypto.json")[0])["version"], 3)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], updates.CLOUD_DATA_CONTRACT_VERSION)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
 
 
 if __name__ == "__main__":

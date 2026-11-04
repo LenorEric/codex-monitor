@@ -10,6 +10,7 @@ from unittest import mock
 
 import monitor_processing
 import monitor_ingestion
+import monitor_sources
 import monitor_backup
 import monitor_token_ledger
 import monitor_tokens
@@ -217,7 +218,7 @@ class ProcessingTests(unittest.TestCase):
         self.assertEqual(len(self.store.index.rows("quota")), 1)
 
     def test_projector_keeps_only_quota_and_forwards_token_work(self):
-        from monitor_projection import DashboardProjector
+        from test_support_projection import DashboardProjector
         projector = DashboardProjector(self.store)
         self.sync()
         self.store.record_quota({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 1}}})
@@ -237,7 +238,7 @@ class ProcessingTests(unittest.TestCase):
             self.assertEqual(projected_points(self.store, view), before[view])
 
     def test_projector_matches_reference_and_monotonic_appends_do_not_replay(self):
-        from monitor_projection import DashboardProjector
+        from test_support_projection import DashboardProjector
         projector = DashboardProjector(self.store)
         accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
         self.sync()
@@ -257,7 +258,7 @@ class ProcessingTests(unittest.TestCase):
         self.assertIsNone(projector.refresh(accounts, now))
 
     def test_quota_rejections_missing_windows_resets_and_late_samples_match_reference(self):
-        from monitor_projection import DashboardProjector
+        from test_support_projection import DashboardProjector
         from datetime import datetime, timezone
         projector = DashboardProjector(self.store)
         accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
@@ -338,7 +339,7 @@ class ProcessingTests(unittest.TestCase):
             self.assertEqual(json.loads(db.execute("SELECT data FROM processing_effective WHERE record_key=?", (key,)).fetchone()[0]), local)
 
     def test_os_watcher_stops_and_delivers_new_session_changes(self):
-        watcher = monitor_ingestion.SourceWatcher(self.root)
+        watcher = monitor_sources.SourceWatcher(self.root)
         self.addCleanup(watcher.stop)
         self.store.index.source_watcher = watcher
         self.sync()

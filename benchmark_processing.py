@@ -9,42 +9,43 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from monitor_projection import DashboardProjector
-from monitor_usage_sync import UsageDataStore
+from monitor_canonical import CanonicalDataStore
+from monitor_delivery import DashboardDelivery
 
 
 def benchmark(count):
     root = Path.cwd() / f".processing-benchmark-{uuid.uuid4().hex}"
     root.mkdir()
     try:
-        store = UsageDataStore(root / "quota.jsonl", root / "ledger.jsonl", "machine", lambda _: "v3:account", threading.RLock())
+        store = CanonicalDataStore(root / "quota.jsonl", root / "ledger.jsonl", "machine", lambda _: "v3:account", threading.RLock())
         def sample(index):
             return {"checkedAt": datetime.fromtimestamp(1893456000 + index, timezone.utc).isoformat(), "accountSlotId": "slot", "accountLabel": "Account",
                 "windows": {"5h": {"usedPercent": 0, "plan": "plus"}, "7d": {"usedPercent": 0, "plan": "plus"}}}
         with store.index.transaction() as db:
-            store.index.write_records(db, "quota", [store.normalize_new_quota(sample(index)) for index in range(count)], backup_path=store.quota_path)
-        store.backup.flush()
-        accounts = {"activeAccountId": "slot", "items": [{"id": "slot", "label": "Account", "usageAccountId": "v3:account"}]}
-        projector = DashboardProjector(store)
+            for index in range(count):
+                store._apply(db, "quota", store.normalize_new_quota(sample(index)), True)
+        delivery = DashboardDelivery(store.index)
         started = time.perf_counter()
-        projector.refresh(accounts, 1893456000 + count)
+        delivery.prepare(now=1893456000 + count)
         initial_seconds = time.perf_counter() - started
         before = dict(store.index.metrics)
-        replayed = projector.metrics["quotaRowsReplayed"]
+        with store.index.transaction() as db:
+            cursors = delivery.cursors(db)
         started, cpu = time.perf_counter(), time.process_time()
         for _ in range(3):
-            assert projector.refresh(accounts, 1893456000 + count) is None
+            delivery.prepare(now=1893456000 + count)
         idle_seconds, idle_cpu = (time.perf_counter() - started) / 3, (time.process_time() - cpu) / 3
         assert store.index.metrics == before
+        with store.index.transaction() as db:
+            assert delivery.cursors(db) == cursors
         started, cpu = time.perf_counter(), time.process_time()
         store.record_quota(sample(count))
-        projector.refresh(accounts, 1893456000 + count + 1)
+        delivery.prepare(now=1893456000 + count + 1)
         result = {"historicalRows": count, "initialSeconds": round(initial_seconds, 6), "idleSeconds": round(idle_seconds, 6), "idleCpuSeconds": round(idle_cpu, 6),
             "appendSeconds": round(time.perf_counter() - started, 6), "appendCpuSeconds": round(time.process_time() - cpu, 6),
-            "appendCanonicalBytesRead": store.index.metrics["canonicalBytesRead"] - before["canonicalBytesRead"],
             "appendVerificationBytesRead": store.index.metrics["sourceVerificationBytes"] - before["sourceVerificationBytes"],
-            "appendRecordsImported": store.index.metrics["recordsImported"] - before["recordsImported"], "appendQuotaRowsReplayed": projector.metrics["quotaRowsReplayed"] - replayed}
-        assert result["appendRecordsImported"] == 1 and result["appendQuotaRowsReplayed"] == 0 and result["appendCanonicalBytesRead"] == 0, result
+            "appendRecordsImported": store.index.metrics["recordsImported"] - before["recordsImported"]}
+        assert result["appendRecordsImported"] == 1 and result["appendVerificationBytesRead"] == 0, result
         return result
     finally:
         if not root.resolve().is_relative_to(Path.cwd().resolve()) or not root.name.startswith(".processing-benchmark-"):

@@ -188,7 +188,7 @@ def refresh(db, index):
     """Commit point/run projections in the same transaction as fact/checkpoint changes."""
     if _refresh_deferred.get():
         return
-    from monitor_processing import encode
+    from monitor_sqlite import encode
     for view, account in list(db.execute("SELECT DISTINCT view,account FROM processing_sampling_changes")):
         keys = [row[0] for row in db.execute("SELECT record_key FROM processing_sampling_changes WHERE view=? AND account=?", (view, account))]
         state_key = f"samplingState:{view}:{account}"

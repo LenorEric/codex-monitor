@@ -43,7 +43,7 @@ class QuotaRunTests(unittest.TestCase):
         self.assertEqual(usage_runs(points, "5h")[0][1:4], [1893510000, 1893534000, 10])
 
     def test_extension_does_not_replay_sampling_or_rebuild_quota_projection(self):
-        from monitor_projection import DashboardProjector
+        from test_support_projection import DashboardProjector
         projector = DashboardProjector(self.store)
         self.store.record_quota(reading(0, 10))
         projector.refresh({}, 1893510000)

@@ -115,7 +115,7 @@ class TimestampMigrationTests(unittest.TestCase):
         self.paths[1].write_text(json.dumps(self.row) + "\n", encoding="utf-8")
 
     def migrate(self):
-        return migrations.migrate_history_data(self.root, *self.paths)
+        return migrations.migrate_history_data(self.root, *self.paths, target_version=21)
 
     def test_local_conversion_preserves_peers_and_rehashes_records(self):
         path = self.root / "usage_monitor_sync_cache-v4.sqlite3"
@@ -192,16 +192,16 @@ class TimestampMigrationTests(unittest.TestCase):
                 raise CloudError("interrupted")
             return put(path, data, **kwargs)
         with mock.patch.object(client, "put", side_effect=fail), self.assertRaisesRegex(CloudError, "interrupted"):
-            migrations.ensure_cloud_contract(client)
+            migrations.ensure_cloud_contract(client, target_version=4)
         self.assertNotIn("migrations/contract-4/machine-a.enc", client.files)
         self.assertNotEqual(client.get(path)[0], original)
-        migrations.ensure_cloud_contract(client)
+        migrations.ensure_cloud_contract(client, target_version=4)
         head, _ = cloud._v4_head(client, box, "machine-a")
         catalog = cloud._v4_catalog(client, box, "machine-a", head)
         manifest = cloud._v4_day_manifest(client, box, "machine-a", "2030-01-01", catalog["2030-01-01"])
         records = cloud._v4_data(client, box, "machine-a", "2030-01-01", "bulk", manifest["parts"]["bulk"])
         self.assertEqual(records[0]["record"]["row"]["windows"]["5h"]["resetAt"], 1893474000)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], migrations.CLOUD_DATA_CONTRACT_VERSION)
+        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
 
 
 if __name__ == "__main__":

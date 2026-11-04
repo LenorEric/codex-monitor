@@ -21,10 +21,10 @@ from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 21
+DATA_CONTRACT_VERSION = 22
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
-CLOUD_DATA_CONTRACT_VERSION = 4
+CLOUD_DATA_CONTRACT_VERSION = 5
 CLOUD_DATA_CONTRACT_PATH = "data-contract.json"
 
 
@@ -611,6 +611,7 @@ DATA_MIGRATIONS = {
     19: _migrate_history_to_v19,
     20: _with_migration_rebuild(_migrate_history_to_v20, "event-only and independent quota storage migration"),
     21: _migrate_history_to_v21,
+    22: lambda paths: __import__("monitor_migration_packages").migrate_local(paths),
 }
 
 
@@ -682,6 +683,8 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
 
 def _run_data_migration(migration, paths: dict[str, Path], version: int, state_path: Path, journal_path: Path) -> None:
     protected_paths = {"processing_index": paths["processing_index"]} if version == 19 else paths
+    if version == 22:
+        protected_paths = {name: paths[name] for name in ("processing_index", "config") if name in paths}
     if version == 15:
         # Historical display/diagnostic logs are not inputs or outputs of v15.
         protected_paths = {name: path for name, path in paths.items() if name not in {"history", "sample_log", "legacy_sample_log"}}
@@ -828,7 +831,11 @@ def migrate_history_data(
     if target_version == DATA_CONTRACT_VERSION and paths["processing_index"].exists():
         from monitor_processing import ProcessingIndex
         # Sampling requests from every step are replayed together, against the final facts.
-        ProcessingIndex(paths["processing_index"])
+        if target_version >= 22:
+            from monitor_canonical import CanonicalIndex
+            CanonicalIndex(paths["processing_index"])
+        else:
+            ProcessingIndex(paths["processing_index"])
     return completed
 
 
@@ -866,7 +873,7 @@ def _migrate_cloud_to_v3(client):
     migrate_cloud_formats(client, getattr(client, "_migration_manager", None))
 
 
-CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3, 4: lambda client: __import__("monitor_migration_events").migrate_cloud_event_only(client)}
+CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3, 4: lambda client: __import__("monitor_migration_events").migrate_cloud_event_only(client), 5: lambda client: __import__("monitor_migration_packages").migrate_cloud(client)}
 
 
 def read_cloud_contract(client):
@@ -889,11 +896,14 @@ def read_cloud_contract(client):
     return version, etag
 
 
-def ensure_cloud_contract(client):
+def ensure_cloud_contract(client, target_version=None):
     from monitor_cloud import CloudError
     from monitor_usage_sync import canonical_json
     current, etag = read_cloud_contract(client)
-    for version in range(current + 1, CLOUD_DATA_CONTRACT_VERSION + 1):
+    target_version = CLOUD_DATA_CONTRACT_VERSION if target_version is None else target_version
+    if type(target_version) is not int or not current <= target_version <= CLOUD_DATA_CONTRACT_VERSION:
+        raise CloudError("Unsupported cloud migration target", 409)
+    for version in range(current + 1, target_version + 1):
         if version not in CLOUD_DATA_MIGRATIONS:
             raise CloudError(f"Missing cloud data migration {version}; cloud access is blocked", 409)
         CLOUD_DATA_MIGRATIONS[version](client)
@@ -902,6 +912,8 @@ def ensure_cloud_contract(client):
             finish_cloud_format_migration(client)
         if version == 4:
             __import__("monitor_migration_events").finish_cloud_event_migration(client)
+        if version == 5:
+            __import__("monitor_migration_packages").finish_cloud(client)
 
 
 
@@ -1406,7 +1418,8 @@ def migrate_cloud_formats(client, manager):
             raise ValueError("Invalid historical cloud account state")
         if account_state.get("ready", True):
             from monitor_accounts import auth_identity, parse_auth_bytes, api_identity_id
-            data = manager._download_account_revision_with(client, box, account_state)
+            from monitor_migration_accounts import download_legacy_account
+            data = download_legacy_account(client, box, account_state)
             identity = auth_identity(parse_auth_bytes(data))
             account_type = identity["accountType"]
             alias = FormatConverter({"accounts": [{"id": account_key, "identity": identity, "accountType": account_type}]}, {}, config, manager.machine_id)

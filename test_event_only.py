@@ -139,13 +139,13 @@ class EventOnlyTests(unittest.TestCase):
         manager, client, box = self.cloud()
         old_catalog = manager._v4_catalog(client, box, "machine", manager._v4_head(client, box, "machine")[0])
         obsolete = manager._v4_day_manifest(client, box, "machine", "2030-01-01", old_catalog["2030-01-01"])["parts"]["bulk"]
-        monitor_migrations.ensure_cloud_contract(client)
+        monitor_migrations.ensure_cloud_contract(client, target_version=4)
         head = manager._v4_head(client, box, "machine")[0]
         self.assertEqual(set(manager._v4_catalog(client, box, "machine", head)), {"2030-01-03"})
         self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
         self.assertNotIn(manager._usage_payload_path("v4/data", "machine", obsolete), client.files)
         self.assertNotIn("migrations/contract-4/machine.enc", client.files)
-        monitor_migrations.ensure_cloud_contract(client)
+        monitor_migrations.ensure_cloud_contract(client, target_version=4)
         self.assertEqual(manager._v4_head(client, box, "machine")[0], head)
 
     def test_cloud_converts_reset_timestamps_and_removes_compaction_in_one_publish(self):
@@ -157,7 +157,7 @@ class EventOnlyTests(unittest.TestCase):
         previous_head = manager._v4_head(client, box, "machine")[0]
         previous_hash = manager._v4_catalog(client, box, "machine", previous_head)["2030-01-04"]["logicalHash"]
         with mock.patch.object(client, "put", wraps=client.put) as put:
-            monitor_migrations.ensure_cloud_contract(client)
+            monitor_migrations.ensure_cloud_contract(client, target_version=4)
         self.assertEqual(sum(call.args[0] == manager._v4_head_path("machine") for call in put.call_args_list), 1)
         self.assertEqual(sum(call.args[0] == "data-contract.json" for call in put.call_args_list), 1)
         head = manager._v4_head(client, box, "machine")[0]
@@ -169,7 +169,7 @@ class EventOnlyTests(unittest.TestCase):
         self.assertIsInstance(rows[0]["record"]["row"]["windows"]["5h"]["resetAt"], (int, float))
         self.assertEqual(rows[0]["contentSha256"], content_hash(rows[0]["record"]))
         self.assertEqual(manifest.get("logicalHash"), previous_hash)
-        monitor_migrations.ensure_cloud_contract(client)
+        monitor_migrations.ensure_cloud_contract(client, target_version=4)
         self.assertEqual(manager._v4_head(client, box, "machine")[0], head)
 
     def test_cloud_marker_failure_retains_uploaded_head_without_rollback(self):
@@ -184,10 +184,10 @@ class EventOnlyTests(unittest.TestCase):
                 raise CloudError("marker unavailable")
             return put(path, data, **kwargs)
         with mock.patch.object(client, "put", side_effect=fail), self.assertRaisesRegex(CloudError, "marker unavailable"):
-            monitor_migrations.ensure_cloud_contract(client)
+            monitor_migrations.ensure_cloud_contract(client, target_version=4)
         self.assertNotEqual(client.get(manager._v4_head_path("machine"))[0], original)
         self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 3)
-        monitor_migrations.ensure_cloud_contract(client)
+        monitor_migrations.ensure_cloud_contract(client, target_version=4)
         self.assertEqual(set(manager._v4_catalog(client, box, "machine", manager._v4_head(client, box, "machine")[0])), {"2030-01-03", "2030-01-04"})
 
 

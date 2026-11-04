@@ -494,7 +494,7 @@ def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, pre
     output = {}
     auth = load_json(args.auth) if not args.local_only and not skip_remote else None
     if not args.local_only and not skip_remote and not is_api_auth(auth or {}):
-        output["remoteUsage"] = {}
+        output["remoteUsage"] = {"_response_callback": getattr(args, "raw_quota_response_callback", None)}
         if opener is None:
             raise UsageError("no HTTP opener is available")
         if getattr(args, "account_attribution_callback", None):

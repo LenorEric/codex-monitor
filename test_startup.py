@@ -78,7 +78,7 @@ class StartupDependencyTests(unittest.TestCase):
             self.assertEqual(lines[-2], "Startup: initialization complete; dashboard ready.")
             self.assertEqual(lines[-1], "Dashboard: http://127.0.0.1:8765/")
 
-    def test_update_installs_new_requirements_and_rolls_back_files_on_pip_failure(self):
+    def test_update_keeps_installed_files_when_dependency_installation_fails(self):
         for fail in (False, True):
             with self.subTest(fail=fail), startup_test_directory() as directory:
                 root = Path(directory)
@@ -98,8 +98,8 @@ class StartupDependencyTests(unittest.TestCase):
                     if fail:
                         with self.assertRaises(subprocess.CalledProcessError):
                             updater._install(None, "1.0.1", files)
-                        self.assertEqual((root / "requirements.txt").read_bytes(), b"old-package\n")
-                        self.assertEqual((root / "version.json").read_bytes(), old_metadata)
+                        self.assertEqual((root / "requirements.txt").read_bytes(), payloads["requirements.txt"])
+                        self.assertEqual((root / "version.json").read_bytes(), payloads["version.json"])
                     else:
                         updater._install(None, "1.0.1", files)
                         self.assertEqual((root / "version.json").read_bytes(), payloads["version.json"])

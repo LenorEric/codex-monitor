@@ -471,8 +471,8 @@ class CloudContractTests(CloudContractFixture):
 
     def test_automatic_usage_retries_contention_without_waiting_normal_interval(self):
         manager = self.manager()
-        manager._usage_data = SimpleNamespace()
-        manager._next_usage_sync_at = 0
+        manager.configure_usage_sync(SimpleNamespace(buffer_status=lambda: {"nextUploadAt": 0}))
+        manager._next_usage_fetch_at = 0
         busy = CloudError("busy", 409, category="lock")
         with mock.patch.object(manager, "sync_usage_data", side_effect=[busy, {}]) as sync:
             self.assertFalse(manager._auto_usage_sync_if_due(0))

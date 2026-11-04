@@ -33,13 +33,14 @@ def _main(instance_lock) -> int:
     parser.add_argument("--codex-home", type=Path, default=codex_home(), help="Codex config directory containing sessions/. Defaults to CODEX_HOME or ~/.codex.")
     parser.add_argument("--interval", type=int, default=90)
     parser.add_argument("--timeout", type=int, default=10, help="Per-request timeout in seconds.")
-    parser.add_argument("--quota-history", type=Path, help="Write-only quota backup path. Defaults to ~/.codex-switch/usage_monitor_quota_readings.jsonl.")
-    parser.add_argument("--token-ledger", type=Path, help="Write-only token event and stored-cost backup path. Defaults to ~/.codex-switch/usage_monitor_token_events.jsonl.")
+    parser.add_argument("--quota-history", type=Path, help="Legacy quota path used to locate the canonical database; canonical JSONL output is retired.")
+    parser.add_argument("--token-ledger", type=Path, help="Legacy token ledger path retained for migration and custom data locations.")
+    parser.add_argument("--raw-quota-log", type=Path, help="Optional raw quota API response JSONL path; writing requires the management setting to be enabled.")
     parser.add_argument("--dashboard", action="store_true", help="Open the local dashboard in the default browser after starting the server.")
     parser.add_argument("--reencrypt-cloud", action="store_true", help="Re-encrypt and verify every encrypted WebDAV payload with the configured hash key, then exit.")
     parser.add_argument("--local-only", action="store_true", help="Only scan local Codex session logs; do not call ChatGPT usage endpoints.")
     parser.add_argument("--no-token-scan", action="store_true", help="Disable local Codex session token usage scanning.")
-    parser.add_argument("--repair-processing", action="store_true", help="Rebuild derived processing checkpoints and dashboard rows; preserve canonical histories and v4 collection periods.")
+    parser.add_argument("--repair-processing", action="store_true", help="Rebuild derived processing checkpoints and dashboard rows; preserve canonical histories, pending uploads, and package receipts.")
     parser.add_argument("--retry-limit", type=int, default=DEFAULT_RETRY_LIMIT, help="Retries for HTTP and dashboard polling failures before raising; network errors retry indefinitely. Defaults to 3.")
     args = parser.parse_args()
     print("Startup: acquiring the single-instance lock...", flush=True)
@@ -68,9 +69,9 @@ def _main(instance_lock) -> int:
         codex_home=args.codex_home,
     )
     args.account_root = args.data_home / "accounts"
-    from monitor_processing import ProcessingIndex
+    from monitor_canonical import CanonicalIndex
     print("Startup: initializing the processing index...", flush=True)
-    index = ProcessingIndex(args.usage_sync_cache.with_name(f"{args.usage_sync_cache.stem}-v4.sqlite3"))
+    index = CanonicalIndex(args.usage_sync_cache.with_name(f"{args.usage_sync_cache.stem}-v4.sqlite3"))
     if args.repair_processing:
         print("Startup: repairing derived processing data...", flush=True)
         index.repair()

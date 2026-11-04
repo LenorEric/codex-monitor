@@ -1278,7 +1278,7 @@ class AccountManager:
             if duplicate_key := self._find_cloud_key(account_key):
                 raise AccountError(f"Bind blocked: this cloud credential profile is already managed as {duplicate_key['label']}", 409)
         if record_transition:
-            cloud.begin_account_transition("bind", accountId=account_id, accountKey=account_key, revisionId=auth_fingerprint(data), etag=etag)
+            cloud.begin_account_transition("bind", accountId=account_id, accountKey=account_key, authSha256=auth_fingerprint(data), etag=etag)
         try:
             self._commit_downloaded_cloud_account(state, data, identity, ready, account_type, account_id, "Bind")
         except Exception:
@@ -1324,7 +1324,7 @@ class AccountManager:
             else:
                 data = credential_path.read_bytes()
                 auth = parse_auth_bytes(data)
-            cloud.begin_account_transition("release", accountId=target["id"], accountKey=account_key, revisionId=auth_fingerprint(data))
+            cloud.begin_account_transition("release", accountId=target["id"], accountKey=account_key, authSha256=auth_fingerprint(data))
             try:
                 identity = auth_identity(auth)
                 cloud.release_account(

@@ -8,7 +8,7 @@ from unittest import mock
 
 import monitor_dashboard
 from monitor_events import delta_state_needs_hydration, process_sample_delta_events
-from monitor_processing import ProcessingIndex
+from monitor_canonical import CanonicalIndex
 from test_monitor_codex_usage import event_sample
 
 
@@ -17,7 +17,7 @@ class ConsoleStateTests(unittest.TestCase):
         self.root = Path.cwd() / f".test-console-state-{uuid.uuid4().hex}"
         self.root.mkdir()
         self.addCleanup(self.cleanup)
-        self.index = ProcessingIndex(self.root / "index.sqlite3")
+        self.index = CanonicalIndex(self.root / "index.sqlite3")
 
     def cleanup(self):
         if self.root.resolve().parent != Path.cwd().resolve() or not self.root.name.startswith(".test-console-state-"):

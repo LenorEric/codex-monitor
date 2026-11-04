@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import math
+import sys
 from pathlib import Path
 import time
 import urllib.request
@@ -44,6 +45,26 @@ def compact_quota_for_debug(compact: dict) -> dict:
 
 def fetch_usage(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path | None, timeout: int, debug: dict | None = None, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_token_refresh: bool = True) -> dict:
     debug = debug if debug is not None else {}
+    response_callback = debug.pop("_response_callback", None)
+    def request():
+        received = False
+        def capture(status, body):
+            nonlocal received
+            received = True
+            try:
+                response_callback(body, status, account_id)
+            except Exception as exc:
+                print(f"Raw quota response logging failed: {exc}", file=sys.stderr, flush=True)
+        try:
+            status, body = request_json(opener, "GET", USAGE_ENDPOINT, headers, timeout=timeout, retries=retries,
+                **({"response_callback": capture} if response_callback else {}))
+        except UsageHttpError as exc:
+            if response_callback and not received:
+                capture(exc.status, exc.body)
+            raise
+        if response_callback and not received:
+            capture(status, body)
+        return status, body
     token = refresh_access_token(auth, opener, auth_path, timeout, retries, auth_lock, refreshed_callback, allow_token_refresh)
     headers = {
         "Authorization": f"Bearer {token}",
@@ -63,13 +84,13 @@ def fetch_usage(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Pa
     })
     started_at = time.monotonic()
     try:
-        status, data = request_json(opener, "GET", USAGE_ENDPOINT, headers, timeout=timeout, retries=retries)
+        status, data = request()
     except UsageHttpError as exc:
         if not exc.is_expired_token():
             raise
         headers["Authorization"] = f"Bearer {refresh_access_token(auth, opener, auth_path, timeout, retries, auth_lock, refreshed_callback, True, True)}"
         debug["expiredTokenRefreshAt"] = now_iso()
-        status, data = request_json(opener, "GET", USAGE_ENDPOINT, headers, timeout=timeout, retries=retries)
+        status, data = request()
     debug.update({
         "completedAt": now_iso(),
         "durationMs": round((time.monotonic() - started_at) * 1000, 3),

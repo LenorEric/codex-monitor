@@ -9,7 +9,7 @@ from unittest import mock
 import monitor_migrations as migrations
 import monitor_sampling as sampling
 from monitor_processing import ProcessingIndex
-from monitor_projection import DashboardProjector
+from test_support_projection import DashboardProjector
 from monitor_usage_sync import UsageDataStore
 
 

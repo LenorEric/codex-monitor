@@ -241,7 +241,7 @@ def retry_operation(operation, retries: int = DEFAULT_RETRY_LIMIT, delay_seconds
                 raise
             time.sleep(delay_seconds)
 
-def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, headers: dict, body: dict | None = None, timeout: int = 10, retries: int = DEFAULT_RETRY_LIMIT, retry_network_errors_forever: bool = True) -> tuple[int, dict]:
+def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, headers: dict, body: dict | None = None, timeout: int = 10, retries: int = DEFAULT_RETRY_LIMIT, retry_network_errors_forever: bool = True, response_callback=None) -> tuple[int, dict]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     redirected_headers = {key: value for key, value in headers.items() if key.lower() not in {"authorization", "proxy-authorization", "chatgpt-account-id"}}
     request = urllib.request.Request(url, data=data, method=method, headers=redirected_headers | ({"Content-Type": "application/json"} if body is not None else {}))
@@ -255,12 +255,20 @@ def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, h
             raise UsageError("HTTP acquisition cancelled during shutdown")
         try:
             with opener.open(request, timeout=timeout) as response:
+                raw = response.read()
                 try:
-                    return response.status, json.loads(response.read().decode("utf-8"))
+                    decoded = json.loads(raw.decode("utf-8"))
                 except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    if response_callback:
+                        response_callback(response.status, raw.decode("utf-8", errors="replace"))
                     raise UsageError(f"Incompatible API response from {method} {url}: expected UTF-8 JSON") from exc
+                if response_callback:
+                    response_callback(response.status, decoded)
+                return response.status, decoded
         except urllib.error.HTTPError as exc:
             error = UsageHttpError(method, url, exc.code, exc.read().decode("utf-8", errors="replace"))
+            if response_callback:
+                response_callback(exc.code, error.body)
             if error.is_expired_token() or attempt >= retries:
                 raise error from exc
         except (urllib.error.URLError, OSError) as exc:

@@ -9,7 +9,8 @@ from types import SimpleNamespace
 from unittest import mock
 
 from monitor_migrations import MigrationError, migrate_history_data
-from monitor_cloud import CloudError, CloudManager, CryptoBox, passphrase_hash
+from monitor_cloud import CloudError, CryptoBox, passphrase_hash
+from test_support_usage_v4 import LegacyUsageCloudManager as CloudManager
 from monitor_usage_sync import UsageDataStore, content_hash, v4_logical_hash
 
 

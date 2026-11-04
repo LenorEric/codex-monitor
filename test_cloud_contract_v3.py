@@ -43,16 +43,16 @@ class CloudContractV3Tests(unittest.TestCase):
 
 
 
-    def test_force_verification_uses_v4_publication(self):
+    def test_force_verification_uses_package_sync(self):
         with self.directory() as directory:
             cloud = self.manager(directory)
             store = SimpleNamespace()
             cloud._usage_data = store
-            with mock.patch.object(cloud, "_connection", return_value=(SimpleNamespace(transfers=[]), object())), mock.patch.object(cloud, "_v4_publish_retry", return_value={}) as publish:
-                cloud._push_usage_data(True)
+            with mock.patch.object(cloud, "_connection", return_value=(SimpleNamespace(transfers=[]), object())), mock.patch("monitor_packages.sync", return_value={}) as publish:
+                cloud._push_usage_data()
 
             publish.assert_called_once()
-            self.assertTrue(publish.call_args.args[-1])
+            self.assertIs(publish.call_args.args[0], cloud)
 
 
 

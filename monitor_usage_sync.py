@@ -375,25 +375,8 @@ def v4_logical_hash(entries: list[dict]) -> str:
     return content_hash([[entry["recordKey"], content_hash(entry["record"])] for entry in sorted(entries, key=lambda item: item["recordKey"])])
 
 
-class UsageDataStore:
-    def __init__(self, quota_path: Path, token_ledger_path: Path, machine_id: str, account_id_resolver, lock, account_mapper=None, cache_path: Path | None = None, account_revision_resolver=None):
-        self.quota_path, self.token_ledger_path = Path(quota_path), Path(token_ledger_path)
-        self.cache_path = Path(cache_path) if cache_path is not None else default_usage_sync_cache_path(self.quota_path)
-        self.v4_cache_path = self.cache_path.with_name(f"{self.cache_path.stem}-v4.sqlite3")
-        self.machine_id, self.account_id_resolver, self.lock, self.account_mapper = machine_id, account_id_resolver, lock, account_mapper
-        self.account_revision_resolver = account_revision_resolver
-        self._local_datasets_cache = None
-        self._merged_datasets_cache = None
-        self._account_revision = None
-        from monitor_processing import ProcessingIndex
-        initialize_v4_cache(self.v4_cache_path)
-        self.index = ProcessingIndex(self.v4_cache_path)
-        from monitor_backup import BackupRecorder
-        from monitor_ingestion import SourceIngestor
-        self.backup = BackupRecorder(self.index)
-        self.sources = SourceIngestor(self)
-        self._database_revision = None
-
+class NormalizedRecords:
+    """Common preprocessing and transport contract, independent of stored histories."""
     def normalize_new_quota(self, row):
         if sync_meta(row).get("originMachineId", self.machine_id) != self.machine_id:
             raise ValueError("Foreign records in local history require data migration")
@@ -416,6 +399,39 @@ class UsageDataStore:
         if not str(sync_meta(row).get("accountId")).startswith("v3:"):
             raise ValueError("Ledger identity requires data migration")
         return row
+
+    @staticmethod
+    def _transport_record(kind: str, row: dict) -> dict:
+        if kind == "quota" and row.get("quotaRunVersion") == 1:
+            raise ValueError("Local quota runs are not cloud records")
+        if kind == "tokenLedger":
+            row = canonical_ledger_row(row)
+        transport = {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}
+        return {"kind": kind, "row": transport}
+
+
+class UsageDataStore(NormalizedRecords):
+    """Released fact/publication layout retained for ordered migrations and fixtures.
+
+    The daemon uses monitor_canonical.CanonicalDataStore for new runtime data.
+    """
+    def __init__(self, quota_path: Path, token_ledger_path: Path, machine_id: str, account_id_resolver, lock, account_mapper=None, cache_path: Path | None = None, account_revision_resolver=None):
+        self.quota_path, self.token_ledger_path = Path(quota_path), Path(token_ledger_path)
+        self.cache_path = Path(cache_path) if cache_path is not None else default_usage_sync_cache_path(self.quota_path)
+        self.v4_cache_path = self.cache_path.with_name(f"{self.cache_path.stem}-v4.sqlite3")
+        self.machine_id, self.account_id_resolver, self.lock, self.account_mapper = machine_id, account_id_resolver, lock, account_mapper
+        self.account_revision_resolver = account_revision_resolver
+        self._local_datasets_cache = None
+        self._merged_datasets_cache = None
+        self._account_revision = None
+        from monitor_processing import ProcessingIndex
+        initialize_v4_cache(self.v4_cache_path)
+        self.index = ProcessingIndex(self.v4_cache_path)
+        from monitor_backup import BackupRecorder
+        from monitor_ingestion import SourceIngestor
+        self.backup = BackupRecorder(self.index)
+        self.sources = SourceIngestor(self)
+        self._database_revision = None
 
     def ingest_local(self):
         with self.lock:
@@ -628,15 +644,6 @@ class UsageDataStore:
         self._local_datasets_cache = local
         self._merged_datasets_cache = merge_quota_rows(local[0] + [row for kind, row in mapped if kind == "quota"]), ledger
         self._account_revision = self.account_revision_resolver() if self.account_revision_resolver is not None else None
-
-    @staticmethod
-    def _transport_record(kind: str, row: dict) -> dict:
-        if kind == "quota" and row.get("quotaRunVersion") == 1:
-            raise ValueError("Local quota runs are not cloud records")
-        if kind == "tokenLedger":
-            row = canonical_ledger_row(row)
-        transport = {key: value for key, value in row.items() if key not in {"accountSlotId", "accountLabel"}}
-        return {"kind": kind, "row": transport}
 
     def refresh_accounts(self) -> None:
         with self.lock:

@@ -282,7 +282,8 @@ class CloudLockTests(CloudContractFixture):
             before = len(self.calls)
             manager = self.manager()
             box = CryptoBox("", CryptoBox.descriptor(""))
-            manager._upload_revision(client, box, "account", b"{}", {"accountId": "account"}, "opaque")
+            with mock.patch.object(manager, "_connection", return_value=(client, box)), mock.patch.object(manager, "_account_with", side_effect=CloudError("HTTP 404", 404)):
+                manager.release_account("account", b"{}", {}, "Empty", ready=False)
             manager._upload_skill_package(client, box, b"skill bytes", "a" * 64)
             manager._put_usage_payload(client, box, "v4/data", "machine", {"version": 1, "machineId": "machine", "day": "2030-01-01", "partId": "bulk", "records": []})
             self.assertFalse(any(method == "GET" for method, _, _ in self.calls[before:]))
