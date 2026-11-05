@@ -21,7 +21,7 @@ from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 22
+DATA_CONTRACT_VERSION = 23
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 from monitor_cloud_contract import CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_CONTRACT_PATH
@@ -610,6 +610,7 @@ DATA_MIGRATIONS = {
     20: _with_migration_rebuild(_migrate_history_to_v20, "event-only and independent quota storage migration"),
     21: _migrate_history_to_v21,
     22: lambda paths: __import__("monitor_migration_packages").migrate_local(paths),
+    23: lambda paths: __import__("monitor_migration_canonical").migrate_local(paths),
 }
 
 
@@ -634,8 +635,10 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
     if not isinstance(journal, dict) or not isinstance(journal.get("version"), int) or isinstance(journal.get("version"), bool) or not isinstance(journal.get("targets"), dict) or not isinstance(journal.get("backups"), dict) or not isinstance(journal.get("existing"), list):
         raise MigrationError("Cannot recover data migration: invalid journal")
     expected_targets = {name: str(path.resolve()) for name, path in paths.items()}
-    if journal["version"] == 19 and set(journal["targets"]) == {"processing_index"}:
+    if journal["version"] in {19, 23} and set(journal["targets"]) == {"processing_index"}:
         expected_targets = {"processing_index": expected_targets["processing_index"]}
+    if journal["version"] == 22:
+        expected_targets = {name: target for name, target in expected_targets.items() if name in {"processing_index", "config"}}
     if journal["version"] < 15:
         for name in list(expected_targets):
             if name in {"config", "machine", "skills"} or name.startswith(("vault_", "cache_source_")):
@@ -681,6 +684,8 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
 
 def _run_data_migration(migration, paths: dict[str, Path], version: int, state_path: Path, journal_path: Path) -> None:
     protected_paths = {"processing_index": paths["processing_index"]} if version == 19 else paths
+    if version == 23:
+        protected_paths = {"processing_index": paths["processing_index"]}
     if version == 22:
         protected_paths = {name: paths[name] for name in ("processing_index", "config") if name in paths}
     if version == 15:
@@ -827,12 +832,11 @@ def migrate_history_data(
         completed.append(version)
     _apply_migration_rebuild(paths)
     if target_version == DATA_CONTRACT_VERSION and paths["processing_index"].exists():
-        from monitor_processing import ProcessingIndex
-        # Sampling requests from every step are replayed together, against the final facts.
-        if target_version >= 22:
+        if target_version >= 23:
             from monitor_canonical import CanonicalIndex
-            CanonicalIndex(paths["processing_index"])
-        else:
+            CanonicalIndex(paths["processing_index"]).close()
+        elif target_version < 22:
+            from monitor_processing import ProcessingIndex
             ProcessingIndex(paths["processing_index"])
     return completed
 

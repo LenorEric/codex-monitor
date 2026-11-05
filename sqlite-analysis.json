@@ -1,0 +1,893 @@
+{
+  "storage": [
+    {
+      "name": "canonical_records",
+      "bytes": 308244480,
+      "payload": 257350824,
+      "unused": 47427635,
+      "pages": 75255
+    },
+    {
+      "name": "sqlite_autoindex_canonical_records_1",
+      "bytes": 67923968,
+      "payload": 57479209,
+      "unused": 8983111,
+      "pages": 16583
+    },
+    {
+      "name": "sqlite_autoindex_canonical_seen_1",
+      "bytes": 42684416,
+      "payload": 36483476,
+      "unused": 5036011,
+      "pages": 10421
+    },
+    {
+      "name": "sqlite_autoindex_delivery_run_refs_1",
+      "bytes": 42053632,
+      "payload": 35230152,
+      "unused": 5795392,
+      "pages": 10267
+    },
+    {
+      "name": "delivery_snapshot",
+      "bytes": 39505920,
+      "payload": 39464435,
+      "unused": 2890,
+      "pages": 9645
+    },
+    {
+      "name": "delivery_run_refs",
+      "bytes": 38719488,
+      "payload": 36339281,
+      "unused": 636086,
+      "pages": 9453
+    },
+    {
+      "name": "canonical_seen",
+      "bytes": 37691392,
+      "payload": 35249119,
+      "unused": 312540,
+      "pages": 9202
+    },
+    {
+      "name": "canonical_time",
+      "bytes": 35508224,
+      "payload": 31021007,
+      "unused": 3436201,
+      "pages": 8669
+    },
+    {
+      "name": "delivery_journal",
+      "bytes": 30748672,
+      "payload": 30574899,
+      "unused": 119314,
+      "pages": 7507
+    },
+    {
+      "name": "delivery_token_refs",
+      "bytes": 28819456,
+      "payload": 24062306,
+      "unused": 4011869,
+      "pages": 7036
+    },
+    {
+      "name": "delivery_run_time",
+      "bytes": 23683072,
+      "payload": 20073278,
+      "unused": 2861748,
+      "pages": 5782
+    },
+    {
+      "name": "sqlite_autoindex_delivery_token_refs_1",
+      "bytes": 15204352,
+      "payload": 12824042,
+      "unused": 1978002,
+      "pages": 3712
+    },
+    {
+      "name": "delivery_token_interval_7d",
+      "bytes": 13594624,
+      "payload": 10854259,
+      "unused": 2506197,
+      "pages": 3319
+    },
+    {
+      "name": "delivery_run_payload_unique",
+      "bytes": 9838592,
+      "payload": 7952061,
+      "unused": 1359783,
+      "pages": 2402
+    },
+    {
+      "name": "source_blocks",
+      "bytes": 9601024,
+      "payload": 8784305,
+      "unused": 457538,
+      "pages": 2344
+    },
+    {
+      "name": "delivery_token_time",
+      "bytes": 9027584,
+      "payload": 7636406,
+      "unused": 1096408,
+      "pages": 2204
+    },
+    {
+      "name": "delivery_token_payloads",
+      "bytes": 8896512,
+      "payload": 8264058,
+      "unused": 278479,
+      "pages": 2172
+    },
+    {
+      "name": "delivery_token_interval_5h",
+      "bytes": 8003584,
+      "payload": 6386951,
+      "unused": 1478913,
+      "pages": 1954
+    },
+    {
+      "name": "canonical_event",
+      "bytes": 7745536,
+      "payload": 6633577,
+      "unused": 820945,
+      "pages": 1891
+    },
+    {
+      "name": "sqlite_autoindex_delivery_token_payloads_1",
+      "bytes": 7639040,
+      "payload": 6510773,
+      "unused": 914835,
+      "pages": 1865
+    },
+    {
+      "name": "sqlite_autoindex_source_blocks_1",
+      "bytes": 6610944,
+      "payload": 5818623,
+      "unused": 631251,
+      "pages": 1614
+    },
+    {
+      "name": "delivery_run_payloads",
+      "bytes": 5459968,
+      "payload": 4274451,
+      "unused": 170451,
+      "pages": 1333
+    },
+    {
+      "name": "delivery_run_payload",
+      "bytes": 3092480,
+      "payload": 2014017,
+      "unused": 390741,
+      "pages": 755
+    },
+    {
+      "name": "delivery_charts",
+      "bytes": 2781184,
+      "payload": 2600080,
+      "unused": 105090,
+      "pages": 679
+    },
+    {
+      "name": "sqlite_autoindex_delivery_charts_1",
+      "bytes": 2666496,
+      "payload": 2151456,
+      "unused": 469084,
+      "pages": 651
+    },
+    {
+      "name": "source_checkpoints",
+      "bytes": 155648,
+      "payload": 117468,
+      "unused": 36420,
+      "pages": 38
+    },
+    {
+      "name": "sqlite_autoindex_delivery_journal_1",
+      "bytes": 69632,
+      "payload": 42842,
+      "unused": 17044,
+      "pages": 17
+    },
+    {
+      "name": "upload_buffer",
+      "bytes": 49152,
+      "payload": 34939,
+      "unused": 13736,
+      "pages": 12
+    },
+    {
+      "name": "processing_meta",
+      "bytes": 36864,
+      "payload": 23807,
+      "unused": 12783,
+      "pages": 9
+    },
+    {
+      "name": "sqlite_autoindex_source_checkpoints_1",
+      "bytes": 32768,
+      "payload": 24057,
+      "unused": 8016,
+      "pages": 8
+    },
+    {
+      "name": "sqlite_schema",
+      "bytes": 28672,
+      "payload": 15846,
+      "unused": 12267,
+      "pages": 7
+    },
+    {
+      "name": "sqlite_autoindex_upload_buffer_1",
+      "bytes": 12288,
+      "payload": 5426,
+      "unused": 6678,
+      "pages": 3
+    },
+    {
+      "name": "delivery_meta",
+      "bytes": 8192,
+      "payload": 4211,
+      "unused": 3934,
+      "pages": 2
+    },
+    {
+      "name": "sqlite_sequence",
+      "bytes": 4096,
+      "payload": 19,
+      "unused": 4065,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_processing_meta_1",
+      "bytes": 4096,
+      "payload": 2457,
+      "unused": 1538,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_package_receipts_1",
+      "bytes": 4096,
+      "payload": 1679,
+      "unused": 2369,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_metadata_1",
+      "bytes": 4096,
+      "payload": 19,
+      "unused": 4066,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_work_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_meta_1",
+      "bytes": 4096,
+      "payload": 88,
+      "unused": 3979,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_dirty_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_accounts_1",
+      "bytes": 4096,
+      "payload": 1991,
+      "unused": 2022,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_rollups_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_parts_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_manifests_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_days_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_day_meta_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_blobs_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "package_receipts",
+      "bytes": 4096,
+      "payload": 1660,
+      "unused": 2378,
+      "pages": 1
+    },
+    {
+      "name": "metadata",
+      "bytes": 4096,
+      "payload": 20,
+      "unused": 4064,
+      "pages": 1
+    },
+    {
+      "name": "delivery_work",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "delivery_dirty",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "delivery_accounts",
+      "bytes": 4096,
+      "payload": 2229,
+      "unused": 1734,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_rollups",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_parts",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_manifests",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_days",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_day_meta",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_blobs",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    }
+  ],
+  "owners": [
+    [
+      "metadata",
+      "metadata"
+    ],
+    [
+      "sqlite_autoindex_metadata_1",
+      "metadata"
+    ],
+    [
+      "processing_meta",
+      "processing_meta"
+    ],
+    [
+      "sqlite_autoindex_processing_meta_1",
+      "processing_meta"
+    ],
+    [
+      "dashboard_days",
+      "dashboard_days"
+    ],
+    [
+      "sqlite_autoindex_dashboard_days_1",
+      "dashboard_days"
+    ],
+    [
+      "dashboard_parts",
+      "dashboard_parts"
+    ],
+    [
+      "sqlite_autoindex_dashboard_parts_1",
+      "dashboard_parts"
+    ],
+    [
+      "dashboard_day_meta",
+      "dashboard_day_meta"
+    ],
+    [
+      "sqlite_autoindex_dashboard_day_meta_1",
+      "dashboard_day_meta"
+    ],
+    [
+      "dashboard_blobs",
+      "dashboard_blobs"
+    ],
+    [
+      "sqlite_autoindex_dashboard_blobs_1",
+      "dashboard_blobs"
+    ],
+    [
+      "dashboard_manifests",
+      "dashboard_manifests"
+    ],
+    [
+      "sqlite_autoindex_dashboard_manifests_1",
+      "dashboard_manifests"
+    ],
+    [
+      "dashboard_rollups",
+      "dashboard_rollups"
+    ],
+    [
+      "sqlite_autoindex_dashboard_rollups_1",
+      "dashboard_rollups"
+    ],
+    [
+      "delivery_meta",
+      "delivery_meta"
+    ],
+    [
+      "sqlite_autoindex_delivery_meta_1",
+      "delivery_meta"
+    ],
+    [
+      "delivery_dirty",
+      "delivery_dirty"
+    ],
+    [
+      "sqlite_autoindex_delivery_dirty_1",
+      "delivery_dirty"
+    ],
+    [
+      "delivery_work",
+      "delivery_work"
+    ],
+    [
+      "sqlite_autoindex_delivery_work_1",
+      "delivery_work"
+    ],
+    [
+      "delivery_accounts",
+      "delivery_accounts"
+    ],
+    [
+      "sqlite_autoindex_delivery_accounts_1",
+      "delivery_accounts"
+    ],
+    [
+      "delivery_charts",
+      "delivery_charts"
+    ],
+    [
+      "sqlite_autoindex_delivery_charts_1",
+      "delivery_charts"
+    ],
+    [
+      "delivery_journal",
+      "delivery_journal"
+    ],
+    [
+      "sqlite_autoindex_delivery_journal_1",
+      "delivery_journal"
+    ],
+    [
+      "delivery_snapshot",
+      "delivery_snapshot"
+    ],
+    [
+      "sqlite_sequence",
+      "sqlite_sequence"
+    ],
+    [
+      "delivery_run_payloads",
+      "delivery_run_payloads"
+    ],
+    [
+      "delivery_run_payload_unique",
+      "delivery_run_payloads"
+    ],
+    [
+      "delivery_run_refs",
+      "delivery_run_refs"
+    ],
+    [
+      "sqlite_autoindex_delivery_run_refs_1",
+      "delivery_run_refs"
+    ],
+    [
+      "delivery_run_payload",
+      "delivery_run_refs"
+    ],
+    [
+      "delivery_token_payloads",
+      "delivery_token_payloads"
+    ],
+    [
+      "sqlite_autoindex_delivery_token_payloads_1",
+      "delivery_token_payloads"
+    ],
+    [
+      "delivery_token_refs",
+      "delivery_token_refs"
+    ],
+    [
+      "sqlite_autoindex_delivery_token_refs_1",
+      "delivery_token_refs"
+    ],
+    [
+      "delivery_token_interval_5h",
+      "delivery_token_refs"
+    ],
+    [
+      "delivery_token_interval_7d",
+      "delivery_token_refs"
+    ],
+    [
+      "delivery_run_time",
+      "delivery_run_refs"
+    ],
+    [
+      "delivery_token_time",
+      "delivery_token_refs"
+    ],
+    [
+      "canonical_records",
+      "canonical_records"
+    ],
+    [
+      "sqlite_autoindex_canonical_records_1",
+      "canonical_records"
+    ],
+    [
+      "canonical_time",
+      "canonical_records"
+    ],
+    [
+      "canonical_event",
+      "canonical_records"
+    ],
+    [
+      "canonical_seen",
+      "canonical_seen"
+    ],
+    [
+      "sqlite_autoindex_canonical_seen_1",
+      "canonical_seen"
+    ],
+    [
+      "upload_buffer",
+      "upload_buffer"
+    ],
+    [
+      "sqlite_autoindex_upload_buffer_1",
+      "upload_buffer"
+    ],
+    [
+      "package_receipts",
+      "package_receipts"
+    ],
+    [
+      "sqlite_autoindex_package_receipts_1",
+      "package_receipts"
+    ],
+    [
+      "source_checkpoints",
+      "source_checkpoints"
+    ],
+    [
+      "sqlite_autoindex_source_checkpoints_1",
+      "source_checkpoints"
+    ],
+    [
+      "source_blocks",
+      "source_blocks"
+    ],
+    [
+      "sqlite_autoindex_source_blocks_1",
+      "source_blocks"
+    ]
+  ],
+  "canonical": [
+    [
+      "local",
+      "quota",
+      60480,
+      2,
+      31222615,
+      1783496923,
+      1793863011
+    ],
+    [
+      "local",
+      "tokenLedger",
+      41678,
+      9,
+      37869812,
+      1775555697,
+      1793863071
+    ],
+    [
+      "merged",
+      "quota",
+      165742,
+      7,
+      85422289,
+      1783496923,
+      1793863011
+    ],
+    [
+      "merged",
+      "tokenLedger",
+      47764,
+      12,
+      42798692,
+      1770813162,
+      1793863071
+    ]
+  ],
+  "seen": [
+    [
+      "local",
+      "quota",
+      60920
+    ],
+    [
+      "local",
+      "tokenLedger",
+      41678
+    ],
+    [
+      "merged",
+      "quota",
+      166451
+    ],
+    [
+      "merged",
+      "tokenLedger",
+      47764
+    ]
+  ],
+  "delivery": {
+    "delivery_accounts": [
+      [
+        "local",
+        9
+      ],
+      [
+        "merged",
+        16
+      ]
+    ],
+    "delivery_charts": [
+      [
+        "local",
+        3906
+      ],
+      [
+        "merged",
+        5631
+      ]
+    ],
+    "delivery_run_refs": [
+      [
+        "local",
+        60480
+      ],
+      [
+        "merged",
+        165742
+      ]
+    ],
+    "delivery_token_refs": [
+      [
+        "local",
+        41678
+      ],
+      [
+        "merged",
+        47764
+      ]
+    ]
+  },
+  "snapshot": [
+    [
+      28137456,
+      11326960,
+      1793863072.5337017
+    ]
+  ],
+  "buffer": [
+    [
+      41,
+      1793861778.354294,
+      1793863072.5144274,
+      29185
+    ]
+  ],
+  "meta_sizes": [
+    [
+      "consoleState",
+      8550
+    ],
+    [
+      "runtimeState",
+      4744
+    ],
+    [
+      "canonicalUsageTotals",
+      2386
+    ],
+    [
+      "canonicalCost:local",
+      1946
+    ],
+    [
+      "quotaObservation:v3:6ad01e8380b8341349080d33cd59b7c3376e1e8579738619ce69bfaf71a0556d",
+      413
+    ],
+    [
+      "quotaObservation:v3:6a2c0dc1a44b7cd51eb3310084d26abfa7ccf90f3ecec2233b95e3043cc5f0eb",
+      409
+    ],
+    [
+      "samplingState:local:v3:6a2c0dc1a44b7cd51eb3310084d26abfa7ccf90f3ecec2233b95e3043cc5f0eb",
+      283
+    ],
+    [
+      "samplingState:merged:v3:62f80437c4717d4be81985e1556df05a33949086d0a4d78d28387968dac36f89",
+      283
+    ],
+    [
+      "samplingState:merged:v3:29a0d04a7e0a45e46e4b7667cdd0beb251b2e485d6c6fb449034ff9e44ab07a8",
+      283
+    ],
+    [
+      "samplingState:merged:v3:cb1ed3a20e41a8513981a1fd6c9d1c2c1fb7deb1de92d113f242e45f9e5a6987",
+      283
+    ],
+    [
+      "samplingState:local:v3:6ad01e8380b8341349080d33cd59b7c3376e1e8579738619ce69bfaf71a0556d",
+      282
+    ],
+    [
+      "samplingState:merged:v3:2581aaabed1bc44df5e8d08230c4c923f46522b2220cd5fbb122d95285a7494d",
+      282
+    ],
+    [
+      "samplingState:merged:v3:6a2c0dc1a44b7cd51eb3310084d26abfa7ccf90f3ecec2233b95e3043cc5f0eb",
+      280
+    ],
+    [
+      "samplingState:merged:v3:320c69a2a58cadd5f38d3d3af4d2e7bf0965beb093ac9d7fbba5cf795615ef73",
+      280
+    ],
+    [
+      "samplingState:merged:v3:6ad01e8380b8341349080d33cd59b7c3376e1e8579738619ce69bfaf71a0556d",
+      278
+    ],
+    [
+      "samplingState:local:v3:102937aa82bc7989696e80b666e860e99fb38bfa24ce041bb1d7040fcf4b053e",
+      29
+    ],
+    [
+      "samplingState:local:v3:868ed713bf1265aed46a39f48a54f773f310114869e915ce2cf0e508cf4b654a",
+      29
+    ],
+    [
+      "samplingState:local:v3:a5569371f6f385f10fb74cc941ce34bb9cb2c8a7616f082cc5937fd58aabcaf0",
+      29
+    ],
+    [
+      "samplingState:local:v3:d23de0b456062139833d43d021dca08803eed0e2cdbb0b8165e409aaa0e7dde8",
+      29
+    ],
+    [
+      "samplingState:local:v3:e4bbb9c347f84641116d70f66e9f801deb503c9202d7dc06b539770c51f31e9d",
+      29
+    ],
+    [
+      "samplingState:local:v3:f09571b045fd472a6a65b3b3c8ac903aa161c10fb2469021e7e6c67e08201005",
+      29
+    ],
+    [
+      "samplingState:merged:v3:102937aa82bc7989696e80b666e860e99fb38bfa24ce041bb1d7040fcf4b053e",
+      29
+    ],
+    [
+      "samplingState:merged:v3:868ed713bf1265aed46a39f48a54f773f310114869e915ce2cf0e508cf4b654a",
+      29
+    ],
+    [
+      "samplingState:merged:v3:a5569371f6f385f10fb74cc941ce34bb9cb2c8a7616f082cc5937fd58aabcaf0",
+      29
+    ],
+    [
+      "samplingState:merged:v3:d23de0b456062139833d43d021dca08803eed0e2cdbb0b8165e409aaa0e7dde8",
+      29
+    ],
+    [
+      "samplingState:merged:v3:e4bbb9c347f84641116d70f66e9f801deb503c9202d7dc06b539770c51f31e9d",
+      29
+    ],
+    [
+      "samplingState:merged:v3:f09571b045fd472a6a65b3b3c8ac903aa161c10fb2469021e7e6c67e08201005",
+      29
+    ],
+    [
+      "samplingState:local:v3:ee7b61eb9a406b14a508d1526864a20bc69224cc3790633860909fb0d6abcb64",
+      29
+    ],
+    [
+      "samplingState:merged:v3:ee7b61eb9a406b14a508d1526864a20bc69224cc3790633860909fb0d6abcb64",
+      29
+    ],
+    [
+      "canonicalStore",
+      4
+    ],
+    [
+      "canonicalRevision",
+      4
+    ]
+  ],
+  "pragmas": {
+    "page_size": 4096,
+    "page_count": 282459,
+    "freelist_count": 85277
+  },
+  "files": {
+    "usage_monitor_sync_cache-v4.sqlite3": 1156952064,
+    "usage_monitor_sync_cache-v4.sqlite3-wal": 41484312,
+    "usage_monitor_sync_cache-v4.sqlite3-shm": 98304
+  }
+}

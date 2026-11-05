@@ -18,6 +18,7 @@ class ConsoleStateTests(unittest.TestCase):
         self.root.mkdir()
         self.addCleanup(self.cleanup)
         self.index = CanonicalIndex(self.root / "index.sqlite3")
+        self.addCleanup(self.index.close)
 
     def cleanup(self):
         if self.root.resolve().parent != Path.cwd().resolve() or not self.root.name.startswith(".test-console-state-"):

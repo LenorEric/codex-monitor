@@ -72,9 +72,12 @@ def _main(instance_lock) -> int:
     from monitor_canonical import CanonicalIndex
     print("Startup: initializing the processing index...", flush=True)
     index = CanonicalIndex(args.usage_sync_cache.with_name(f"{args.usage_sync_cache.stem}-v4.sqlite3"))
-    if args.repair_processing:
-        print("Startup: repairing derived processing data...", flush=True)
-        index.repair()
+    try:
+        if args.repair_processing:
+            print("Startup: repairing derived processing data...", flush=True)
+            index.repair()
+    finally:
+        index.close()
     if args.reencrypt_cloud:
         result = CloudManager(args.data_home, SkillManager(args.codex_home, args.data_home), None).reencrypt_remote_data()
         print(f"Re-encrypted and verified {result['reencrypted']} cloud payloads.")

@@ -1,17 +1,44 @@
 """One-time local conversion from released stores to canonical views and the upload buffer."""
 
+import copy
+import hashlib
 import json
 import sqlite3
 import time
 from contextlib import closing
+from datetime import datetime, timezone
 
 import monitor_sample_store as samples
 from monitor_common import parse_timestamp
 from monitor_usage_sync import canonical_json, record_account_key, record_key
 
 
+def initialize_v22(db):
+    db.executescript("""
+        CREATE TABLE IF NOT EXISTS processing_meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS canonical_records(
+            view TEXT NOT NULL CHECK(view IN ('local','merged')),kind TEXT NOT NULL,account TEXT NOT NULL,
+            record_key TEXT NOT NULL,first INTEGER NOT NULL,last INTEGER NOT NULL,data TEXT NOT NULL,
+            PRIMARY KEY(view,kind,account,record_key));
+        CREATE INDEX IF NOT EXISTS canonical_time ON canonical_records(view,kind,account,first,last);
+        CREATE INDEX IF NOT EXISTS canonical_event ON canonical_records(view,json_extract(data,'$.eventId')) WHERE kind='tokenLedger';
+        CREATE TABLE IF NOT EXISTS canonical_seen(view TEXT,kind TEXT,record_key TEXT,PRIMARY KEY(view,kind,record_key));
+        CREATE TABLE IF NOT EXISTS upload_buffer(seq INTEGER PRIMARY KEY AUTOINCREMENT,record_key TEXT UNIQUE NOT NULL,arrived REAL NOT NULL,data TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS package_receipts(destination TEXT,machine TEXT,package TEXT,PRIMARY KEY(destination,machine,package));
+        CREATE TABLE IF NOT EXISTS source_checkpoints(path TEXT PRIMARY KEY,state TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS source_blocks(path TEXT,block INTEGER,size INTEGER,digest TEXT,PRIMARY KEY(path,block));
+    """)
+
+
+def fragment_v22(row, label, first, last):
+    row = copy.deepcopy(row)
+    row["checkedAt"] = datetime.fromtimestamp(first, timezone.utc).isoformat()
+    row["windows"] = {label: row["windows"][label] | {"firstAt": first, "lastAt": last}}
+    row["sync"]["recordId"] = hashlib.sha256(canonical_json([record_account_key(row), label, first, last, row["windows"][label]])).hexdigest()
+    return row
+
+
 def migrate_local(paths):
-    from monitor_canonical import CanonicalDataStore, initialize
     from monitor_processing import ProcessingIndex
     from monitor_delivery import initialize_delivery
     from monitor_sampling import WINDOWS
@@ -43,7 +70,7 @@ def migrate_local(paths):
             home = next(home for home, event in pending if event["eventId"] == row["eventId"])
             index.put(db, f"ledgerNotifications:{home}", index.get(db, f"ledgerNotifications:{home}", []) + [row])
     with closing(samples.connect(path)) as db:
-        initialize(db)
+        initialize_v22(db)
         initialize_delivery(db)
         with db:
             def put(view, kind, row):
@@ -74,7 +101,7 @@ def migrate_local(paths):
                         "accountLabel": point.get("accountLabel", "Unknown"), "sync": {"version": 1, "accountId": account, "originMachineId": "migrated"},
                         "windows": {label: {"usedPercent": value["raw"], "continuous": value.get("continuous"), "multiplier": value.get("multiplier", 1),
                         "resetAt": value.get("resetAt"), "plan": value.get("plan", "plus"), "firstAt": first, "lastAt": last, "resetBoundary": bool(point.get("resetWindow"))}}}
-                    put(view, "quota", CanonicalDataStore._fragment(row, label, first, last))
+                    put(view, "quota", fragment_v22(row, label, first, last))
             # Publication history is converted to temporary candidates. The first
             # online sync removes candidates already present in migrated packages.
             for key, period, data in db.execute("SELECT record_key,period,record_json FROM local_records ORDER BY period,record_key"):

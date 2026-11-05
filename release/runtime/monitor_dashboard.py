@@ -434,7 +434,8 @@ class UsageDashboardState:
             slot_usage_accounts = {str(account["id"]): str(account["usageAccountId"]) for account in console_accounts["items"]}
             from monitor_sampling import quota_point
             with self.usage_data.index.transaction() as db:
-                quota_points = [quota_point(json.loads(data)) for data, in db.execute("SELECT data FROM canonical_records WHERE view='local' AND kind='quota' ORDER BY first,record_key")]
+                from monitor_canonical_store import CanonicalRepository
+                quota_points = [quota_point(row) for row in CanonicalRepository.rows(db, "local", "quota")]
             hydrate_delta_state_from_events(self.console_event_state, historical_console_events(quota_points, local_ledger, slot_usage_accounts))
         # Seeding lastSample establishes a baseline; it must not count the previous run's final delta twice.
         reset_runtime_baselines(self.console_event_state)
@@ -1683,5 +1684,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         for worker in (thread, inactive_account_thread, session_refresh_thread, dashboard_cache_thread, config_thread):
             worker.join()
         server.server_close()
+        if hasattr(state, "usage_data"):
+            state.usage_data.index.close()
         instance_lock.release()
     return AUTO_UPDATE_RESTART if auto_updater is not None and auto_updater.restart_requested else 0

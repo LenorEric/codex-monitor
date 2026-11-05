@@ -1,0 +1,84 @@
+{
+  "counts": [
+    [
+      "local",
+      "quota",
+      60488
+    ],
+    [
+      "local",
+      "tokenLedger",
+      41746
+    ],
+    [
+      "merged",
+      "quota",
+      165750
+    ],
+    [
+      "merged",
+      "tokenLedger",
+      47832
+    ]
+  ],
+  "before": {
+    "fileBytes": 1144483840,
+    "freeBytes": 336224256,
+    "canonicalTables": {
+      "canonical_records": 308457472
+    },
+    "canonicalIndexes": {
+      "canonical_event": 7757824,
+      "canonical_time": 35528704,
+      "sqlite_autoindex_canonical_records_1": 67973120
+    },
+    "canonicalBytes": 419717120,
+    "identityBytes": 80433152,
+    "otherAllocatedBytes": 306708480
+  },
+  "conversionSeconds": 45.958153,
+  "after": {
+    "fileBytes": 1144483840,
+    "freeBytes": 427933696,
+    "canonicalTables": {
+      "canonical_quota": 103227392,
+      "canonical_tokens": 72790016
+    },
+    "canonicalIndexes": {
+      "canonical_quota_overlap": 24752128,
+      "canonical_quota_predecessor": 22892544,
+      "canonical_quota_time": 23060480,
+      "canonical_tokens_event": 7757824,
+      "canonical_tokens_time": 8867840,
+      "sqlite_autoindex_canonical_quota_1": 40443904,
+      "sqlite_autoindex_canonical_tokens_1": 24207360
+    },
+    "canonicalBytes": 327999488,
+    "identityBytes": 80433152,
+    "otherAllocatedBytes": 306716672
+  },
+  "workload": {
+    "before": {
+      "quotaRows": 97125,
+      "tokenRows": 25165,
+      "readSeconds": 1.377038,
+      "prepareSeconds": 2.3582,
+      "singleValueEditRollbackSeconds": 5.1e-05
+    },
+    "after": {
+      "quotaRows": 97125,
+      "tokenRows": 25165,
+      "readSeconds": 1.122039,
+      "prepareSeconds": 2.612175,
+      "singleValueEditRollbackSeconds": 2.1e-05
+    }
+  },
+  "canonicalReductionPercent": 21.85,
+  "notes": [
+    "Read-only source; independent SQLite backups; no compaction.",
+    "Median of 3 warm runs on the largest Merged quota account.",
+    "Preparation measures account reads, quota_point, usage_runs and token_row; excludes delivery writes and gzip.",
+    "Edit measures one observed-value UPDATE followed by rollback, not the full range merge processor.",
+    "Conversion timing excludes migration-journal backup time."
+  ]
+}

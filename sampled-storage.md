@@ -1,10 +1,21 @@
 # Canonical storage and package synchronization
 
-The pending targets are local contract 22 and cloud contract 5. The successful v1.5.29 release contains local 21/cloud 4; generated release artifacts remain unchanged until an explicit release.
+The pending target is local contract 23. The successful v1.5.31 release contains local 22/cloud 5. Cloud contract 5 is unchanged; generated release artifacts remain unchanged until an explicit release.
 
 ## Permanent canonical data
 
-`monitor_canonical.py` owns `canonical_records`. Local and Merged use the same `(view, kind, account, record_key, first, last, data)` layout, JSON record types, units, and processing helpers. The selector is outside the payload. `canonical_seen` stores stable input identities for duplicate suppression; no canonical record refers to a cloud package, day, part, or publication generation.
+`monitor_canonical_store.py` owns typed `canonical_quota` and `canonical_tokens` tables through `CanonicalRepository`. Both use `dataset IN ('local','merged')`, stable account/record keys, identical columns and constraints, and the same in-memory record mapping and preparation helpers. The selector is outside the record payload. `canonical_seen` retains stable input identities for duplicate suppression, including quota identities whose ranges have subsequently changed; no canonical record refers to a cloud package, day, part, or publication generation.
+
+| Table | Typed business columns |
+| --- | --- |
+| `canonical_quota` | Account slot/label, window, integer Unix-second coverage bounds, observation timestamp, observed percentage, nullable accepted value, multiplier, plan, reset timestamp/boundary, version and identity provenance |
+| `canonical_tokens` | Account slot/label, event/session identity, fractional Unix occurrence timestamp, raw/billing model, tier, all seven integer token counters, all five REAL USD cost components, optional source filename and provenance |
+
+Tables use SQLite STRICT typing, compound primary keys `(dataset,account,record_key)`, and indexes for chronological reads, quota overlap/predecessor lookup, and token-event lookup. Counters/costs are nonnegative; numeric values must be finite; windows, datasets, tiers and versions are constrained. Quota bounds cannot be reversed. No extra historical accounting equations or acceptance rules are introduced.
+
+Known business values are not stored as JSON. Small presence/integer masks retain optional-field and integer-versus-float semantics. Timestamp columns are numeric; companion text columns preserve original ISO spellings where the existing record contract uses strings. `extras_json` is nullable and contains only unknown extension fields in their original nesting. The shared mapper never parses JSON for ordinary canonical records. Stored costs retain their existing numeric values without repricing, scaling, or rounding. The `first`/`last` columns preserve released chronological indexing semantics; quota `range_first`/`range_last` retain the actual stored window boundaries.
+
+The upload buffer, parser checkpoints, and variable operational metadata keep their existing JSON representation. Prepared quota/token tables remain typed; bulk snapshots and sequenced journals retain serialized client JSON. Automatic canonical compaction is disabled: deleted pages remain available for SQLite reuse.
 
 Quota records use `quotaRunVersion: 1`, one window per record, and integer Unix-second bounds. `usedPercent` preserves the observed value; `continuous` is the accepted value or null. Records also retain the resolved multiplier, plan, reset time, and reset boundary. Compatible observations extend a range. A conflicting point inside a range splits its coverage at t-1 and t+1 seconds. Explicit points win over inferred coverage; identical identities do not apply twice. Local changes also enter Merged, and cloud imports change Merged alone.
 
@@ -34,6 +45,17 @@ Canonical JSONL backups and their runtime queue are retired. `saveRawQuotaRespon
 
 ## Conversion and compatibility
 
+Local migration 23 converts contract-22 JSON canonical records directly into the two typed tables. It verifies every record round trip, stable keys, bounds and dataset/type counts before dropping the old table. The existing migration journal and SQLite backup cover this database only; interrupted conversion or marker publication is recoverable and retryable. Invalid/unrepresentable records fail with their identity, leaving the original representation intact.
+
+The contract changes because existing saved canonical rows must be converted before typed-only runtime access. It is representation-only: recorded costs, saved quota decisions, identity history, parser checkpoints, upload sequence/arrival/attempt state, package receipts, cached totals, prepared snapshots, journals and stream sequences are preserved. There is no historical sampling replay or projection rebuild. Sequential local upgrades retain the released contract-22 initializer and conversion helpers in migration-only code. Custom data paths and historical JSONL files are unchanged.
+
+
 Migration 22 preserves saved costs, quota decisions and both datasets, converts outstanding parsed source events before deleting the old event queue, and retires the legacy typed fact/publication/remote layout. Existing publication records become temporary candidates. The first online synchronization removes candidates already represented in migrated cloud packages, retaining unsent records; offline startup remains supported.
 
 Cloud history and account files have already been converted offline. Cloud contract 5 is now checked without migration: older roots and populated roots with no marker are rejected, while empty roots can be initialized. Retired cloud readers, pack/catalog converters and migration registries are removed. Sequential local upgrades remain supported.
+
+## Reproducible storage comparison
+
+Run `python benchmark_canonical_storage.py <contract-22.sqlite3> --output canonical-storage-benchmark.json`. The source is read-only; conversion and measurements use temporary SQLite backups which are removed afterward. APSW is needed only for this development benchmark when system SQLite omits `dbstat`; it is not a runtime dependency. Compare table plus index allocations, excluding reusable free pages, rather than raw JSON length or total file size. Conversion temporarily needs both layouts and the migration backup; no VACUUM is performed.
+
+See `canonical-storage-benchmark.md` for the measured fixture, storage and timing results. Preparation timings cover account reads and the shared interpretation functions, not network delivery, delivery-table writes, or gzip. Single-value edit timings are not full range-merge benchmarks.

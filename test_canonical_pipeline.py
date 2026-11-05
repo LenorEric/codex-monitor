@@ -12,6 +12,7 @@ from monitor_canonical import CanonicalDataStore
 from monitor_cloud import CloudError, CloudManager, CryptoBox
 from monitor_delivery import DashboardDelivery
 from monitor_migration_packages import migrate_local
+from monitor_migration_canonical import migrate_local as migrate_typed
 from monitor_packages import fetch, push
 from monitor_usage_sync import UsageDataStore, add_record_provenance
 import test_sqlite_authority as authority
@@ -40,7 +41,9 @@ class CanonicalPipelineTests(unittest.TestCase):
 
 
     def open_store(self, name="a"):
-        return CanonicalDataStore(self.root / name / "quota.jsonl", self.root / name / "token.jsonl", name, lambda _: "v3:account", threading.RLock())
+        store = CanonicalDataStore(self.root / name / "quota.jsonl", self.root / name / "token.jsonl", name, lambda _: "v3:account", threading.RLock())
+        self.addCleanup(store.index.close)
+        return store
 
     @staticmethod
     def quota(at="2030-01-01T10:00:00Z", value=50, seven=None):
@@ -199,6 +202,7 @@ class CanonicalPipelineTests(unittest.TestCase):
         old.record_ledger([authority.SQLiteAuthorityTests.ledger(cost=3)])
         old.initialize_v4_index()
         migrate_local({"processing_index": old.index.path})
+        migrate_typed({"processing_index": old.index.path})
         new = self.open_store("legacy")
         self.assertEqual(new.index.ledger_cost()[0]["totalCostUsd"], 3)
         self.assertEqual(new.datasets("local"), new.datasets("merged"))
@@ -300,7 +304,9 @@ class CanonicalPipelineTests(unittest.TestCase):
         push(self.manager, self.client, self.box)
         old.record_quota(self.quota("2030-01-02T00:01:00Z", 51))
         migrate_local({"processing_index": old.index.path})
+        migrate_typed({"processing_index": old.index.path})
         new = CanonicalDataStore(root / "quota.jsonl", root / "token.jsonl", "a", lambda _: "v3:account", threading.RLock())
+        self.addCleanup(new.index.close)
         self.manager._usage_data = new
         before = new.datasets("merged")
         fetch(self.manager, self.client, self.box)
@@ -354,6 +360,7 @@ class CanonicalPipelineTests(unittest.TestCase):
         old.sources.scan(root)
         log.unlink()
         migrate_local({"processing_index": old.index.path})
+        migrate_typed({"processing_index": old.index.path})
         new = self.open_store("pending")
         self.assertEqual(new.datasets()[1][0]["tokens"]["inputTokens"], 100)
         self.assertEqual(new.buffer_status()["pendingRecords"], 1)

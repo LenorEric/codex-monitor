@@ -32,6 +32,8 @@ RUNTIME_FILES = (
     "monitor_cloud.py",
     "monitor_cloud_contract.py",
     "monitor_canonical.py",
+    "monitor_canonical_store.py",
+    "monitor_migration_canonical.py",
     "monitor_canonical_ingestion.py",
     "monitor_packages.py",
     "monitor_migration_packages.py",

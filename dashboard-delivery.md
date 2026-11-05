@@ -1,6 +1,6 @@
 # Dashboard bulk and live delivery
 
-The same backend interpretation layer directly consumes either permanent canonical dataset. Both datasets have identical schemas, fields, units and storage helpers; only selection and stream routing differ. Local contract 22/cloud contract 5 are pending against released local 21/cloud 4. HTTP has no explicit protocol version.
+The same backend interpretation layer directly consumes either permanent canonical dataset. Both datasets have identical schemas, fields, units and storage helpers; only selection and stream routing differ. Local contract 23 is pending against released local 22/cloud 5 (v1.5.31); cloud contract 5 is unchanged. Typed canonical quota/token rows are mapped directly into the same preparation implementation for either dataset. The representation migration preserves existing prepared tables, snapshots, journals and stream sequences without requesting a rebuild. HTTP has no explicit protocol version.
 
 ## Pipeline and preparation
 

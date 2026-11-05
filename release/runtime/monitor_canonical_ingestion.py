@@ -6,6 +6,7 @@ import json
 import threading
 from pathlib import Path
 
+from monitor_canonical_store import CanonicalRepository
 from monitor_common import empty_token_totals
 from monitor_sources import SOURCE_READ_BYTES, serialized
 from monitor_tokens import _update_codex_file_state, collect_codex_session_files
@@ -64,7 +65,7 @@ class CanonicalSourceIngestor:
             seen = set()
             for _, events in self.pending.values():
                 for event in events:
-                    if event["eventId"] in seen or db.execute("SELECT 1 FROM canonical_records WHERE view='local' AND kind='tokenLedger' AND json_extract(data,'$.eventId')=? LIMIT 1", (event["eventId"],)).fetchone():
+                    if event["eventId"] in seen or CanonicalRepository.has_event(db, event["eventId"]):
                         continue
                     seen.add(event["eventId"])
                     tokens = empty_token_totals()

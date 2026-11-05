@@ -12,36 +12,41 @@ from pathlib import Path
 
 from monitor_common import parse_timestamp
 from monitor_sqlite import IndexState
+from monitor_canonical_store import CanonicalRepository as records, initialize as initialize_typed
 from monitor_usage_sync import NormalizedRecords, canonical_json, record_account_key, record_key
 
 
 def initialize(db):
-    db.executescript("""
+    initialize_typed(db)
+    for statement in """
         CREATE TABLE IF NOT EXISTS processing_meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS canonical_records(
-            view TEXT NOT NULL CHECK(view IN ('local','merged')),kind TEXT NOT NULL,account TEXT NOT NULL,
-            record_key TEXT NOT NULL,first INTEGER NOT NULL,last INTEGER NOT NULL,data TEXT NOT NULL,
-            PRIMARY KEY(view,kind,account,record_key));
-        CREATE INDEX IF NOT EXISTS canonical_time ON canonical_records(view,kind,account,first,last);
-        CREATE INDEX IF NOT EXISTS canonical_event ON canonical_records(view,json_extract(data,'$.eventId')) WHERE kind='tokenLedger';
         CREATE TABLE IF NOT EXISTS canonical_seen(view TEXT,kind TEXT,record_key TEXT,PRIMARY KEY(view,kind,record_key));
         CREATE TABLE IF NOT EXISTS upload_buffer(seq INTEGER PRIMARY KEY AUTOINCREMENT,record_key TEXT UNIQUE NOT NULL,arrived REAL NOT NULL,data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS package_receipts(destination TEXT,machine TEXT,package TEXT,PRIMARY KEY(destination,machine,package));
         CREATE TABLE IF NOT EXISTS source_checkpoints(path TEXT PRIMARY KEY,state TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS source_blocks(path TEXT,block INTEGER,size INTEGER,digest TEXT,PRIMARY KEY(path,block));
-    """)
+    """.split(";"):
+        if statement.strip():
+            db.execute(statement)
 
 
 class CanonicalIndex(IndexState):
     canonical = True
 
+    def maintain_disk_space(self):
+        # Contract 23 deliberately retains freed pages for subsequent ingestion.
+        return 0
+
     def __init__(self, path):
         self.path, self.lock = Path(path), threading.RLock()
+        self._db = None
+        self._closed = False
+        self._transaction_depth = 0
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.metrics = {"recordsImported": 0, "sourceBytesRead": 0, "sourceVerificationBytes": 0, "sourcesChecked": 0}
         with closing(sqlite3.connect(self.path)) as db:
-            if db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_facts'").fetchone() and not db.execute("SELECT 1 FROM sqlite_master WHERE name='canonical_records'").fetchone():
-                raise ValueError("Local contract 22 migration must complete before canonical data can be used")
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name IN ('processing_facts','canonical_records')").fetchone():
+                raise ValueError("Local contract 23 migration must complete before typed canonical data can be used")
             db.execute("PRAGMA journal_mode=WAL")
             initialize(db)
             db.execute("INSERT OR IGNORE INTO processing_meta VALUES('canonicalStore','true')")
@@ -51,14 +56,57 @@ class CanonicalIndex(IndexState):
 
     @contextmanager
     def transaction(self):
-        with self.lock, closing(sqlite3.connect(self.path, timeout=10)) as db, db:
-            db.execute("PRAGMA foreign_keys=ON")
-            db.execute("PRAGMA recursive_triggers=ON")
-            yield db
+        with self.lock:
+            if self._closed:
+                raise RuntimeError("Canonical index is closed")
+            if self._db is None:
+                # All access, including shutdown, is serialized by self.lock.
+                db = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+                try:
+                    db.execute("PRAGMA foreign_keys=ON")
+                    db.execute("PRAGMA recursive_triggers=ON")
+                except BaseException:
+                    db.close()
+                    raise
+                self._db = db
+            db = self._db
+            depth = self._transaction_depth
+            self._transaction_depth += 1
+            try:
+                if depth:
+                    db.execute(f"SAVEPOINT canonical_{depth}")
+                    try:
+                        yield db
+                    except BaseException:
+                        db.execute(f"ROLLBACK TO canonical_{depth}")
+                        raise
+                    finally:
+                        db.execute(f"RELEASE canonical_{depth}")
+                else:
+                    with db:
+                        db.execute("BEGIN")
+                        yield db
+            finally:
+                self._transaction_depth -= 1
+
+    def close(self):
+        with self.lock:
+            if self._transaction_depth:
+                raise RuntimeError("Cannot close canonical index during a transaction")
+            if self._db is not None:
+                self._db.close()
+                self._db = None
+            self._closed = True
+
+    def __del__(self):
+        # Also release handles for short-lived indexes and failed initialization.
+        db = getattr(self, "_db", None)
+        if db is not None:
+            db.close()
 
     def rows(self, kind, account=None, session=None):
         with self.transaction() as db:
-            rows = [json.loads(data) for data, in db.execute("SELECT data FROM canonical_records WHERE view='local' AND kind=? ORDER BY first,record_key", (kind,))]
+            rows = records.rows(db, "local", kind, account)
         return [row for row in rows if (account is None or record_account_key(row) == account) and (session is None or row.get("sessionId") == session)]
 
     def ledger_cost(self):
@@ -66,7 +114,7 @@ class CanonicalIndex(IndexState):
         with self.transaction() as db:
             cached = self.get(db, "canonicalCost:local")
             if cached is None:
-                cached = token_cost_snapshot(token_sessions_from_ledger([json.loads(data) for data, in db.execute("SELECT data FROM canonical_records WHERE view='local' AND kind='tokenLedger' ORDER BY first,record_key")]))
+                cached = token_cost_snapshot(token_sessions_from_ledger(records.rows(db, "local", "tokenLedger")))
                 self.put(db, "canonicalCost:local", cached)
             return tuple(cached)
 
@@ -75,8 +123,8 @@ class CanonicalIndex(IndexState):
         if cached is None:
             from monitor_common import empty_token_totals
             cached = {"totals": empty_token_totals(), "byModel": {}, "fastByModel": {}}
-            for data, in db.execute("SELECT data FROM canonical_records WHERE view='local' AND kind='tokenLedger'"):
-                self.add_usage(cached, json.loads(data))
+            for row in records.rows(db, "local", "tokenLedger"):
+                self.add_usage(cached, row)
             self.put(db, "canonicalUsageTotals", cached)
         return cached
 
@@ -117,25 +165,19 @@ class CanonicalDataStore(NormalizedRecords):
     def refresh_accounts(self):
         # Canonical account IDs are independent of credential slots and labels.
         with self.index.transaction() as db:
-            for account, in list(db.execute("SELECT DISTINCT account FROM canonical_records")):
+            for account in {account for _, account in records.accounts(db)}:
                 mapped = self.account_mapper(account, None, None) if self.account_mapper else None
                 if mapped:
-                    db.execute("UPDATE canonical_records SET data=json_set(data,'$.accountSlotId',?,'$.accountLabel',?) WHERE account=?", (mapped[0], mapped[1], account))
-            db.execute("INSERT OR IGNORE INTO delivery_dirty SELECT DISTINCT view,account FROM canonical_records")
+                    records.update_account(db, account, mapped[0], mapped[1])
+            records.dirty_all(db)
 
     def rename_account(self, account_id, label):
         with self.index.transaction() as db:
-            for view, kind, account, key, data in list(db.execute("SELECT view,kind,account,record_key,data FROM canonical_records")):
-                row = json.loads(data)
-                if row.get("accountSlotId") == account_id:
-                    row["accountLabel"] = label
-                    db.execute("UPDATE canonical_records SET data=? WHERE view=? AND kind=? AND account=? AND record_key=?", (canonical_json(row).decode(), view, kind, account, key))
-                    db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", (view, account))
+            records.rename_account(db, account_id, label)
 
     def datasets(self, view="local"):
         with self.index.transaction() as db:
-            rows = [(kind, json.loads(data)) for kind, data in db.execute("SELECT kind,data FROM canonical_records WHERE view=? ORDER BY first,record_key", (view,))]
-        return tuple([row for kind, row in rows if kind == wanted] for wanted in ("quota", "tokenLedger"))
+            return tuple(records.rows(db, view, kind) for kind in ("quota", "tokenLedger"))
 
     def buffer_status(self):
         with self.index.transaction() as db:
@@ -163,7 +205,7 @@ class CanonicalDataStore(NormalizedRecords):
         stamp = int(parse_timestamp(row.get("checkedAt") or row.get("occurredAt")))
         last = max((window.get("lastAt", stamp) for window in row.get("windows", {}).values()), default=stamp)
         key, account = record_key(kind, row), record_account_key(row)
-        db.execute("INSERT OR REPLACE INTO canonical_records VALUES(?,?,?,?,?,?,?)", (view, kind, account, key, stamp, last, canonical_json(row).decode()))
+        records.write(db, view, kind, row, key, account, (stamp, last))
         if kind == "tokenLedger" and view == "local":
             from monitor_tokens import normalize_codex_model, sum_cost_totals
             cost = self.index.get(db, "canonicalCost:local")
@@ -191,9 +233,7 @@ class CanonicalDataStore(NormalizedRecords):
         for label, window in row["windows"].items():
             first, last = int(window["firstAt"]), int(window["lastAt"])
             account = record_account_key(row)
-            existing = [(key, json.loads(data)) for key, data in db.execute(
-                "SELECT record_key,data FROM canonical_records WHERE view=? AND kind='quota' AND account=? AND first<=? AND last>=? ORDER BY first,record_key", (view, account, last, first))]
-            existing = [(key, old) for key, old in existing if label in old["windows"]]
+            existing = records.items(db, view, "quota", account, condition="window=? AND first<=? AND last>=?", parameters=(label, last, first))
             if first == last and any(old["windows"][label]["firstAt"] == old["windows"][label]["lastAt"] == first for _, old in existing):
                 continue
             spans = [(first, last)]
@@ -205,19 +245,19 @@ class CanonicalDataStore(NormalizedRecords):
                     continue
                 if first == last and all(prior.get(field) == window.get(field) for field in ("usedPercent", "continuous", "multiplier", "resetAt", "plan")):
                     return
-                db.execute("DELETE FROM canonical_records WHERE view=? AND kind='quota' AND account=? AND record_key=?", (view, account, key))
+                records.delete(db, view, "quota", account, key)
                 for a, b in ((a, min(b, first - 1)), (max(a, last + 1), b)):
                     if a <= b:
                         self._save(db, view, "quota", self._fragment(old, label, a, b))
             for a, b in spans:
                 incoming = self._fragment(row, label, a, b)
                 # Extend a compatible predecessor only when no intervening evidence exists.
-                previous = db.execute("SELECT record_key,last,data FROM canonical_records WHERE view=? AND kind='quota' AND account=? AND last<? AND json_type(data,?) IS NOT NULL ORDER BY last DESC LIMIT 1", (view, account, a, f'$.windows."{label}"')).fetchone()
+                previous = records.items(db, view, "quota", account, condition="window=? AND last<?", parameters=(label, a), order="last DESC", limit=1)
                 if previous:
-                    prior = json.loads(previous[2])
+                    prior = previous[0][1]
                     value = prior.get("windows", {}).get(label)
                     if value and window["continuous"] is not None and not window["resetBoundary"] and all(value.get(field) == window.get(field) for field in ("usedPercent", "continuous", "multiplier", "resetAt", "plan")):
-                        db.execute("DELETE FROM canonical_records WHERE view=? AND kind='quota' AND account=? AND record_key=?", (view, account, previous[0]))
+                        records.delete(db, view, "quota", account, previous[0][0])
                         incoming = self._fragment(incoming, label, int(value["firstAt"]), b)
                 self._save(db, view, "quota", incoming)
 
@@ -230,9 +270,10 @@ class CanonicalDataStore(NormalizedRecords):
         if stamp < state.get("timestamp", -1):
             state = {"windows": {}}
             for name, (label, _) in WINDOWS.items():
-                previous = db.execute("SELECT data FROM canonical_records WHERE view=? AND kind='quota' AND account=? AND first<? ORDER BY first DESC", (view, account, stamp))
-                for data, in previous:
-                    window = json.loads(data).get("windows", {}).get(label)
+                previous = records.rows(db, view, "quota", account, condition="window=? AND continuous IS NOT NULL AND first<?",
+                    parameters=(label, stamp), order="first DESC", limit=1)
+                for previous_row in previous:
+                    window = previous_row.get("windows", {}).get(label)
                     if window and window.get("continuous") is not None:
                         state["windows"][name] = {"raw": window["continuous"], "timestamp": min(window["lastAt"], stamp - 1), "resetAt": window.get("resetAt"), "plan": window["plan"]}
                         break
