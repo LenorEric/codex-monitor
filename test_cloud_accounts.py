@@ -11,7 +11,7 @@ from unittest import mock
 from monitor_accounts import auth_identity
 from monitor_cloud import CloudError, CloudManager, CryptoBox
 from monitor_skills import SkillManager
-from test_usage_v4 import MemoryWebDav
+from test_support_webdav import MemoryWebDav
 
 
 class CloudAccountTests(unittest.TestCase):

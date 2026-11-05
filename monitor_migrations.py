@@ -1,6 +1,6 @@
-"""Own local/cloud data contracts, ordered upgrades, journal recovery and old-format conversion.
+"""Own local data upgrades, journal recovery and old-format conversion.
 
-Released steps are immutable. Local 20 includes independent quota storage and event-only history; cloud 4 converts reset timestamps and removes legacy token history. Frozen historical codecs remain separate implementation
+Released local steps are immutable. Frozen local historical codecs remain separate implementation
 helpers; application modules only invoke the entry points here.
 """
 
@@ -24,8 +24,7 @@ import monitor_sample_store as samples
 DATA_CONTRACT_VERSION = 22
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
-CLOUD_DATA_CONTRACT_VERSION = 5
-CLOUD_DATA_CONTRACT_PATH = "data-contract.json"
+from monitor_cloud_contract import CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_CONTRACT_PATH
 
 
 class MigrationError(RuntimeError):
@@ -97,11 +96,11 @@ def _preserve_projection_work(db):
 
 
 def validate_contract_metadata(metadata: dict) -> None:
-    for field, target, migrations in (("dataContractVersion", DATA_CONTRACT_VERSION, DATA_MIGRATIONS), ("cloudDataContractVersion", CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_MIGRATIONS)):
+    for field, target in (("dataContractVersion", DATA_CONTRACT_VERSION), ("cloudDataContractVersion", CLOUD_DATA_CONTRACT_VERSION)):
         if type(metadata.get(field)) is not int or metadata[field] != target:
-            raise MigrationError(f"Package {field} must match migration target {target}")
-        if set(migrations) != set(range(1, target + 1)) or not all(callable(step) for step in migrations.values()):
-            raise MigrationError(f"Migration registry for {field} must contain every step from 1 through {target}")
+            raise MigrationError(f"Package {field} must match contract target {target}")
+    if set(DATA_MIGRATIONS) != set(range(1, DATA_CONTRACT_VERSION + 1)) or not all(callable(step) for step in DATA_MIGRATIONS.values()):
+        raise MigrationError(f"Local migration registry must contain every step from 1 through {DATA_CONTRACT_VERSION}")
 
 
 def installed_data_contract_version(runtime_dir: Path, fallback: int = DATA_CONTRACT_VERSION) -> int:
@@ -560,7 +559,6 @@ def _migrate_history_to_v19(paths: dict[str, Path]) -> None:
         request_migration_rebuild(paths, "conflicting source identities", sampling=True)
 
 
-
 def _migrate_history_to_v20(paths: dict[str, Path]) -> None:
     # One pending migration combines all changes since released contract 19.
     if paths["processing_index"].exists():
@@ -855,66 +853,6 @@ def migrate_installed_data(
         token_ledger_path or default_token_ledger_path(history), sample_log_path or default_sample_log_path(history),
         installed_data_contract_version(runtime_dir) if target_version is None else target_version, runtime_state_path, dashboard_cache_path, usage_sync_cache_path, cloud_state_path, codex_home,
     )
-
-
-def _migrate_cloud_to_v1(client):
-    # Adopt existing account, skills and usage formats without changing any payload.
-    # Future steps must preserve originals and be idempotent: the marker commits last.
-    pass
-
-
-def _migrate_cloud_to_v2(client):
-    # The coordination file is provisioned and exclusively owned before migration.
-    # Payload formats and all retained sources remain unchanged.
-    pass
-
-
-def _migrate_cloud_to_v3(client):
-    migrate_cloud_formats(client, getattr(client, "_migration_manager", None))
-
-
-CLOUD_DATA_MIGRATIONS = {1: _migrate_cloud_to_v1, 2: _migrate_cloud_to_v2, 3: _migrate_cloud_to_v3, 4: lambda client: __import__("monitor_migration_events").migrate_cloud_event_only(client), 5: lambda client: __import__("monitor_migration_packages").migrate_cloud(client)}
-
-
-def read_cloud_contract(client):
-    from monitor_cloud import CloudError
-    try:
-        data, etag = client.get(CLOUD_DATA_CONTRACT_PATH)
-    except CloudError as exc:
-        if exc.http_status == 404:
-            return 0, None
-        raise
-    try:
-        value = json.loads(data)
-    except (ValueError, UnicodeDecodeError) as exc:
-        raise CloudError("Invalid cloud data contract metadata; cloud access is blocked", 409) from exc
-    version = value.get("dataContractVersion") if isinstance(value, dict) else None
-    if not isinstance(version, int) or isinstance(version, bool) or version < 0:
-        raise CloudError("Invalid cloud data contract version; cloud access is blocked", 409)
-    if version > CLOUD_DATA_CONTRACT_VERSION:
-        raise CloudError(f"Cloud data contract {version} is newer than this app's target {CLOUD_DATA_CONTRACT_VERSION}; cloud access is blocked until the local script is updated", 409, category="update_required")
-    return version, etag
-
-
-def ensure_cloud_contract(client, target_version=None):
-    from monitor_cloud import CloudError
-    from monitor_usage_sync import canonical_json
-    current, etag = read_cloud_contract(client)
-    target_version = CLOUD_DATA_CONTRACT_VERSION if target_version is None else target_version
-    if type(target_version) is not int or not current <= target_version <= CLOUD_DATA_CONTRACT_VERSION:
-        raise CloudError("Unsupported cloud migration target", 409)
-    for version in range(current + 1, target_version + 1):
-        if version not in CLOUD_DATA_MIGRATIONS:
-            raise CloudError(f"Missing cloud data migration {version}; cloud access is blocked", 409)
-        CLOUD_DATA_MIGRATIONS[version](client)
-        etag = client.put(CLOUD_DATA_CONTRACT_PATH, canonical_json({"dataContractVersion": version}), etag=etag)
-        if version == 3:
-            finish_cloud_format_migration(client)
-        if version == 4:
-            __import__("monitor_migration_events").finish_cloud_event_migration(client)
-        if version == 5:
-            __import__("monitor_migration_packages").finish_cloud(client)
-
 
 
 DEFAULT_DATA_FILES = (
@@ -1376,172 +1314,6 @@ def migrate_local_formats(paths, codex_home=None):
             source.unlink(missing_ok=True)
 
 
-def migrate_cloud_formats(client, manager):
-    """Convert under one operation lease; accepted uploads are final."""
-    from monitor_cloud import CloudError, CryptoBox
-    from monitor_usage_sync import canonical_json, content_hash, record_key, v4_logical_hash, v4_period, v4_record_envelope
-    from monitor_migration_events import validate_v4_envelope
-    import time
-    def optional(path):
-        try:
-            return client.get(path)
-        except CloudError as exc:
-            if exc.http_status == 404:
-                return None, None
-            raise
-    descriptor, descriptor_etag = optional("crypto.json")
-    if descriptor is None:
-        return
-    if manager is None:
-        raise CloudError("Cloud format migration requires the configured monitor", 409)
-    config = manager.config()
-    verifier = config["webdav"].get("encryptionPassphraseHash", "")
-    parsed = json.loads(descriptor)
-    if parsed.get("format") == "codex-switch-crypto" and parsed.get("version") in {1, 2}:
-        parsed["version"] = 3
-    box = CryptoBox(verifier, parsed)
-    converter = FormatConverter(manager.accounts.manifest if manager.accounts else {}, manager._state, config, manager.machine_id)
-    import re
-    # Account credentials provide authoritative identities even for accounts
-    # absent from this machine. Remember their old usage aliases during this
-    # conversion only, without guessing based on display labels.
-    for filename in manager._optional_remote_list(client, "accounts/states"):
-        if not filename.endswith(".enc"):
-            continue
-        account_key = filename[:-4]
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", account_key) is None:
-            raise ValueError("Invalid migrated cloud account key")
-        path = f"accounts/states/{filename}"
-        account_bytes, account_etag = client.get(path)
-        account_state = json.loads(box.decrypt(f"account-state:{account_key}", account_bytes))
-        if account_state.get("accountKey") != account_key or account_state.get("version") != 1:
-            raise ValueError("Invalid historical cloud account state")
-        if account_state.get("ready", True):
-            from monitor_accounts import auth_identity, parse_auth_bytes, api_identity_id
-            from monitor_migration_accounts import download_legacy_account
-            data = download_legacy_account(client, box, account_state)
-            identity = auth_identity(parse_auth_bytes(data))
-            account_type = identity["accountType"]
-            alias = FormatConverter({"accounts": [{"id": account_key, "identity": identity, "accountType": account_type}]}, {}, config, manager.machine_id)
-            converter.aliases.update(alias.aliases)
-            account_state["accountType"] = account_type
-            if account_type == "api":
-                account_state["apiIdentityId"] = api_identity_id(identity)
-        if account_state.get("configHeader"):
-            import tomlkit
-            if not account_state.get("configHeaderToml"):
-                account_state["configHeaderToml"] = tomlkit.dumps(account_state["configHeader"])
-        account_state.pop("configHeader", None)
-        account_state.setdefault("configHeaderToml", "")
-        client.put(path, box.encrypt(f"account-state:{account_key}", canonical_json(account_state)), etag=account_etag)
-    # Monolithic skill snapshots become the current per-skill packages.
-    pointer_bytes, pointer_etag = optional("skills/current.enc")
-    if pointer_bytes:
-        pointer = json.loads(box.decrypt("skills-pointer", pointer_bytes))
-        if pointer.get("version") == 1:
-            snapshot_id = pointer["snapshotId"]
-            data = box.decrypt(f"skills-snapshot:{snapshot_id}", client.get(f"skills/snapshots/{snapshot_id}.enc")[0])
-            client.ensure_directories("skills/packages")
-            packages = {name: manager._upload_skill_package(client, box, data, manager.skills.skill_package_hash(data)) for name, data in manager.skills.split_snapshot(data).items()}
-            pointer = {"version": 2, "packages": packages, "updatedAt": pointer.get("updatedAt")}
-            client.put("skills/current.enc", box.encrypt("skills-pointer", canonical_json(pointer)), etag=pointer_etag)
-        elif pointer.get("version") != 2:
-            raise ValueError("Unknown cloud skill format")
-    old_machines = {name[:-4] for name in manager._optional_remote_list(client, "usage/machines") if name.endswith(".enc")}
-    machines = old_machines | {name[:-4] for name in manager._optional_remote_list(client, "usage/v4/heads") if name.endswith(".enc")}
-    for machine in sorted(machines):
-        import re
-        if re.fullmatch(r"[A-Za-z0-9_-]{1,128}", machine) is None:
-            raise ValueError("Invalid migrated machine ID")
-        head, head_etag = manager._v4_head(client, box, machine)
-        catalog = manager._v4_catalog(client, box, machine, head)
-        days = {}
-        for day, reference in catalog.items():
-            manifest = manager._v4_day_manifest(client, box, machine, day, reference)
-            for part, digest in manifest["parts"].items():
-                entries = manager._v4_data(client, box, machine, day, part, digest)
-                try:
-                    for entry in entries:
-                        record = converter.record(entry["record"], machine)
-                        if record is not None:
-                            key = record_key(record["kind"], record["row"])
-                            value = v4_record_envelope(machine, key, record, entry["collectionPeriod"])
-                            validate_v4_envelope(value, machine)
-                            days.setdefault(day, {})[key] = value
-                finally:
-                    if hasattr(entries, "close"):
-                        entries.close()
-        if machine in old_machines:
-            pointer = json.loads(box.decrypt(f"usage-pointer:{machine}", client.get(f"usage/machines/{machine}.enc")[0]))
-            if pointer.get("machineId") != machine:
-                raise ValueError("Old usage pointer owner mismatch")
-            operations = []
-            if pointer.get("version") == 1:
-                checkpoint = manager._download_usage_payload(client, box, "checkpoints", machine, pointer["checkpointId"])
-                operations = [{"action": "upsert", **record} for record in checkpoint.get("records", [])]
-                chunks, seen, chunk_id = [], set(), pointer.get("headChunkId")
-                while chunk_id:
-                    if chunk_id in seen:
-                        raise ValueError("Cyclic old usage chain")
-                    seen.add(chunk_id)
-                    chunk = manager._download_usage_payload(client, box, "chunks", machine, chunk_id)
-                    chunks.append(chunk)
-                    chunk_id = chunk.get("parentChunkId")
-                for chunk in reversed(chunks):
-                    operations.extend(chunk.get("operations", []))
-            elif pointer.get("version") == 2:
-                for digest in pointer["packs"].values():
-                    pack = manager._download_usage_payload(client, box, "packs", machine, digest)
-                    operations.extend({"action": "upsert", **entry} for entry in pack["records"])
-            else:
-                raise ValueError("Unknown cloud usage format")
-            records = {}
-            for operation in operations:
-                if operation["action"] == "delete":
-                    records.pop(operation["key"], None)
-                elif operation["action"] == "upsert":
-                    records[operation["key"]] = operation["record"]
-                else:
-                    raise ValueError("Invalid historical operation")
-            for source in records.values():
-                record = converter.record(source, machine)
-                if record is None:
-                    continue
-                row = record.get("row") or {}
-                event = row.get("checkedAt") or row.get("occurredAt") or (row.get("session") or {}).get("updatedAt")
-                period = v4_period(parse_timestamp(event) or time.time())
-                key = record_key(record["kind"], row)
-                value = v4_record_envelope(machine, key, record, period)
-                validate_v4_envelope(value, machine)
-                days.setdefault(period[:10], {}).setdefault(key, value)
-        new_catalog = {}
-        for path in ("usage/v4/heads", f"usage/v4/data/{machine}", f"usage/v4/days/{machine}", f"usage/v4/months/{machine}"):
-            client.ensure_directories(path)
-        for day, records in sorted(days.items()):
-            entries = sorted(records.values(), key=lambda row: row["recordKey"])
-            data_id, _ = manager._put_usage_payload(client, box, "v4/data", machine, {"version": 1, "machineId": machine, "day": day, "partId": "bulk", "records": entries})
-            logical = v4_logical_hash(entries)
-            manifest = {"version": 1, "machineId": machine, "day": day, "layout": "bulk", "logicalHash": logical, "parts": {"bulk": data_id}}
-            manifest_id, _ = manager._put_usage_payload(client, box, "v4/days", machine, manifest)
-            new_catalog[day] = {"manifestId": manifest_id, "logicalHash": logical, "layout": "bulk"}
-        months = {}
-        for month in sorted({day[:7] for day in new_catalog}):
-            months[month] = manager._put_usage_payload(client, box, "v4/months", machine, {"version": 1, "machineId": machine, "month": month, "days": {day: ref for day, ref in new_catalog.items() if day[:7] == month}})[0]
-        updated = {"version": 4, "machineId": machine, "generation": (head or {}).get("generation", 0) + 1, "months": months, "activeDay": None}
-        client.put(manager._v4_head_path(machine), box.encrypt(f"usage-v4-head:{machine}", canonical_json(updated)), etag=head_etag)
-    client.put("crypto.json", canonical_json(CryptoBox.descriptor(verifier)), etag=descriptor_etag)
-
-
-def finish_cloud_format_migration(client):
-    from monitor_cloud import CloudError
-    for path in ("usage/machines", "usage/packs", "usage/chunks", "usage/checkpoints", "skills/snapshots", "migrations/contract-3"):
-        try:
-            client.delete(path)
-        except CloudError as exc:
-            if exc.http_status != 404:
-                raise
-
-
 def _migrate_config_files(private_root, config_path, state_path, machine_path) -> None:
     from monitor_accounts import atomic_write_json
     from monitor_common import now_iso as _timestamp
@@ -1667,8 +1439,6 @@ def _migrate_config_files(private_root, config_path, state_path, machine_path) -
             atomic_write_json(state_path, state)
 
 
-
-
 def migrate_sample_store(path, batch_size=256):
     """One atomic bounded-memory conversion, protected additionally by startup's journal."""
     from monitor_migration_samples import connect, initialize, create_views, put_fact, put_local, put_remote, select_sample, _record, _envelope, canonical
@@ -1721,7 +1491,6 @@ def migrate_sample_store(path, batch_size=256):
         create_views(db)
         if db.execute("PRAGMA foreign_key_check").fetchone():
             raise ValueError("Sample ownership foreign key check failed")
-
 
 
 RESET_TIMESTAMP_FIELDS = {"resetAt", "baselineResetAt", "rollbackBaselineResetAt", "backwardResetCandidateAt"}

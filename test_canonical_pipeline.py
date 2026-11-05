@@ -15,8 +15,7 @@ from monitor_migration_packages import migrate_local
 from monitor_packages import fetch, push
 from monitor_usage_sync import UsageDataStore, add_record_provenance
 import test_sqlite_authority as authority
-from test_support_usage_v4 import LegacyUsageCloudManager
-from test_usage_v4 import MemoryWebDav, moment
+from test_support_webdav import MemoryWebDav, moment
 
 
 class PackageWebDav(MemoryWebDav):
@@ -39,9 +38,6 @@ class CanonicalPipelineTests(unittest.TestCase):
         self.manager._machine["machineId"] = "a"
         self.manager._config["webdav"]["enabled"] = True
 
-    def publish_legacy(self):
-        with mock.patch.object(self.manager, "_v4_sealed_day", LegacyUsageCloudManager._v4_sealed_day, create=True):
-            return LegacyUsageCloudManager._v4_publish_objects(self.manager, self.client, self.box, False)
 
     def open_store(self, name="a"):
         return CanonicalDataStore(self.root / name / "quota.jsonl", self.root / name / "token.jsonl", name, lambda _: "v3:account", threading.RLock())
@@ -289,30 +285,20 @@ class CanonicalPipelineTests(unittest.TestCase):
         with mock.patch.object(Path, "open", side_effect=OSError("unwritable")):
             state._record_raw_quota_response(response, 200, "account")
 
-    def test_cloud_conversion_and_first_sync_only_publish_unsent_candidates(self):
-        from monitor_migrations import ensure_cloud_contract
+    def test_first_sync_reconciles_unsent_local_migration_candidates(self):
         root = self.root / "legacy"
         old = UsageDataStore(root / "quota.jsonl", root / "token.jsonl", "a", lambda _: "v3:account", threading.RLock())
         old.backup.enabled = lambda: False
         old.record_quota(self.quota())
         old.record_quota(self.quota("2030-01-01T11:00:00Z"))
-        self.manager._usage_data = old
-        with mock.patch("time.time", return_value=moment("2030-01-02T00:00:00Z")):
-            self.publish_legacy()
+        old.initialize_v4_index(moment("2030-01-02T00:00:00Z"))
+        published = self.open_store("published")
+        published.machine_id = "a"
+        published.record_quota(self.quota())
+        published.record_quota(self.quota("2030-01-01T11:00:00Z"))
+        self.manager._usage_data = published
+        push(self.manager, self.client, self.box)
         old.record_quota(self.quota("2030-01-02T00:01:00Z", 51))
-        self.client.put("crypto.json", canonical_bytes(CryptoBox.descriptor("")))
-        self.client.put("data-contract.json", canonical_bytes({"dataContractVersion": 4}))
-        self.client._migration_manager = self.manager
-        from monitor_usage_packs import UsageObjectReader
-        legacy_entries = UsageObjectReader.entries
-        def with_summary(reader, day, reference):
-            yield from legacy_entries(reader, day, reference)
-            yield {"recordKey": "obsolete-summary", "collectionPeriod": "2030-01-01T10:00Z",
-                "record": {"kind": "costSummary", "row": {"checkedAt": "2030-01-01T10:00:00Z", "cost": {"totalCostUsd": 999}}}}
-        with mock.patch.object(UsageObjectReader, "entries", with_summary):
-            ensure_cloud_contract(self.client)
-        self.assertFalse(any(path.startswith("usage/v4/") for path in self.client.files))
-        self.assertEqual(json.loads(self.client.get("data-contract.json")[0])["dataContractVersion"], 5)
         migrate_local({"processing_index": old.index.path})
         new = CanonicalDataStore(root / "quota.jsonl", root / "token.jsonl", "a", lambda _: "v3:account", threading.RLock())
         self.manager._usage_data = new
@@ -372,29 +358,6 @@ class CanonicalPipelineTests(unittest.TestCase):
         self.assertEqual(new.datasets()[1][0]["tokens"]["inputTokens"], 100)
         self.assertEqual(new.buffer_status()["pendingRecords"], 1)
 
-    def test_cloud_marker_failure_keeps_v4_sources_and_retry_is_idempotent(self):
-        from monitor_migrations import ensure_cloud_contract
-        old = UsageDataStore(self.root / "old" / "quota.jsonl", self.root / "old" / "token.jsonl", "a", lambda _: "v3:account", threading.RLock())
-        old.backup.enabled = lambda: False
-        old.record_quota(self.quota())
-        self.manager._usage_data = old
-        with mock.patch("time.time", return_value=moment("2030-01-02T00:00:00Z")):
-            self.publish_legacy()
-        self.client.put("crypto.json", canonical_bytes(CryptoBox.descriptor("")))
-        self.client.put("data-contract.json", canonical_bytes({"dataContractVersion": 4}))
-        self.client._migration_manager = self.manager
-        original = self.client.put
-        def fail(path, data, **kwargs):
-            if path == "data-contract.json":
-                raise CloudError("marker failed", 502)
-            return original(path, data, **kwargs)
-        with mock.patch.object(self.client, "put", side_effect=fail), self.assertRaises(CloudError):
-            ensure_cloud_contract(self.client)
-        self.assertTrue(any(path.startswith("usage/v4/") for path in self.client.files))
-        packages = {path for path in self.client.files if path.startswith("usage/v5/")}
-        ensure_cloud_contract(self.client)
-        self.assertEqual({path for path in self.client.files if path.startswith("usage/v5/")}, packages)
-        self.assertFalse(any(path.startswith("usage/v4/") for path in self.client.files))
 
     def test_binding_account_updates_both_view_labels_without_cloud_history(self):
         self.store.record_ledger([authority.SQLiteAuthorityTests.ledger()])

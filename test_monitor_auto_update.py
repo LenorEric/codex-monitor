@@ -458,14 +458,14 @@ print("Packaged runtime imports and SQLite migration OK")
         self.assertEqual(package["dataContractVersion"], monitor_migrations.DATA_CONTRACT_VERSION)
         self.assertEqual(sorted(monitor_migrations.DATA_MIGRATIONS), list(range(1, monitor_migrations.DATA_CONTRACT_VERSION + 1)))
         self.assertEqual(manifest, {"version": package["version"], "files": dict(sorted(actual.items(), key=lambda item: item[0].casefold()))})
-        from monitor_migrations import CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_MIGRATIONS
+        from monitor_cloud_contract import CLOUD_DATA_CONTRACT_VERSION
         self.assertEqual(package["cloudDataContractVersion"], CLOUD_DATA_CONTRACT_VERSION)
-        self.assertEqual(sorted(CLOUD_DATA_MIGRATIONS), list(range(1, CLOUD_DATA_CONTRACT_VERSION + 1)))
+        self.assertFalse(hasattr(monitor_migrations, "CLOUD_DATA_MIGRATIONS"))
         released = json.loads((build_release.RUNTIME_DIR / "version.json").read_text(encoding="utf-8"))
         self.assertEqual(released["version"], package["version"])
         self.assertIn(monitor_migrations.DATA_CONTRACT_VERSION, {released["dataContractVersion"], released["dataContractVersion"] + 1})
-        # The next cloud representation follows released contract 4.
-        self.assertEqual(CLOUD_DATA_CONTRACT_VERSION, released["cloudDataContractVersion"] + 1)
+        # Cloud migrations are retired; the current released cloud contract stays unchanged.
+        self.assertEqual(CLOUD_DATA_CONTRACT_VERSION, released["cloudDataContractVersion"])
         self.assertTrue(all((build_release.ROOT / name).is_file() for name in build_release.RUNTIME_FILES))
         self.assertEqual(build_release.next_patch_version("1.5.5"), "1.5.6")
         ignore = (build_release.ROOT / ".vscodeignore").read_text(encoding="utf-8").splitlines()

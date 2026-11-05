@@ -5282,9 +5282,9 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         client = object.__new__(WebDavClient)
         client.request = mock.Mock(return_value=(b"", None, 404))
 
-        client.delete("skills/snapshots/old.enc")
+        client.delete("skills/packages/old.enc")
 
-        client.request.assert_called_once_with("DELETE", "skills/snapshots/old.enc", expected=(200, 204, 404))
+        client.request.assert_called_once_with("DELETE", "skills/packages/old.enc", expected=(200, 204, 404))
 
     def test_webdav_conditional_delete_uses_if_match(self):
         client = object.__new__(WebDavClient)
@@ -5411,8 +5411,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
                 def get(self, path):
                     self.downloads.append(path)
-                    if path.startswith("skills/snapshots/"):
-                        return b"snapshot", '"snapshot"'
                     return json.dumps(combined_account({"version": 1, "accountKey": "changed", "label": "Changed", "boundMachineId": None})).encode(), '"changed"'
 
                 def get_if_changed(self, path, etag):
@@ -6065,7 +6063,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             encryption_hash = passphrase_hash("passphrase", "https://example.test", "user")
             box = CryptoBox(encryption_hash, CryptoBox.descriptor(encryption_hash))
             purposes = {
-                "skills/packages/package.enc": "skill-package:package", "skills/snapshots/snapshot.enc": "skills-snapshot:snapshot", "skills/current.enc": "skills-pointer",
+                "skills/packages/package.enc": "skill-package:package", "skills/current.enc": "skills-pointer",
                 "accounts/account.enc": "account:account",
             }
             original = {path: box.encrypt(purpose, path.encode()) for path, purpose in purposes.items()}
@@ -6083,8 +6081,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
                 def list(self, path):
                     return {
-                        "skills": ["current.enc"], "skills/packages": ["package.enc"], "skills/snapshots": ["snapshot.enc"], "accounts": ["account.enc"],
-                        
+                        "skills": ["current.enc"], "skills/packages": ["package.enc"], "accounts": ["account.enc"],
+
                     }.get(path, [])
 
             with mock.patch.object(cloud, "_connection", return_value=(Client(), box)), mock.patch.object(cloud, "fetch", return_value={"verified": True}) as fetch:
@@ -6575,23 +6573,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             download.assert_called_once_with(client, box, "key-a")
             self.assertEqual(result, (state, b'{"tokens":{}}', '"etag"'))
 
-    def test_cloud_account_revision_validation_supports_opaque_and_legacy_identity_keys(self):
-        with self.account_directory() as directory:
-            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
-
-            def download(state, auth_data, revision_data, account_key):
-                revision = hashlib.sha256(auth_data).hexdigest()
-                payload = json.dumps({"version": 1, "accountKey": state["accountKey"], "authSize": len(auth_data), "authSha256": revision, "auth": base64.b64encode(auth_data).decode(), **revision_data}).encode()
-                client = SimpleNamespace(get=mock.Mock(return_value=(payload, '"etag"')))
-                box = SimpleNamespace(decrypt=lambda _purpose, data: data, account_key=mock.Mock(return_value=account_key))
-                from monitor_migration_accounts import download_legacy_account
-                self.assertEqual(download_legacy_account(client, box, {**state, "revisionId": revision}), auth_data)
-                return box
-
-            opaque_box = download({"accountKey": "placeholder-key", "keyType": "opaque", "accountId": None}, b"{}", {"keyType": "opaque", "accountIdHash": None}, "wrong-key")
-            opaque_box.account_key.assert_not_called()
-            legacy_box = download({"accountKey": "identity-key", "accountId": "acct-a"}, json.dumps(self.account_auth("acct-a", "refresh-a")).encode(), {"accountIdHash": hashlib.sha256(b"acct-a").hexdigest()}, "identity-key")
-            legacy_box.account_key.assert_not_called()
 
     def test_cloud_release_accepts_matching_identity_on_opaque_binding_key(self):
         with self.account_directory() as directory:

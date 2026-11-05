@@ -25,7 +25,7 @@ class CloudContractFixture(unittest.TestCase):
         self.root = Path.cwd() / f".test-cloud-contract-{uuid.uuid4().hex}"
         self.root.mkdir()
         self.addCleanup(shutil.rmtree, self.root)
-        self.files = {CLOUD_LOCK_PATH: (b'{"writing":0}', '"lock"'), "crypto.json": (b'{"format":"codex-switch-plain","version":1}', '"1"')}
+        self.files = {CLOUD_LOCK_PATH: (b'{"writing":0}', '"lock"'), "crypto.json": (b'{"format":"codex-switch-plain","version":1}', '"1"'), CLOUD_DATA_CONTRACT_PATH: (b'{"dataContractVersion":5}', '"contract"')}
         self.calls = []
         self.token = None
         self.revision = 1
@@ -158,22 +158,31 @@ class CloudContractFixture(unittest.TestCase):
 
 
 class CloudContractTests(CloudContractFixture):
-    def test_missing_marker_is_adopted_without_rewriting_existing_data(self):
-        self.files["payload"] = b"old", '"payload"'
-        manager = self.manager()
-        self.assertEqual(self.run_operation(manager)[0], b"old")
-        self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0]), {"dataContractVersion": monitor_migrations.CLOUD_DATA_CONTRACT_VERSION})
-        self.assertEqual(self.files["payload"][0], b"old")
-        self.assertIsNone(self.token)
-        events = manager.operation_queue.snapshot()["events"]
-        self.assertEqual([event["phase"] for event in events], ["start", "end"])
-        self.assertEqual(events[-1]["operation"]["status"], "succeeded")
 
-    def test_equal_version_does_not_run_migration(self):
+    def test_older_contracts_are_rejected_without_locking_or_writing(self):
+        for version in range(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION):
+            self.mark_version(version)
+            self.calls.clear()
+            with self.subTest(version=version), self.assertRaisesRegex(CloudError, "Automatic cloud migration has been removed"):
+                self.run_operation(self.manager(str(version)))
+            self.assertTrue(all(method == "GET" and path == CLOUD_DATA_CONTRACT_PATH for method, path, _ in self.calls))
+
+    def test_missing_marker_initializes_only_an_empty_root(self):
+        from monitor_cloud_contract import require_cloud_contract
+        client = SimpleNamespace(get=mock.Mock(side_effect=CloudError("HTTP 404", 404, http_status=404)), list=mock.Mock(return_value=[]), put=mock.Mock())
+        require_cloud_contract(client)
+        self.assertEqual(json.loads(client.put.call_args.args[1]), {"dataContractVersion": 5})
+        self.assertTrue(client.put.call_args.kwargs["create"])
+        client.put.reset_mock()
+        client.list.return_value = ["accounts", "usage"]
+        with self.assertRaisesRegex(CloudError, "Existing files were left unchanged"):
+            require_cloud_contract(client)
+        client.put.assert_not_called()
+
+    def test_equal_version_does_not_rewrite_contract(self):
         self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION)
         self.files["payload"] = b"old", '"payload"'
-        with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {1: mock.Mock(side_effect=AssertionError("unexpected migration"))}):
-            self.run_operation(self.manager())
+        self.run_operation(self.manager())
         self.assertFalse(any(method == "PUT" and path != CLOUD_LOCK_PATH and not path.startswith(".lock-probe-") for method, path, _ in self.calls))
 
     def test_newer_contract_blocks_reads_writes_and_overwrite_before_locking(self):
@@ -196,45 +205,16 @@ class CloudContractTests(CloudContractFixture):
         self.assertIsNone(self.token)
         self.assertFalse(any(path == "payload" for _, path, _ in self.calls))
 
-    def test_failed_migration_preserves_marker_and_payload_and_retries(self):
-        self.mark_version(0)
-        self.files["payload"] = b"old", '"payload"'
-        manager = self.manager()
-        with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {1: mock.Mock(side_effect=RuntimeError("interrupted"))}), self.assertRaisesRegex(RuntimeError, "interrupted"):
-            self.run_operation(manager)
-        self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0])["dataContractVersion"], 0)
-        self.assertEqual(self.files["payload"][0], b"old")
-        self.assertIsNone(self.token)
-        self.assertEqual(self.run_operation(manager)[0], b"old")
 
-    def test_pending_migrations_run_in_order_and_resume_at_last_commit(self):
-        self.mark_version(1)
-        self.files["payload"] = b"old", '"payload"'
-        applied = []
-        def fail(client):
-            applied.append(3)
-            raise RuntimeError("interrupted")
-        manager = self.manager()
-        with mock.patch.object(monitor_migrations, "CLOUD_DATA_CONTRACT_VERSION", 3), mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {2: lambda client: applied.append(2), 3: fail}):
-            with self.assertRaisesRegex(RuntimeError, "interrupted"):
-                self.run_operation(manager)
-            self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0])["dataContractVersion"], 2)
-            with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {3: lambda client: applied.append(3)}):
-                self.run_operation(manager)
-        self.assertEqual(applied, [2, 3, 3])
-
-    def test_missing_step_and_invalid_marker_fail_closed(self):
+    def test_invalid_marker_fails_closed(self):
         manager = self.manager()
         for value in (b"broken", b'{"dataContractVersion":true}', b'{"dataContractVersion":-1}', b"[]"):
             self.files[CLOUD_DATA_CONTRACT_PATH] = value, '"contract"'
             with self.subTest(value=value), self.assertRaisesRegex(CloudError, "Invalid cloud"):
                 self.run_operation(manager)
-        self.mark_version(0)
-        with mock.patch.dict(monitor_migrations.CLOUD_DATA_MIGRATIONS, {}, clear=True), self.assertRaisesRegex(CloudError, "Missing cloud"):
-            self.run_operation(manager)
         self.assertIsNone(self.token)
 
-    def test_other_client_cannot_migrate_or_write_during_operation(self):
+    def test_other_client_cannot_access_payloads_during_operation(self):
         self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION)
         manager = self.manager()
         def held_operation():
@@ -440,12 +420,6 @@ class CloudContractTests(CloudContractFixture):
         self.assertNotIn(CLOUD_LOCK_PATH, self.files)
         self.assertIn(monitor_cloud.CLOUD_LOCK_INIT_PATH, self.directories)
 
-    def test_released_v1_migrates_without_changing_payloads(self):
-        self.mark_version(1)
-        self.files["payload"] = b"retained", '"payload"'
-        self.assertEqual(self.run_operation(self.manager())[0], b"retained")
-        self.assertEqual(json.loads(self.files[CLOUD_DATA_CONTRACT_PATH][0]), {"dataContractVersion": monitor_migrations.CLOUD_DATA_CONTRACT_VERSION})
-        self.assertEqual(self.files["payload"][0], b"retained")
 
     def test_automatic_skill_batch_checks_busy_lock_only_once(self):
         self.mark_version(monitor_migrations.CLOUD_DATA_CONTRACT_VERSION)

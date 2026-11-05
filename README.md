@@ -209,7 +209,7 @@ Open **Manage skills & accounts → Config file**. Configure the remote without 
 
 Use **Test WebDAV** before Push. Jianguoyun/Nutstore users can use `https://dav.jianguoyun.com/dav/` with an application password.
 
-The sync root has one global cloud data contract in `data-contract.json`. Every operation claims the root’s `sync-lock.json` using a native file lock and an atomic ETag-based owner claim. Its `writing` flag becomes 1 before writes and returns to 0 before unlock; readers claim the same file for consistency. Folder locking is unnecessary, and infinite file locks are supported. Older cloud contracts migrate automatically; newer versions block access until the local script is updated. Optimistic writes cannot bypass coordination; interrupted ownership requires explicit recovery. Update all participating clients. See [cloud contract and recovery details](cloud-data-contract.md).
+The sync root has one global cloud data contract in `data-contract.json`. Every operation claims the root’s `sync-lock.json` using a native file lock and an atomic ETag-based owner claim. Its `writing` flag becomes 1 before writes and returns to 0 before unlock; readers claim the same file for consistency. Folder locking is unnecessary, and infinite file locks are supported. Only cloud contract 5 is supported; older contracts are rejected without conversion, and newer versions block access until the local script is updated. Optimistic writes cannot bypass coordination; interrupted ownership requires explicit recovery. Update all participating clients. See [cloud contract and recovery details](cloud-data-contract.md).
 
 Manual and automatic WebDAV operations share a server-side queue and run one at a time. The management page shows a spinner and the running-plus-waiting count in the bottom-right corner. Click it to inspect operations or remove waiting work.
 Share/Unshare Skill and Unmanage apply their local changes when execution starts, so removing waiting work prevents those changes too. Each operation has one queued/start notification and one outcome notification, including skipped, cancelled, and partially completed work.
@@ -260,7 +260,7 @@ In the cloud sync root, each account is one encrypted `accounts/<account-key>.en
 
 SQLite permanently stores both canonical datasets and recorded token costs. Ingestion commits Local, corresponding Merged changes, upload-buffer entries and parser checkpoints atomically. Session files are read incrementally while their consumed prefix is unchanged; replacement, truncation or changed prefixes trigger reparsing with identity deduplication, preserving committed history. Raw cloud payloads and intermediate parsed events have no persistent queue.
 
-Canonical JSONL backups are retired. Enable `saveRawQuotaResponses` explicitly to log quota API response bodies, including invalid responses, with capture time/account/status metadata. Token events, costs, processed records and authentication headers are never included; logging failures do not block ingestion. Contract 22 preserves saved results while converting the old ownership layout to canonical datasets and a temporary buffer. Cloud contract 5 replaces day/month discovery with immutable packages; released migration codecs remain available for sequential upgrades.
+Canonical JSONL backups are retired. Enable `saveRawQuotaResponses` explicitly to log quota API response bodies, including invalid responses, with capture time/account/status metadata. Token events, costs, processed records and authentication headers are never included; logging failures do not block ingestion. Contract 22 preserves saved results while converting the old ownership layout to canonical datasets and a temporary buffer. Cloud contract 5 replaces day/month discovery with immutable packages; local migration codecs remain available for sequential upgrades. Cloud conversion is complete; the runtime rejects older or populated unmarked cloud roots without migration.
 
 > [!WARNING]
 > Protect the whole `~/.codex-switch` directory. Never commit it, place it in support bundles, log it, or share screenshots of its contents. Losing the encryption passphrase makes encrypted remote data unrecoverable.
@@ -361,7 +361,8 @@ Credentials, local history, caches, tests, reference sources, and development-on
 | `codex_monitor_daemon.py` | Canonical CLI entry point, monitor startup, automatic update coordination, and restart. |
 | `monitor_codex_usage.py` | Compatibility wrapper for the former entry command. |
 | `monitor_auto_update.py` | Verified background runtime updater. |
-| `monitor_migrations.py` | Local/cloud contract targets, ordered migrations, rollback recovery and old-format conversion. |
+| `monitor_migrations.py` | Sequential local migrations, rollback recovery and local old-format conversion. |
+| `monitor_cloud_contract.py` | Current cloud contract validation and empty-root initialization. |
 | `monitor_dashboard.py` | Polling loops, dashboard/API server, response caches, control authorization, and UI datasets. |
 | `monitor_accounts.py` | Local credential vault, identity-safe switching, API copy transfer, and OpenAI move transfer. |
 | `monitor_cloud.py` | Configuration, WebDAV, encryption, serialized cloud operations, packages, and transfer diagnostics. |

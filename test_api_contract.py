@@ -13,10 +13,8 @@ import monitor_history
 import monitor_migrations as migrations
 import monitor_quota
 import monitor_sample_store as samples
-from monitor_cloud import CloudError, CloudManager, CryptoBox
 from monitor_processing import initialize_processing_index
 from monitor_usage_sync import content_hash, initialize_v4_cache, v4_record_envelope, validate_v4_envelope
-from test_unified_contract import MemoryWebDav
 
 
 def usage_response(plan="plus"):
@@ -167,41 +165,6 @@ class TimestampMigrationTests(unittest.TestCase):
             self.assertEqual([point["fiveHour"]["continuous"] for point in stored_points(db, "local")], [40, None, 20])
         self.assertEqual(self.paths[1].read_bytes(), original)
         self.assertEqual(self.migrate(), [])
-
-    def test_cloud_conversion_keeps_uploaded_head_and_retries_after_failure(self):
-        cloud = CloudManager(self.root, SimpleNamespace(), None)
-        self.addCleanup(cloud.operation_queue.close)
-        client = MemoryWebDav()
-        client._migration_manager = cloud
-        box = CryptoBox("", CryptoBox.descriptor(""))
-        client.put("crypto.json", json.dumps(box.descriptor("")).encode())
-        client.put("data-contract.json", b'{"dataContractVersion":3}')
-        record = {"kind": "quota", "row": self.row}
-        envelope = v4_record_envelope("machine-a", "quota:quota-a", record, "2030-01-01T00:00Z")
-        from monitor_usage_sync import v4_logical_hash
-        digest, _ = cloud._put_usage_payload(client, box, "v4/data", "machine-a", {"version": 1, "machineId": "machine-a", "day": "2030-01-01", "partId": "bulk", "records": [envelope]})
-        logical = v4_logical_hash([envelope])
-        manifest, _ = cloud._put_usage_payload(client, box, "v4/days", "machine-a", {"version": 1, "machineId": "machine-a", "day": "2030-01-01", "layout": "bulk", "logicalHash": logical, "parts": {"bulk": digest}})
-        month, _ = cloud._put_usage_payload(client, box, "v4/months", "machine-a", {"version": 1, "machineId": "machine-a", "month": "2030-01", "days": {"2030-01-01": {"manifestId": manifest, "logicalHash": logical, "layout": "bulk"}}})
-        path = cloud._v4_head_path("machine-a")
-        original = box.encrypt("usage-v4-head:machine-a", json.dumps({"version": 4, "machineId": "machine-a", "generation": 1, "months": {"2030-01": month}, "activeDay": None}).encode())
-        client.put(path, original)
-        put = client.put
-        def fail(path, data, **kwargs):
-            if path == "data-contract.json":
-                raise CloudError("interrupted")
-            return put(path, data, **kwargs)
-        with mock.patch.object(client, "put", side_effect=fail), self.assertRaisesRegex(CloudError, "interrupted"):
-            migrations.ensure_cloud_contract(client, target_version=4)
-        self.assertNotIn("migrations/contract-4/machine-a.enc", client.files)
-        self.assertNotEqual(client.get(path)[0], original)
-        migrations.ensure_cloud_contract(client, target_version=4)
-        head, _ = cloud._v4_head(client, box, "machine-a")
-        catalog = cloud._v4_catalog(client, box, "machine-a", head)
-        manifest = cloud._v4_day_manifest(client, box, "machine-a", "2030-01-01", catalog["2030-01-01"])
-        records = cloud._v4_data(client, box, "machine-a", "2030-01-01", "bulk", manifest["parts"]["bulk"])
-        self.assertEqual(records[0]["record"]["row"]["windows"]["5h"]["resetAt"], 1893474000)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
 
 
 if __name__ == "__main__":

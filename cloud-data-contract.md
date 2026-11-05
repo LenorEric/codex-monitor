@@ -1,17 +1,15 @@
 # Global cloud data contract
 
-Each WebDAV sync root has one unencrypted `data-contract.json` containing `{"dataContractVersion":5}`. This is the authoritative global cloud contract. The app target is `CLOUD_DATA_CONTRACT_VERSION` in `monitor_migrations.py`, also declared as `cloudDataContractVersion` in `package.json` and packaged `version.json`. Object-level format identifiers remain for decoding and validation; they do not independently authorize access or trigger global upgrades.
+Each WebDAV sync root has one unencrypted `data-contract.json` containing `{"dataContractVersion":5}`. This is the authoritative global cloud contract. The app target is `CLOUD_DATA_CONTRACT_VERSION` in `monitor_cloud_contract.py`, also declared as `cloudDataContractVersion` in `package.json` and packaged `version.json`. Object-level format identifiers remain for decoding and validation; they do not independently authorize access or trigger global upgrades.
 
-Every logical cloud operation checks the marker before accessing payloads. It then claims `sync-lock.json` as described below, rechecks the marker, and retains ownership until the entire operation, including nested account, skills, and usage requests, finishes. Busy manual operations report the conflict immediately; automatic fetch and usage sync retry after 30 seconds instead of waiting their normal interval. All coordination and migration requests stay inside the existing single queued/start and outcome notification pair.
+Every logical cloud operation reads the marker before accessing payloads, claims `sync-lock.json`, and checks the marker again under that lease. Current cloud data is already converted; the script contains no cloud migration registry, old-format readers or conversion routines.
 
-- Equal version: permit normal reads and writes under file ownership.
-- Lower version, including an absent marker treated as zero: run every pending `CLOUD_DATA_MIGRATIONS` step consecutively, commit each version with PUT; an accepted upload completes that step without read-back.
-- Higher version: block payload reads, writes, destructive overwrite, and passphrase rotation; report that the local script needs an update. Reading the marker itself is necessary to make this decision.
-- Invalid metadata, a missing migration, or invalid coordination status: stop before payload access. Unsupported optional server capabilities do not block synchronization.
+- Contract 5 permits normal reads and writes.
+- Older or newer contract markers block access without rewriting the marker or payloads. Newer contracts require an updated script; older data must already have been converted outside this runtime.
+- A missing marker is initialized to 5 only for an empty root containing at most synchronization lock metadata. Existing unmarked data is left unchanged and access is blocked.
+- Invalid metadata blocks access. Contract checks and nested requests remain inside the single queued/start and completion notification pair for each logical operation.
 
-Released cloud contracts 1–4 remain available for ordered upgrades. Contract 4 converts quota reset timestamps to Unix seconds and removes legacy session baselines, source coverage metadata and dependent token records that cannot be converted to complete current events from cloud data. The runtime accepts only current `usage` events. Conversion checks dependent sessions across all day partitions, transforms retained reset timestamps, publishes each changed partition once and updates each head under the JSON operation lease. The contract marker commits once after both conversions succeed. Accepted uploads remain in place on failure; no cloud rollback journal or backup head is created. Retrying an upload resends the local bytes rather than restoring old cloud contents. Obsolete usage payloads are collected after the migrated head is published and before the contract marker commits. Local contract 20 can rebuild affected events from retained SQLite source events; it discards records that cannot be rebuilt without guessing identities or account ownership.
-
-The pending cloud contract 5 converts the complete released cloud-4 history directly to chronological immutable packages. It preserves original sources until publication and marker advancement succeed, then retires the old day/month catalogs. This conversion is necessary because package-ID discovery replaces ownership catalogs. Local contract 22 similarly replaces saved fact/publication ownership with permanent, identically shaped Local/Merged canonical datasets, an upload buffer and separate package receipts. Saved decisions, recorded costs and valid prepared results are preserved. Sequential migration support remains available; interrupted conversion retries safely and older clients reject marker 5.
+Local data contract 22 and its sequential migrations remain supported independently. Cloud synchronization does not replay, convert or delete old remote layouts.
 
 ## Current usage packages
 
@@ -27,7 +25,7 @@ Each account occupies one encrypted `accounts/<account-key>.enc` file, authentic
 
 Release/Share publishes one file. Bind/Link reads and validates that file; deletion removes that file. Retrying an identical Release preserves the existing account, and conflicting credentials remain rejected. Fetch uses the file's ETag to skip unchanged accounts, and passphrase rotation reencrypts the same file. There are no separate state files, revision directories or revision cleanup operations.
 
-This account layout is converted offline in the paused local synchronization folder at the user's request. The cloud contract remains 5; this change adds no automatic cloud migration. The legacy reader remains isolated for released sequential migrations and offline conversion. Existing pending local transfers still accept their historical credential-checksum field during recovery.
+This account layout is converted offline in the paused local synchronization folder at the user's request. The cloud contract remains 5; this change adds no automatic cloud migration. Existing pending local transfers still accept their historical credential-checksum field during recovery.
 
 ## File coordination
 
@@ -47,7 +45,7 @@ Cloud overwrite preserves `data-contract.json`, `sync-lock.json`, and `.sync-loc
 
 ## Interruption and recovery
 
-A crashed operation's valid expiry lease can be reclaimed at or after `expiresAt`. Contenders reread ownership before claiming; available native locks and conditional headers are used without assuming the provider enforces them. Local expiry and owner checks stop a former owner from continuing after observed ownership loss, but cannot make a read/write sequence atomic on an unsupported provider. Takeover does not roll back interrupted multi-object writes; the existing account and migration recovery checks still apply.
+A crashed operation's valid expiry lease can be reclaimed at or after `expiresAt`. Contenders reread ownership before claiming; available native locks and conditional headers are used without assuming the provider enforces them. Local expiry and owner checks stop a former owner from continuing after observed ownership loss, but cannot make a read/write sequence atomic on an unsupported provider. Takeover does not roll back interrupted multi-object writes; the existing account recovery checks still apply.
 
 Legacy owner records without `expiresAt` remain eternal, malformed records fail closed, and stranded initialization gates or infinite native locks still require manual recovery. Stop participating clients, preserve originals, inspect retained sources and interrupted account/passphrase operations, restore consistency, and release provider locks before clearing legacy status. Never clear a live owner's record.
 
@@ -56,25 +54,3 @@ This additive lease format requires no data-contract bump or saved-data conversi
 The protocol coordinates updated, cooperating clients through the owner lease; it does not promise server-enforced atomic exclusion when the provider ignores conditional updates or native locking. It does not prevent manual edits or software bypassing the coordination file. Upgrade all participating clients before using the new protocol. Released cloud-contract-1 clients reject marker 2; during transition, a conforming server's old recursive root lock conflicts with the new file lock. Pre-contract clients cannot enforce the version gate and must be stopped or upgraded.
 
 Cloud uploads trust successful PUT responses, including responses without a strong ETag. Successful uploads need no verification read-back or cloud rollback journal. An uncertain package descriptor outcome is resolved before acknowledging its local buffer prefix. Business data is read when needed, modified locally, and uploaded. Network errors and transient HTTP 408/425/429/500/502/503/504 responses trigger up to three PUT attempts with a one-second delay, reusing the exact local bytes and rewinding streams. Under a live operation lease, retry requests omit stale create/update preconditions so an upload whose response was lost can be resent without a verification GET. Initial conflicts, authorization failures, and failed/expired leases are not bypassed. If attempts are exhausted, report failure and leave completed uploads in place. Multi-file operations, including passphrase rotation, may therefore remain partially applied; there is no automatic cloud rollback or transaction recovery. Download-time authentication, format and identity checks remain enforced. Local data migrations and local credential preservation retain their own safety mechanisms.
-
-Cloud contract 4 also removes retired quota `compaction` metadata while preserving observation timestamps and window readings. It updates record content hashes and partition logical hashes within the same head migration, without upload read-back.
-
-## Released cloud-4 packs (migration input)
-
-Released contract 4 writes final historical records directly into chronological packs after applying its semantic conversions. Unchanged historical days are packed too.
-Packs remain at `usage/v4/data/<machine-id>/<hash>.enc`; their internal version 2 contains `machineId` and `records`, without a single owning day or part.
-Records are ordered by `(collectionPeriod, recordKey)`. Complete record envelopes, including unknown extension fields, retain their original collection periods.
-
-Count the complete uncompressed canonical UTF-8 JSON representation. After appending a complete record makes a pack exceed 75,000,000 bytes, seal it; subsequent records enter the next pack.
-The final incomplete pack is published too. Serialize each final envelope once for packing, then compress and encrypt each completed pack once. The threshold is not a compressed or encrypted size limit.
-
-Version-2 month indexes inline historical day references as `{"logicalHash":"...","layout":"packed","segments":[{"payloadId":"...","recordOffset":0,"recordCount":123}]}`.
-Offsets are zero-based record ordinals, and ranges are half-open. One pack may span months and one day may span packs. Each month lists only its own days but may reference a shared cross-month pack.
-Packed days need no separate day-manifest object. Legacy month/day/data objects remain readable, and a month may mix legacy manifest references with packed references.
-
-Daily logical hashes continue to describe record contents, independent of object IDs, record ordering or range locations. A verified cached day with the same hash needs no data download or projection rebuild after repacking.
-Missing or changed days download the required packs, with one decode per physical object per operation and disk-backed range access. Only the requested days are applied; malformed ranges or digests preserve existing verified caches.
-
-Ordinary publication preserves unchanged packed references. A corrected day may become a standalone daily object while other days retain the original shared pack.
-Garbage collection follows all live references across months and the active day; a shared pack survives until its final reference disappears. Migration publishes data, indexes and heads before cleaning unreachable usage objects and committing contract 4.
-These released rules remain available for sequential upgrades; current contract-5 synchronization uses immutable package discovery instead. Synchronizing Python runtimes must understand the new object versions; dashboard and extension protocols do not change.

@@ -1,5 +1,4 @@
 import base64
-import hashlib
 import json
 import shutil
 import uuid
@@ -7,20 +6,17 @@ import threading
 import unittest
 from contextlib import closing
 from pathlib import Path
-from types import SimpleNamespace
 from unittest import mock
 
 import monitor_migrations as updates
 import monitor_migration_samples as old_samples
 import monitor_sample_store as samples
-from monitor_accounts import AccountManager
-from monitor_cloud import CloudManager, CryptoBox, passphrase_hash, valid_passphrase_hash
+from monitor_cloud import CryptoBox, valid_passphrase_hash
 from monitor_common import empty_cost_totals, empty_token_totals
 from monitor_migrations import FormatConverter, convert_verifier, stable_id, write_json
 from monitor_processing import initialize_processing_index
 from monitor_migrations import _load_v18_token_ledger as load_token_ledger
 from monitor_usage_sync import UsageDataStore, content_hash, initialize_v4_cache, record_key, validate_sync_operation
-from test_usage_v4 import MemoryWebDav
 
 
 class UnifiedContractTests(unittest.TestCase):
@@ -31,7 +27,7 @@ class UnifiedContractTests(unittest.TestCase):
         for field in metadata:
             with self.subTest(field=field), self.assertRaises(monitor_migrations.MigrationError):
                 monitor_migrations.validate_contract_metadata(metadata | {field: metadata[field] + 1})
-        for name in ("DATA_MIGRATIONS", "CLOUD_DATA_MIGRATIONS"):
+        for name in ("DATA_MIGRATIONS",):
             registry = dict(getattr(monitor_migrations, name))
             del registry[1]
             with self.subTest(registry=name), mock.patch.object(monitor_migrations, name, registry), self.assertRaises(monitor_migrations.MigrationError):
@@ -213,72 +209,6 @@ class UnifiedContractTests(unittest.TestCase):
         self.assertEqual(box.key, b"k" * 32)
         encrypted = box.encrypt("test", b"retained data")
         self.assertEqual(box.decrypt("test", encrypted), b"retained data")
-
-    def test_cloud_migration_converts_old_packs_to_v4_and_commits_after_verification(self):
-        self.migrate()
-        cloud = CloudManager(self.root, SimpleNamespace(), AccountManager(self.root / "auth.json", self.root / "accounts"))
-        self.addCleanup(cloud.operation_queue.close)
-        client = MemoryWebDav()
-        client._migration_manager = cloud
-        box = CryptoBox("", CryptoBox.descriptor(""))
-        client.put("crypto.json", json.dumps(box.descriptor("")).encode())
-        client.put("data-contract.json", b'{"dataContractVersion":2}')
-        row = self.quota()
-        row["sync"]["originMachineId"] = "machine-b"
-        record = {"kind": "quota", "row": row}
-        digest, _ = cloud._put_usage_payload(client, box, "packs", "machine-b", {"version": 1, "machineId": "machine-b", "packId": "pack", "records": [{"key": "old", "record": record}]})
-        client.put("usage/machines/machine-b.enc", box.encrypt("usage-pointer:machine-b", json.dumps({"version": 2, "machineId": "machine-b", "packs": {"pack": digest}}).encode()))
-        from monitor_migrations import ensure_cloud_contract
-        ensure_cloud_contract(client, target_version=4)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
-        head, _ = cloud._v4_head(client, box, "machine-b")
-        catalog = cloud._v4_catalog(client, box, "machine-b", head)
-        self.assertEqual(set(catalog), {"2026-07-15"})
-        reference = catalog["2026-07-15"]
-        manifest = cloud._v4_day_manifest(client, box, "machine-b", "2026-07-15", reference)
-        rows = list(cloud._v4_data(client, box, "machine-b", "2026-07-15", "bulk", manifest["parts"]["bulk"]))
-        self.assertTrue(rows[0]["record"]["row"]["sync"]["accountId"].startswith("v3:"))
-        self.assertNotIn("usage/machines/machine-b.enc", client.files)
-
-    def test_encrypted_cloud_failure_retains_uploaded_roots_and_retries(self):
-        from monitor_cloud import CloudError
-        from monitor_migrations import ensure_cloud_contract
-        from monitor_skills import SkillManager
-        self.migrate()
-        skills = SkillManager(self.root / "codex", self.root, self.root / "gemini")
-        cloud = CloudManager(self.root, skills, None)
-        self.addCleanup(cloud.operation_queue.close)
-        key = passphrase_hash("test", "https://example.test", "user")
-        cloud._config["webdav"]["encryptionPassphraseHash"] = key
-        client = MemoryWebDav()
-        client._migration_manager = cloud
-        box = CryptoBox(key, CryptoBox.descriptor(key))
-        descriptor = box.descriptor(key) | {"version": 2}
-        client.put("crypto.json", json.dumps(descriptor).encode())
-        client.put("data-contract.json", b'{"dataContractVersion":2}')
-        demo = skills.skills_root / "demo"
-        demo.mkdir(parents=True)
-        (demo / "SKILL.md").write_text("Retain this skill", encoding="utf-8")
-        snapshot = skills.snapshot()
-        client.put("skills/snapshots/old.enc", box.encrypt("skills-snapshot:old", snapshot))
-        pointer = box.encrypt("skills-pointer", b'{"version":1,"snapshotId":"old"}')
-        client.put("skills/current.enc", pointer)
-        original_put = client.put
-        def fail(path, data, **kwargs):
-            if path == "crypto.json":
-                raise CloudError("simulated commit failure")
-            return original_put(path, data, **kwargs)
-        with mock.patch.object(client, "put", side_effect=fail), self.assertRaisesRegex(CloudError, "simulated"):
-            ensure_cloud_contract(client, target_version=4)
-        self.assertNotEqual(client.get("skills/current.enc")[0], pointer)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 2)
-        ensure_cloud_contract(client, target_version=4)
-        migrated = json.loads(box.decrypt("skills-pointer", client.get("skills/current.enc")[0]))
-        self.assertEqual(migrated["version"], 2)
-        package = migrated["packages"]["demo"]
-        self.assertEqual(skills.inspect_snapshot(cloud._download_skill_package(client, box, "demo", package))[1]["demo"]["SKILL.md"], b"Retain this skill")
-        self.assertEqual(json.loads(client.get("crypto.json")[0])["version"], 3)
-        self.assertEqual(json.loads(client.get("data-contract.json")[0])["dataContractVersion"], 4)
 
 
 if __name__ == "__main__":

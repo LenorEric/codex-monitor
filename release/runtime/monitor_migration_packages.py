@@ -1,4 +1,4 @@
-"""One-time conversion from released stores to canonical views and immutable packages."""
+"""One-time local conversion from released stores to canonical views and the upload buffer."""
 
 import json
 import sqlite3
@@ -124,59 +124,3 @@ def migrate_local(paths):
         config.pop("saveJsonl", None)
         config.setdefault("saveRawQuotaResponses", False)
         atomic_write_json(paths["config"], config)
-
-
-def migrate_cloud(client):
-    from monitor_cloud import CloudError, CryptoBox
-    from monitor_packages import PACK_RAW_BYTES, envelope_bytes, prepare, publish
-    from monitor_usage_packs import UsageObjectReader
-    try:
-        descriptor = json.loads(client.get("crypto.json")[0])
-    except CloudError as exc:
-        if exc.http_status == 404:
-            return
-        raise
-    manager = getattr(client, "_migration_manager", None)
-    if manager is None:
-        raise CloudError("Package migration requires the configured monitor", 409)
-    box = CryptoBox(manager.config()["webdav"]["encryptionPassphraseHash"], descriptor)
-    for filename in manager._optional_remote_list(client, "usage/v4/heads"):
-        if not filename.endswith(".enc"):
-            continue
-        machine = filename[:-4]
-        head, _ = manager._v4_head(client, box, machine)
-        catalog = manager._v4_catalog(client, box, machine, head)
-        # Migration-only scratch provides chronological ordering across all dates.
-        # It is not a runtime remote cache and is deleted on close.
-        with closing(sqlite3.connect("")) as staging, UsageObjectReader(manager, client, box, machine) as reader:
-            staging.execute("CREATE TABLE records(key TEXT PRIMARY KEY,period TEXT,data TEXT)")
-            for day, reference in sorted(catalog.items()):
-                for entry in reader.entries(day, reference):
-                    # Released migrations retained derived-only chart summaries.
-                    # Canonical token events already own these recorded costs;
-                    # summaries are neither canonical inputs nor cloud charges.
-                    if entry["record"]["kind"] == "costSummary":
-                        continue
-                    staging.execute("INSERT INTO records VALUES(?,?,?)", (entry["recordKey"], entry["collectionPeriod"], canonical_json(entry["record"]).decode()))
-            pending, size, first, last = [], 0, None, None
-            for period, data in staging.execute("SELECT period,data FROM records ORDER BY period,key"):
-                last = parse_timestamp(period) or 0
-                first = last if first is None else first
-                pending.append(json.loads(data))
-                size += len(data.encode("utf-8")) + (len(pending) > 1)
-                if size + envelope_bytes(machine, first, last) > PACK_RAW_BYTES:
-                    package, payload, metadata = prepare(machine, pending, first, last)
-                    publish(manager, client, box, machine, package, payload, metadata)
-                    pending, size, first = [], 0, None
-            if pending:
-                package, payload, metadata = prepare(machine, pending, first, last)
-                publish(manager, client, box, machine, package, payload, metadata)
-
-
-def finish_cloud(client):
-    # Called only after the contract marker is committed; failed migration leaves
-    # every old source available for a deterministic retry.
-    client.delete("usage/v4")
-    manager = getattr(client, "_migration_manager", None)
-    if manager is not None:
-        manager._v4_month_cache.clear()

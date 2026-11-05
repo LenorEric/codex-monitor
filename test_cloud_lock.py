@@ -285,7 +285,9 @@ class CloudLockTests(CloudContractFixture):
             with mock.patch.object(manager, "_connection", return_value=(client, box)), mock.patch.object(manager, "_account_with", side_effect=CloudError("HTTP 404", 404)):
                 manager.release_account("account", b"{}", {}, "Empty", ready=False)
             manager._upload_skill_package(client, box, b"skill bytes", "a" * 64)
-            manager._put_usage_payload(client, box, "v4/data", "machine", {"version": 1, "machineId": "machine", "day": "2030-01-01", "partId": "bulk", "records": []})
+            from monitor_packages import publish
+            package, compressed, descriptor = "a" * 64, b"payload", {"version": 1}
+            publish(manager, client, box, "machine", package, compressed, descriptor)
             self.assertFalse(any(method == "GET" for method, _, _ in self.calls[before:]))
         finally:
             client.release_file_lock()

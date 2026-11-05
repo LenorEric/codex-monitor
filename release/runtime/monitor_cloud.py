@@ -10,19 +10,16 @@ import json
 import re
 import secrets
 import threading
-import tempfile
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-import zlib
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.exceptions import InvalidTag
 
 from monitor_accounts import AccountError, api_identity_id, atomic_write_json, auth_identity, parse_auth_bytes
 from monitor_cloud_queue import CloudOperationQueue, OperationSkipped
@@ -30,8 +27,8 @@ from monitor_cloud_lock import CloudAccessLock, CLOUD_LOCK_PATH, CLOUD_LOCK_INIT
 from monitor_webdav_log import WebDavLog
 from monitor_common import SafeRedirectHandler, now_iso as _timestamp
 from monitor_skills import SkillError
-from monitor_migrations import CLOUD_DATA_CONTRACT_PATH, read_cloud_contract, ensure_cloud_contract
-from monitor_usage_sync import canonical_json, content_hash, require_usage_fields
+from monitor_cloud_contract import CLOUD_DATA_CONTRACT_PATH, read_cloud_contract, require_cloud_contract
+from monitor_usage_sync import canonical_json, content_hash
 
 AUTO_PUSH_STABLE_SECONDS = 5
 AUTO_PUSH_RETRY_SECONDS = 30
@@ -483,7 +480,6 @@ class CloudManager:
         self._auto_push_failure_id = 0
         self._last_auto_fetch_at = time.monotonic() - min(_elapsed_since(self._state.get("lastAutoFetchAt"), AUTO_FETCH_INTERVAL_SECONDS), AUTO_FETCH_INTERVAL_SECONDS)
         self._usage_data = None
-        self._v4_month_cache = {}
         self._usage_account_ids = {}
         self._next_usage_sync_at = time.monotonic()
 
@@ -722,7 +718,6 @@ class CloudManager:
         self._state["usage"]["remote"] = {}
         self._state.setdefault("usageV4", {})["remote"] = {}
         self._state["usageV4"]["localHeadEtag"] = None
-        self._v4_month_cache.clear()
         self._save_state()
         atomic_write_json(self.config_path, config)
 
@@ -1096,12 +1091,11 @@ class CloudManager:
         if identity in self._contract_clients:
             return self._contract_clients[identity]
         client = WebDavClient(webdav, diagnostic_log=getattr(self, "_webdav_log", None))
-        # Check newer versions before even attempting root creation or locking.
+        # Reject unsupported contracts before attempting root creation or locking.
         read_cloud_contract(client)
         client.acquire_file_lock()
         self._contract_clients[identity] = client
-        client._migration_manager = self
-        ensure_cloud_contract(client)
+        require_cloud_contract(client)
         return client
 
     def _connection(self, initialize: bool = False) -> tuple[WebDavClient, CryptoBox]:
@@ -1141,7 +1135,6 @@ class CloudManager:
         self._state.setdefault("usageV4", {})["remote"] = {}
         self._state["usageV4"]["localHeadEtag"] = None
         self._state["usageV4"].pop("lastGcDay", None)
-        self._v4_month_cache.clear()
         self._state["conditionalWritesVerified"] = False
         self._state["decryptFailure"] = None
         self._save_state()
@@ -1227,20 +1220,10 @@ class CloudManager:
         inventory = []
         for package_id in sorted(name[:-4] for name in self._optional_remote_list(client, "skills/packages") if name.endswith(".enc") and "/" not in name and "\\" not in name):
             inventory.append((f"skills/packages/{package_id}.enc", f"skill-package:{package_id}"))
-        for snapshot_id in sorted(name[:-4] for name in self._optional_remote_list(client, "skills/snapshots") if name.endswith(".enc") and "/" not in name and "\\" not in name):
-            inventory.append((f"skills/snapshots/{snapshot_id}.enc", f"skills-snapshot:{snapshot_id}"))
         if "current.enc" in self._optional_remote_list(client, "skills"):
             inventory.append(("skills/current.enc", "skills-pointer"))
         for key in sorted(name[:-4] for name in self._optional_remote_list(client, "accounts") if name.endswith(".enc") and "/" not in name and "\\" not in name):
             inventory.append((self._account_path(key), f"account:{key}"))
-        for name in sorted(self._optional_remote_list(client, "usage/v4/heads")):
-            if not name.endswith(".enc") or "/" in name or "\\" in name:
-                continue
-            machine_id = name[:-4]
-            inventory.append((self._v4_head_path(machine_id), f"usage-v4-head:{machine_id}"))
-            for kind in ("v4/months", "v4/days", "v4/data"):
-                for payload_id in sorted(item[:-4] for item in self._optional_remote_list(client, f"usage/{kind}/{machine_id}") if item.endswith(".enc") and "/" not in item and "\\" not in item):
-                    inventory.append((self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"))
         for machine in sorted(self._optional_remote_list(client, "usage/v5/packages")):
             for name in sorted(self._optional_remote_list(client, f"usage/v5/packages/{machine}")):
                 if name.endswith(".enc") and "/" not in name and "\\" not in name:
@@ -1451,175 +1434,6 @@ class CloudManager:
         self._state["remote"]["accounts"].pop(key, None)
         self._save_state()
         return {"accountKey": key, "deleted": True, "alreadyDeleted": state is None}
-
-
-    @staticmethod
-    def _usage_payload_path(kind: str, machine_id: str, payload_id: str) -> str:
-        return f"usage/{kind}/{machine_id}/{payload_id}.enc"
-
-    @staticmethod
-    def _usage_payload_bytes(value: dict) -> tuple[str, bytes]:
-        compressed = zlib.compress(canonical_json(value), 9)
-        return hashlib.sha256(compressed).hexdigest(), compressed
-
-    @staticmethod
-    def _v4_head_path(machine_id: str) -> str:
-        return f"usage/v4/heads/{machine_id}.enc"
-
-    def _v4_head(self, client: WebDavClient, box: CryptoBox, machine_id: str) -> tuple[dict | None, str | None]:
-        client.transfer_category = "metadata"
-        try:
-            encrypted, etag = client.get(self._v4_head_path(machine_id))
-        except CloudError as exc:
-            if exc.http_status == 404:
-                return None, None
-            raise
-        try:
-            head = json.loads(box.decrypt(f"usage-v4-head:{machine_id}", encrypted, 1024 * 1024))
-        except (ValueError, TypeError) as exc:
-            raise CloudError("Invalid usage v4 head", 409) from exc
-        try:
-            require_usage_fields(head, version=int, machineId=str, generation=int, months=dict, activeDay=(dict, type(None)))
-            if any(type(month) is not str or type(digest) is not str for month, digest in head["months"].items()):
-                raise ValueError("Invalid usage month reference types")
-            if head["activeDay"] is not None:
-                require_usage_fields(head["activeDay"], day=str, manifestId=str, layout=str)
-        except ValueError as exc:
-            raise CloudError("Invalid usage v4 head fields", 409) from exc
-        return head, etag
-
-    def _v4_catalog(self, client: WebDavClient, box: CryptoBox, machine_id: str, head: dict | None) -> dict[str, dict]:
-        if head is None:
-            return {}
-        catalog = {}
-        for month, payload_id in sorted(head["months"].items()):
-            cache_key = (machine_id, payload_id)
-            if cache_key not in self._v4_month_cache:
-                client.transfer_category = "metadata"
-                value = self._download_usage_payload(client, box, "v4/months", machine_id, payload_id)
-                try:
-                    require_usage_fields(value, version=int, machineId=str, month=str, days=dict)
-                    for day, reference in value["days"].items():
-                        if type(day) is not str:
-                            raise ValueError("Invalid usage day key type")
-                        require_usage_fields(reference, layout=str)
-                        if reference["layout"] == "packed":
-                            require_usage_fields(reference, segments=list)
-                            for segment in reference["segments"]:
-                                require_usage_fields(segment, payloadId=str, recordOffset=int, recordCount=int)
-                        else:
-                            require_usage_fields(reference, manifestId=str)
-                except ValueError as exc:
-                    raise CloudError("Invalid usage v4 month fields", 409) from exc
-                self._v4_month_cache[cache_key] = value
-            catalog.update(self._v4_month_cache[cache_key]["days"])
-        if head.get("activeDay"):
-            day = head["activeDay"]["day"]
-            catalog[day] = {key: value for key, value in head["activeDay"].items() if key != "day"}
-        return catalog
-
-    def _v4_day_manifest(self, client: WebDavClient, box: CryptoBox, machine_id: str, day: str, reference: dict) -> dict:
-        if reference["layout"] == "packed":
-            return {**reference, "version": 2, "machineId": machine_id, "day": day, "parts": {"bulk": reference}}
-        client.transfer_category = "metadata"
-        value = self._download_usage_payload(client, box, "v4/days", machine_id, reference["manifestId"])
-        try:
-            require_usage_fields(value, version=int, machineId=str, day=str, layout=str, parts=dict)
-            if any(type(part) is not str or type(digest) is not str for part, digest in value["parts"].items()):
-                raise ValueError("Invalid usage part reference types")
-        except ValueError as exc:
-            raise CloudError("Invalid usage v4 day manifest fields", 409) from exc
-        return value | {"day": day}
-
-    def _v4_data(self, client: WebDavClient, box: CryptoBox, machine_id: str, day: str, part: str, payload_id: str, category: str = "payload") -> list[dict]:
-        client.transfer_category = category
-        if isinstance(payload_id, dict):
-            from monitor_usage_packs import UsageObjectReader
-            from monitor_streaming import Records
-            reader = UsageObjectReader(self, client, box, machine_id)
-            return Records(lambda: iter(reader.entries(day, payload_id)), lambda: reader.__exit__())
-        value = self._download_usage_payload(client, box, "v4/data", machine_id, payload_id)
-        from monitor_streaming import RecordSpool
-        try:
-            require_usage_fields(value, version=int, machineId=str, day=str, partId=str, records=(list, RecordSpool))
-        except ValueError as exc:
-            raise CloudError("Invalid usage v4 data part fields", 409) from exc
-        return value["records"]
-
-    def _v4_write_head(self, client: WebDavClient, box: CryptoBox, head: dict, etag: str | None) -> str:
-        data = box.encrypt(f"usage-v4-head:{head['machineId']}", canonical_json(head))
-        return client.put(self._v4_head_path(head["machineId"]), data, etag=etag)
-
-
-    @staticmethod
-    def _decode_usage_payload(box: CryptoBox, purpose: str, encrypted: bytes, expected_id: str) -> dict:
-        compressed = box.decrypt(purpose, encrypted)
-        try:
-            decoder = zlib.decompressobj()
-            uncompressed = decoder.decompress(compressed, 600 * 1024 * 1024 + 1)
-            if len(uncompressed) > 600 * 1024 * 1024 or decoder.unconsumed_tail or not decoder.eof or decoder.unused_data:
-                raise ValueError("Usage payload exceeds the decoder safety bound")
-            value = json.loads(uncompressed)
-        except (ValueError, json.JSONDecodeError, zlib.error) as exc:
-            raise CloudError("Invalid usage payload", 409) from exc
-        if not isinstance(value, dict) or type(value.get("version")) is not int:
-            raise CloudError("Unsupported usage payload", 409)
-        return value
-
-    def _put_usage_payload(self, client: WebDavClient, box: CryptoBox, kind: str, machine_id: str, value: dict) -> tuple[str, int]:
-        if kind == "v4/data" and hasattr(client, "put_file"):
-            from monitor_streaming import compressed_payload, encrypt_file
-            with tempfile.TemporaryFile() as compressed, tempfile.TemporaryFile() as encrypted:
-                payload_id, size = compressed_payload(value, compressed)
-                path, purpose = self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"
-                encrypt_file(box, purpose, compressed, encrypted, size, payload_id)
-                try:
-                    client.put_file(path, encrypted, create=True)
-                except CloudError as exc:
-                    if exc.http_status != 412:
-                        raise
-                return payload_id, size
-        from monitor_streaming import Records
-        if isinstance(value.get("records"), Records):
-            value = value | {"records": list(value["records"])}
-        payload_id, compressed = self._usage_payload_bytes(value)
-        path, purpose = self._usage_payload_path(kind, machine_id, payload_id), f"usage-{kind}:{machine_id}:{payload_id}"
-        try:
-            client.put(path, box.encrypt(purpose, compressed), create=True)
-        except CloudError as exc:
-            if "HTTP 412" not in str(exc):
-                raise
-        return payload_id, len(compressed)
-
-
-    def _download_usage_payload(self, client: WebDavClient, box: CryptoBox, kind: str, machine_id: str, payload_id: str) -> dict:
-        if kind == "v4/data" and hasattr(client, "get_file"):
-            from monitor_streaming import decode_payload
-            try:
-                with tempfile.TemporaryFile() as downloaded:
-                    client.get_file(self._usage_payload_path(kind, machine_id, payload_id), downloaded)
-                    return decode_payload(box, f"usage-{kind}:{machine_id}:{payload_id}", downloaded, payload_id)
-            except (ValueError, zlib.error, InvalidTag) as exc:
-                raise CloudError("Usage payload authentication or validation failed", 409, decrypt_failed=True) from exc
-        encrypted, _ = client.get(self._usage_payload_path(kind, machine_id, payload_id))
-        return self._decode_usage_payload(box, f"usage-{kind}:{machine_id}:{payload_id}", encrypted, payload_id)
-
-
-    def _v4_gc(self, client: WebDavClient, box: CryptoBox, machine_id: str, head: dict, *, catalog=None, manifests=None) -> None:
-        client.transfer_category = "metadata"
-        if catalog is None:
-            catalog = self._v4_catalog(client, box, machine_id, head)
-        referenced = {"v4/months": set(head["months"].values()), "v4/days": {reference["manifestId"] for reference in catalog.values() if "manifestId" in reference}, "v4/data": set()}
-        for day, reference in catalog.items():
-            if reference["layout"] == "packed":
-                referenced["v4/data"].update(segment["payloadId"] for segment in reference["segments"])
-            else:
-                manifest = manifests[day] if manifests and day in manifests else self._v4_day_manifest(client, box, machine_id, day, reference)
-                referenced["v4/data"].update(manifest["parts"].values())
-        for kind, retained in referenced.items():
-            for name in self._optional_remote_list(client, f"usage/{kind}/{machine_id}"):
-                if name.endswith(".enc") and name[:-4] not in retained:
-                    client.delete(self._usage_payload_path(kind, machine_id, name[:-4]))
 
 
     def _record_usage_transfers(self, client: WebDavClient, start: int = 0) -> None:
