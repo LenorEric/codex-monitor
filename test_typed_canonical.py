@@ -245,7 +245,7 @@ class TypedCanonicalTests(unittest.TestCase):
         (root / migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":21}', encoding="utf-8")
         args = (root, root / "history", old.quota_path, root / "sessions", old.token_ledger_path, root / "diagnostics")
         with mock.patch("monitor_common.request_json", side_effect=AssertionError("offline migration used network")):
-            self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [22, 23, 24])
+            self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [22, 23, 24, 25])
             self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [])
         new = CanonicalDataStore(old.quota_path, old.token_ledger_path, "a", lambda _: "v3:account", threading.RLock())
         self.addCleanup(new.index.close)

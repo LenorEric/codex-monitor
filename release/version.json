@@ -1,5 +1,5 @@
 {
-  "version": "1.5.33",
+  "version": "1.5.34",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 5819,
@@ -30,8 +30,8 @@
       "sha256": "4c6689de2707a734172329f685d58a5005d7524db91474ce5153b6adbe269b1c"
     },
     "monitor_canonical.py": {
-      "size": 18283,
-      "sha256": "3acc48a0904210d41dc4227e7dd0546725ecba936886f7ff8c12e77c88c8159e"
+      "size": 18704,
+      "sha256": "5e46eba584e1cd5c02023e4c29181b1d818f3406ac03e8c33e6c166ed99d4fbf"
     },
     "monitor_canonical_ingestion.py": {
       "size": 6589,
@@ -133,9 +133,13 @@
       "size": 42620,
       "sha256": "68ae94ddcab8f509859d6933601184ffb8ce73661984e99593c9f5385695f3f6"
     },
+    "monitor_migration_zero_quota.py": {
+      "size": 2732,
+      "sha256": "393f1964bee87f2060ee7ab66e3134c65942e1659f7e1543a1ce6834d426bf2b"
+    },
     "monitor_migrations.py": {
-      "size": 93656,
-      "sha256": "fd2be9ea204d906314597f17d572e119e3c1ab4e64d92d9db25eede7c6c259cd"
+      "size": 93751,
+      "sha256": "13af572d763ef2eea1c72ede6d41514ab149cfa744d6128a07e4d19ce0466a78"
     },
     "monitor_packages.py": {
       "size": 9904,
@@ -211,7 +215,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "4c1d1505e3be36166d8e1b602b8cf7dee434fd95a94364ed2e5147119805b124"
+      "sha256": "f80f878806b216096d8de88fdbc8d77204bcc3f4dce1b295072e55055c3e480b"
     }
   }
 }

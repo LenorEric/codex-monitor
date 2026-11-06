@@ -332,7 +332,7 @@ class QuotaBoundaryMigrationTests(unittest.TestCase):
         self.legacy_seen()
         (self.root / migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":23}', encoding="utf-8")
         args = (self.root, self.root / "history", self.store.quota_path, self.root / "sessions", self.store.token_ledger_path, self.root / "diagnostics")
-        self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [24])
+        self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [24, 25])
         self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [])
         self.assertFalse(self.has_column())
         with closing(sqlite3.connect(self.store.index.path)) as db:

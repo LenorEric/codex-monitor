@@ -242,7 +242,8 @@ class CanonicalDataStore(NormalizedRecords):
 
     @staticmethod
     def _quota_compatible(previous, current):
-        return all(previous.get(field) == current.get(field) for field in ("usedPercent", "multiplier", "resetAt", "plan"))
+        return all(previous.get(field) == current.get(field) for field in ("usedPercent", "multiplier", "plan")) and (
+            previous.get("usedPercent") == current.get("usedPercent") == 0 or previous.get("resetAt") == current.get("resetAt"))
 
     def _quota_merge(self, db, view, row):
         """Keep covered points unchanged and extend compatible neighboring runs."""
@@ -264,6 +265,7 @@ class CanonicalDataStore(NormalizedRecords):
                     if a <= b:
                         self._save(db, view, "quota", self._fragment(old, label, a, b))
             for a, b in spans:
+                merged = row
                 # Check only immediate neighbors, so different states remain barriers.
                 previous = records.items(db, view, "quota", account, condition="window=? AND last<?", parameters=(label, a), order="last DESC", limit=1)
                 if previous:
@@ -277,8 +279,11 @@ class CanonicalDataStore(NormalizedRecords):
                     value = following[0][1]["windows"][label]
                     if self._quota_compatible(value, window):
                         records.delete(db, view, "quota", account, following[0][0])
+                        if value["lastAt"] > window["lastAt"]:
+                            # Latest observation wins, even when its deadline moved backward.
+                            merged = row | {"windows": {label: window | {"resetAt": value.get("resetAt")}}}
                         b = int(value["lastAt"])
-                self._save(db, view, "quota", self._fragment(row, label, a, b))
+                self._save(db, view, "quota", self._fragment(merged, label, a, b))
 
     def _quota_records(self, row):
         from monitor_sampling import WINDOWS, quota_point
