@@ -22,7 +22,7 @@ def validate_run(row):
             raise ValueError("Invalid quota run timestamps or multiplier")
         if first > last or first != parse_timestamp(row.get("checkedAt")) or window["multiplier"] <= 0:
             raise ValueError("Invalid quota run bounds")
-        if "continuous" not in window or isinstance(window["continuous"], bool) or window["continuous"] not in (None, window.get("usedPercent")) or type(window.get("resetBoundary")) is not bool:
+        if "continuous" not in window or isinstance(window["continuous"], bool) or window["continuous"] not in (None, window.get("usedPercent")):
             raise ValueError("Invalid quota run decision")
         if window["continuous"] is None and first != last:
             raise ValueError("Rejected quota observations cannot span multiple observations")
@@ -39,7 +39,7 @@ def legacy_tail(db, account, row):
     point = json.loads(point[0])
     return row | {"quotaRunVersion": 1, "windows": {label: value | {
         "firstAt": point["timestamp"], "lastAt": point["timestamp"], "continuous": point[name]["continuous"],
-        "multiplier": point[name]["multiplier"], "resetBoundary": False}
+        "multiplier": point[name]["multiplier"]}
         for name, (label, _) in WINDOWS.items() if (value := row["windows"].get(label)) is not None}}
 
 
@@ -48,7 +48,7 @@ def can_extend(previous, current):
     return (previous["continuous"] is not None and current["continuous"] is not None
         and previous["continuous"] == current["continuous"] and previous["multiplier"] == current["multiplier"]
         and parse_timestamp(previous.get("resetAt")) == parse_timestamp(current.get("resetAt"))
-        and not current["resetBoundary"] and current["firstAt"] > previous["lastAt"])
+        and current["firstAt"] > previous["lastAt"])
 
 
 def latest_window(store, db, account, label):
@@ -101,14 +101,14 @@ def record_runs(store, db, rows):
                 stamp = observation["timestamp"]
                 window = {"usedPercent": value["raw"], "resetAt": value.get("resetAt"), "plan": value["plan"],
                     "firstAt": stamp, "lastAt": stamp, "continuous": value["continuous"],
-                    "multiplier": value.get("multiplier", point[name]["multiplier"]), "resetBoundary": bool(observation.get("resetWindow"))}
+                    "multiplier": value.get("multiplier", point[name]["multiplier"])}
                 previous = latest_window(store, db, account, label)
                 if previous and can_extend(previous["windows"][label], window):
                     previous["windows"][label]["lastAt"] = stamp
                     canonical = previous
                 else:
                     checked = datetime.fromtimestamp(stamp, timezone.utc).isoformat()
-                    identity = f"quota-run:{account}:{label}:{checked}:{window['resetBoundary']}"
+                    identity = f"quota-run:{account}:{label}:{checked}:{window['usedPercent']}"
                     canonical = row | {"quotaRunVersion": 1, "checkedAt": checked, "windows": {label: window},
                         "sync": row["sync"] | {"recordId": hashlib.sha256(identity.encode()).hexdigest()}}
                 changed |= store.index.write_records(db, "quota", [canonical])
@@ -124,7 +124,7 @@ def restore_window(point, name, window, state):
     if window["continuous"] is None:
         if name in state:
             state[name]["protection"] = window["raw"]
-    elif not window["resetBoundary"]:
+    else:
         if name not in state or window["lastAt"] >= state[name]["timestamp"]:
             state[name] = {"raw": window["raw"], "timestamp": window["lastAt"],
                 "checkedAt": datetime.fromtimestamp(window["lastAt"], timezone.utc).isoformat(), "resetAt": window.get("resetAt"), "plan": window["plan"]}

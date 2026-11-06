@@ -774,15 +774,15 @@ class AccountManager:
     def sync_active_from_live(self) -> bool:
         return self.reconcile_active_from_live()[0]
 
-    def inactive_ready_credentials(self) -> list[dict]:
+    def inactive_ready_credentials(self, include_active: bool = False) -> list[dict]:
         with self.lock:
             active_id = self.manifest.get("activeAccountId")
             credentials = []
             for account in self.manifest["accounts"]:
                 credential_path = self._account_path(account["id"])
-                if account["id"] == active_id or account.get("accountType") == "api" or not account.get("ready") or not credential_path.exists():
+                if (account["id"] == active_id and not include_active) or account.get("accountType") == "api" or not account.get("ready") or not credential_path.exists():
                     continue
-                data = credential_path.read_bytes()
+                data = self.auth_path.read_bytes() if account["id"] == active_id and self.auth_path.exists() else credential_path.read_bytes()
                 credentials.append({"id": account["id"], "label": account["label"], "data": data, "fingerprint": auth_fingerprint(data)})
             return credentials
 

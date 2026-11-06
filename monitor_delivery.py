@@ -330,7 +330,7 @@ class DashboardDelivery:
 
     @staticmethod
     def _runs(db, view, account, window):
-        return [list(row) for row in db.execute("SELECT id,first,last,value,multiplier,flags,reset,plan FROM delivery_runs WHERE view=? AND account=? AND window=? ORDER BY first,id", (view, account, window))]
+        return [list(row) for row in db.execute("SELECT id,first,last,value,multiplier,flags,reset,plan FROM delivery_runs WHERE view=? AND account=? AND window=? ORDER BY first,value IS NULL,value,id", (view, account, window))]
 
     @staticmethod
     def _tokens(db, view, account):

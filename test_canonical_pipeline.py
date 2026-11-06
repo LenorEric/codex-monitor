@@ -12,11 +12,17 @@ from monitor_canonical import CanonicalDataStore
 from monitor_cloud import CloudError, CloudManager, CryptoBox
 from monitor_delivery import DashboardDelivery
 from monitor_migration_packages import migrate_local
-from monitor_migration_canonical import migrate_local as migrate_typed
+from monitor_migration_canonical import migrate_local as migrate_contract23
+from monitor_migration_quota_boundary import migrate_local as migrate_contract24
 from monitor_packages import fetch, push
 from monitor_usage_sync import UsageDataStore, add_record_provenance
 import test_sqlite_authority as authority
 from test_support_webdav import MemoryWebDav, moment
+
+
+def migrate_typed(paths):
+    migrate_contract23(paths)
+    migrate_contract24(paths)
 
 
 class PackageWebDav(MemoryWebDav):
@@ -79,7 +85,7 @@ class CanonicalPipelineTests(unittest.TestCase):
             names = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertFalse(names & {"processing_scan_events", "processing_backup_queue", "remote_record_refs", "local_record_refs"})
 
-    def test_late_point_splits_only_merged_and_preserves_local(self):
+    def test_late_point_inside_range_preserves_both_datasets(self):
         self.store.record_quota(self.quota())
         self.store.record_quota(self.quota("2030-01-01T11:00:00Z"))
         before = self.store.datasets("local")
@@ -87,9 +93,7 @@ class CanonicalPipelineTests(unittest.TestCase):
         self.assertEqual(self.store.datasets("local"), before)
         windows = self.windows("merged")
         self.assertEqual([(w["firstAt"], w["lastAt"], w["usedPercent"]) for w in windows], [
-            (moment("2030-01-01T10:00:00Z"), moment("2030-01-01T10:29:59Z"), 50),
-            (moment("2030-01-01T10:30:00Z"), moment("2030-01-01T10:30:00Z"), 51),
-            (moment("2030-01-01T10:30:01Z"), moment("2030-01-01T11:00:00Z"), 50)])
+            (moment("2030-01-01T10:00:00Z"), moment("2030-01-01T11:00:00Z"), 50)])
         self.store.record_ledger([authority.SQLiteAuthorityTests.ledger(cost=2)])
         delivery = DashboardDelivery(self.store.index)
         delivery.prepare()
@@ -177,6 +181,20 @@ class CanonicalPipelineTests(unittest.TestCase):
         self.client.files.clear()
         fetch(self.manager, self.client, self.box)
         self.assertEqual(self.manager._usage_data.datasets("merged"), before)
+
+    def test_fetch_skips_own_directory_without_receipts_even_during_bootstrap(self):
+        self.store.record_quota(self.quota())
+        push(self.manager, self.client, self.box)
+        with self.store.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT COUNT(*) FROM package_receipts").fetchone()[0], 1)
+            db.execute("DELETE FROM package_receipts")
+        for bootstrap in (False, True):
+            with self.subTest(bootstrap=bootstrap):
+                with self.store.index.transaction() as db:
+                    self.store.index.put(db, "legacyPublicationPending", bootstrap)
+                with mock.patch.object(self.manager, "_optional_remote_list", return_value=["a"]) as listing, mock.patch.object(self.client, "get", side_effect=AssertionError("own package downloaded")):
+                    self.assertEqual(fetch(self.manager, self.client, self.box)["packagesDownloaded"], 0)
+                listing.assert_called_once_with(self.client, "usage/v5/packages")
 
     def test_import_failure_rolls_back_receipt_and_data(self):
         rows = [self.remote(self.quota()), {"kind": "quota", "row": {"windows": {"5h": {}}}}]
@@ -289,7 +307,7 @@ class CanonicalPipelineTests(unittest.TestCase):
         with mock.patch.object(Path, "open", side_effect=OSError("unwritable")):
             state._record_raw_quota_response(response, 200, "account")
 
-    def test_first_sync_reconciles_unsent_local_migration_candidates(self):
+    def test_first_sync_preserves_local_migration_candidates_when_skipping_own_directory(self):
         root = self.root / "legacy"
         old = UsageDataStore(root / "quota.jsonl", root / "token.jsonl", "a", lambda _: "v3:account", threading.RLock())
         old.backup.enabled = lambda: False
@@ -311,7 +329,7 @@ class CanonicalPipelineTests(unittest.TestCase):
         before = new.datasets("merged")
         fetch(self.manager, self.client, self.box)
         self.assertEqual(new.datasets("merged"), before)
-        self.assertEqual(new.buffer_status()["pendingRecords"], 1)
+        self.assertEqual(new.buffer_status()["pendingRecords"], 3)
         self.assertEqual(push(self.manager, self.client, self.box)["packagesUploaded"], 1)
 
     def test_startup_due_buffer_and_independent_fetch_schedule(self):

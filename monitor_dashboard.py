@@ -471,12 +471,13 @@ class UsageDashboardState:
         from monitor_sampling import WINDOWS, accepted_windows
         with self.usage_data.index.transaction() as db:
             state = self.usage_data.index.get(db, f"samplingState:local:{record_account_key(sample)}", {"windows": {}})
-            point = self.usage_data.index.get(db, f"quotaObservation:{record_account_key(sample)}", {})
+            point = (self.usage_data.quota_preprocessor.observations.get(record_account_key(sample), {}) if getattr(self.usage_data.index, "canonical", False)
+                else self.usage_data.index.get(db, f"quotaObservation:{record_account_key(sample)}", {}))
         sample["windows"], sample["rejectedWindows"] = accepted_windows(state["windows"]), {}
         for name, (label, _) in WINDOWS.items():
             if (raw_windows.get(label, {}).get("usedPercent") is not None
                     and parse_timestamp(raw_windows[label].get("percentCheckedAt") or sample["checkedAt"]) == parse_timestamp(sample["checkedAt"])
-                    and point.get(name, {}).get("continuous") is None):
+                    and not point.get(name, {}).get("accepted", point.get(name, {}).get("continuous") is not None)):
                 sample["rejectedWindows"][label] = raw_windows[label]
         sample["usingPreviousWindows"] = bool(sample["rejectedWindows"])
         sample["percentCheckedAt"] = max((window["percentCheckedAt"] for window in sample["windows"].values()), default=None)
@@ -730,10 +731,12 @@ class UsageDashboardState:
 
     def _inactive_usage_credentials(self) -> list[dict]:
         status = self.accounts.status()
-        active = self.cloud.usage_account_id(status["activeAccountId"]) if status.get("activeAccountId") else None
+        active_account = next((account for account in status["items"] if account["id"] == status.get("activeAccountId")), None)
+        include_active = bool(active_account and active_account.get("isApiAccount"))
+        active = self.cloud.usage_account_id(status["activeAccountId"]) if status.get("activeAccountId") and not include_active else None
         priority = {slot: -index for index, slot in enumerate(status.get("slotOrder", []))}
         groups = {}
-        for credential in self.accounts.inactive_ready_credentials():
+        for credential in self.accounts.inactive_ready_credentials(include_active=include_active):
             account = self.cloud.usage_account_id(credential["id"])
             if account == active:
                 continue
@@ -748,7 +751,8 @@ class UsageDashboardState:
         polled = 0
         for credential in self._inactive_usage_credentials():
             active_id = self.accounts.status().get("activeAccountId")
-            if active_id and self.cloud.usage_account_id(active_id) == credential["usageAccountId"]:
+            active_account = next((account for account in self.accounts.status()["items"] if account["id"] == active_id), None)
+            if active_id and not (active_account and active_account.get("isApiAccount")) and self.cloud.usage_account_id(active_id) == credential["usageAccountId"]:
                 continue
             if now - self.inactive_account_poll_started_at.get(credential["usageAccountId"], float("-inf")) < INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS:
                 continue

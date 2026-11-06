@@ -146,6 +146,8 @@ def fetch(manager, client, box):
         bootstrap = store.index.get(db, "legacyPublicationPending", False)
         seen = set(db.execute("SELECT machine,package FROM package_receipts WHERE destination=?", (dest,)))
     for machine in sorted(manager._optional_remote_list(client, "usage/v5/packages")):
+        if machine == store.machine_id:
+            continue
         for name in sorted(manager._optional_remote_list(client, f"usage/v5/packages/{machine}")):
             if not name.endswith(".enc"):
                 continue
@@ -154,9 +156,6 @@ def fetch(manager, client, box):
                 continue
             descriptor = _descriptor(client, box, machine, package)
             data = records(client, box, machine, package, descriptor)
-            if bootstrap and machine == store.machine_id:
-                with store.index.transaction() as db:
-                    db.executemany("DELETE FROM upload_buffer WHERE record_key=? AND seq<=?", ((record_key(row["kind"], row["row"]), store.index.get(db, "legacyPublicationCutoff", 0)) for row in data))
             store.import_package(dest, machine, package, data)
             downloaded += 1
     if bootstrap:

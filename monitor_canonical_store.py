@@ -28,13 +28,11 @@ QUOTA = COMMON + (
     ("run_version", "quotaRunVersion", "INTEGER", True),
     ("observed_at", "checkedAt", "TIME", True),
     ("used_percent", "windows.$.usedPercent", "REAL", True),
-    ("continuous", "windows.$.continuous", "REAL", False),
     ("multiplier", "windows.$.multiplier", "REAL", True),
     ("plan", "windows.$.plan", "TEXT", True),
     ("reset_at", "windows.$.resetAt", "TIME", False),
     ("range_first", "windows.$.firstAt", "INTEGER", True),
     ("range_last", "windows.$.lastAt", "INTEGER", True),
-    ("reset_boundary", "windows.$.resetBoundary", "BOOL", True),
 )
 TOKEN = COMMON + (
     ("schema_version", "schemaVersion", "INTEGER", True),
@@ -116,6 +114,8 @@ class CanonicalRepository:
             if len(row.get("windows", {})) != 1:
                 raise ValueError("Canonical quota records must contain exactly one window")
             window = next(iter(row["windows"]))
+            if "continuous" in row["windows"][window]:
+                raise ValueError("Obsolete canonical quota field: continuous")
         stamp = parse_timestamp(row.get("checkedAt") if kind == "quota" else row.get("occurredAt"))
         if stamp is None or not math.isfinite(stamp):
             raise ValueError("Invalid canonical timestamp")
@@ -200,7 +200,7 @@ class CanonicalRepository:
         return cls.decoder(kind, tuple(names))(values)
 
     @classmethod
-    def items(cls, db, dataset, kind, account=None, condition="", parameters=(), order="first,record_key", limit=None):
+    def items(cls, db, dataset, kind, account=None, condition="", parameters=(), order=None, limit=None):
         table = TABLES[kind][0]
         where, args = ["dataset=?"], [dataset]
         if account is not None:
@@ -209,6 +209,8 @@ class CanonicalRepository:
         if condition:
             where.append("(" + condition + ")")
             args.extend(parameters)
+        if order is None:
+            order = "first,used_percent,record_key" if kind == "quota" else "first,record_key"
         cursor = db.execute(f"SELECT * FROM {table} WHERE {' AND '.join(where)} ORDER BY {order}" + (f" LIMIT {int(limit)}" if limit is not None else ""), args)
         names = [value[0] for value in cursor.description]
         key_index = names.index("record_key")

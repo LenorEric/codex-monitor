@@ -17,8 +17,18 @@ def multiplier(plan, timestamp):
     return {"plus": 1, "pro_lite": 5, "pro": 20 if timestamp < PRO_CUTOVER else 10}.get(plan, 1)
 
 
+def quota_point_order(point, window=None):
+    """Order observations by time, then by ascending value within each window."""
+    return (point.get("timestamp") is None, point.get("timestamp") or 0, point.get("usageAccountId", ""),
+        tuple(value if value is not None and math.isfinite(value) else math.inf
+            for name in ((window,) if window else dict(WINDOWS).values())
+            for value in [point.get(name, {}).get("raw", point.get(name, {}).get("continuous"))]))
+
+
 def connected(previous, current, window):
     if previous[3] is None or current[3] is None:
+        return False
+    if previous[6:7] != current[6:7]:
         return False
     gap = current[1] - previous[2]
     if gap > 14400:
@@ -33,7 +43,7 @@ def usage_runs(points, window):
     """Internal rows append reset and plan; only the first six fields go on the wire."""
     name = dict(WINDOWS)[window]
     result = []
-    for point in points:
+    for point in sorted(points, key=lambda point: quota_point_order(point, name)):
         if "runWindows" in point and name not in point["runWindows"]:
             continue
         if point.get("resetWindow") not in (None, name):

@@ -13,14 +13,35 @@ from monitor_canonical import CanonicalDataStore, CanonicalIndex
 from monitor_canonical_store import CanonicalRepository as records, TABLES
 from monitor_common import parse_timestamp
 from monitor_delivery import DashboardDelivery
-from monitor_migration_canonical import migrate_local
+from monitor_migration_canonical import migrate_local as migrate_contract23
+from monitor_migration_quota_boundary import migrate_local as migrate_contract24
+from monitor_migration_canonical_schema import CanonicalRepository as released_records
 from monitor_migration_packages import initialize_v22
 from monitor_usage_sync import canonical_json, record_account_key, record_key
 import test_canonical_pipeline as pipeline
 import test_sqlite_authority as authority
 
 
+def migrate_local(paths):
+    migrate_contract23(paths)
+    migrate_contract24(paths)
+
+
 class TypedCanonicalTests(unittest.TestCase):
+    def test_same_time_canonical_and_delivery_reads_order_by_value(self):
+        template = next(row for row in self.store.datasets()[0] if "5h" in row["windows"])
+        with self.store.index.transaction() as db:
+            for value in (30, 10, 20):
+                row = copy.deepcopy(template)
+                row["sync"]["recordId"] = str(100 - value)
+                row["windows"]["5h"].update(usedPercent=value)
+                self.store._save(db, "local", "quota", row)
+            self.assertEqual([row["windows"]["5h"]["usedPercent"] for row in records.rows(db, "local", "quota", condition="window='5h'")], [10, 20, 30, 50])
+        delivery = DashboardDelivery(self.store.index)
+        delivery.prepare()
+        with self.store.index.transaction() as db:
+            self.assertEqual([row[3] for row in delivery._runs(db, "local", "v3:account", "5h")], [10, 20, 30, 50])
+
     def setUp(self):
         self.root = Path.cwd() / (".typed-test-" + uuid.uuid4().hex)
         self.root.mkdir()
@@ -44,6 +65,9 @@ class TypedCanonicalTests(unittest.TestCase):
             for dataset in ("local", "merged"):
                 for kind, rows in zip(("quota", "tokenLedger"), self.store.datasets(dataset)):
                     for row in rows:
+                        row = copy.deepcopy(row)
+                        for window in row.get("windows", {}).values():
+                            window["resetBoundary"] = False
                         stamp = int(parse_timestamp(row.get("checkedAt") or row.get("occurredAt")))
                         last = max((w["lastAt"] for w in row.get("windows", {}).values()), default=stamp)
                         db.execute("INSERT INTO canonical_records VALUES(?,?,?,?,?,?,?)", (dataset, kind, record_account_key(row), record_key(kind, row), stamp, last, canonical_json(row).decode()))
@@ -89,14 +113,14 @@ class TypedCanonicalTests(unittest.TestCase):
     def test_quota_numeric_types_and_saved_rejection(self):
         row = copy.deepcopy(self.store.datasets()[0][0])
         window = row["windows"][next(iter(row["windows"]))]
-        window.update(usedPercent=50.0, continuous=None, multiplier=5, resetAt="2030-01-02T00:00:00Z", resetBoundary=True)
+        window.update(usedPercent=50.0, multiplier=5, resetAt="2030-01-02T00:00:00Z")
         self.assertEqual(canonical_json(self.round_trip("quota", row)), canonical_json(row))
         window["resetAt"] = None
         self.assertEqual(canonical_json(self.round_trip("quota", row)), canonical_json(row))
 
     def test_database_constraints(self):
         changes = {"dataset": "wrong", "window": "1h", "first": 9999999999, "range_first": 9999999999,
-            "used_percent": 101, "multiplier": -1, "reset_boundary": 2, "continuous": float("inf"), "run_version": 2}
+            "used_percent": 101, "multiplier": -1, "run_version": 2}
         with self.store.index.transaction() as db:
             for column, value in changes.items():
                 with self.subTest(column=column), self.assertRaises(sqlite3.IntegrityError):
@@ -107,7 +131,7 @@ class TypedCanonicalTests(unittest.TestCase):
                     db.execute(f"UPDATE canonical_tokens SET {column}=? WHERE dataset='local'", (value,))
 
     def test_writer_rejects_invalid_types_and_nonfinite_values(self):
-        for path, value in (("continuous", float("nan")), ("multiplier", True), ("firstAt", 1.5), ("resetBoundary", 1)):
+        for path, value in (("continuous", float("nan")), ("multiplier", True), ("firstAt", 1.5)):
             row = copy.deepcopy(self.store.datasets()[0][0])
             row["windows"][next(iter(row["windows"]))][path] = value
             with self.subTest(path=path), self.assertRaises((ValueError, sqlite3.IntegrityError)):
@@ -152,14 +176,14 @@ class TypedCanonicalTests(unittest.TestCase):
 
     def test_interruption_rolls_back_even_after_partial_population(self):
         path = self.legacy()
-        original = records.write
+        original = released_records.write
         calls = []
         def interrupt(*args, **kwargs):
             original(*args, **kwargs)
             calls.append(True)
             if len(calls) == 2:
                 raise KeyboardInterrupt()
-        with mock.patch.object(records, "write", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+        with mock.patch.object(released_records, "write", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
             migrate_local({"processing_index": path})
         with closing(sqlite3.connect(path)) as db:
             self.assertFalse(db.execute("SELECT 1 FROM sqlite_master WHERE name='canonical_quota'").fetchone())
@@ -221,7 +245,7 @@ class TypedCanonicalTests(unittest.TestCase):
         (root / migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":21}', encoding="utf-8")
         args = (root, root / "history", old.quota_path, root / "sessions", old.token_ledger_path, root / "diagnostics")
         with mock.patch("monitor_common.request_json", side_effect=AssertionError("offline migration used network")):
-            self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [22, 23])
+            self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [22, 23, 24])
             self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [])
         new = CanonicalDataStore(old.quota_path, old.token_ledger_path, "a", lambda _: "v3:account", threading.RLock())
         self.addCleanup(new.index.close)
@@ -252,7 +276,7 @@ class TypedCanonicalTests(unittest.TestCase):
             db.execute("DELETE FROM canonical_quota WHERE dataset='merged' AND window='5h'")
             def insert(first, last, value):
                 row = copy.deepcopy(template)
-                row["windows"]["5h"].update(usedPercent=value, continuous=value)
+                row["windows"]["5h"].update(usedPercent=value)
                 self.store._quota_merge(db, "merged", self.store._fragment(row, "5h", first, last))
             insert(100, 200, 50)
             insert(100, 100, 51)
@@ -262,20 +286,34 @@ class TypedCanonicalTests(unittest.TestCase):
             insert(125, 175, 54)
             windows = [row["windows"]["5h"] for row in records.rows(db, "merged", "quota", condition="window='5h'")]
             self.assertEqual([(w["firstAt"], w["lastAt"], w["usedPercent"]) for w in windows],
-                [(100, 100, 51), (101, 124, 50), (125, 149, 54), (150, 150, 53), (151, 175, 54), (176, 199, 50), (200, 200, 52)])
+                [(100, 124, 50), (125, 175, 54), (176, 200, 50)])
             self.assertEqual(len(records.rows(db, "merged", "quota", condition="window='7d'")), 1)
 
-    def test_rejection_and_reset_barriers_survive_typed_round_trip(self):
-        template = next(row for row in self.store.datasets()[0] if "5h" in row["windows"])
+    def test_fresh_store_has_no_continuous_mapping_or_column(self):
         with self.store.index.transaction() as db:
-            db.execute("DELETE FROM canonical_quota WHERE dataset='merged' AND window='5h'")
-            for stamp, continuous, reset in ((100, 50, False), (110, None, False), (120, 50, False), (130, 50, True)):
-                row = copy.deepcopy(template)
-                row["windows"]["5h"].update(continuous=continuous, resetBoundary=reset)
-                self.store._quota_merge(db, "merged", self.store._fragment(row, "5h", stamp, stamp))
-            windows = [row["windows"]["5h"] for row in records.rows(db, "merged", "quota", condition="window='5h'")]
-            self.assertEqual([(w["firstAt"], w["lastAt"], w["continuous"], w["resetBoundary"]) for w in windows],
-                [(100, 100, 50, False), (110, 110, None, False), (120, 120, 50, False), (130, 130, 50, True)])
+            self.assertNotIn("continuous", [row[1] for row in db.execute("PRAGMA table_info(canonical_quota)")])
+        self.assertNotIn("continuous", [field[0] for field in TABLES["quota"][1]])
+        row = copy.deepcopy(self.store.datasets()[0][0])
+        row["windows"][next(iter(row["windows"]))]["continuous"] = None
+        with self.assertRaisesRegex(ValueError, "Obsolete canonical quota field"):
+            self.round_trip("quota", row)
+
+    def test_legacy_json_boundary_is_removed_by_contract24(self):
+        from monitor_migration_quota_boundary import migrate_local as remove_boundary
+        path = self.legacy()
+        with closing(sqlite3.connect(path)) as db:
+            for view, account, key, data in db.execute("SELECT view,account,record_key,data FROM canonical_records WHERE kind='quota'").fetchall():
+                legacy = json.loads(data)
+                for w in legacy["windows"].values():
+                    w["resetBoundary"] = True
+                db.execute("UPDATE canonical_records SET data=? WHERE view=? AND account=? AND record_key=?", (json.dumps(legacy), view, account, key))
+            db.commit()
+        migrate_local({"processing_index": path})
+        remove_boundary({"processing_index": path})
+        converted = CanonicalIndex(path)
+        self.addCleanup(converted.close)
+        with converted.transaction() as db:
+            self.assertEqual(records.rows(db, "local", "quota"), self.store.datasets()[0])
 
     def test_late_cloud_observation_after_migration_preserves_local_and_costs(self):
         from monitor_usage_sync import add_record_provenance
@@ -292,7 +330,7 @@ class TypedCanonicalTests(unittest.TestCase):
         self.assertEqual(converted.datasets("local"), local)
         self.assertEqual(converted.index.ledger_cost(), cost)
         windows = [row["windows"]["5h"] for row in converted.datasets("merged")[0] if "5h" in row["windows"]]
-        self.assertEqual([w["usedPercent"] for w in windows], [50, 51, 50])
+        self.assertEqual([w["usedPercent"] for w in windows], [50])
 
 
 if __name__ == "__main__":

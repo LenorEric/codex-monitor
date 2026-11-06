@@ -25,6 +25,20 @@ def reading(minute, percent, *, account="v3:a", reset=1893520800, seven=None, pl
 
 
 class SamplingTests(unittest.TestCase):
+    def test_same_time_saved_values_restore_in_ascending_order_without_reset_metadata(self):
+        rows = []
+        for value in (30, 10, 20):
+            row = reading(0, value)
+            row["quotaRunVersion"] = 1
+            row["sync"]["recordId"] = str(100 - value)
+            row["windows"]["5h"].update(continuous=value, multiplier=1, firstAt=1893510000, lastAt=1893510000)
+            rows.append(row)
+        for source in (rows, list(reversed(rows))):
+            states = {}
+            points = sample_rows(source, states)
+            self.assertEqual([point["fiveHour"]["raw"] for point in points], [10, 20, 30])
+            self.assertEqual(states["v3:a"]["fiveHour"]["raw"], 30)
+
     def values(self, values):
         return [point["fiveHour"]["continuous"] for point in sample_rows([reading(index, value) for index, value in enumerate(values)])]
 
@@ -218,7 +232,12 @@ class SamplingStorageTests(unittest.TestCase):
         for window in ("5h", "7d"):
             self.assertEqual([run[1:] for run in usage_runs(self.points(), window)], [run[1:] for run in usage_runs(sample_rows(rows), window)])
         self.assertEqual(len(self.points()), 6)
-        self.assertEqual(sorted(point["resetWindow"] for point in self.points() if point.get("resetWindow")), ["fiveHour", "sevenDay"])
+        self.assertFalse(any("resetWindow" in point for point in self.points()))
+        self.assertTrue(all("resetBoundary" not in window for row in self.store.index.rows("quota") for window in row["windows"].values()))
+        states = {}
+        sample_rows(list(reversed(self.store.index.rows("quota"))), states)
+        self.assertEqual(states["v3:a"]["fiveHour"]["raw"], 10)
+        self.assertEqual(states["v3:a"]["sevenDay"]["raw"], 20)
         from test_support_projection import DashboardProjector
         projector = DashboardProjector(self.store)
         projector.refresh({"items": []}, 1893513600)

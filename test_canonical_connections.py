@@ -52,6 +52,15 @@ class CanonicalConnectionTests(unittest.TestCase):
             self.assertIsNone(self.index.get(reused, "test"))
             self.index.put(reused, "test", 2)
 
+    def test_connection_commits_completed_statements_before_an_error(self):
+        with self.assertRaisesRegex(ValueError, "abort"):
+            with self.index.connection() as db:
+                self.index.put(db, "completed", 1)
+                raise ValueError("abort")
+        self.assertFalse(db.in_transaction)
+        with closing(sqlite3.connect(self.index.path)) as independent:
+            self.assertEqual(independent.execute("SELECT value FROM processing_meta WHERE name='completed'").fetchone()[0], "1")
+
     def test_nested_transaction_does_not_commit_outer_transaction(self):
         with self.assertRaises(ValueError):
             with self.index.transaction() as db:

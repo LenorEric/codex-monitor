@@ -7,6 +7,7 @@ from contextvars import ContextVar
 from datetime import datetime, timezone
 
 from monitor_common import coerce_float, parse_timestamp
+from monitor_interpretation import quota_point_order
 import monitor_sample_store as samples
 
 WINDOWS = {"fiveHour": ("5h", 18000), "sevenDay": ("7d", 604800)}
@@ -41,11 +42,11 @@ def quota_point(row):
         from monitor_interpretation import multiplier
         point[name] = {"raw": raw, "continuous": raw, "resetAt": window.get("resetAt"), "plan": "plus" if plan == "unknown" else plan, "multiplier": multiplier(plan, point["timestamp"] or 0)}
         if row.get("quotaRunVersion") == 1 and label in (row.get("windows") or {}):
-            point[name].update({key: window[key] for key in ("continuous", "multiplier", "firstAt", "lastAt", "resetBoundary")})
+            point[name].update({key: window[key] for key in ("multiplier", "firstAt", "lastAt")})
+            # Retired JSON stores retain saved decisions for sequential migrations only.
+            point[name]["continuous"] = window.get("continuous", raw)
             point[name]["storedRun"] = True
             point.setdefault("runWindows", []).append(name)
-            if window["resetBoundary"]:
-                point["resetWindow"] = name
     return point
 
 
@@ -103,11 +104,11 @@ def sample_rows(rows, states=None):
                 point["runWindows"] = sorted(set(point["runWindows"] + merged[key]["runWindows"]))
         merged[key] = point
     states = {} if states is None else states
-    points = sorted(merged.values(), key=lambda point: (point["timestamp"] is None, point["timestamp"] or 0, point["checkedAt"] or "", point["usageAccountId"]))
+    points = sorted(merged.values(), key=quota_point_order)
     reset_points = []
     for point in points:
         sample_point(point, states.setdefault(point["usageAccountId"], {}), reset_points)
-    return sorted(points + reset_points, key=lambda point: (point["timestamp"] is None, point["timestamp"] or 0, point["usageAccountId"], not bool(point.get("resetWindow")), point.get("resetWindow", "")))
+    return sorted(points + reset_points, key=quota_point_order)
 
 
 def point_key(point):
@@ -227,4 +228,4 @@ def stored_points(db, view, account=None):
         query += " AND account=?"
         values.append(account)
     points = [json.loads(row[0]) for row in db.execute(query + " ORDER BY event_at IS NULL,event_at,account,record_key", values)]
-    return sorted(points, key=lambda point: (point["timestamp"] is None, point["timestamp"] or 0, point["usageAccountId"], not bool(point.get("resetWindow")), point.get("resetWindow", "")))
+    return sorted(points, key=quota_point_order)

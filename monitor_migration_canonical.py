@@ -4,7 +4,7 @@ import json
 import sqlite3
 from contextlib import closing
 
-from monitor_canonical_store import CanonicalRepository, TABLES, initialize
+from monitor_migration_canonical_schema import CanonicalRepository, TABLES, initialize
 from monitor_usage_sync import canonical_json
 
 

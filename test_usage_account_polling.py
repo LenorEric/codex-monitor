@@ -18,9 +18,10 @@ class UsageAccountPollingTests(unittest.TestCase):
         state.args = SimpleNamespace(local_only=False)
         state.opener = object()
         state.accounts = SimpleNamespace(
-            status=lambda: {"activeAccountId": active, "slotOrder": ["b1", "b2", "a1", "a2", "c1"]},
+            status=lambda: {"activeAccountId": active, "slotOrder": ["b1", "b2", "a1", "a2", "c1"],
+                "items": [{"id": slot, "isApiAccount": slot == "api"} for slot in (*slots, "api")]},
             attribution_timeline=lambda: [{"accountSlotId": slot} for slot in ("a1", "b2", "b1", "a2")],
-            inactive_ready_credentials=lambda: [{"id": slot, "label": slot, "data": json.dumps({"tokens": {}}).encode()} for slot in slots if slot != active],
+            inactive_ready_credentials=lambda include_active=False: [{"id": slot, "label": slot, "data": json.dumps({"tokens": {}}).encode()} for slot in slots if include_active or slot != active],
         )
         state.cloud = SimpleNamespace(usage_account_id=lambda slot: slots[slot])
         state.inactive_account_poll_started_at = {}
@@ -42,6 +43,12 @@ class UsageAccountPollingTests(unittest.TestCase):
         state.inactive_account_poll_started_at["c"] = 100
         self.assertEqual({r["usageAccountId"] for r in state._inactive_usage_credentials()}, {"a", "c"})
         self.assertEqual(state.poll_due_inactive_accounts(101), 0)
+
+    def test_api_active_slot_polls_every_openai_account_as_inactive(self):
+        state = self.state("api")
+        state.accounts.status = lambda: {"activeAccountId": "api", "slotOrder": ["b1", "b2", "a1", "a2", "c1", "api"],
+            "items": [{"id": slot, "isApiAccount": slot == "api"} for slot in ("a1", "a2", "b1", "b2", "c1", "api")]}
+        self.assertEqual({(row["usageAccountId"], row["id"]) for row in state._inactive_usage_credentials()}, {("a", "a1"), ("b", "b1"), ("c", "c1")})
 
     def test_one_request_per_inactive_account_and_shared_failure_health(self):
         state = self.state()

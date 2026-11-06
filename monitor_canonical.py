@@ -6,6 +6,7 @@ import json
 import sqlite3
 import threading
 import time
+import traceback
 from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -20,7 +21,7 @@ def initialize(db):
     initialize_typed(db)
     for statement in """
         CREATE TABLE IF NOT EXISTS processing_meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS canonical_seen(view TEXT,kind TEXT,record_key TEXT,PRIMARY KEY(view,kind,record_key));
+        CREATE TABLE IF NOT EXISTS canonical_seen(view TEXT NOT NULL,record_key TEXT NOT NULL,PRIMARY KEY(view,record_key)) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS upload_buffer(seq INTEGER PRIMARY KEY AUTOINCREMENT,record_key TEXT UNIQUE NOT NULL,arrived REAL NOT NULL,data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS package_receipts(destination TEXT,machine TEXT,package TEXT,PRIMARY KEY(destination,machine,package));
         CREATE TABLE IF NOT EXISTS source_checkpoints(path TEXT PRIMARY KEY,state TEXT NOT NULL);
@@ -47,6 +48,10 @@ class CanonicalIndex(IndexState):
         with closing(sqlite3.connect(self.path)) as db:
             if db.execute("SELECT 1 FROM sqlite_master WHERE name IN ('processing_facts','canonical_records')").fetchone():
                 raise ValueError("Local contract 23 migration must complete before typed canonical data can be used")
+            if any(column[1] == "continuous" for column in db.execute("PRAGMA table_info(canonical_quota)")):
+                raise ValueError("Local contract 24 migration must remove rejected quota points and continuous before runtime access")
+            if any(column[1] == "kind" for column in db.execute("PRAGMA table_info(canonical_seen)")):
+                raise ValueError("Local contract 24 migration must remove quota identities before runtime access")
             db.execute("PRAGMA journal_mode=WAL")
             initialize(db)
             db.execute("INSERT OR IGNORE INTO processing_meta VALUES('canonicalStore','true')")
@@ -55,13 +60,14 @@ class CanonicalIndex(IndexState):
             db.commit()
 
     @contextmanager
-    def transaction(self):
+    def connection(self):
+        """Serialize access without grouping completed statements into a transaction."""
         with self.lock:
             if self._closed:
                 raise RuntimeError("Canonical index is closed")
             if self._db is None:
                 # All access, including shutdown, is serialized by self.lock.
-                db = sqlite3.connect(self.path, timeout=10, check_same_thread=False)
+                db = sqlite3.connect(self.path, timeout=10, check_same_thread=False, isolation_level=None)
                 try:
                     db.execute("PRAGMA foreign_keys=ON")
                     db.execute("PRAGMA recursive_triggers=ON")
@@ -69,7 +75,11 @@ class CanonicalIndex(IndexState):
                     db.close()
                     raise
                 self._db = db
-            db = self._db
+            yield self._db
+
+    @contextmanager
+    def transaction(self):
+        with self.connection() as db:
             depth = self._transaction_depth
             self._transaction_depth += 1
             try:
@@ -159,6 +169,8 @@ class CanonicalDataStore(NormalizedRecords):
         self.machine_id, self.account_id_resolver, self.lock = machine_id, account_id_resolver, lock
         self.account_mapper = account_mapper
         self.index = CanonicalIndex(self.v4_cache_path)
+        from monitor_quota_preprocessing import QuotaPreprocessor
+        self.quota_preprocessor = QuotaPreprocessor(self.index)
         from monitor_canonical_ingestion import CanonicalSourceIngestor
         self.sources = CanonicalSourceIngestor(self)
 
@@ -228,13 +240,17 @@ class CanonicalDataStore(NormalizedRecords):
         row["sync"]["recordId"] = hashlib.sha256(canonical_json([record_account_key(row), label, first, last, row["windows"][label]])).hexdigest()
         return row
 
+    @staticmethod
+    def _quota_compatible(previous, current):
+        return all(previous.get(field) == current.get(field) for field in ("usedPercent", "multiplier", "resetAt", "plan"))
+
     def _quota_merge(self, db, view, row):
-        """Overlay only overlapping spans, retaining explicit observations and barriers."""
+        """Keep covered points unchanged and extend compatible neighboring runs."""
         for label, window in row["windows"].items():
             first, last = int(window["firstAt"]), int(window["lastAt"])
             account = record_account_key(row)
             existing = records.items(db, view, "quota", account, condition="window=? AND first<=? AND last>=?", parameters=(label, last, first))
-            if first == last and any(old["windows"][label]["firstAt"] == old["windows"][label]["lastAt"] == first for _, old in existing):
+            if first == last and existing:
                 continue
             spans = [(first, last)]
             for key, old in existing:
@@ -243,97 +259,71 @@ class CanonicalDataStore(NormalizedRecords):
                 if a == b:
                     spans = [(x, y) for start, end in spans for x, y in ((start, min(end, a - 1)), (max(start, a + 1), end)) if x <= y]
                     continue
-                if first == last and all(prior.get(field) == window.get(field) for field in ("usedPercent", "continuous", "multiplier", "resetAt", "plan")):
-                    return
                 records.delete(db, view, "quota", account, key)
                 for a, b in ((a, min(b, first - 1)), (max(a, last + 1), b)):
                     if a <= b:
                         self._save(db, view, "quota", self._fragment(old, label, a, b))
             for a, b in spans:
-                incoming = self._fragment(row, label, a, b)
-                # Extend a compatible predecessor only when no intervening evidence exists.
+                # Check only immediate neighbors, so different states remain barriers.
                 previous = records.items(db, view, "quota", account, condition="window=? AND last<?", parameters=(label, a), order="last DESC", limit=1)
                 if previous:
                     prior = previous[0][1]
                     value = prior.get("windows", {}).get(label)
-                    if value and window["continuous"] is not None and not window["resetBoundary"] and all(value.get(field) == window.get(field) for field in ("usedPercent", "continuous", "multiplier", "resetAt", "plan")):
+                    if value and self._quota_compatible(value, window):
                         records.delete(db, view, "quota", account, previous[0][0])
-                        incoming = self._fragment(incoming, label, int(value["firstAt"]), b)
-                self._save(db, view, "quota", incoming)
+                        a = int(value["firstAt"])
+                following = records.items(db, view, "quota", account, condition="window=? AND first>?", parameters=(label, b), order="first", limit=1)
+                if following:
+                    value = following[0][1]["windows"][label]
+                    if self._quota_compatible(value, window):
+                        records.delete(db, view, "quota", account, following[0][0])
+                        b = int(value["lastAt"])
+                self._save(db, view, "quota", self._fragment(row, label, a, b))
 
-    def _quota_interpret(self, db, row, view):
-        from monitor_sampling import WINDOWS, quota_point, sample_point
-        account = record_account_key(row)
-        state = self.index.get(db, f"samplingState:{view}:{account}", {"windows": {}})
-        point, resets = quota_point(row), []
+    def _quota_records(self, row):
+        from monitor_sampling import WINDOWS, quota_point
+        point = quota_point(row)
         stamp = int(point["timestamp"])
-        if stamp < state.get("timestamp", -1):
-            state = {"windows": {}}
-            for name, (label, _) in WINDOWS.items():
-                previous = records.rows(db, view, "quota", account, condition="window=? AND continuous IS NOT NULL AND first<?",
-                    parameters=(label, stamp), order="first DESC", limit=1)
-                for previous_row in previous:
-                    window = previous_row.get("windows", {}).get(label)
-                    if window and window.get("continuous") is not None:
-                        state["windows"][name] = {"raw": window["continuous"], "timestamp": min(window["lastAt"], stamp - 1), "resetAt": window.get("resetAt"), "plan": window["plan"]}
-                        break
-        sample_point(point, state["windows"], resets)
-        state["timestamp"] = stamp
-        if stamp >= self.index.get(db, f"samplingState:{view}:{account}", {}).get("timestamp", -1):
-            self.index.put(db, f"samplingState:{view}:{account}", state)
-        if view == "local":
-            self.index.put(db, f"quotaObservation:{account}", point)
-        result = []
-        for observation in resets + [point]:
-            for name, (label, _) in WINDOWS.items():
-                value = observation[name]
-                if label not in row["windows"] or value["raw"] is None or observation.get("resetWindow") not in (None, name):
-                    continue
-                stamp = int(observation["timestamp"])
-                canonical = copy.deepcopy(row) | {"quotaRunVersion": 1, "windows": {label: {
-                    "usedPercent": value["raw"], "continuous": value["continuous"], "multiplier": value.get("multiplier", point[name]["multiplier"]),
-                    "resetAt": value.get("resetAt"), "plan": value["plan"], "firstAt": stamp, "lastAt": stamp, "resetBoundary": bool(observation.get("resetWindow"))}}}
-                result.append(self._fragment(canonical, label, stamp, stamp))
-        return result
+        for name, (label, _) in WINDOWS.items():
+            if label not in row["windows"]:
+                continue
+            window = point[name]
+            canonical = row | {"quotaRunVersion": 1, "windows": {label: {
+                "usedPercent": window["raw"], "multiplier": window["multiplier"], "resetAt": window.get("resetAt"),
+                "plan": window["plan"], "firstAt": stamp, "lastAt": stamp}}}
+            yield self._fragment(canonical, label, stamp, stamp)
 
     def _apply(self, db, kind, row, local=False):
-        key = record_key(kind, row)
         views = ("local", "merged") if local else ("merged",)
+        quota_records = tuple(self._quota_records(row)) if kind == "quota" else ()
         changed = False
-        canonical = None
-        local_row = None
         for view in views:
             if kind == "quota":
-                labels = [label for label in row["windows"] if db.execute("INSERT OR IGNORE INTO canonical_seen VALUES(?,?,?)", (view, kind, key + ":" + label)).rowcount]
-                if not labels:
-                    continue
-                if view == "local":
-                    local_row = row | {"windows": {label: row["windows"][label] for label in labels}}
-                if canonical is None:
-                    canonical = self._quota_interpret(db, row | {"windows": {label: row["windows"][label] for label in labels}}, view)
-                for item in canonical:
-                    if any(label in item["windows"] for label in labels):
-                        self._quota_merge(db, view, item)
+                for item in quota_records:
+                    self._quota_merge(db, view, item)
             else:
-                if not db.execute("INSERT OR IGNORE INTO canonical_seen VALUES(?,?,?)", (view, kind, key)).rowcount:
+                if not db.execute("INSERT OR IGNORE INTO canonical_seen VALUES(?,?)", (view, record_key(kind, row))).rowcount:
                     continue
-                if view == "local":
-                    local_row = row
                 self._save(db, view, kind, row)
             changed = True
-        if local_row is not None:
-            self._enqueue(db, kind, local_row)
+        if local and changed:
+            self._enqueue(db, kind, row)
         self.index.metrics["recordsImported"] += int(changed)
         return changed
 
     def record_quota(self, sample):
         from monitor_history import quota_history_rows_from_sample
-        with self.lock, self.index.transaction() as db:
-            changed = False
-            for row in quota_history_rows_from_sample(sample):
-                if (row := self.normalize_new_quota(row)) is not None:
-                    changed |= self._apply(db, "quota", row, True)
-            return changed
+        try:
+            with self.lock, self.index.connection() as db:
+                changed = False
+                for row in quota_history_rows_from_sample(sample):
+                    if (row := self.normalize_new_quota(row)) is not None:
+                        for accepted in self.quota_preprocessor.process(db, row):
+                            changed |= self._apply(db, "quota", accepted, True)
+                return changed
+        except Exception:
+            traceback.print_exc()
+            raise
 
     def record_ledger(self, rows):
         with self.lock, self.index.transaction() as db:

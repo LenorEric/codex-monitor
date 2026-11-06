@@ -1,0 +1,932 @@
+{
+  "capturedAt": "2026-11-05T19:04:46.632039+08:00",
+  "path": "C:\\Users\\M011097\\.codex-switch\\usage_monitor_sync_cache-v4.sqlite3",
+  "pragmas": {
+    "page_size": 4096,
+    "page_count": 277767,
+    "freelist_count": 109789,
+    "auto_vacuum": 2
+  },
+  "owners": [
+    [
+      "metadata",
+      "table",
+      "metadata"
+    ],
+    [
+      "sqlite_autoindex_metadata_1",
+      "index",
+      "metadata"
+    ],
+    [
+      "processing_meta",
+      "table",
+      "processing_meta"
+    ],
+    [
+      "sqlite_autoindex_processing_meta_1",
+      "index",
+      "processing_meta"
+    ],
+    [
+      "dashboard_days",
+      "table",
+      "dashboard_days"
+    ],
+    [
+      "sqlite_autoindex_dashboard_days_1",
+      "index",
+      "dashboard_days"
+    ],
+    [
+      "dashboard_parts",
+      "table",
+      "dashboard_parts"
+    ],
+    [
+      "sqlite_autoindex_dashboard_parts_1",
+      "index",
+      "dashboard_parts"
+    ],
+    [
+      "dashboard_day_meta",
+      "table",
+      "dashboard_day_meta"
+    ],
+    [
+      "sqlite_autoindex_dashboard_day_meta_1",
+      "index",
+      "dashboard_day_meta"
+    ],
+    [
+      "dashboard_blobs",
+      "table",
+      "dashboard_blobs"
+    ],
+    [
+      "sqlite_autoindex_dashboard_blobs_1",
+      "index",
+      "dashboard_blobs"
+    ],
+    [
+      "dashboard_manifests",
+      "table",
+      "dashboard_manifests"
+    ],
+    [
+      "sqlite_autoindex_dashboard_manifests_1",
+      "index",
+      "dashboard_manifests"
+    ],
+    [
+      "dashboard_rollups",
+      "table",
+      "dashboard_rollups"
+    ],
+    [
+      "sqlite_autoindex_dashboard_rollups_1",
+      "index",
+      "dashboard_rollups"
+    ],
+    [
+      "delivery_meta",
+      "table",
+      "delivery_meta"
+    ],
+    [
+      "sqlite_autoindex_delivery_meta_1",
+      "index",
+      "delivery_meta"
+    ],
+    [
+      "delivery_dirty",
+      "table",
+      "delivery_dirty"
+    ],
+    [
+      "sqlite_autoindex_delivery_dirty_1",
+      "index",
+      "delivery_dirty"
+    ],
+    [
+      "delivery_work",
+      "table",
+      "delivery_work"
+    ],
+    [
+      "sqlite_autoindex_delivery_work_1",
+      "index",
+      "delivery_work"
+    ],
+    [
+      "delivery_accounts",
+      "table",
+      "delivery_accounts"
+    ],
+    [
+      "sqlite_autoindex_delivery_accounts_1",
+      "index",
+      "delivery_accounts"
+    ],
+    [
+      "delivery_charts",
+      "table",
+      "delivery_charts"
+    ],
+    [
+      "sqlite_autoindex_delivery_charts_1",
+      "index",
+      "delivery_charts"
+    ],
+    [
+      "delivery_journal",
+      "table",
+      "delivery_journal"
+    ],
+    [
+      "sqlite_autoindex_delivery_journal_1",
+      "index",
+      "delivery_journal"
+    ],
+    [
+      "delivery_snapshot",
+      "table",
+      "delivery_snapshot"
+    ],
+    [
+      "sqlite_sequence",
+      "table",
+      "sqlite_sequence"
+    ],
+    [
+      "delivery_run_payloads",
+      "table",
+      "delivery_run_payloads"
+    ],
+    [
+      "delivery_run_payload_unique",
+      "index",
+      "delivery_run_payloads"
+    ],
+    [
+      "delivery_run_refs",
+      "table",
+      "delivery_run_refs"
+    ],
+    [
+      "sqlite_autoindex_delivery_run_refs_1",
+      "index",
+      "delivery_run_refs"
+    ],
+    [
+      "delivery_run_payload",
+      "index",
+      "delivery_run_refs"
+    ],
+    [
+      "delivery_token_payloads",
+      "table",
+      "delivery_token_payloads"
+    ],
+    [
+      "sqlite_autoindex_delivery_token_payloads_1",
+      "index",
+      "delivery_token_payloads"
+    ],
+    [
+      "delivery_token_refs",
+      "table",
+      "delivery_token_refs"
+    ],
+    [
+      "sqlite_autoindex_delivery_token_refs_1",
+      "index",
+      "delivery_token_refs"
+    ],
+    [
+      "delivery_token_interval_5h",
+      "index",
+      "delivery_token_refs"
+    ],
+    [
+      "delivery_token_interval_7d",
+      "index",
+      "delivery_token_refs"
+    ],
+    [
+      "delivery_run_time",
+      "index",
+      "delivery_run_refs"
+    ],
+    [
+      "delivery_token_time",
+      "index",
+      "delivery_token_refs"
+    ],
+    [
+      "canonical_seen",
+      "table",
+      "canonical_seen"
+    ],
+    [
+      "sqlite_autoindex_canonical_seen_1",
+      "index",
+      "canonical_seen"
+    ],
+    [
+      "upload_buffer",
+      "table",
+      "upload_buffer"
+    ],
+    [
+      "sqlite_autoindex_upload_buffer_1",
+      "index",
+      "upload_buffer"
+    ],
+    [
+      "package_receipts",
+      "table",
+      "package_receipts"
+    ],
+    [
+      "sqlite_autoindex_package_receipts_1",
+      "index",
+      "package_receipts"
+    ],
+    [
+      "source_checkpoints",
+      "table",
+      "source_checkpoints"
+    ],
+    [
+      "sqlite_autoindex_source_checkpoints_1",
+      "index",
+      "source_checkpoints"
+    ],
+    [
+      "source_blocks",
+      "table",
+      "source_blocks"
+    ],
+    [
+      "sqlite_autoindex_source_blocks_1",
+      "index",
+      "source_blocks"
+    ],
+    [
+      "canonical_quota",
+      "table",
+      "canonical_quota"
+    ],
+    [
+      "sqlite_autoindex_canonical_quota_1",
+      "index",
+      "canonical_quota"
+    ],
+    [
+      "canonical_quota_time",
+      "index",
+      "canonical_quota"
+    ],
+    [
+      "canonical_tokens",
+      "table",
+      "canonical_tokens"
+    ],
+    [
+      "sqlite_autoindex_canonical_tokens_1",
+      "index",
+      "canonical_tokens"
+    ],
+    [
+      "canonical_tokens_time",
+      "index",
+      "canonical_tokens"
+    ],
+    [
+      "canonical_quota_overlap",
+      "index",
+      "canonical_quota"
+    ],
+    [
+      "canonical_quota_predecessor",
+      "index",
+      "canonical_quota"
+    ],
+    [
+      "canonical_tokens_event",
+      "index",
+      "canonical_tokens"
+    ]
+  ],
+  "counts": {
+    "metadata": 1,
+    "processing_meta": 31,
+    "dashboard_days": 0,
+    "dashboard_parts": 0,
+    "dashboard_day_meta": 0,
+    "dashboard_blobs": 0,
+    "dashboard_manifests": 0,
+    "dashboard_rollups": 0,
+    "delivery_meta": 7,
+    "delivery_dirty": 0,
+    "delivery_work": 0,
+    "delivery_accounts": 25,
+    "delivery_charts": 9537,
+    "delivery_journal": 43,
+    "delivery_snapshot": 1,
+    "sqlite_sequence": 1,
+    "delivery_run_payloads": 166020,
+    "delivery_run_refs": 226310,
+    "delivery_token_payloads": 48089,
+    "delivery_token_refs": 90092,
+    "canonical_seen": 317647,
+    "upload_buffer": 13,
+    "package_receipts": 17,
+    "source_checkpoints": 213,
+    "source_blocks": 48270,
+    "canonical_quota": 226310,
+    "canonical_tokens": 90092
+  },
+  "storage": [
+    {
+      "name": "canonical_quota",
+      "bytes": 103280640,
+      "payload": 94532610,
+      "unused": 6753878,
+      "pages": 25215
+    },
+    {
+      "name": "canonical_tokens",
+      "bytes": 73211904,
+      "payload": 62318767,
+      "unused": 9978680,
+      "pages": 17874
+    },
+    {
+      "name": "sqlite_autoindex_canonical_seen_1",
+      "bytes": 42840064,
+      "payload": 36612621,
+      "unused": 5058906,
+      "pages": 10459
+    },
+    {
+      "name": "sqlite_autoindex_delivery_run_refs_1",
+      "bytes": 42094592,
+      "payload": 35243836,
+      "unused": 5822196,
+      "pages": 10277
+    },
+    {
+      "name": "sqlite_autoindex_canonical_quota_1",
+      "bytes": 40476672,
+      "payload": 34532011,
+      "unused": 4920841,
+      "pages": 9882
+    },
+    {
+      "name": "delivery_snapshot",
+      "bytes": 39538688,
+      "payload": 39497066,
+      "unused": 2995,
+      "pages": 9653
+    },
+    {
+      "name": "delivery_run_refs",
+      "bytes": 38735872,
+      "payload": 36353405,
+      "unused": 637662,
+      "pages": 9457
+    },
+    {
+      "name": "canonical_seen",
+      "bytes": 37826560,
+      "payload": 35374928,
+      "unused": 315684,
+      "pages": 9235
+    },
+    {
+      "name": "delivery_token_refs",
+      "bytes": 28921856,
+      "payload": 24157531,
+      "unused": 4014069,
+      "pages": 7061
+    },
+    {
+      "name": "canonical_quota_overlap",
+      "bytes": 24772608,
+      "payload": 21179721,
+      "unused": 2841385,
+      "pages": 6048
+    },
+    {
+      "name": "sqlite_autoindex_canonical_tokens_1",
+      "bytes": 24354816,
+      "payload": 20646262,
+      "unused": 3276838,
+      "pages": 5946
+    },
+    {
+      "name": "delivery_run_time",
+      "bytes": 23691264,
+      "payload": 20081066,
+      "unused": 2861864,
+      "pages": 5784
+    },
+    {
+      "name": "canonical_quota_time",
+      "bytes": 23064576,
+      "payload": 19369241,
+      "unused": 2948837,
+      "pages": 5631
+    },
+    {
+      "name": "canonical_quota_predecessor",
+      "bytes": 22900736,
+      "payload": 20048171,
+      "unused": 2106547,
+      "pages": 5591
+    },
+    {
+      "name": "sqlite_autoindex_delivery_token_refs_1",
+      "bytes": 15319040,
+      "payload": 12917317,
+      "unused": 1996479,
+      "pages": 3740
+    },
+    {
+      "name": "delivery_token_interval_7d",
+      "bytes": 13586432,
+      "payload": 10854259,
+      "unused": 2498029,
+      "pages": 3317
+    },
+    {
+      "name": "source_blocks",
+      "bytes": 10199040,
+      "payload": 9289148,
+      "unused": 529721,
+      "pages": 2490
+    },
+    {
+      "name": "delivery_run_payload_unique",
+      "bytes": 9838592,
+      "payload": 7954173,
+      "unused": 1357539,
+      "pages": 2402
+    },
+    {
+      "name": "delivery_token_time",
+      "bytes": 9097216,
+      "payload": 7691981,
+      "unused": 1108311,
+      "pages": 2221
+    },
+    {
+      "name": "delivery_token_payloads",
+      "bytes": 8957952,
+      "payload": 8320082,
+      "unused": 281365,
+      "pages": 2187
+    },
+    {
+      "name": "canonical_tokens_time",
+      "bytes": 8912896,
+      "payload": 7673014,
+      "unused": 943498,
+      "pages": 2176
+    },
+    {
+      "name": "delivery_token_interval_5h",
+      "bytes": 8048640,
+      "payload": 6386951,
+      "unused": 1523837,
+      "pages": 1965
+    },
+    {
+      "name": "canonical_tokens_event",
+      "bytes": 7811072,
+      "payload": 6682002,
+      "unused": 835914,
+      "pages": 1907
+    },
+    {
+      "name": "sqlite_autoindex_delivery_token_payloads_1",
+      "bytes": 7696384,
+      "payload": 6555298,
+      "unused": 926186,
+      "pages": 1879
+    },
+    {
+      "name": "sqlite_autoindex_source_blocks_1",
+      "bytes": 7012352,
+      "payload": 6151606,
+      "unused": 690376,
+      "pages": 1712
+    },
+    {
+      "name": "delivery_run_payloads",
+      "bytes": 5464064,
+      "payload": 4275551,
+      "unused": 173166,
+      "pages": 1334
+    },
+    {
+      "name": "delivery_run_payload",
+      "bytes": 3092480,
+      "payload": 2014809,
+      "unused": 389685,
+      "pages": 755
+    },
+    {
+      "name": "delivery_charts",
+      "bytes": 2781184,
+      "payload": 2600080,
+      "unused": 105090,
+      "pages": 679
+    },
+    {
+      "name": "sqlite_autoindex_delivery_charts_1",
+      "bytes": 2666496,
+      "payload": 2151456,
+      "unused": 469084,
+      "pages": 651
+    },
+    {
+      "name": "source_checkpoints",
+      "bytes": 172032,
+      "payload": 128893,
+      "unused": 41201,
+      "pages": 42
+    },
+    {
+      "name": "delivery_journal",
+      "bytes": 45056,
+      "payload": 34544,
+      "unused": 10177,
+      "pages": 11
+    },
+    {
+      "name": "sqlite_schema",
+      "bytes": 36864,
+      "payload": 19803,
+      "unused": 16443,
+      "pages": 9
+    },
+    {
+      "name": "sqlite_autoindex_source_checkpoints_1",
+      "bytes": 32768,
+      "payload": 26372,
+      "unused": 5643,
+      "pages": 8
+    },
+    {
+      "name": "processing_meta",
+      "bytes": 32768,
+      "payload": 22111,
+      "unused": 10387,
+      "pages": 8
+    },
+    {
+      "name": "upload_buffer",
+      "bytes": 12288,
+      "payload": 6543,
+      "unused": 5617,
+      "pages": 3
+    },
+    {
+      "name": "delivery_meta",
+      "bytes": 8192,
+      "payload": 4211,
+      "unused": 3934,
+      "pages": 2
+    },
+    {
+      "name": "sqlite_sequence",
+      "bytes": 4096,
+      "payload": 19,
+      "unused": 4065,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_upload_buffer_1",
+      "bytes": 4096,
+      "payload": 1114,
+      "unused": 2934,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_processing_meta_1",
+      "bytes": 4096,
+      "payload": 2457,
+      "unused": 1538,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_package_receipts_1",
+      "bytes": 4096,
+      "payload": 2855,
+      "unused": 1165,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_metadata_1",
+      "bytes": 4096,
+      "payload": 19,
+      "unused": 4066,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_work_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_meta_1",
+      "bytes": 4096,
+      "payload": 88,
+      "unused": 3979,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_journal_1",
+      "bytes": 4096,
+      "payload": 534,
+      "unused": 3425,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_dirty_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_delivery_accounts_1",
+      "bytes": 4096,
+      "payload": 1991,
+      "unused": 2022,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_rollups_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_parts_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_manifests_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_days_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_day_meta_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "sqlite_autoindex_dashboard_blobs_1",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "package_receipts",
+      "bytes": 4096,
+      "payload": 2822,
+      "unused": 1181,
+      "pages": 1
+    },
+    {
+      "name": "metadata",
+      "bytes": 4096,
+      "payload": 20,
+      "unused": 4064,
+      "pages": 1
+    },
+    {
+      "name": "delivery_work",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "delivery_dirty",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "delivery_accounts",
+      "bytes": 4096,
+      "payload": 2229,
+      "unused": 1734,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_rollups",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_parts",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_manifests",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_days",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_day_meta",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    },
+    {
+      "name": "dashboard_blobs",
+      "bytes": 4096,
+      "payload": 0,
+      "unused": 4088,
+      "pages": 1
+    }
+  ],
+  "canonical": {
+    "canonical_quota": [
+      [
+        "local",
+        60524,
+        2,
+        1783496923,
+        1793876561
+      ],
+      [
+        "merged",
+        165786,
+        7,
+        1783496923,
+        1793876561
+      ]
+    ],
+    "canonical_tokens": [
+      [
+        "local",
+        42003,
+        9,
+        1775555697,
+        1793876655
+      ],
+      [
+        "merged",
+        48089,
+        12,
+        1770813162,
+        1793876655
+      ]
+    ]
+  },
+  "delivery": {
+    "delivery_accounts": [
+      [
+        "local",
+        9
+      ],
+      [
+        "merged",
+        16
+      ]
+    ],
+    "delivery_charts": [
+      [
+        "local",
+        3906
+      ],
+      [
+        "merged",
+        5631
+      ]
+    ],
+    "delivery_run_refs": [
+      [
+        "local",
+        60524
+      ],
+      [
+        "merged",
+        165786
+      ]
+    ],
+    "delivery_token_refs": [
+      [
+        "local",
+        42003
+      ],
+      [
+        "merged",
+        48089
+      ]
+    ]
+  },
+  "snapshot": [
+    [
+      28162846,
+      11334201,
+      1793876660.1042516
+    ]
+  ],
+  "buffer": [
+    [
+      13,
+      1793875358.0150454,
+      1793876660.0938098,
+      5325
+    ]
+  ],
+  "files": {
+    "usage_monitor_sync_cache-v4.sqlite3": 1137733632,
+    "usage_monitor_sync_cache-v4.sqlite3-wal": 47000992,
+    "usage_monitor_sync_cache-v4.sqlite3-shm": 98304
+  },
+  "tableBytesIncludingIndexes": {
+    "canonical_quota": 214495232,
+    "canonical_tokens": 114290688,
+    "canonical_seen": 80666624,
+    "delivery_run_refs": 107614208,
+    "delivery_snapshot": 39538688,
+    "delivery_token_refs": 74973184,
+    "source_blocks": 17211392,
+    "delivery_run_payloads": 15302656,
+    "delivery_token_payloads": 16654336,
+    "delivery_charts": 5447680,
+    "source_checkpoints": 204800,
+    "delivery_journal": 49152,
+    "sqlite_schema": 36864,
+    "processing_meta": 36864,
+    "upload_buffer": 16384,
+    "delivery_meta": 12288,
+    "sqlite_sequence": 4096,
+    "package_receipts": 8192,
+    "metadata": 8192,
+    "delivery_work": 8192,
+    "delivery_dirty": 8192,
+    "delivery_accounts": 8192,
+    "dashboard_rollups": 8192,
+    "dashboard_parts": 8192,
+    "dashboard_manifests": 8192,
+    "dashboard_days": 8192,
+    "dashboard_day_meta": 8192,
+    "dashboard_blobs": 8192
+  },
+  "groupBytes": {
+    "Canonical records": 328785920,
+    "Identity indexes": 80666624,
+    "UI preparation/delivery": 259616768,
+    "Ingestion checkpoints": 17416192,
+    "Other metadata/SQLite": 86016,
+    "Upload buffer": 16384,
+    "Download receipts": 8192,
+    "Legacy empty dashboard": 49152
+  },
+  "allocatedBytes": 686645248,
+  "freeBytes": 449695744
+}

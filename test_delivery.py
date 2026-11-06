@@ -23,6 +23,12 @@ def point(stamp, value, reset=100000, plan="plus", weekly=None):
 
 
 class InterpretationTests(unittest.TestCase):
+    def test_same_time_values_sort_ascending_independently_for_each_window(self):
+        points = [point(100, 30, weekly=10), point(100, 10, weekly=30), point(100, 20, weekly=20)]
+        for window in ("5h", "7d"):
+            self.assertEqual([row[3] for row in usage_runs(points, window)], [10, 20, 30])
+            self.assertEqual([row[3] for row in usage_runs(list(reversed(points)), window)], [10, 20, 30])
+
     def test_multiplier_boundary(self):
         self.assertEqual(multiplier("pro", PRO_CUTOVER - 1), 20)
         self.assertEqual(multiplier("pro", PRO_CUTOVER), 10)
