@@ -159,6 +159,30 @@ class FinalDeliveryTests(unittest.TestCase):
         self.assert_charts()
         self.assertEqual(sum(model[1] for row in self.view()["chart:5h"] for model in row[6]), 300000000)
 
+    def test_full_rebuild_replaces_delivery_atomically_from_canonical(self):
+        self.put_quota(1000, 0, reset=10000)
+        self.put_quota(1100, 1, reset=20000)
+        self.token("event", 1050)
+        self.delivery.prepare()
+        before = self.bulk()
+        with self.store.index.transaction() as db:
+            canonical = db.execute("SELECT COUNT(*) FROM canonical_quota").fetchone()[0], db.execute("SELECT COUNT(*) FROM canonical_tokens").fetchone()[0]
+            db.execute("INSERT INTO delivery_items VALUES('local','v3:account','tokens','stale',0,0,0,'[\"stale\",0,[]]')")
+        with mock.patch.object(self.delivery, "_publish", side_effect=RuntimeError("interrupted")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                self.delivery.prepare(rebuild=True)
+        with self.store.index.transaction() as db:
+            self.assertIsNotNone(db.execute("SELECT 1 FROM delivery_items WHERE id='stale'").fetchone())
+        self.delivery.prepare(rebuild=True)
+        after = self.bulk()
+        self.assertNotEqual(after["epoch"], before["epoch"])
+        self.assertIsNone(self.delivery.replay(before["epoch"], before["cursors"]))
+        self.assertNotIn("stale", [row[0] for row in self.view()["tokens"]])
+        self.assertEqual([row[5] for row in self.view()["usage:5h"]], [1, 0])
+        self.assert_charts()
+        with self.store.index.transaction() as db:
+            self.assertEqual((db.execute("SELECT COUNT(*) FROM canonical_quota").fetchone()[0], db.execute("SELECT COUNT(*) FROM canonical_tokens").fetchone()[0]), canonical)
+
     def test_random_insert_delete_and_reset_neighborhoods_match_reference(self):
         random.seed(342)
         for index in range(30):

@@ -350,6 +350,8 @@ class UsageDashboardState:
         self.usage_data.sources.on_new_cost = self.accounts.promote_active_slot_on_cost
         from monitor_delivery import DashboardDelivery
         self.delivery = DashboardDelivery(self.usage_data.index)
+        print("Startup: rebuilding dashboard delivery from canonical data...", flush=True)
+        self.delivery.prepare(rebuild=True)
         self.cloud.configure_usage_sync(self.usage_data)
         print("Startup: recovering account transitions and reconciling managed skills...", flush=True)
         try:

@@ -378,7 +378,7 @@ class FinalDelivery:
         if totals is not None:
             self._set(db, view, account, "tokens", totals.tokens(f"append:{cutoff}:{number}"))
 
-    def _account(self, db, view, account, cutoff):
+    def _account(self, db, view, account, cutoff, bootstrap=False):
         before = db.execute("SELECT label FROM delivery_accounts WHERE view=? AND account=?", (view, account)).fetchone()
         label = before[0] if before else "Unknown"
         for table in ("canonical_tokens", "canonical_quota"):
@@ -386,7 +386,7 @@ class FinalDelivery:
             if row and row[0]:
                 label = row[0]
         db.execute("INSERT OR REPLACE INTO stage.accounts VALUES(?,?,?)", (view, account, label))
-        bootstrap = db.execute("SELECT 1 FROM delivery_pending WHERE view=? AND account=? AND seq<=? AND kind='bootstrap' LIMIT 1", (view, account, cutoff)).fetchone() is not None
+        bootstrap = bootstrap or db.execute("SELECT 1 FROM delivery_pending WHERE view=? AND account=? AND seq<=? AND kind='bootstrap' LIMIT 1", (view, account, cutoff)).fetchone() is not None
         for window in ("5h", "7d"):
             if bootstrap:
                 span = db.execute("SELECT MIN(first),MAX(last) FROM canonical_quota WHERE dataset=? AND account=? AND window=?", (view, account, window)).fetchone()
@@ -422,13 +422,13 @@ class FinalDelivery:
             "channel": channel, "account": account, "data": data}
         db.execute("INSERT INTO delivery_journal VALUES(?,?,?,?)", (stream, seq, now, encoded(packet)))
 
-    def _publish(self, path, cutoff, state, now):
+    def _publish(self, path, cutoff, state, now, rebuild=False):
         with self.index.lock, closing(self._connect()) as db, db:
             db.execute("ATTACH DATABASE ? AS output", (path,))
             db.execute("BEGIN IMMEDIATE")
             for view, account, label in db.execute("SELECT view,account,label FROM output.accounts"):
                 before = db.execute("SELECT label FROM delivery_accounts WHERE view=? AND account=?", (view, account)).fetchone()
-                if before is None or before[0] != label:
+                if not rebuild and (before is None or before[0] != label):
                     self._packet(db, view, "account", account, {"label": label}, now)
                 db.execute("INSERT INTO delivery_accounts VALUES(?,?,'[]',?) ON CONFLICT(view,account) DO UPDATE SET label=excluded.label", (view, account, label))
             db.execute("INSERT OR IGNORE INTO delivery_models SELECT name FROM output.models")
@@ -443,10 +443,16 @@ class FinalDelivery:
                 self.metrics["outputRowsWritten"] += 1
                 row = json.loads(body) if body else None
                 data = [row] if channel == "tokens" else [row[1]] if channel.startswith("quota:") else {"set": [row] if row else [], "remove": [] if row else [key]}
-                self._packet(db, view, channel, account, data, now)
+                if not rebuild:
+                    self._packet(db, view, channel, account, data, now)
             db.execute("DELETE FROM delivery_pending WHERE seq<=?", (cutoff,))
+            if rebuild:
+                db.execute("DELETE FROM delivery_journal")
+                db.execute("UPDATE delivery_meta SET value=? WHERE name='epoch'", (uuid.uuid4().hex,))
+                db.execute("UPDATE delivery_meta SET value='0' WHERE name IN ('local','merged','state')")
             if state is not None and state != (self.state or {}):
-                self._packet(db, "state", "state", None, state, now)
+                if not rebuild:
+                    self._packet(db, "state", "state", None, state, now)
                 db.execute("INSERT OR REPLACE INTO delivery_meta VALUES('statePayload',?)", (encoded(state).decode(),))
             db.execute("DELETE FROM delivery_journal WHERE created<?", (now - DAY,))
             size = db.execute("SELECT COALESCE(SUM(length(body)),0) FROM delivery_journal").fetchone()[0]
@@ -456,7 +462,7 @@ class FinalDelivery:
                 db.execute("DELETE FROM delivery_journal WHERE rowid IN (SELECT rowid FROM "
                     "(SELECT rowid,SUM(length(body)) OVER (ORDER BY created DESC,stream DESC,seq DESC) AS bytes FROM delivery_journal) WHERE bytes>?)", (JOURNAL_BYTES,))
 
-    def prepare(self, now=None, status=None, force=False):
+    def prepare(self, now=None, status=None, force=False, rebuild=False):
         from monitor_dashboard import dashboard_safe_json
         started = time.perf_counter()
         now = time.time() if now is None else now
@@ -477,7 +483,7 @@ class FinalDelivery:
                     self.state = json.loads(saved[0]) if saved else None
                     if status is None:
                         state = self.state
-                if state == self.state and not check.execute("SELECT 1 FROM delivery_pending LIMIT 1").fetchone():
+                if not rebuild and state == self.state and not check.execute("SELECT 1 FROM delivery_pending LIMIT 1").fetchone():
                     self.metrics["prepareSeconds"] = round(time.perf_counter() - started, 6)
                     self.cloud_pending = False
                     return before != self.head
@@ -487,15 +493,29 @@ class FinalDelivery:
                     path = os.path.join(directory, "stage.sqlite3")
                     db.execute("ATTACH DATABASE ? AS stage", (path,))
                     self._stage(db)
+                    if rebuild:
+                        db.execute("INSERT INTO stage.edits(view,account,channel,id) SELECT view,account,channel,id FROM delivery_items "
+                            "WHERE channel IN ('tokens','usage:5h','usage:7d','chart:5h','chart:7d','quota:5h','quota:7d')")
                     db.commit()
                     db.execute("BEGIN")
                     cutoff = db.execute("SELECT COALESCE(MAX(seq),0) FROM delivery_pending").fetchone()[0]
-                    for view, account in db.execute("SELECT DISTINCT view,account FROM delivery_pending WHERE seq<=? ORDER BY view,account", (cutoff,)):
-                        self._account(db, view, account, cutoff)
+                    if rebuild:
+                        accounts = db.execute("SELECT dataset,account FROM canonical_quota UNION SELECT dataset,account FROM canonical_tokens "
+                            "UNION SELECT view,account FROM delivery_pending WHERE seq<=? ORDER BY 1,2", (cutoff,))
+                    else:
+                        accounts = db.execute("SELECT DISTINCT view,account FROM delivery_pending WHERE seq<=? ORDER BY view,account", (cutoff,))
+                    for view, account in accounts:
+                        if rebuild:
+                            self._account(db, view, account, cutoff, bootstrap=True)
+                        else:
+                            self._account(db, view, account, cutoff)
                     db.commit()
                     # Release the source snapshot before taking the publication lock.
                     db.execute("DETACH DATABASE stage")
-                    self._publish(path, cutoff, state, now)
+                    if rebuild:
+                        self._publish(path, cutoff, state, now, rebuild=True)
+                    else:
+                        self._publish(path, cutoff, state, now)
                 with closing(self._connect()) as db:
                     self.head = self._head(db)
                 self.state = state
