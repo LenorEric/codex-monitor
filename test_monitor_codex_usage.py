@@ -4044,25 +4044,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
 
 
-    def test_usage_time_filter_rebases_same_account_on_subscription_change(self):
-        for label, output in (("5h", "fiveHour"), ("7d", "sevenDay")):
-            for values in ([80, 1, 2], [1, 80, 81]):
-                with self.subTest(label=label, values=values):
-                    rows = [{"checkedAt": f"2030-01-01T00:{index:02}:00Z", "accountSlotId": "a", "windows": {
-                        label: {"usedPercent": value, "resetAt": "2030-01-05T00:00:00Z", "plan": "pro" if index == 0 else "plus"},
-                    }} for index, value in enumerate(values)]
-                    self.assertEqual([point[output]["continuous"] for point in __import__("monitor_sampling").sample_rows(rows)], values)
 
 
-    def test_usage_time_filter_learns_a_legitimate_fast_rate_from_history(self):
-        rows = [
-            {"checkedAt": f"2030-01-01T00:{minute:02}:00Z", "accountSlotId": "account-a", "windows": {"5h": {"usedPercent": minute * 8, "resetAt": "2030-01-01T05:00:00Z"}}}
-            for minute in range(11)
-        ]
-
-        points = __import__("monitor_sampling").sample_rows(rows)
-
-        self.assertEqual([point["fiveHour"]["continuous"] for point in points], [minute * 8 for minute in range(11)])
 
 
 

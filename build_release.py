@@ -46,7 +46,6 @@ RUNTIME_FILES = (
     "monitor_quota.py",
     "monitor_quota_preprocessing.py",
     "monitor_sampling.py",
-    "monitor_quota_runs.py",
     "monitor_sqlite.py",
     "monitor_sources.py",
     "monitor_streaming.py",
@@ -117,14 +116,15 @@ def rebuild_runtime(version: str) -> None:
     metadata = json.loads((ROOT / "package.json").read_text(encoding="utf-8"))
     validate_contract_metadata(metadata)
     validate_runtime_files()
-    if RUNTIME_DIR.exists():
-        shutil.rmtree(RUNTIME_DIR)
-    RUNTIME_DIR.mkdir(parents=True)
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     for name in RUNTIME_FILES:
         write_text_lf(RUNTIME_DIR / name, (ROOT / name).read_text(encoding="utf-8"))
     write_text_lf(RUNTIME_DIR / "README.md", (ROOT / "release-runtime.md").read_text(encoding="utf-8"))
     write_text_lf(RUNTIME_DIR / "version.json", json.dumps({"version": version, "dataContractVersion": metadata["dataContractVersion"], "cloudDataContractVersion": metadata["cloudDataContractVersion"]}, indent=2) + "\n")
     write_text_lf(RELEASE_DIR / "README.md", (ROOT / "release-package.md").read_text(encoding="utf-8").replace("{{VERSION}}", version))
+    for path in RUNTIME_DIR.iterdir():
+        if path.is_file() and path.name not in {*RUNTIME_FILES, "README.md", "version.json"}:
+            path.unlink()
 
 
 def write_release_version(version: str) -> None:
@@ -140,7 +140,7 @@ def build_vsix(output: Path) -> None:
     npx = shutil.which("npx.cmd") or shutil.which("npx")
     if npx is None:
         raise RuntimeError("npx is required to package the VS Code extension")
-    temporary_output = output.with_suffix(".vsix.tmp")
+    temporary_output = output.with_name(output.stem + ".tmp.vsix")
     temporary_output.unlink(missing_ok=True)
     try:
         subprocess.run([npx, "--yes", f"@vscode/vsce@{VSCE_VERSION}", "package", "--out", str(temporary_output)], cwd=ROOT, check=True)
@@ -191,6 +191,15 @@ def commit_release(version: str) -> None:
 
 
 def main() -> None:
+    git = shutil.which("git")
+    if git is None:
+        raise RuntimeError("git is required to check for tracked changes")
+    changes = [subprocess.run([git, "diff", "--quiet", *args, "--"], cwd=ROOT).returncode for args in ((), ("--cached",))]
+    if any(code not in (0, 1) for code in changes):
+        raise RuntimeError("git could not check for tracked changes")
+    if not any(changes):
+        print("No tracked changes; release skipped.")
+        return
     validate_contract_metadata(json.loads((ROOT / "package.json").read_text(encoding="utf-8")))
     validate_runtime_files()
     version = bump_package_version()

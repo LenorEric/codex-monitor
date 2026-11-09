@@ -60,7 +60,7 @@ class CloudAccessLock:
                 return state
             if not isinstance(state.get("owner"), str) or not state["owner"] or set(state) - {"writing", "owner", "expiresAt"}:
                 raise ValueError()
-            if "expiresAt" in state and (type(state["expiresAt"]) is not int or state["expiresAt"] < 0):
+            if type(state.get("expiresAt")) is not int or state["expiresAt"] < 0:
                 raise ValueError()
             return state
         except (ValueError, UnicodeDecodeError):
@@ -68,7 +68,7 @@ class CloudAccessLock:
 
     @staticmethod
     def eligible(state):
-        if state.get("owner") and ("expiresAt" not in state or state["expiresAt"] > time.time()):
+        if state.get("owner") and state["expiresAt"] > time.time():
             raise lock_error("Cloud synchronization is busy or an interrupted operation needs recovery; sync-lock.json is owned by another operation", 423)
 
     def _read(self):

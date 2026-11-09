@@ -141,9 +141,7 @@ def push(manager, client, box, force=True):
 def fetch(manager, client, box):
     store, dest = manager._usage_data, destination(manager)
     downloaded = 0
-    bootstrap = False
     with store.index.transaction() as db:
-        bootstrap = store.index.get(db, "legacyPublicationPending", False)
         seen = set(db.execute("SELECT machine,package FROM package_receipts WHERE destination=?", (dest,)))
     for machine in sorted(manager._optional_remote_list(client, "usage/v5/packages")):
         if machine == store.machine_id:
@@ -152,22 +150,18 @@ def fetch(manager, client, box):
             if not name.endswith(".enc"):
                 continue
             package = name[:-4]
-            if (machine, package) in seen and not bootstrap:
+            if (machine, package) in seen:
                 continue
             descriptor = _descriptor(client, box, machine, package)
             data = records(client, box, machine, package, descriptor)
             store.import_package(dest, machine, package, data)
             downloaded += 1
-    if bootstrap:
-        with store.index.transaction() as db:
-            db.execute("DELETE FROM processing_meta WHERE name IN ('legacyPublicationPending','legacyPublicationCutoff')")
     return {"packagesDownloaded": downloaded, "payloadsDownloaded": downloaded}
 
 
 def sync(manager, client, box, force=True, download=True, upload=True):
     from monitor_cloud import CloudError
     result, errors = {}, []
-    # Bootstrap must reconcile old publication candidates before attempting upload.
     for name, enabled, operation in (("fetched", download, lambda: fetch(manager, client, box)), ("published", upload, lambda: push(manager, client, box, force))):
         if not enabled:
             result[name] = {"skipped": True}
@@ -176,10 +170,6 @@ def sync(manager, client, box, force=True, download=True, upload=True):
             result[name] = operation()
         except Exception as exc:
             errors.append((name, exc))
-            if name == "fetched":
-                with manager._usage_data.index.transaction() as db:
-                    if manager._usage_data.index.get(db, "legacyPublicationPending", False):
-                        break
     if errors:
         raise CloudError("Usage synchronization partially completed; " + "; ".join(f"{name}: {exc}" for name, exc in errors), 502,
             details=[result], decrypt_failed=any(getattr(exc, "decrypt_failed", False) for _, exc in errors))

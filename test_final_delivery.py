@@ -281,7 +281,7 @@ class FinalDeliveryTests(unittest.TestCase):
         self.assertEqual(len(self.view()["tokens"]), 2)
         self.assertFalse(self.delivery.prepare())
 
-    def test_cloud_import_and_repair_preserve_frozen_groups_and_local_view(self):
+    def test_cloud_import_preserves_frozen_groups_and_local_view(self):
         self.put_quota(1000, 10)
         self.put_quota(2000, 20)
         self.token("first", 1500)
@@ -295,11 +295,6 @@ class FinalDeliveryTests(unittest.TestCase):
         self.assertEqual(self.delivery.head[0], epoch)
         self.assertEqual(self.view(), before)
         self.assertEqual(self.view("merged")["tokens"], before["tokens"])
-        self.assert_charts()
-        before = copy.deepcopy(self.view("merged")["tokens"])
-        self.store.index.repair()
-        self.delivery.prepare()
-        self.assertEqual(self.view("merged")["tokens"], before)
         self.assert_charts()
 
     def test_actual_http_and_websocket_use_final_rows(self):
@@ -414,7 +409,8 @@ class FinalDeliveryTests(unittest.TestCase):
             db.execute("DELETE FROM delivery_journal WHERE stream='local' AND seq=1")
         self.assertIsNone(self.delivery.replay(self.delivery.head[0], cursor))
 
-    def test_explicit_repair_removes_orphans_without_discarding_tokens(self):
+    def test_migration_recalculation_removes_orphans_without_discarding_tokens(self):
+        from monitor_delivery import request_attribution_rebuild
         self.put_quota(1000, 10)
         self.put_quota(2000, 20)
         self.token("a", 1500)
@@ -423,7 +419,8 @@ class FinalDeliveryTests(unittest.TestCase):
         with self.store.index.transaction() as db:
             db.execute("DELETE FROM canonical_quota")
             db.execute("DELETE FROM delivery_pending")  # Simulate lost derived progress.
-        self.store.index.repair()
+        with self.store.index.transaction() as db:
+            request_attribution_rebuild(db)
         self.delivery.prepare()
         self.assertEqual(self.view()["tokens"], before)
         self.assertEqual(self.view()["usage:5h"], [])

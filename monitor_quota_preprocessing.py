@@ -1,6 +1,7 @@
 """Accept local quota observations before upload and canonical processing."""
 
 import copy
+import hashlib
 from datetime import datetime, timezone
 
 from monitor_canonical_store import CanonicalRepository
@@ -19,7 +20,7 @@ class QuotaPreprocessor:
         state = self.index.get(db, f"samplingState:local:{account}", {"windows": {}})
         point = quota_point(row)
         result = []
-        for name, (label, _) in WINDOWS.items():
+        for name, (label, period) in WINDOWS.items():
             if label not in row["windows"]:
                 continue
             value = point[name]
@@ -43,6 +44,13 @@ class QuotaPreprocessor:
             current = row | {"windows": {label: row["windows"][label]}}
             if previous is None or not resets_match(value.get("resetAt"), previous.get("resetAt")):
                 self.pending.pop(key, None)
+                reset_at = parse_timestamp(value.get("resetAt"))
+                previous_reset = parse_timestamp(previous.get("resetAt")) if previous else None
+                if previous and previous["raw"] != 0 and reset_at is not None and previous_reset is not None and reset_at > previous_reset + 15 and previous["timestamp"] < reset_at - period < stamp:
+                    checked_at = datetime.fromtimestamp(reset_at - period, timezone.utc).isoformat()
+                    identity = f"quota:{account}:{checked_at}"
+                    result.append(current | {"checkedAt": checked_at, "windows": {label: current["windows"][label] | {"usedPercent": 0}},
+                        "sync": current["sync"] | {"recordId": hashlib.sha256(identity.encode()).hexdigest()}})
                 result.append(current)
             elif pending:
                 if value["raw"] < pending["windows"][label]["usedPercent"]:

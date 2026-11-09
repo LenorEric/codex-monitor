@@ -13,57 +13,81 @@ from monitor_tokens import _update_codex_file_state, collect_codex_session_files
 from monitor_usage_sync import canonical_json
 
 
+BLOCK_BYTES = 4096
+
+
+def _file_stamp(stat):
+    return (stat.st_dev, stat.st_ino), stat.st_size, stat.st_mtime_ns
+
+
 class CanonicalSourceIngestor:
     def __init__(self, store):
         self.store, self.index, self.lock = store, store.index, threading.RLock()
         self.pending, self.home, self.on_new_cost = {}, "", None
 
+    def _prefix_matches(self, db, source, offset):
+        verified = 0
+        with Path(source).open("rb") as stream:
+            for block, size, digest in db.execute("SELECT block,size,digest FROM source_blocks WHERE path=? ORDER BY block", (source,)):
+                if block * BLOCK_BYTES != verified or size != min(BLOCK_BYTES, offset - verified) or size <= 0:
+                    return False
+                data = stream.read(size)
+                self.index.metrics["sourceVerificationBytes"] += len(data)
+                if len(data) != size or hashlib.sha256(data).hexdigest() != digest:
+                    return False
+                verified += size
+        return verified == offset
+
     @serialized
     def scan(self, home):
         self.home = str(Path(home).resolve())
-        if getattr(self, "source_watcher", None) is not None:
-            self.source_watcher.drain()
+        self.pending.clear()
         with self.index.transaction() as db:
             saved = dict(db.execute("SELECT path,state FROM source_checkpoints"))
             for path in collect_codex_session_files(Path(home)):
                 source = str(path.resolve())
-                previous = self.pending.get(source, (json.loads(saved[source]) if source in saved else None, []))[0]
-                state = dict(previous) if previous else None
-                if state:
-                    state["identity"] = tuple(state["identity"])
-                    state["partial"] = base64.b64decode(state["partial"])
-                    state["events"] = []
-                    stat = path.stat()
-                    if [state["size"], state["mtimeNs"]] != [stat.st_size, stat.st_mtime_ns]:
-                        with path.open("rb") as stream:
-                            for block, size, digest in db.execute("SELECT block,size,digest FROM source_blocks WHERE path=? ORDER BY block", (source,)):
-                                stream.seek(block * 4096)
-                                data = stream.read(size)
-                                self.index.metrics["sourceVerificationBytes"] += len(data)
-                                if hashlib.sha256(data).hexdigest() != digest:
-                                    state = None
-                                    break
-                updated = _update_codex_file_state(path, state, max_bytes=SOURCE_READ_BYTES)
+                state = json.loads(saved[source]) if source in saved else None
+                self.index.metrics["sourcesChecked"] += 1
+                try:
+                    identity, size, modified = _file_stamp(path.stat())
+                    if state and tuple(state["identity"]) == identity:
+                        if state["offset"] == size and state["mtimeNs"] == modified:
+                            continue
+                        if size > state["offset"] and self._prefix_matches(db, source, state["offset"]):
+                            state["identity"] = identity
+                            state["partial"] = base64.b64decode(state["partial"])
+                            state["events"] = []
+                        else:
+                            state = None
+                    else:
+                        state = None
+                    offset = state["offset"] if state else 0
+                    updated = _update_codex_file_state(path, state, max_bytes=SOURCE_READ_BYTES)
+                    observed = _file_stamp(path.stat())
+                except FileNotFoundError:
+                    continue
                 if updated is None:
                     continue
-                events = list(self.pending.get(source, (None, []))[1]) if state is not None else []
+                if observed[0] != updated["identity"] or observed[2] != updated["mtimeNs"] or observed[1] < updated["offset"]:
+                    continue
+                # A verified prefix belongs to this exact file version.
+                if offset and observed != (identity, size, modified):
+                    continue
+                events = []
                 for event in updated.pop("events"):
                     identity = [updated["sessionId"], event["checkedAt"], event["cumulative"]]
                     events.append({"eventId": f'{updated["sessionId"]}:{hashlib.sha256(canonical_json(identity)).hexdigest()[:24]}',
                         "sessionId": updated["sessionId"], "sourceFile": path.name,
                         **{key: value for key, value in event.items() if key not in {"index", "lineIndex", "cumulative"}}})
-                self.index.metrics["sourcesChecked"] += 1
-                self.index.metrics["sourceBytesRead"] += max(0, updated["offset"] - (state or {}).get("offset", 0))
-                updated["observedSize"] = path.stat().st_size
+                self.index.metrics["sourceBytesRead"] += max(0, updated["offset"] - offset)
+                updated["observedSize"] = observed[1]
                 updated["partial"] = base64.b64encode(updated["partial"]).decode()
-                if not events and previous and updated["offset"] == previous["offset"] and updated["mtimeNs"] == previous["mtimeNs"] and tuple(updated["identity"]) == tuple(previous["identity"]):
-                    continue
-                self.pending[source] = updated, events
+                self.pending[source] = updated, events, min(offset, updated["offset"]) // BLOCK_BYTES
         from monitor_tokens import add_token_delta
         with self.index.transaction() as db:
             usage = self.index.usage_totals(db)
             seen = set()
-            for _, events in self.pending.values():
+            for _, events, _ in self.pending.values():
                 for event in events:
                     if event["eventId"] in seen or CanonicalRepository.has_event(db, event["eventId"]):
                         continue
@@ -77,13 +101,23 @@ class CanonicalSourceIngestor:
     def sync_ledger(self, path, slot, label, timeline, provenance, normalize, machine_id):
         from monitor_token_ledger import _usage_records
         with self.index.transaction() as db:
-            for source, (state, events) in self.pending.items():
+            for source, (state, events, first_block) in self.pending.items():
+                expected = state["identity"], state["observedSize"], state["mtimeNs"]
                 try:
-                    stat = Path(source).stat()
+                    with Path(source).open("rb") as stream:
+                        if _file_stamp(Path(source).stat()) != expected:
+                            continue
+                        stream.seek(first_block * BLOCK_BYTES)
+                        blocks = []
+                        while stream.tell() < state["offset"]:
+                            data = stream.read(min(BLOCK_BYTES, state["offset"] - stream.tell()))
+                            if not data:
+                                break
+                            blocks.append((source, first_block + len(blocks), len(data), hashlib.sha256(data).hexdigest()))
+                        if stream.tell() != state["offset"] or _file_stamp(Path(source).stat()) != expected:
+                            continue
                 except FileNotFoundError:
                     continue
-                if (stat.st_size, stat.st_mtime_ns) != (state.get("observedSize", state["size"]), state["mtimeNs"]):
-                    continue  # Rescan from the last committed checkpoint.
                 additions = []
                 for row in _usage_records(events if state.get("hasSessionMeta") else [], slot, label, timeline):
                     row = provenance(row)
@@ -92,14 +126,8 @@ class CanonicalSourceIngestor:
                 if additions:
                     self.index.put(db, f"ledgerNotifications:{self.home}", self.index.get(db, f"ledgerNotifications:{self.home}", []) + additions)
                 db.execute("INSERT OR REPLACE INTO source_checkpoints VALUES(?,?)", (source, json.dumps(state)))
-                db.execute("DELETE FROM source_blocks WHERE path=?", (source,))
-                try:
-                    with Path(source).open("rb") as stream:
-                        for block in range((state["offset"] + 4095) // 4096):
-                            data = stream.read(min(4096, state["offset"] - stream.tell()))
-                            db.execute("INSERT INTO source_blocks VALUES(?,?,?,?)", (source, block, len(data), hashlib.sha256(data).hexdigest()))
-                except FileNotFoundError:
-                    pass
+                db.execute("DELETE FROM source_blocks WHERE path=? AND block>=?", (source, first_block))
+                db.executemany("INSERT INTO source_blocks VALUES(?,?,?,?)", blocks)
         self.pending.clear()
         with self.index.transaction() as db:
             notifications = self.index.get(db, f"ledgerNotifications:{self.home}", [])

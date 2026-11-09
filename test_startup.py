@@ -47,7 +47,7 @@ class StartupDependencyTests(unittest.TestCase):
             f"runpy.run_path({str(root / 'codex_monitor_daemon.py')!r}, run_name='__main__')",
         ], capture_output=True, text=True)
         self.assertEqual(result.returncode, 1)
-        self.assertIn("Missing Python library: watchdog", result.stderr)
+        self.assertIn("Missing Python library: wsproto", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertNotIn("monitor_dashboard", result.stderr)
 

@@ -17,7 +17,7 @@ Local data contract 22 and its sequential migrations remain supported independen
 
 One durable logical upload buffer becomes due 30 minutes after its oldest remaining arrival. Manual uploads flush immediately, startup schedules overdue data, and successful publication clears only the snapshot prefix. Concurrent arrivals remain buffered. Confirmed failures retain the growing buffer; retry begins after 30 seconds and backs off to 15 minutes. Minimal attempt metadata resolves uncertain publication, including remote success before local acknowledgement, before replacement or clearing.
 
-Download discovery lists descriptors and fetches only unseen IDs for the current destination. Decoding stays in memory; canonical import and receipt commit together. Missing remote packages never remove canonical history. Downloads keep an independent 30-minute cadence, including after upload failures. First synchronization reconciles legacy publication candidates against converted history, keeping genuinely unsent data and retrying after offline/interrupted startup.
+Download discovery lists descriptors and fetches only unseen IDs for the current destination. Decoding stays in memory; canonical import and receipt commit together. Missing remote packages never remove canonical history. Downloads keep an independent 30-minute cadence, including after upload failures.
 
 ## Account files
 
@@ -47,9 +47,9 @@ Cloud overwrite preserves `data-contract.json`, `sync-lock.json`, and `.sync-loc
 
 A crashed operation's valid expiry lease can be reclaimed at or after `expiresAt`. Contenders reread ownership before claiming; available native locks and conditional headers are used without assuming the provider enforces them. Local expiry and owner checks stop a former owner from continuing after observed ownership loss, but cannot make a read/write sequence atomic on an unsupported provider. Takeover does not roll back interrupted multi-object writes; the existing account recovery checks still apply.
 
-Legacy owner records without `expiresAt` remain eternal, malformed records fail closed, and stranded initialization gates or infinite native locks still require manual recovery. Stop participating clients, preserve originals, inspect retained sources and interrupted account/passphrase operations, restore consistency, and release provider locks before clearing legacy status. Never clear a live owner's record.
+Owner records require `expiresAt`; malformed records fail closed, and stranded initialization gates or infinite native locks still require manual recovery. Stop participating clients, preserve originals, inspect retained sources and interrupted account/passphrase operations, restore consistency, and release provider locks before clearing legacy status. Never clear a live owner's record.
 
-This additive lease format requires no data-contract bump or saved-data conversion: existing idle and legacy owner records remain valid, old clients already reject owned records, and release restores the original idle representation. Previously abandoned legacy owners are not automatically assigned an expiry.
+Idle records remain valid, and releasing an owned lease restores the idle representation. Owner records without an expiry are rejected and preserved for manual recovery.
 
 The protocol coordinates updated, cooperating clients through the owner lease; it does not promise server-enforced atomic exclusion when the provider ignores conditional updates or native locking. It does not prevent manual edits or software bypassing the coordination file. Upgrade all participating clients before using the new protocol. Released cloud-contract-1 clients reject marker 2; during transition, a conforming server's old recursive root lock conflicts with the new file lock. Pre-contract clients cannot enforce the version gate and must be stopped or upgraded.
 

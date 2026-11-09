@@ -76,7 +76,7 @@ class CloudLockTests(CloudContractFixture):
         self.assertEqual(self.files["payload"][0], b"after")
         second.release_file_lock()
 
-    def test_legacy_owner_is_eternal_and_malformed_status_is_preserved(self):
+    def test_missing_expiry_and_malformed_status_are_rejected_and_preserved(self):
         for state in ({"writing": 0, "owner": "legacy"}, {"writing": 1, "owner": "legacy"}, {"writing": 1},
                 {"writing": 0, "owner": "x", "expiresAt": True}, {"writing": 0, "owner": "x", "expiresAt": 1.5},
                 {"writing": 0, "owner": "x", "expiresAt": "0"}, {"writing": 0, "owner": "x", "expiresAt": -1},
@@ -84,7 +84,7 @@ class CloudLockTests(CloudContractFixture):
             with self.subTest(state=state):
                 self.files[CLOUD_LOCK_PATH] = json.dumps(state).encode(), '"old"'
                 before = self.files[CLOUD_LOCK_PATH]
-                with self.assertRaises(CloudError):
+                with self.assertRaisesRegex(CloudError, "Invalid cloud lock status"):
                     self.client().acquire_file_lock()
                 self.assertEqual(self.files[CLOUD_LOCK_PATH], before)
                 self.assertIsNone(self.token)

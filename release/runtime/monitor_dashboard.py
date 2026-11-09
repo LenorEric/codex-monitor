@@ -1618,15 +1618,8 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         REQUEST_STOP.event = getattr(state, "stop_event", None)
         operation()
     token_thread = None
-    source_watcher = None
     print("Startup: starting token capture, quota polling, session refresh, dashboard, cloud, and configuration workers...", flush=True)
     if hasattr(state, "usage_data") and not getattr(args, "no_token_scan", True):
-        from monitor_sources import SourceWatcher
-        try:
-            source_watcher = SourceWatcher(args.codex_home)
-            state.usage_data.sources.source_watcher = source_watcher
-        except (ImportError, OSError) as exc:
-            print(f"Session notifications unavailable; bounded polling and audits remain active: {exc}", file=sys.stderr, flush=True)
         args.background_token_capture = True
         token_thread = threading.Thread(target=managed_worker, args=(state.run_token_capture,), name="token-capture", daemon=True)
         token_thread.start()
@@ -1685,8 +1678,6 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         cloud_thread.join()
         if token_thread is not None:
             token_thread.join()
-        if source_watcher is not None:
-            source_watcher.stop()
         for worker in (thread, inactive_account_thread, session_refresh_thread, dashboard_cache_thread, config_thread):
             worker.join()
         server.server_close()

@@ -31,7 +31,7 @@ Usage IDs depend on window, start and business state, not a moving range end/res
 
 A single delivery lock serializes expensive calculation and snapshot encoding. Calculation uses a consistent SQLite read transaction and a system-temporary staging database, not a long main-database write transaction. Publication atomically applies final row edits, appends journal messages, advances cursors and acknowledges work through the captured sequence. Concurrent ingestion remains queued for the next batch. Pre-publication failures leave old delivery intact; committed publication cannot append the same token work again, including recovery after acknowledgement failure.
 
-Ordinary ingestion and cloud imports resume pending work without bootstrapping history or resetting the epoch. Startup rebuilds delivery as described above; explicit repair queues quota/attribution work while retaining frozen token rows.
+Ordinary ingestion and cloud imports resume pending work without bootstrapping history or resetting the epoch. Startup rebuilds delivery as described above.
 
 ## Complete snapshots
 

@@ -150,18 +150,6 @@ class CanonicalIndex(IndexState):
         with self.transaction() as db:
             return self.get(db, "canonicalRevision", 0)
 
-    def repair(self):
-        from monitor_delivery import enqueue_quota_repair
-        with self.transaction() as db:
-            # Token wire groups are immutable, including across a repair. Quota
-            # and attribution can be regenerated independently from retained facts.
-            # Retain old final rows until the worker atomically publishes the diff,
-            # including removals. Connected clients must not retain obsolete rows.
-            for table in ("source_checkpoints", "source_blocks"):
-                db.execute(f"DELETE FROM {table}")
-            enqueue_quota_repair(db)
-            db.execute("DELETE FROM processing_meta WHERE name LIKE 'canonicalCost:%' OR name='canonicalUsageTotals'")
-
 
 class CanonicalDataStore(NormalizedRecords):
     def __init__(self, quota_path, token_ledger_path, machine_id, account_id_resolver, lock, account_mapper=None, cache_path=None):

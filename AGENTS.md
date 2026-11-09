@@ -48,4 +48,4 @@
 
 * The script should be designed to work for both windows and linux.
 * Unix timestamp is preferred than time string.
-* Temporary file should be deliver into the tmp file (such as test env).
+* Temporary file should be deliver into the tmp file (such as test runtime or objects).

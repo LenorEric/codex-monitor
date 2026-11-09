@@ -53,7 +53,7 @@ class CanonicalSamplingTests(unittest.TestCase):
         self.assertEqual(self.store.buffer_status()["pendingRecords"], 3)
 
     def test_any_reset_change_accepts_drop_and_discards_pending_without_zero_point(self):
-        for reset in (1893520700, 1893520900, None):
+        for reset in (1893520700, 1893528120, None):
             with self.subTest(reset=reset):
                 account = "v3:" + str(reset)
                 for row in (reading(0, 40, account=account), reading(1, 20, account=account), reading(2, 10, account=account, reset=reset)):
@@ -69,9 +69,48 @@ class CanonicalSamplingTests(unittest.TestCase):
         self.store.record_quota(reading(2, 20, reset=reset + 15))
         self.assertEqual([w["usedPercent"] for w in self.windows()], [40, 20])
 
+    def test_forward_reset_inserts_ordinary_zero_before_current_point(self):
+        self.store.record_quota(reading(0, 40))
+        self.store.record_quota(reading(2, 10, reset=1893510060 + 18000))
+        for view in ("local", "merged"):
+            self.assertEqual([(w["usedPercent"], w["firstAt"]) for w in self.windows(view)],
+                [(40, 1893510000), (0, 1893510060), (10, 1893510120)])
+        self.assertEqual(self.store.buffer_status()["pendingRecords"], 3)
+        with self.store.index.connection() as db:
+            import json
+            rows = [json.loads(row[0])["row"] for row in db.execute("SELECT data FROM upload_buffer ORDER BY seq")]
+        self.assertEqual([row["windows"]["5h"]["usedPercent"] for row in rows], [40, 0, 10])
+        self.assertEqual(set(rows[0]), set(rows[1]))
+        self.assertNotEqual(rows[1]["sync"]["recordId"], rows[2]["sync"]["recordId"])
+
+    def test_zero_insertion_boundaries(self):
+        for label, period in (("5h", 18000), ("7d", 604800)):
+            for change, old_usage, start_offset, expected in ((15, 40, -1, False), (16, 40, -1, True),
+                    (-16, 40, -1, False), (16, 0, -1, False), (16, 40, 0, False), (16, 40, 1, False)):
+                with self.subTest(label=label, change=change, old_usage=old_usage, start_offset=start_offset):
+                    account = f"v3:{label}:{change}:{old_usage}:{start_offset}"
+                    current_time = 1893510120
+                    new_reset = current_time + start_offset + period
+                    first = reading(0, old_usage, account=account)
+                    second = reading(2, 10, account=account)
+                    first["windows"] = {label: {"usedPercent": old_usage, "resetAt": new_reset - change, "plan": "plus"}}
+                    second["windows"] = {label: {"usedPercent": 10, "resetAt": new_reset, "plan": "plus"}}
+                    self.store.record_quota(first)
+                    self.store.record_quota(second)
+                    points = self.windows(label=label, account=account)
+                    self.assertEqual(any(w["usedPercent"] == 0 and w["firstAt"] == current_time - 1 for w in points), expected)
+
+    def test_zero_is_not_inserted_at_or_before_previous_point(self):
+        for offset in (-1, 0, 1):
+            with self.subTest(offset=offset):
+                account = f"v3:previous:{offset}"
+                self.store.record_quota(reading(0, 40, account=account))
+                self.store.record_quota(reading(2, 10, account=account, reset=1893510000 + offset + 18000))
+                self.assertEqual([w["usedPercent"] for w in self.windows(account=account)], [40, 0, 10] if offset > 0 else [40, 10])
+
     def test_reset_change_prevents_cost_interval_across_increasing_values(self):
         self.store.record_quota(reading(0, 40))
-        self.store.record_quota(reading(1, 50, reset=1893520900))
+        self.store.record_quota(reading(1, 50, reset=1893528060))
         runs = usage_runs([quota_point(row) for row in self.store.datasets()[0]], "5h")
         self.assertEqual(valid_intervals(runs), [])
 

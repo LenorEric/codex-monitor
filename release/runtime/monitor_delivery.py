@@ -79,8 +79,8 @@ def enqueue_accounts(db):
         "UNION SELECT dataset,account,'account' FROM canonical_tokens")
 
 
-def enqueue_quota_repair(db):
-    """Explicit recovery also removes orphan final rows; keep frozen tokens."""
+def enqueue_quota_recalculation(db):
+    """Queue migration recalculation, including removal of orphan final rows."""
     db.execute("INSERT INTO delivery_pending(view,account,kind,window,first,last) "
         "SELECT view,account,'quota',window,MIN(first),MAX(last) FROM "
         "(SELECT dataset AS view,account,window,first,last FROM canonical_quota UNION ALL "
@@ -668,7 +668,7 @@ def numeric_state(value):
 
 
 def request_attribution_rebuild(db):
-    enqueue_quota_repair(db)
+    enqueue_quota_recalculation(db)
     if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_meta'").fetchone():
         db.execute("INSERT OR REPLACE INTO delivery_meta VALUES('attributionRule',?)", ("1",))
 

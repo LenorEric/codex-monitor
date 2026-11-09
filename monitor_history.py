@@ -151,11 +151,6 @@ def normalize_quota_history_row(row: dict) -> dict | None:
     }
     if isinstance(row.get("sync"), dict):
         normalized["sync"] = row["sync"]
-    if "quotaRunVersion" in row:
-        from monitor_quota_runs import validate_run
-        validate_run(row)
-        normalized["quotaRunVersion"] = row["quotaRunVersion"]
-        normalized["windows"] = {label: dict(window) for label, window in row["windows"].items()}
     return normalized
 
 

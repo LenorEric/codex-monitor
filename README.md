@@ -53,7 +53,7 @@ Local and Merged are permanent canonical datasets with the same structure and UI
 - VS Code 1.96 or newer for the extension.
 - A working Codex login in the normal `CODEX_HOME`.
 - Port `8765` available.
-- Python dependencies from `requirements.txt`—currently `cryptography>=46.0.0,<47`, `tomlkit>=0.13.3,<1`, and `watchdog>=6.0.0,<7`.
+- Python dependencies from `requirements.txt`.
 - Network/proxy access compatible with the environment variables recognized by Python and `monitor_common.py`.
 
 ## Quick start
