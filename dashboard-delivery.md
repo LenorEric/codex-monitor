@@ -25,13 +25,13 @@ Only the new batch is grouped: API accounts use existing UTC minute groups; othe
 
 Quota work retains discontinuous extents and merges only overlaps. The processor reads actual neighboring canonical records, updates usage connection flags and valid cost edges, and recalculates changed or neighboring attribution intervals. It scans candidate canonical tokens within each interval plus the existing 600-second nearest-assignment allowance, comparing neighboring edges to preserve the earlier-interval tie rule. This is not a fixed ±600-second quota invalidation: interval length and adjacent edges determine the affected region.
 
-At service startup, delivery rows are rebuilt once from canonical data before dashboard workers start. The rebuild stages replacements and publishes them atomically; failure preserves the previous delivery rows. A successful rebuild resets the delivery epoch so clients request a fresh snapshot. Legacy delivery rows without canonical sources remain intact.
+At service startup, canonical-derived delivery rows are cleared and rebuilt once before dashboard workers start. A failure stops startup; the next startup retries the rebuild. The delivery epoch changes so clients request a fresh snapshot. Legacy delivery rows without canonical sources remain intact.
 
 Usage IDs depend on window, start and business state, not a moving range end/reset deadline. Chart IDs depend on both endpoint usage IDs. An unchanged range tail extends the usage row and current reset without scanning historical tokens unless its actual adjacency changes. Empty time gaps do not produce buckets, work or loops.
 
 A single delivery lock serializes expensive calculation and snapshot encoding. Calculation uses a consistent SQLite read transaction and a system-temporary staging database, not a long main-database write transaction. Publication atomically applies final row edits, appends journal messages, advances cursors and acknowledges work through the captured sequence. Concurrent ingestion remains queued for the next batch. Pre-publication failures leave old delivery intact; committed publication cannot append the same token work again, including recovery after acknowledgement failure.
 
-Restart loads small metadata and resumes pending work. Ordinary ingestion, cloud imports and restart do not bootstrap history or reset epoch. One streaming bootstrap is reserved for a missing derived store; explicit repair queues quota/attribution work while retaining frozen token rows. Old final rows remain until the replacement diff commits.
+Ordinary ingestion and cloud imports resume pending work without bootstrapping history or resetting the epoch. Startup rebuilds delivery as described above; explicit repair queues quota/attribution work while retaining frozen token rows.
 
 ## Complete snapshots
 

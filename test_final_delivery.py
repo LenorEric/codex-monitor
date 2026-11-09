@@ -159,7 +159,7 @@ class FinalDeliveryTests(unittest.TestCase):
         self.assert_charts()
         self.assertEqual(sum(model[1] for row in self.view()["chart:5h"] for model in row[6]), 300000000)
 
-    def test_full_rebuild_replaces_delivery_atomically_from_canonical(self):
+    def test_full_rebuild_clears_delivery_and_retries_after_failure(self):
         self.put_quota(1000, 0, reset=10000)
         self.put_quota(1100, 1, reset=20000)
         self.token("event", 1050)
@@ -168,12 +168,14 @@ class FinalDeliveryTests(unittest.TestCase):
         with self.store.index.transaction() as db:
             canonical = db.execute("SELECT COUNT(*) FROM canonical_quota").fetchone()[0], db.execute("SELECT COUNT(*) FROM canonical_tokens").fetchone()[0]
             db.execute("INSERT INTO delivery_items VALUES('local','v3:account','tokens','stale',0,0,0,'[\"stale\",0,[]]')")
+            db.execute("INSERT INTO delivery_items VALUES('local','v3:account','legacy','legacy',0,0,0,'[0,0,[]]')")
         with mock.patch.object(self.delivery, "_publish", side_effect=RuntimeError("interrupted")):
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
-                self.delivery.prepare(rebuild=True)
+                self.delivery.rebuild()
         with self.store.index.transaction() as db:
-            self.assertIsNotNone(db.execute("SELECT 1 FROM delivery_items WHERE id='stale'").fetchone())
-        self.delivery.prepare(rebuild=True)
+            self.assertIsNone(db.execute("SELECT 1 FROM delivery_items WHERE id='stale'").fetchone())
+            self.assertIsNotNone(db.execute("SELECT 1 FROM delivery_items WHERE id='legacy'").fetchone())
+        self.delivery.rebuild()
         after = self.bulk()
         self.assertNotEqual(after["epoch"], before["epoch"])
         self.assertIsNone(self.delivery.replay(before["epoch"], before["cursors"]))
