@@ -703,7 +703,8 @@ function applyLive(packet){
     let views=transportAccounts.get(packet.account);
     if(packet.channel==="account"){
       if(!views){views={};for(const view of ["local","merged"]){const data={quota:{"5h":null,"7d":null},legacy:[],frame:null};for(const channel of ["tokens","usage:5h","usage:7d","chart:5h","chart:7d"])data[channel]=new Map();views[view]=data}transportAccounts.set(packet.account,views)}
-      if(!bulkData.accounts.some(account=>account.id===packet.account))bulkData.accounts.push({id:packet.account,label:packet.data.label});
+      const account=bulkData.accounts.find(account=>account.id===packet.account);
+      if(account)account.label=packet.data.label;else bulkData.accounts.push({id:packet.account,label:packet.data.label});
       bulkData.cursors[packet.stream]=packet.seq;showBulkView();return;
     }
     if(!views){reloadBulk();return}

@@ -21,7 +21,6 @@ def initialize(db):
     initialize_typed(db)
     for statement in """
         CREATE TABLE IF NOT EXISTS processing_meta(name TEXT PRIMARY KEY,value TEXT NOT NULL);
-        CREATE TABLE IF NOT EXISTS canonical_seen(view TEXT NOT NULL,record_key TEXT NOT NULL,PRIMARY KEY(view,record_key)) WITHOUT ROWID;
         CREATE TABLE IF NOT EXISTS upload_buffer(seq INTEGER PRIMARY KEY AUTOINCREMENT,record_key TEXT UNIQUE NOT NULL,arrived REAL NOT NULL,data TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS package_receipts(destination TEXT,machine TEXT,package TEXT,PRIMARY KEY(destination,machine,package));
         CREATE TABLE IF NOT EXISTS source_checkpoints(path TEXT PRIMARY KEY,state TEXT NOT NULL);
@@ -50,12 +49,12 @@ class CanonicalIndex(IndexState):
                 raise ValueError("Local contract 23 migration must complete before typed canonical data can be used")
             if any(column[1] == "continuous" for column in db.execute("PRAGMA table_info(canonical_quota)")):
                 raise ValueError("Local contract 24 migration must remove rejected quota points and continuous before runtime access")
-            if any(column[1] == "kind" for column in db.execute("PRAGMA table_info(canonical_seen)")):
-                raise ValueError("Local contract 24 migration must remove quota identities before runtime access")
+            if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_snapshot'").fetchone() and not db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_items'").fetchone():
+                raise ValueError("Local contract 26 migration must convert saved preparation before runtime access")
             db.execute("PRAGMA journal_mode=WAL")
             initialize(db)
             db.execute("INSERT OR IGNORE INTO processing_meta VALUES('canonicalStore','true')")
-            from monitor_delivery import initialize_delivery
+            from monitor_final_delivery import initialize as initialize_delivery
             initialize_delivery(db)
             db.commit()
 
@@ -152,11 +151,15 @@ class CanonicalIndex(IndexState):
             return self.get(db, "canonicalRevision", 0)
 
     def repair(self):
-        from monitor_delivery import request_attribution_rebuild
+        from monitor_final_delivery import enqueue_quota_repair
         with self.transaction() as db:
-            for table in ("delivery_run_refs", "delivery_token_refs", "delivery_charts", "delivery_accounts", "delivery_work", "source_checkpoints", "source_blocks"):
+            # Token wire groups are immutable, including across a repair. Quota
+            # and attribution can be regenerated independently from retained facts.
+            # Retain old final rows until the worker atomically publishes the diff,
+            # including removals. Connected clients must not retain obsolete rows.
+            for table in ("source_checkpoints", "source_blocks"):
                 db.execute(f"DELETE FROM {table}")
-            request_attribution_rebuild(db)
+            enqueue_quota_repair(db)
             db.execute("DELETE FROM processing_meta WHERE name LIKE 'canonicalCost:%' OR name='canonicalUsageTotals'")
 
 
@@ -208,8 +211,11 @@ class CanonicalDataStore(NormalizedRecords):
             record_key(kind, row), time.time() if now is None else now, canonical_json(self._transport_record(kind, row)).decode()))
 
     def _changed(self, db, view, kind, account, key):
-        db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", (view, account))
-        db.execute("INSERT OR IGNORE INTO delivery_work VALUES(?,?,?,?)", (view, account, kind, key))
+        # The typed-table triggers durably enqueue the actual mutation, including
+        # deletions and changed extents, in the same transaction as these facts.
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_pending'").fetchone():
+            db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", (view, account))
+            db.execute("INSERT OR IGNORE INTO delivery_work VALUES(?,?,?,?)", (view, account, kind, key))
         self.index.put(db, "canonicalRevision", self.index.get(db, "canonicalRevision", 0) + 1)
 
     def _save(self, db, view, kind, row):
@@ -217,7 +223,8 @@ class CanonicalDataStore(NormalizedRecords):
         stamp = int(parse_timestamp(row.get("checkedAt") or row.get("occurredAt")))
         last = max((window.get("lastAt", stamp) for window in row.get("windows", {}).values()), default=stamp)
         key, account = record_key(kind, row), record_account_key(row)
-        records.write(db, view, kind, row, key, account, (stamp, last))
+        if not records.write(db, view, kind, row, key, account, (stamp, last), insert_only=kind == "tokenLedger"):
+            return False
         if kind == "tokenLedger" and view == "local":
             from monitor_tokens import normalize_codex_model, sum_cost_totals
             cost = self.index.get(db, "canonicalCost:local")
@@ -231,6 +238,7 @@ class CanonicalDataStore(NormalizedRecords):
                 self.index.add_usage(usage, row)
                 self.index.put(db, "canonicalUsageTotals", usage)
         self._changed(db, view, kind, account, key)
+        return True
 
     @staticmethod
     def _fragment(row, label, first, last):
@@ -307,9 +315,8 @@ class CanonicalDataStore(NormalizedRecords):
                 for item in quota_records:
                     self._quota_merge(db, view, item)
             else:
-                if not db.execute("INSERT OR IGNORE INTO canonical_seen VALUES(?,?)", (view, record_key(kind, row))).rowcount:
+                if not self._save(db, view, kind, row):
                     continue
-                self._save(db, view, kind, row)
             changed = True
         if local and changed:
             self._enqueue(db, kind, row)

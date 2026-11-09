@@ -1,13 +1,13 @@
 {
-  "version": "1.5.34",
+  "version": "1.5.35",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 5819,
       "sha256": "2255d6511fb1fe204479fd9fd73c8dc02332998c75131c5b8a7d4942bd386d5f"
     },
     "dashboard.html": {
-      "size": 127949,
-      "sha256": "558a9ed43bd19b354251f7bc4cce445b3d80d3b50d4d92db942955df68ac380c"
+      "size": 128014,
+      "sha256": "61d18329e715582a1ba9dcf1532e81ee559f689219e3308bea8334ad9deb6162"
     },
     "LICENSE": {
       "size": 35147,
@@ -30,16 +30,16 @@
       "sha256": "4c6689de2707a734172329f685d58a5005d7524db91474ce5153b6adbe269b1c"
     },
     "monitor_canonical.py": {
-      "size": 18704,
-      "sha256": "5e46eba584e1cd5c02023e4c29181b1d818f3406ac03e8c33e6c166ed99d4fbf"
+      "size": 19134,
+      "sha256": "aa33d228d52cc79302677bbc198b34eb66f2b5fd2129e5304935822472d0755f"
     },
     "monitor_canonical_ingestion.py": {
       "size": 6589,
       "sha256": "1b5d2ed311d433302277c136ad156d9602786d92224d16bcba225b0ceb79994a"
     },
     "monitor_canonical_store.py": {
-      "size": 13053,
-      "sha256": "6c3b9e6b944b6a9967268fcf1833c9c27bd5d899cdffa1948131c454810b55a8"
+      "size": 13792,
+      "sha256": "d56663b65e4c2398eb98b76a2ea1a7687a992e8d2372aeaa744978aa30a11ce1"
     },
     "monitor_cloud.py": {
       "size": 101331,
@@ -66,12 +66,12 @@
       "sha256": "38b7d8279832391bd8ef6698421466048ac134f9cad7bfd894b10de58bfa3ad4"
     },
     "monitor_dashboard.py": {
-      "size": 100885,
-      "sha256": "ff3cb49e06f402d232d8b92f1fb2cbeac3a46af2a3ea939692174596c085226e"
+      "size": 100996,
+      "sha256": "62c699b2c1cc38ce7853987fdebc9c698f2572ce2ae4bd764160897cd82d83e2"
     },
     "monitor_delivery.py": {
-      "size": 38729,
-      "sha256": "b19a16a4655f55e0942ad37edfcb2dfa23115c6e4995ee275f65b790b642335e"
+      "size": 39443,
+      "sha256": "25d1962223782b26f5d7ba8bc667cf941d13f7e39feed94a895c37810d80462e"
     },
     "monitor_dependencies.py": {
       "size": 1888,
@@ -84,6 +84,10 @@
     "monitor_events.py": {
       "size": 37161,
       "sha256": "47bdecf7ca02de3e9783420ae70e89b1f96b41eb841bf3b730c157684f0f0e6f"
+    },
+    "monitor_final_delivery.py": {
+      "size": 38711,
+      "sha256": "4b5706dd88f4c55f33037fae8216df3baf44d3470a479137217dc4ca9fe24fdd"
     },
     "monitor_history.py": {
       "size": 24570,
@@ -98,16 +102,20 @@
       "sha256": "c31498ed67a0c3a164fe79fdce760acc7d45ca010acc4891b34c428f3bb0f07d"
     },
     "monitor_live.py": {
-      "size": 4382,
-      "sha256": "212c8f2618fcecc09e74255faf5e73021e519ee40456a4278a19ce024655b092"
+      "size": 5022,
+      "sha256": "139d9387994322dee7866f50deabbea9c9cb1e42855428f8d118892779696897"
     },
     "monitor_migration_canonical.py": {
-      "size": 2718,
-      "sha256": "bbeadda521b86778c7277510e2c91688b600389512db26a001174d2fb2f027d9"
+      "size": 3520,
+      "sha256": "a4d494e72d0a03fe5bbfb3b69a25c04054a70eab5ec76c1965a50ff580960410"
     },
     "monitor_migration_canonical_schema.py": {
       "size": 12933,
       "sha256": "5ecc6227ed2abe9c9ba821efec5ed1a5b443c91e50ab77ee745fdeb049f19453"
+    },
+    "monitor_migration_delivery.py": {
+      "size": 15196,
+      "sha256": "3a177b7f077c1c56348dc0e04d445dba552af13dfd5515e4b0fcd85da7b8b3c3"
     },
     "monitor_migration_events.py": {
       "size": 11816,
@@ -138,8 +146,8 @@
       "sha256": "393f1964bee87f2060ee7ab66e3134c65942e1659f7e1543a1ce6834d426bf2b"
     },
     "monitor_migrations.py": {
-      "size": 93751,
-      "sha256": "13af572d763ef2eea1c72ede6d41514ab149cfa744d6128a07e4d19ce0466a78"
+      "size": 93844,
+      "sha256": "c92f84b023cf866c4f056c8ddc0a47bf580879c2fde43b0366edf7e590e9e79e"
     },
     "monitor_packages.py": {
       "size": 9904,
@@ -206,8 +214,8 @@
       "sha256": "da44b7aa8d682f8a915513754b6a8107b55ad14c409dafaf103b9d910603cb60"
     },
     "README.md": {
-      "size": 4398,
-      "sha256": "395654a742514e4bf5184b135ca8a65b6cc7444e3cc9e33865ea5050038d0351"
+      "size": 4551,
+      "sha256": "095526fed6a8fdda8249bb20a955e4cc10f9442cb39e8f7413647df59cfcdf01"
     },
     "requirements.txt": {
       "size": 79,
@@ -215,7 +223,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "f80f878806b216096d8de88fdbc8d77204bcc3f4dce1b295072e55055c3e480b"
+      "sha256": "613991cae9fd944dd09ea0877da39a7b76648a4f1e2b3752992c1013fc42f67e"
     }
   }
 }

@@ -48,6 +48,8 @@ RUNTIME_FILES = (
     "monitor_device_auth.py",
     "monitor_dashboard.py",
     "monitor_delivery.py",
+    "monitor_final_delivery.py",
+    "monitor_migration_delivery.py",
     "monitor_interpretation.py",
     "monitor_live.py",
     "monitor_events.py",

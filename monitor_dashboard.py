@@ -1688,6 +1688,8 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         for worker in (thread, inactive_account_thread, session_refresh_thread, dashboard_cache_thread, config_thread):
             worker.join()
         server.server_close()
+        if hasattr(state, "delivery") and hasattr(state.delivery, "close"):
+            state.delivery.close()
         if hasattr(state, "usage_data"):
             state.usage_data.index.close()
         instance_lock.release()

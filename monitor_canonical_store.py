@@ -107,7 +107,7 @@ def _pop(value, path):
 
 class CanonicalRepository:
     @staticmethod
-    def write(db, dataset, kind, row, key=None, account=None, bounds=None):
+    def write(db, dataset, kind, row, key=None, account=None, bounds=None, *, insert_only=False):
         table, fields = TABLES[kind]
         window = None
         if kind == "quota":
@@ -157,7 +157,12 @@ class CanonicalRepository:
                 columns.append(column + "_text")
                 values.append(text)
         values[7] = canonical_json(extras).decode() if extras else None
-        db.execute(f"INSERT OR REPLACE INTO {table}({','.join(columns)}) VALUES({','.join('?' for _ in values)})", values)
+        if not insert_only:
+            before = db.execute(f"SELECT {','.join(columns)} FROM {table} WHERE dataset=? AND account=? AND record_key=?", values[:3]).fetchone()
+            if before == tuple(values):
+                return False
+        conflict = " ON CONFLICT(dataset,account,record_key) DO NOTHING" if insert_only else ""
+        return db.execute(f"INSERT {'INTO' if insert_only else 'OR REPLACE INTO'} {table}({','.join(columns)}) VALUES({','.join('?' for _ in values)}){conflict}", values).rowcount > 0
 
     @staticmethod
     @lru_cache(maxsize=8)
@@ -235,7 +240,11 @@ class CanonicalRepository:
 
     @classmethod
     def dirty_all(cls, db):
-        db.executemany("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", cls.accounts(db))
+        if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_pending'").fetchone():
+            from monitor_final_delivery import enqueue_accounts
+            enqueue_accounts(db)
+        else:
+            db.executemany("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", cls.accounts(db))
 
     @staticmethod
     def update_account(db, account, slot, label):
@@ -246,6 +255,7 @@ class CanonicalRepository:
     @staticmethod
     def rename_account(db, slot, label):
         for table, fields in TABLES.values():
-            db.execute(f"INSERT OR IGNORE INTO delivery_dirty SELECT dataset,account FROM {table} WHERE account_slot=?", (slot,))
+            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_pending'").fetchone():
+                db.execute(f"INSERT OR IGNORE INTO delivery_dirty SELECT dataset,account FROM {table} WHERE account_slot=?", (slot,))
             mask = 1 << next(bit for bit, field in enumerate(fields) if field[0] == "account_label")
             db.execute(f"UPDATE {table} SET account_label=?,present=present|? WHERE account_slot=?", (label, mask, slot))

@@ -8,6 +8,20 @@ from monitor_migration_canonical_schema import CanonicalRepository, TABLES, init
 from monitor_usage_sync import canonical_json
 
 
+def remove_seen(paths):
+    """Contract 26: retain token identities in their existing primary key only."""
+    if not paths["processing_index"].exists():
+        return
+    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
+        db.execute("BEGIN IMMEDIATE")
+        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='canonical_seen'").fetchone():
+            return
+        # Never discard a tombstone for an event missing from permanent history.
+        if db.execute("SELECT view,record_key FROM canonical_seen EXCEPT SELECT dataset,record_key FROM canonical_tokens LIMIT 1").fetchone():
+            raise ValueError("Cannot remove canonical_seen: an identity has no permanent token record; original data was preserved")
+        db.execute("DROP TABLE canonical_seen")
+
+
 def migrate_local(paths):
     path = paths["processing_index"]
     if not path.exists():

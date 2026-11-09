@@ -24,6 +24,8 @@ class ZeroQuotaMergeTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         self.store = CanonicalDataStore(self.root / "quota.jsonl", self.root / "ledger.jsonl", "test", lambda _: "v3:test", threading.RLock())
         self.addCleanup(self.store.index.close)
+        from test_support_delivery import released_delivery
+        released_delivery(self.store)
         self.paths = {"processing_index": self.store.index.path}
 
     @staticmethod
@@ -163,7 +165,7 @@ class ZeroQuotaMergeTests(unittest.TestCase):
         self.seed_history()
         (self.root / migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":24}', encoding="utf-8")
         args = (self.root, self.root / "history", self.store.quota_path, self.root / "sessions", self.store.token_ledger_path, self.root / "diagnostics")
-        self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [25])
+        self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [25, 26])
         self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [])
         self.assertEqual(len(self.windows()), 1)
         self.assertEqual(self.store.index.ledger_cost()[0]["totalCostUsd"], 2)

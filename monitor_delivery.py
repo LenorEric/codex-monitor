@@ -269,6 +269,11 @@ def initialize_delivery(db):
 
 def request_attribution_rebuild(db):
     """Recalculate memberships/charts from retained tokens without replaying quota sampling."""
+    if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_items'").fetchone():
+        from monitor_final_delivery import enqueue_quota_repair
+        enqueue_quota_repair(db)
+        db.execute("INSERT OR REPLACE INTO delivery_meta VALUES('attributionRule',?)", (str(ATTRIBUTION_RULE_VERSION),))
+        return
     source = "(SELECT dataset AS view,account FROM canonical_quota UNION SELECT dataset,account FROM canonical_tokens)" if db.execute("SELECT 1 FROM sqlite_master WHERE name='canonical_quota'").fetchone() else "canonical_records" if db.execute("SELECT 1 FROM sqlite_master WHERE name='canonical_records'").fetchone() else "processing_quota_points"
     db.execute(f"INSERT OR IGNORE INTO delivery_dirty SELECT view,account FROM delivery_accounts UNION SELECT view,account FROM delivery_token_refs UNION SELECT view,account FROM {source}")
     # Force full attribution while preserving queued token additions.
@@ -297,6 +302,14 @@ def numeric_state(value):
 
 
 class DashboardDelivery:
+    def __new__(cls, index):
+        if getattr(index, "canonical", False):
+            with closing(samples.connect(index.path)) as db:
+                if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_items'").fetchone():
+                    from monitor_final_delivery import FinalDelivery
+                    return FinalDelivery(index)
+        return super().__new__(cls)
+
     def __init__(self, index):
         self.index = index
         self.lock = threading.RLock()

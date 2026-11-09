@@ -30,6 +30,6 @@ The local data contract is 22 and the cloud contract is 5. Startup converts rele
 
 This runtime is distributed under the GNU General Public License version 3. See `LICENSE` in this directory.
 
-Dashboard delivery uses one account-based gzip bulk containing both views, followed by sequenced WebSocket channels on port 8765. No HTTP protocol number is required. Cloud changes replace the complete bulk. See dashboard-delivery.md in the source repository.
+Dashboard delivery uses one account-based gzip bulk containing both views, followed by sequenced WebSocket channels on port 8765. No HTTP protocol number is required. Cloud imports use ordinary Merged deltas. Final token groups are immutable, and snapshots stream on demand from final delivery rows. See dashboard-delivery.md in the source repository.
 
-Pending local contract 23 replaces canonical JSON records with typed quota/token columns. This representation conversion preserves saved identities, costs, quota decisions and prepared delivery artifacts without historical replay. Cloud contract 5 and client formats are unchanged. Freed SQLite pages remain reusable; automatic canonical compaction is disabled.
+Pending local contract 26 removes redundant identity/preparation storage and converts saved display results into final delivery rows and recoverable pending work. Canonical costs and upload/parser state are preserved without history replay. The delivery epoch changes once during conversion. Cloud contract 5 and client formats are unchanged. Freed SQLite pages remain reusable; automatic canonical compaction is disabled.

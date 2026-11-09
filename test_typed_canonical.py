@@ -40,7 +40,7 @@ class TypedCanonicalTests(unittest.TestCase):
         delivery = DashboardDelivery(self.store.index)
         delivery.prepare()
         with self.store.index.transaction() as db:
-            self.assertEqual([row[3] for row in delivery._runs(db, "local", "v3:account", "5h")], [10, 20, 30, 50])
+            self.assertEqual([row[3] for row in db.execute("SELECT id,first,last,json_extract(body,'$[3]') FROM delivery_items WHERE view='local' AND channel='usage:5h' ORDER BY first,json_extract(body,'$[3]')")], [10, 20, 30, 50])
 
     def setUp(self):
         self.root = Path.cwd() / (".typed-test-" + uuid.uuid4().hex)
@@ -245,7 +245,7 @@ class TypedCanonicalTests(unittest.TestCase):
         (root / migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":21}', encoding="utf-8")
         args = (root, root / "history", old.quota_path, root / "sessions", old.token_ledger_path, root / "diagnostics")
         with mock.patch("monitor_common.request_json", side_effect=AssertionError("offline migration used network")):
-            self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [22, 23, 24, 25])
+            self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [22, 23, 24, 25, 26])
             self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=old.cache_path), [])
         new = CanonicalDataStore(old.quota_path, old.token_ledger_path, "a", lambda _: "v3:account", threading.RLock())
         self.addCleanup(new.index.close)
@@ -263,7 +263,7 @@ class TypedCanonicalTests(unittest.TestCase):
         delivery.prepare(force=True)
         with self.store.index.transaction() as db:
             for dataset in ("local", "merged"):
-                self.assertTrue(db.execute("SELECT 1 FROM delivery_journal WHERE stream=? AND body LIKE ?", (dataset, '%second%')).fetchone())
+                self.assertTrue(db.execute("SELECT 1 FROM delivery_journal WHERE stream=? AND body LIKE ?", (dataset, '%"channel":"tokens"%')).fetchone())
         self.assertNotEqual(json.loads(delivery.bulk(False))["accounts"], original["accounts"])
         before = delivery.bulk(False)
         index = CanonicalIndex(self.store.index.path)

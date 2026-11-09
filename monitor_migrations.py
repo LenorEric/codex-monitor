@@ -21,7 +21,7 @@ from monitor_common import atomic_write_bytes, parse_timestamp
 import monitor_sample_store as samples
 
 
-DATA_CONTRACT_VERSION = 25
+DATA_CONTRACT_VERSION = 26
 DATA_MIGRATION_STATE_FILENAME = "usage_monitor_data_contract.json"
 DATA_MIGRATION_JOURNAL_FILENAME = "usage_monitor_data_migration.json"
 from monitor_cloud_contract import CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_CONTRACT_PATH
@@ -613,6 +613,7 @@ DATA_MIGRATIONS = {
     23: lambda paths: __import__("monitor_migration_canonical").migrate_local(paths),
     24: lambda paths: __import__("monitor_migration_quota_boundary").migrate_local(paths),
     25: lambda paths: __import__("monitor_migration_zero_quota").migrate_local(paths),
+    26: lambda paths: __import__("monitor_migration_delivery").migrate_local(paths),
 }
 
 
@@ -637,7 +638,7 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
     if not isinstance(journal, dict) or not isinstance(journal.get("version"), int) or isinstance(journal.get("version"), bool) or not isinstance(journal.get("targets"), dict) or not isinstance(journal.get("backups"), dict) or not isinstance(journal.get("existing"), list):
         raise MigrationError("Cannot recover data migration: invalid journal")
     expected_targets = {name: str(path.resolve()) for name, path in paths.items()}
-    if journal["version"] in {19, 23, 24, 25} and set(journal["targets"]) == {"processing_index"}:
+    if journal["version"] in {19, 23, 24, 25, 26} and set(journal["targets"]) == {"processing_index"}:
         expected_targets = {"processing_index": expected_targets["processing_index"]}
     if journal["version"] == 22:
         expected_targets = {name: target for name, target in expected_targets.items() if name in {"processing_index", "config"}}
@@ -686,7 +687,7 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
 
 def _run_data_migration(migration, paths: dict[str, Path], version: int, state_path: Path, journal_path: Path) -> None:
     protected_paths = {"processing_index": paths["processing_index"]} if version == 19 else paths
-    if version in {23, 24, 25}:
+    if version in {23, 24, 25, 26}:
         protected_paths = {"processing_index": paths["processing_index"]}
     if version == 22:
         protected_paths = {name: paths[name] for name in ("processing_index", "config") if name in paths}

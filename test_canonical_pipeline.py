@@ -23,6 +23,8 @@ from test_support_webdav import MemoryWebDav, moment
 def migrate_typed(paths):
     migrate_contract23(paths)
     migrate_contract24(paths)
+    from monitor_migration_delivery import migrate_delivery
+    migrate_delivery(paths)
 
 
 class PackageWebDav(MemoryWebDav):

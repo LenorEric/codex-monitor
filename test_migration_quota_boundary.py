@@ -25,10 +25,16 @@ class QuotaBoundaryMigrationTests(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root)
         self.store = CanonicalDataStore(self.root / "quota.jsonl", self.root / "ledger.jsonl", "a", lambda _: "v3:account", threading.RLock())
         self.addCleanup(self.store.index.close)
+        from test_support_delivery import released_delivery
+        released_delivery(self.store)
         self.store.record_quota(pipeline.CanonicalPipelineTests.quota(seven=10))
         self.store.record_ledger([authority.SQLiteAuthorityTests.ledger(cost=2)])
         DashboardDelivery(self.store.index).prepare()
         self.paths = {"processing_index": self.store.index.path}
+        # These fixtures exercise the released pre-26 identity layout.
+        with self.store.index.transaction() as db:
+            db.execute("CREATE TABLE canonical_seen(view TEXT NOT NULL,record_key TEXT NOT NULL,PRIMARY KEY(view,record_key)) WITHOUT ROWID")
+            db.execute("INSERT INTO canonical_seen SELECT dataset,record_key FROM canonical_tokens")
 
     def insert_quota(self, db, key, first, last=None, dataset="local", account="history", window="5h", **state):
         records.write(db, dataset, "quota", {"checkedAt": first, "quotaRunVersion": 1,
@@ -332,12 +338,11 @@ class QuotaBoundaryMigrationTests(unittest.TestCase):
         self.legacy_seen()
         (self.root / migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":23}', encoding="utf-8")
         args = (self.root, self.root / "history", self.store.quota_path, self.root / "sessions", self.store.token_ledger_path, self.root / "diagnostics")
-        self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [24, 25])
+        self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [24, 25, 26])
         self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [])
         self.assertFalse(self.has_column())
         with closing(sqlite3.connect(self.store.index.path)) as db:
-            self.assertEqual([row[1] for row in db.execute("PRAGMA table_info(canonical_seen)")], ["view", "record_key"])
-            self.assertEqual(db.execute("SELECT COUNT(*) FROM canonical_seen").fetchone()[0], 2)
+            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='canonical_seen'").fetchone())
 
 
 if __name__ == "__main__":
