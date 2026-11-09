@@ -61,6 +61,14 @@ class CanonicalSamplingTests(unittest.TestCase):
                 self.assertEqual([w["usedPercent"] for w in self.windows(account=account)], [40, 10])
                 self.assertEqual(self.windows(account=account)[-1]["resetAt"], reset)
 
+    def test_small_reset_drift_does_not_skip_decrease_confirmation(self):
+        self.store.record_quota(reading(0, 40))
+        reset = self.windows()[0]["resetAt"]
+        self.store.record_quota(reading(1, 20, reset=reset + 15))
+        self.assertEqual([w["usedPercent"] for w in self.windows()], [40])
+        self.store.record_quota(reading(2, 20, reset=reset + 15))
+        self.assertEqual([w["usedPercent"] for w in self.windows()], [40, 20])
+
     def test_reset_change_prevents_cost_interval_across_increasing_values(self):
         self.store.record_quota(reading(0, 40))
         self.store.record_quota(reading(1, 50, reset=1893520900))

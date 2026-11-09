@@ -333,6 +333,11 @@ def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+def resets_match(first, second):
+    first, second = parse_timestamp(first), parse_timestamp(second)
+    return first == second or first is not None and second is not None and abs(first - second) <= 15
+
+
 def parse_timestamp(value: str | int | float | None) -> int | float | None:
     # Saved history predates numeric reset times; API validation lives at ingress.
     if type(value) in (int, float):

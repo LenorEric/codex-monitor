@@ -37,6 +37,7 @@ RUNTIME_FILES = (
     "monitor_migration_canonical_schema.py",
     "monitor_migration_quota_boundary.py",
     "monitor_migration_zero_quota.py",
+    "monitor_migration_quota_drift.py",
     "monitor_canonical_ingestion.py",
     "monitor_packages.py",
     "monitor_migration_packages.py",

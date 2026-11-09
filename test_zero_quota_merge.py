@@ -71,7 +71,7 @@ class ZeroQuotaMergeTests(unittest.TestCase):
         with self.store.index.transaction() as db:
             db.execute("DELETE FROM canonical_quota")
         self.merge(self.row(100, 1000, value=5))
-        self.merge(self.row(200, 1001, value=5))
+        self.merge(self.row(200, 1016, value=5))
         self.assertEqual(len(self.windows()), 2)
 
     def seed_history(self):
@@ -165,7 +165,7 @@ class ZeroQuotaMergeTests(unittest.TestCase):
         self.seed_history()
         (self.root / migrations.DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":24}', encoding="utf-8")
         args = (self.root, self.root / "history", self.store.quota_path, self.root / "sessions", self.store.token_ledger_path, self.root / "diagnostics")
-        self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [25, 26])
+        self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [25, 26, 27])
         self.assertEqual(migrations.migrate_history_data(*args, usage_sync_cache_path=self.store.cache_path), [])
         self.assertEqual(len(self.windows()), 1)
         self.assertEqual(self.store.index.ledger_cost()[0]["totalCostUsd"], 2)

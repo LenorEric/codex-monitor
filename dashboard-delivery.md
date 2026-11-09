@@ -1,6 +1,6 @@
 # Canonical → final dashboard delivery
 
-The pending local contract is 26, following released local 25/cloud 5 (v1.5.34). Cloud contract 5 and the HTTP/WebSocket wire formats stay unchanged. Both permanent canonical datasets use the same `FinalDelivery` processor; only dataset selection and stream routing differ.
+The pending local contract is 27, following released local 26/cloud 5 (v1.5.35). Cloud contract 5 and the HTTP/WebSocket wire formats stay unchanged. Both permanent canonical datasets use the same `FinalDelivery` processor; only dataset selection and stream routing differ. Contract 27 targets quota ranges affected by reset drift for recalculation after historical compaction.
 
 ## Durable state
 
@@ -66,7 +66,7 @@ The WebUI retains Local/Merged switching and local date/model/account filtering.
 
 ## Contract 26 conversion
 
-The unreleased contract 26 combines identity-store cleanup with final-output storage conversion. Keeping the old layout would retain preparation copies and permanent snapshots; reader changes alone cannot remove these saved structures.
+Contract 26 combined identity-store cleanup with final-output storage conversion. Keeping the old layout would retain preparation copies and permanent snapshots; reader changes alone cannot remove these saved structures.
 
 Conversion streams the old snapshot BLOB through a bounded JSON reader, then applies its covered journal suffix. Duplicate baseline IDs or failed row round trips abort safely. When suffix coverage is unavailable, saved prepared rows supply a streaming baseline without resampling canonical history or repricing. Outstanding legacy work becomes pending invalidations. Only after validation are preparation/snapshot tables removed and the delivery epoch changed once. Canonical, upload attempts/buffer, parser checkpoints and receipts remain intact. Existing migration backup/journal recovery applies; no automatic VACUUM or release packaging runs.
 

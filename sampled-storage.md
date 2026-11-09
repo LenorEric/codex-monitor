@@ -1,6 +1,8 @@
 # Canonical storage and package synchronization
 
-The pending target is local contract 26. The successful v1.5.34 release contains local 25/cloud 5. Cloud contract 5 is unchanged; generated release artifacts remain unchanged until an explicit release.
+The pending target is local contract 27. The successful v1.5.35 release contains local 26/cloud 5. Cloud contract 5 is unchanged; generated release artifacts remain unchanged until an explicit release.
+
+Contract 27 compacts adjacent historical quota runs whose reset timestamps differ by at most 15 seconds, retaining the earliest identity and latest reset. It leaves gaps over four hours intact, preserves upload and receipt state, and queues affected quota ranges for delivery recalculation. Existing cloud packages remain valid and are not rewritten.
 
 ## Permanent canonical data
 

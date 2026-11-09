@@ -51,6 +51,13 @@ class InterpretationTests(unittest.TestCase):
         self.assertFalse(connected(base, ["b", 14401, 14401, 11, 1], "5h"))
         self.assertFalse(connected(base, ["b", 3600, 3600, 16, 1], "7d"))
 
+    def test_reset_timestamp_tolerance(self):
+        base = ["a", 0, 0, 10, 1, 0, 10000]
+        for difference in (-15, -1, 0, 1, 15):
+            self.assertTrue(connected(base, ["b", 90, 90, 10, 1, 0, 10000 + difference], "5h"))
+        for reset in (None, 9984, 10016):
+            self.assertFalse(connected(base, ["b", 90, 90, 10, 1, 0, reset], "5h"))
+
     def test_interval_eligibility_preserves_plan_boundaries_and_normalized_delta(self):
         runs = usage_runs([point(0, 1, plan="pro"), point(100, 2, plan="pro"), point(200, 3, plan="plus"), point(300, 4, plan="plus")], "5h")
         self.assertEqual([row[3:] for row in valid_intervals(runs)], [[20, 20], [1, 1]])

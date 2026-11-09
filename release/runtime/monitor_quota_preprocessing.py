@@ -4,7 +4,7 @@ import copy
 from datetime import datetime, timezone
 
 from monitor_canonical_store import CanonicalRepository
-from monitor_common import parse_timestamp
+from monitor_common import parse_timestamp, resets_match
 from monitor_sampling import WINDOWS, quota_point
 from monitor_usage_sync import record_account_key
 
@@ -41,7 +41,7 @@ class QuotaPreprocessor:
             if pending and stamp <= parse_timestamp(pending["checkedAt"]):
                 continue  # Confirmation requires a later local observation.
             current = row | {"windows": {label: row["windows"][label]}}
-            if previous is None or parse_timestamp(value.get("resetAt")) != parse_timestamp(previous.get("resetAt")):
+            if previous is None or not resets_match(value.get("resetAt"), previous.get("resetAt")):
                 self.pending.pop(key, None)
                 result.append(current)
             elif pending:

@@ -11,7 +11,7 @@ from contextlib import closing, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from monitor_common import parse_timestamp
+from monitor_common import parse_timestamp, resets_match
 from monitor_sqlite import IndexState
 from monitor_canonical_store import CanonicalRepository as records, initialize as initialize_typed
 from monitor_usage_sync import NormalizedRecords, canonical_json, record_account_key, record_key
@@ -251,7 +251,7 @@ class CanonicalDataStore(NormalizedRecords):
     @staticmethod
     def _quota_compatible(previous, current):
         return all(previous.get(field) == current.get(field) for field in ("usedPercent", "multiplier", "plan")) and (
-            previous.get("usedPercent") == current.get("usedPercent") == 0 or previous.get("resetAt") == current.get("resetAt"))
+            previous.get("usedPercent") == current.get("usedPercent") == 0 or resets_match(previous.get("resetAt"), current.get("resetAt")))
 
     def _quota_merge(self, db, view, row):
         """Keep covered points unchanged and extend compatible neighboring runs."""

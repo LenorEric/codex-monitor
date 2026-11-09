@@ -4,7 +4,7 @@ import bisect
 import math
 from collections import defaultdict
 
-from monitor_common import parse_timestamp
+from monitor_common import parse_timestamp, resets_match
 
 MONEY = 100_000_000
 ATTRIBUTION_RULE_VERSION = 2
@@ -28,7 +28,7 @@ def quota_point_order(point, window=None):
 def connected(previous, current, window):
     if previous[3] is None or current[3] is None:
         return False
-    if previous[6:7] != current[6:7]:
+    if not resets_match(previous[6] if len(previous) > 6 else None, current[6] if len(current) > 6 else None):
         return False
     gap = current[1] - previous[2]
     if gap > 14400:
@@ -60,8 +60,9 @@ def usage_runs(points, window):
         row = [str(point.get("_key") or f"{stamp}:{point.get('resetWindow', '')}"), value.get("firstAt", stamp), value.get("lastAt", stamp), percent, factor, 1,
             parse_timestamp(value.get("resetAt")), plan]
         previous = result[-1] if result else None
-        if not value.get("storedRun") and previous and percent is not None and previous[3:5] == row[3:5] and previous[6] == row[6] and not point.get("resetWindow"):
+        if not value.get("storedRun") and previous and percent is not None and previous[3:5] == row[3:5] and resets_match(previous[6], row[6]) and not point.get("resetWindow"):
             previous[2] = stamp
+            previous[6] = row[6]
             continue
         if previous and connected(previous, row, window):
             row[5] = 0
