@@ -223,10 +223,10 @@ def add_token_delta(totals: dict, delta: dict) -> None:
 
 def normalize_saved_token_totals(value: dict | None) -> dict:
     value = value if isinstance(value, dict) else {}
-    input_tokens = max(0, int(value.get("inputTokens") or 0))
-    cached_input_tokens = min(input_tokens, max(0, int(value.get("cachedInputTokens") or 0)))
-    cache_write_input_tokens = min(input_tokens - cached_input_tokens, max(0, int(value.get("cacheWriteInputTokens") or 0)))
-    output_tokens = max(0, int(value.get("outputTokens") or 0))
+    input_tokens = max(0, int(value.get("inputTokens") or value.get("input_tokens") or 0))
+    cached_input_tokens = min(input_tokens, max(0, int(value.get("cachedInputTokens") or value.get("cached_input_tokens") or 0)))
+    cache_write_input_tokens = min(input_tokens - cached_input_tokens, max(0, int(value.get("cacheWriteInputTokens") or value.get("cache_write_input_tokens") or value.get("cached_output_tokens") or value.get("cachedOutputTokens") or 0)))
+    output_tokens = max(0, int(value.get("outputTokens") or value.get("output_tokens") or 0))
     return {
         "inputTokens": input_tokens,
         "freshInputTokens": max(0, input_tokens - cached_input_tokens - cache_write_input_tokens),

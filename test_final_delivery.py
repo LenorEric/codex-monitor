@@ -15,13 +15,29 @@ from unittest import mock
 from monitor_canonical import CanonicalDataStore, CanonicalIndex
 from monitor_canonical_store import CanonicalRepository
 from monitor_delivery import DashboardDelivery
-from monitor_final_delivery import Totals, encoded
+from monitor_delivery import Totals, encoded
 from monitor_interpretation import chart_rows, usage_runs, valid_intervals
 from monitor_live import send_bulk
-from monitor_migration_delivery import JsonReader, migrate_delivery
 from monitor_sampling import quota_point
 from test_support_delivery import released_delivery
-import test_sqlite_authority as authority
+from monitor_common import empty_token_totals, empty_cost_totals
+
+
+def make_test_ledger(event="event", cost=1):
+    return {
+        "schemaVersion": 2,
+        "recordType": "usage",
+        "eventId": event,
+        "sessionId": "session",
+        "occurredAt": "2030-01-01T00:00:00Z",
+        "rawModel": "gpt-5",
+        "billingModel": "gpt-5",
+        "serviceTier": "default",
+        "accountSlotId": "slot",
+        "accountLabel": "A",
+        "tokens": empty_token_totals(),
+        "cost": empty_cost_totals() | {"totalCostUsd": cost},
+    }
 
 
 class FinalDeliveryTests(unittest.TestCase):
@@ -48,7 +64,7 @@ class FinalDeliveryTests(unittest.TestCase):
         return row
 
     def token(self, key, stamp, cost=1):
-        row = authority.SQLiteAuthorityTests.ledger(event=key, cost=cost)
+        row = make_test_ledger(event=key, cost=cost)
         row["occurredAt"] = datetime.fromtimestamp(stamp, timezone.utc).isoformat()
         row["tokens"]["freshInputTokens"] = 10
         self.store.record_ledger([row])
@@ -63,7 +79,7 @@ class FinalDeliveryTests(unittest.TestCase):
     def reference(self, view="local", window="5h"):
         with self.store.index.transaction() as db:
             quotas = CanonicalRepository.rows(db, view, "quota", "v3:account")
-            from monitor_final_delivery import token_projection
+            from monitor_delivery import token_projection
             tokens = list(token_projection(db, view, "v3:account"))
         return chart_rows(tokens, valid_intervals(usage_runs([quota_point(row) for row in quotas], window)))
 
@@ -390,7 +406,7 @@ class FinalDeliveryTests(unittest.TestCase):
     def test_journal_retention_bounds_large_publications(self):
         for index in range(20):
             self.token(str(index), 1000 + index)
-        with mock.patch('monitor_final_delivery.JOURNAL_BYTES', 1200):
+        with mock.patch('monitor_delivery.JOURNAL_BYTES', 1200):
             self.delivery.prepare()
         with self.store.index.transaction() as db:
             self.assertLessEqual(db.execute("SELECT SUM(length(body)) FROM delivery_journal").fetchone()[0], 1200)
@@ -448,98 +464,6 @@ class FinalDeliveryMigrationTests(unittest.TestCase):
     quota = staticmethod(FinalDeliveryTests.quota)
     put_quota = FinalDeliveryTests.put_quota
     token = FinalDeliveryTests.token
-    def legacy(self):
-        self.delivery.close()
-        released_delivery(self.store)
-        self.delivery = DashboardDelivery(self.store.index)
-        for stamp, value in ((1000, 10), (2000, 20)):
-            self.put_quota(stamp, value)
-        self.token("first", 1500)
-        self.delivery.prepare(force=True)
 
-    def test_snapshot_and_suffix_preserve_frozen_results(self):
-        self.legacy()
-        before = json.loads(self.delivery.bulk(False))
-        self.token("after-snapshot", 1800)
-        # Build journal/preparation but deliberately retain the earlier bulk.
-        self.delivery.last_prepare = 10**12
-        self.delivery.prepare()
-        packets = self.delivery.replay(before["epoch"], before["cursors"])
-        self.assertTrue(any(packet["channel"] == "tokens" for packet in packets))
-        self.store.index.close()
-        migrate_delivery({"processing_index": self.store.index.path})
-        index = CanonicalIndex(self.store.index.path)
-        self.addCleanup(index.close)
-        migrated = DashboardDelivery(index)
-        self.addCleanup(migrated.close)
-        result = json.loads(migrated.bulk(False))
-        for view in ("local", "merged"):
-            tokens = result["accounts"][0][view]["tokens"]
-            self.assertEqual(len(tokens), len(before["accounts"][0][view]["tokens"]) + 1)
-            self.assertEqual(sum(model[-1] for row in tokens for model in row[2]), 200000000)
-        self.assertNotEqual(result["epoch"], before["epoch"])
-        self.assertFalse(migrated.prepare())
-
-    def test_expired_journal_falls_back_to_prepared_values(self):
-        self.legacy()
-        before = json.loads(self.delivery.bulk(False))
-        with self.store.index.transaction() as db:
-            db.execute("UPDATE delivery_meta SET value='other' WHERE name='epoch'")
-        self.store.index.close()
-        migrate_delivery({"processing_index": self.store.index.path})
-        index = CanonicalIndex(self.store.index.path)
-        self.addCleanup(index.close)
-        migrated = DashboardDelivery(index)
-        self.addCleanup(migrated.close)
-        actual = json.loads(migrated.bulk(False))
-        self.assertEqual(sum(model[-1] for row in actual["accounts"][0]["local"]["tokens"] for model in row[2]), 100000000)
-        self.assertEqual(actual["accounts"][0]["local"]["chart:5h"], before["accounts"][0]["local"]["chart:5h"])
-
-    def test_snapshot_parser_is_incremental_at_utf8_and_numeric_boundaries(self):
-        class Tiny(io.BytesIO):
-            def read(self, count=-1): return super().read(3)
-        reader = JsonReader(Tiny(encoded({"模型": [123456789, {"x": "🙂"}]})))
-        for name in reader.members():
-            self.assertEqual(name, "模型")
-            self.assertEqual(reader.value(), [123456789, {"x": "🙂"}])
-
-    def test_conversion_failure_rolls_back_and_retry_preserves_other_state(self):
-        self.legacy()
-        with self.store.index.transaction() as db:
-            original = {table: list(db.execute("SELECT * FROM " + table)) for table in ("canonical_tokens", "upload_buffer", "source_checkpoints", "package_receipts")}
-            snapshot_body = db.execute("SELECT body FROM delivery_snapshot").fetchone()[0]
-        self.store.index.close()
-        with mock.patch("monitor_migration_delivery.put", side_effect=RuntimeError("interrupted conversion")), self.assertRaises(RuntimeError):
-            migrate_delivery({"processing_index": self.store.index.path})
-        with closing(sqlite3.connect(self.store.index.path)) as db:
-            self.assertIsNone(db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_items'").fetchone())
-            self.assertEqual(db.execute("SELECT body FROM delivery_snapshot").fetchone()[0], snapshot_body)
-        migrate_delivery({"processing_index": self.store.index.path})
-        with closing(sqlite3.connect(self.store.index.path)) as db:
-            for table, rows in original.items():
-                self.assertEqual(list(db.execute("SELECT * FROM " + table)), rows)
-
-    def test_conversion_retains_dirty_work_and_deleted_last_quota(self):
-        self.legacy()
-        self.token("unprepared", 1800)
-        with self.store.index.transaction() as db:
-            db.execute("DELETE FROM canonical_quota")
-            db.execute("DELETE FROM delivery_work")  # Older dirty-only invalidation.
-        self.store.index.close()
-        migrate_delivery({"processing_index": self.store.index.path})
-        index = CanonicalIndex(self.store.index.path)
-        self.addCleanup(index.close)
-        migrated = DashboardDelivery(index)
-        self.addCleanup(migrated.close)
-        migrated.prepare()
-        result = json.loads(migrated.bulk(False))
-        for view in ("local", "merged"):
-            data = result["accounts"][0][view]
-            self.assertEqual(data["usage:5h"], [])
-            self.assertEqual(data["chart:5h"], [])
-            self.assertEqual(sum(model[-1] for row in data["tokens"] for model in row[2]), 200000000)
-        self.assertFalse(migrated.prepare())
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     unittest.main()

@@ -241,7 +241,7 @@ class CanonicalRepository:
     @classmethod
     def dirty_all(cls, db):
         if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_pending'").fetchone():
-            from monitor_final_delivery import enqueue_accounts
+            from monitor_delivery import enqueue_accounts
             enqueue_accounts(db)
         else:
             db.executemany("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", cls.accounts(db))

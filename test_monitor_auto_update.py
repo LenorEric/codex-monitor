@@ -102,66 +102,6 @@ class AutoUpdateTests(unittest.TestCase):
             finally:
                 updater.stop()
 
-    def test_history_data_migration_rewrites_every_store_and_only_runs_once(self):
-        with temporary_directory() as data_home:
-            history = data_home / "custom.jsonl"
-            quota = data_home / "custom.quota.jsonl"
-            sessions = data_home / "custom.sessions.jsonl"
-            ledger = data_home / "custom.ledger.jsonl"
-            samples = data_home / "custom.samples.jsonl"
-            history.write_text('{"window":"5h","delta":[{"checkedAt":"2026-01-01T00:00:00Z","deltaPercent":1,"deltaCostUsd":0.1}]}', encoding="utf-8")
-            quota.write_text('{"checkedAt":"2026-01-01T00:00:00Z","windows":{"5h":{"used_percent":4,"usedPercent":4}}}', encoding="utf-8")
-            sessions.write_text('{"sessionId":"s1","startedAt":"2026-01-01T00:00:00Z","tokens":{"input_tokens":2}}', encoding="utf-8")
-            ledger.write_text('{"schemaVersion":1,"recordType":"priceEpoch","pricingId":"p1"}', encoding="utf-8")
-            samples.write_text('{"sample":1}{"sample":2}', encoding="utf-8")
-            (data_home / "usage_monitor_state.json").write_text('{"runCostUsd":3,"windows":{"5h":{"baselineCostUsd":2,"baselinePercent":4}},"lastSample":{"costDelta":{"totalCostUsd":1}}}', encoding="utf-8")
-            (data_home / "usage_monitor_dashboard_cache.json").write_text('{"version":2}', encoding="utf-8")
-            (data_home / "usage_monitor_sync_cache.json").write_text('{"version":2}', encoding="utf-8")
-            (data_home / "cloud-state.json").write_text('{"usage":{"published":{"old":"pack"},"remote":{"machine":"cursor"},"lastSuccessAt":"old","lastAttemptAt":"old","lastFullVerificationAt":"old","failure":{"message":"old"}}}', encoding="utf-8")
-
-            self.assertEqual(migrate_history_data(data_home, history, quota, sessions, ledger, samples, target_version=4), [1, 2, 3, 4])
-            self.assertEqual(json.loads((data_home / DATA_MIGRATION_STATE_FILENAME).read_text(encoding="utf-8")), {"dataContractVersion": 4})
-            self.assertEqual([json.loads(line) for line in samples.read_text(encoding="utf-8").splitlines()], [{"sample": 1}, {"sample": 2}])
-            self.assertIn('"accountSlotId":"unknown"', quota.read_text(encoding="utf-8"))
-            self.assertFalse(history.exists())
-            self.assertFalse(sessions.exists())
-            self.assertIn('"recordType":"legacyBaseline"', ledger.read_text(encoding="utf-8"))
-            self.assertFalse((data_home / "usage_monitor_dashboard_cache.json").exists())
-            self.assertFalse((data_home / "usage_monitor_sync_cache.json").exists())
-            self.assertEqual(json.loads((data_home / "usage_monitor_state.json").read_text(encoding="utf-8")), {"windows": {"5h": {}}, "lastSample": {}})
-            cloud_usage = json.loads((data_home / "cloud-state.json").read_text(encoding="utf-8"))["usage"]
-            self.assertEqual(cloud_usage, {"published": {"old": "pack"}, "remote": {}, "lastSuccessAt": None, "lastAttemptAt": None, "failure": None})
-            snapshots = {path: path.read_bytes() for path in (quota, ledger, samples, data_home / "usage_monitor_state.json", data_home / "cloud-state.json")}
-            self.assertEqual(migrate_history_data(data_home, history, quota, sessions, ledger, samples, target_version=4), [])
-            self.assertEqual(snapshots, {path: path.read_bytes() for path in snapshots})
-
-    def test_successful_update_defers_data_migration_until_new_runtime_startup(self):
-        with temporary_directory() as temporary:
-            runtime, data_home = temporary / "runtime", temporary / "data"
-            runtime.mkdir()
-            data_home.mkdir()
-            (runtime / "version.json").write_text('{"version":"1.5.0","dataContractVersion":1}', encoding="utf-8")
-            (runtime / "monitor.py").write_bytes(b"old")
-            (data_home / DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":1}', encoding="utf-8")
-            (data_home / "usage_monitor_history.jsonl").write_text('{"window":"5h","delta":[]}', encoding="utf-8")
-            files = {"monitor.py": b"new", "version.json": b'{"version":"1.5.1","dataContractVersion":2}\n'}
-            responses = {RELEASE_VERSION_URL: json.dumps({"version": "1.5.1", "files": {name: descriptor(data) for name, data in files.items()}}).encode(), **{RUNTIME_FILE_URL.format(name=name): data for name, data in files.items()}}
-
-            self.assertTrue(AutoUpdater(runtime, lambda: True, lambda: Opener(responses)).check_for_update())
-
-            self.assertEqual(json.loads((data_home / DATA_MIGRATION_STATE_FILENAME).read_text(encoding="utf-8")), {"dataContractVersion": 1})
-            self.assertTrue((data_home / "usage_monitor_history.jsonl").exists())
-            self.assertEqual(installed_data_contract_version(runtime), 2)
-
-    def test_history_data_migration_does_not_advance_after_invalid_history(self):
-        with temporary_directory() as data_home:
-            paths = [data_home / name for name in ("history", "quota", "sessions", "ledger", "samples")]
-            paths[4].write_text('{"valid":true}\nnot-json\n', encoding="utf-8")
-            with self.assertRaises(json.JSONDecodeError):
-                migrate_history_data(data_home, *paths)
-            self.assertFalse((data_home / DATA_MIGRATION_STATE_FILENAME).exists())
-            self.assertEqual(paths[4].read_text(encoding="utf-8"), '{"valid":true}\nnot-json\n')
-
     def test_history_data_migration_runs_each_intermediate_version_and_checkpoints(self):
         with temporary_directory() as data_home:
             paths = [data_home / name for name in ("history", "quota", "sessions", "ledger", "samples")]
@@ -380,8 +320,8 @@ class AutoUpdateTests(unittest.TestCase):
             runtime = root / "runtime"
             runtime.mkdir()
             (runtime / "preserved.txt").write_text("existing release", encoding="utf-8")
-            for omitted in ("monitor_backup.py", "monitor_ingestion.py"):
-                with self.subTest(omitted=omitted), mock.patch.object(build_release, "RUNTIME_FILES", tuple(name for name in build_release.RUNTIME_FILES if name != omitted)), mock.patch.object(build_release, "RUNTIME_DIR", runtime), mock.patch.object(build_release, "bump_package_version") as bump:
+            for omitted in ("monitor_dependencies.py", "monitor_common.py"):
+                with self.subTest(omitted=omitted), mock.patch.object(build_release, "RUNTIME_FILES", tuple(name for name in build_release.RUNTIME_FILES if name != omitted)), mock.patch.object(build_release, "RUNTIME_DIR", runtime), mock.patch.object(build_release, "bump_package_version", return_value="1.5.23") as bump:
                     with self.assertRaisesRegex(ValueError, omitted):
                         build_release.main()
                     bump.assert_not_called()
@@ -401,11 +341,9 @@ from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import monitor_dashboard
 from monitor_usage_sync import UsageDataStore
-from monitor_migrations import _migrate_history_to_v19
 root = Path(sys.argv[2])
 store = UsageDataStore(root / "quota.jsonl", root / "ledger.jsonl", "machine", lambda _: "v3:a", threading.RLock())
 store.record_quota({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 10}}})
-_migrate_history_to_v19({"processing_index": store.index.path, "token_ledger": store.token_ledger_path})
 assert len(store.datasets()[0]) == 1
 assert all(Path(module.__file__).parent == Path(sys.argv[1]) for name, module in sys.modules.items() if name.startswith("monitor_") and getattr(module, "__file__", None))
 print("Packaged runtime imports and SQLite migration OK")

@@ -54,7 +54,7 @@ class CanonicalIndex(IndexState):
             db.execute("PRAGMA journal_mode=WAL")
             initialize(db)
             db.execute("INSERT OR IGNORE INTO processing_meta VALUES('canonicalStore','true')")
-            from monitor_final_delivery import initialize as initialize_delivery
+            from monitor_delivery import initialize as initialize_delivery
             initialize_delivery(db)
             db.commit()
 
@@ -151,7 +151,7 @@ class CanonicalIndex(IndexState):
             return self.get(db, "canonicalRevision", 0)
 
     def repair(self):
-        from monitor_final_delivery import enqueue_quota_repair
+        from monitor_delivery import enqueue_quota_repair
         with self.transaction() as db:
             # Token wire groups are immutable, including across a repair. Quota
             # and attribution can be regenerated independently from retained facts.
@@ -193,6 +193,15 @@ class CanonicalDataStore(NormalizedRecords):
     def datasets(self, view="local"):
         with self.index.transaction() as db:
             return tuple(records.rows(db, view, kind) for kind in ("quota", "tokenLedger"))
+
+    def snapshot(self, view="local"):
+        quotas, tokens = self.datasets(view)
+        local = {}
+        for row in quotas:
+            local[record_key("quota", row)] = {"kind": "quota", "row": row}
+        for row in tokens:
+            local[record_key("tokenLedger", row)] = {"kind": "tokenLedger", "row": row}
+        return local, set(local)
 
     def buffer_status(self):
         with self.index.transaction() as db:

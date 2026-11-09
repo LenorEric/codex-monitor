@@ -28,7 +28,7 @@ def quota_point_order(point, window=None):
 def connected(previous, current, window):
     if previous[3] is None or current[3] is None:
         return False
-    if not resets_match(previous[6] if len(previous) > 6 else None, current[6] if len(current) > 6 else None):
+    if previous[3] != 0 and current[3] != 0 and not resets_match(previous[6] if len(previous) > 6 else None, current[6] if len(current) > 6 else None):
         return False
     gap = current[1] - previous[2]
     if gap > 14400:

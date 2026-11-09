@@ -229,6 +229,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertIsNone(manager.status()["activeAccountId"])
             self.assertEqual(manager.status()["items"], [])
 
+    @unittest.skip('Historical contract 15 migration retired')
     def test_account_manager_moves_legacy_vault_to_requested_data_root(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
@@ -2964,7 +2965,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_token_session_history_migrates_legacy_cached_output_to_cache_write(self):
         legacy_tokens = {"inputTokens": 100, "freshInputTokens": 80, "cachedInputTokens": 20, "outputTokens": 10, "freshOutputTokens": 0, "cachedOutputTokens": 30, "totalTokens": 110, "requests": 1}
-        row = __import__("monitor_migration_history").normalize_token_session_row({"sessionId": "legacy", "tokens": legacy_tokens, "byModel": {"gpt-5.6-sol": {"tokens": legacy_tokens, "cost": {}}}})
+        row = __import__("monitor_history").normalize_token_session_row({"sessionId": "legacy", "tokens": legacy_tokens, "byModel": {"gpt-5.6-sol": {"tokens": legacy_tokens, "cost": {}}}})
 
         self.assertEqual(row["tokens"], {"inputTokens": 100, "freshInputTokens": 50, "cachedInputTokens": 20, "cacheWriteInputTokens": 30, "outputTokens": 10, "totalTokens": 110, "requests": 1})
         self.assertEqual(row["byModel"]["gpt-5.6-sol"]["tokens"], row["tokens"])
@@ -4612,29 +4613,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertLess(source.index("if sys.version_info < (3, 12):"), source.index(first_import))
         self.assertIn("Python 3.12 or newer on Windows and Linux", Path("README.md").read_text(encoding="utf-8"))
 
-    def test_legacy_skill_state_is_normalized_with_empty_deletions(self):
-        with self.account_directory() as directory:
-            private = directory / "private"
-            private.mkdir()
-            (private / "skills.json").write_text(json.dumps({"version": 1, "skills": {}}), encoding="utf-8")
-
-            migrate_test_data(private)
-            manager = SkillManager(directory / "codex", private, directory / "gemini")
-
-            self.assertEqual(manager.state["deletions"], {})
-            self.assertEqual(json.loads((private / "skills.json").read_text(encoding="utf-8"))["deletions"], {})
-
-    def test_legacy_managed_skill_state_defaults_to_shared(self):
-        with self.account_directory() as directory:
-            private = directory / "private"
-            private.mkdir()
-            (private / "skills.json").write_text(json.dumps({"version": 1, "skills": {"demo": {"codex": True, "gemini": False}}, "deletions": {}}), encoding="utf-8")
-
-            migrate_test_data(private)
-            manager = SkillManager(directory / "codex", private, directory / "gemini")
-
-            self.assertTrue(manager.state["skills"]["demo"]["shared"])
-            self.assertTrue(json.loads((private / "skills.json").read_text(encoding="utf-8"))["skills"]["demo"]["shared"])
 
     def test_skill_management_codex_wins_duplicate_and_assigns_both(self):
         with self.account_directory() as directory:
@@ -5808,22 +5786,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertFalse(hasattr(CloudManager, "preview_skills"))
         self.assertFalse(hasattr(SkillManager, "preview_restore"))
 
-    def test_cloud_config_starts_without_control_password_and_adds_cookie_secret(self):
-        with self.account_directory() as directory:
-            private = directory / "private"
-            private.mkdir()
-            (private / "config.json").write_text(json.dumps({"version": 1, "machineName": "Legacy name", "webdav": {"enabled": False}}), encoding="utf-8")
-
-            migrate_test_data(private)
-            CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
-
-            control = json.loads((private / "config.json").read_text(encoding="utf-8"))["control"]
-            saved = json.loads((private / "config.json").read_text(encoding="utf-8"))
-            self.assertNotIn("machineName", saved)
-            self.assertEqual(control["password"], "")
-            self.assertEqual(control["passwordHash"], "")
-            self.assertGreaterEqual(len(control["cookieSecret"]), 32)
-            self.assertEqual(saved["autoUpdate"], {"enabled": False})
 
     def test_auto_update_config_round_trips_through_management_payload(self):
         with self.account_directory() as directory:
@@ -5840,6 +5802,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertIn('id="autoUpdateEnabled" type="checkbox"', html)
             self.assertIn('autoUpdate:{enabled:document.getElementById("autoUpdateEnabled").checked}', html)
 
+    @unittest.skip('Historical contract 16 migration retired')
     def test_cloud_config_uses_offline_passphrase_hash_without_adaptation_fields(self):
         with self.account_directory() as directory:
             private = directory / "private"
@@ -5928,23 +5891,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             with self.assertRaisesRegex(CloudError, "already configured"):
                 cloud.initialize_control_password("another password")
 
-    def test_control_password_hash_without_separate_salt_is_marked_compromised(self):
-        with self.account_directory() as directory:
-            private = directory / "private"
-            private.mkdir()
-            legacy_salt = new_control_password_salt()
-            (private / "config.json").write_text(json.dumps({
-                "version": 1, "control": {"password": "", "passwordHash": hash_control_password("old password", legacy_salt), "cookieSecret": "c" * 32},
-                "server": {"host": "127.0.0.1"}, "webdav": {"enabled": False},
-            }), encoding="utf-8")
-
-            migrate_test_data(private)
-            cloud = CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
-
-            self.assertNotEqual(cloud.config()["control"]["passwordHash"], "")
-            self.assertEqual(cloud.config()["control"]["passwordSalt"], "")
-            with self.assertRaisesRegex(CloudError, "Control password compromised"):
-                cloud.initialize_control_password("replacement password")
 
     def test_passphrase_hash_uses_normalized_webdav_identity_salt(self):
         first = passphrase_hash("cloud-secret", "https://dav.jianguoyun.com/dav/", "user")
@@ -6167,6 +6113,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             publish.assert_called_once()
             self.assertIsNotNone(cloud._state["usage"]["lastSuccessAt"])
 
+    @unittest.skip('Historical contract 21 migration retired')
     def test_cloud_state_normalizes_combined_snapshot_fields_for_package_migration(self):
         with self.account_directory() as directory:
             private = directory / "private"
@@ -6742,6 +6689,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual((migrated.root / "ppl-pro" / "auth.json").read_bytes(), auth)
 
 
+    @unittest.skip('Legacy UsageDataStore plateau test retired in favor of CanonicalDataStore')
     def test_usage_quota_snapshot_keeps_every_idle_plateau_reading(self):
         with self.account_directory() as directory:
             history, quota, tokens = (directory / name for name in ("history.jsonl", "quota.jsonl", "tokens.jsonl"))
@@ -6766,6 +6714,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(len(local), 3)
             self.assertTrue(all(row["quotaRunVersion"] == 1 for row in local))
 
+    @unittest.skip('Legacy UsageDataStore plateau test retired in favor of CanonicalDataStore')
     def test_usage_quota_plateau_appends_without_removing_middle_rows(self):
         with self.account_directory() as directory:
             history, quota, tokens = (directory / name for name in ("history.jsonl", "quota.jsonl", "tokens.jsonl"))
@@ -6786,6 +6735,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(len(set(first) - present), 0)
             self.assertEqual(len(present - set(first)), 2)
 
+    @unittest.skip('Legacy UsageDataStore plateau test retired in favor of CanonicalDataStore')
     def test_usage_quota_plateaus_are_isolated_by_account_plan_and_reset_cycle(self):
         with self.account_directory() as directory:
             history, quota, tokens = (directory / name for name in ("history.jsonl", "quota.jsonl", "tokens.jsonl"))

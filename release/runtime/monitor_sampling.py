@@ -8,7 +8,6 @@ from datetime import datetime, timezone
 
 from monitor_common import coerce_float, parse_timestamp
 from monitor_interpretation import quota_point_order
-import monitor_sample_store as samples
 
 WINDOWS = {"fiveHour": ("5h", 18000), "sevenDay": ("7d", 604800)}
 SAMPLING_RULE_VERSION = 1

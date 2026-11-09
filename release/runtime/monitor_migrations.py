@@ -16,7 +16,6 @@ from contextlib import closing
 from pathlib import Path
 
 from monitor_common import atomic_write_bytes, parse_timestamp
-import monitor_sample_store as samples
 from monitor_cloud_contract import CLOUD_DATA_CONTRACT_VERSION, CLOUD_DATA_CONTRACT_PATH
 
 
@@ -32,7 +31,7 @@ class MigrationError(RuntimeError):
 def request_migration_rebuild(paths: dict[str, Path], reason: str, *, sampling: bool = False, delivery_only: bool = False) -> None:
     if "processing_index" not in paths or not paths["processing_index"].exists():
         return
-    with closing(samples.connect(paths["processing_index"])) as db, db:
+    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_meta'").fetchone():
             return
         row = db.execute("SELECT value FROM processing_meta WHERE name='migrationRebuildPending'").fetchone()
@@ -47,7 +46,7 @@ def request_migration_rebuild(paths: dict[str, Path], reason: str, *, sampling: 
 def _apply_migration_rebuild(paths: dict[str, Path]) -> None:
     if not paths["processing_index"].exists():
         return
-    with closing(samples.connect(paths["processing_index"])) as db, db:
+    with closing(sqlite3.connect(paths["processing_index"])) as db, db:
         if not db.execute("SELECT 1 FROM sqlite_master WHERE name='processing_meta'").fetchone():
             return
         row = db.execute("SELECT value FROM processing_meta WHERE name='migrationRebuildPending'").fetchone()
@@ -337,12 +336,8 @@ def migrate_history_data(
         completed.append(version)
     _apply_migration_rebuild(paths)
     if target_version == DATA_CONTRACT_VERSION and paths["processing_index"].exists():
-        if target_version >= 23:
-            from monitor_canonical import CanonicalIndex
-            CanonicalIndex(paths["processing_index"]).close()
-        elif target_version < 22:
-            from monitor_processing import ProcessingIndex
-            ProcessingIndex(paths["processing_index"])
+        from monitor_canonical import CanonicalIndex
+        CanonicalIndex(paths["processing_index"]).close()
     return completed
 
 
