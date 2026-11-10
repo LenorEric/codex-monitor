@@ -82,7 +82,8 @@ function animationHarness() {
 }
 
 test("double-clicking the date field returns to today, then toggles the full-day axis", () => {
-    const h = harness();
+    const h = harness(), transitions = [];
+    h.context.drawAll = animate => { transitions.push(animate); };
     h.run("load=()=>{drawCount++};setupControls()");
     const input = h.elements.get("rangeDate"), today = h.run("localDateValue(new Date())");
     input.getBoundingClientRect = () => ({ right: 138 });
@@ -100,7 +101,8 @@ test("double-clicking the date field returns to today, then toggles the full-day
     assert.deepEqual(Array.from(h.run("fullDayTimeDomain()")), Array.from(h.run("Object.values(selectedDateBounds()).map(value=>value/1000)")));
     input.ondblclick({ clientX: 40 });
     assert.equal(h.run("fullDayTimeDomain()"), null);
-    assert.equal(h.context.drawCount, 3);
+    assert.equal(h.context.drawCount, 1);
+    assert.deepEqual(transitions, [true, true]);
 });
 
 test("full-day charts end at next midnight and keep future data off the plots", () => {

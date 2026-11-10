@@ -478,7 +478,7 @@ function setupControls(){
     if(selectedDate!==today){
       selectedDate=today;selected="Date";saveSelections();syncControls();load(true);return;
     }
-    fullDayDate=fullDayDate===today?null:today;drawAll();
+    fullDayDate=fullDayDate===today?null:today;drawAll(true);
   };
   date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}saveSelections();setupControls();load(true)};
   const selector=document.getElementById("dateSelector");selector.onpointerenter=cancelDateLeaveTracking;selector.onpointerleave=startDateLeaveTracking;

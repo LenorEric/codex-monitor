@@ -118,7 +118,11 @@ def rebuild_runtime(version: str) -> None:
     validate_runtime_files()
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     for name in RUNTIME_FILES:
-        write_text_lf(RUNTIME_DIR / name, (ROOT / name).read_text(encoding="utf-8"))
+        contents = (ROOT / name).read_text(encoding="utf-8")
+        destination = RUNTIME_DIR / name
+        if name.endswith(".py") and destination.is_file() and destination.read_text(encoding="utf-8") == contents:
+            continue
+        write_text_lf(destination, contents)
     write_text_lf(RUNTIME_DIR / "README.md", (ROOT / "release-runtime.md").read_text(encoding="utf-8"))
     write_text_lf(RUNTIME_DIR / "version.json", json.dumps({"version": version, "dataContractVersion": metadata["dataContractVersion"], "cloudDataContractVersion": metadata["cloudDataContractVersion"]}, indent=2) + "\n")
     write_text_lf(RELEASE_DIR / "README.md", (ROOT / "release-package.md").read_text(encoding="utf-8").replace("{{VERSION}}", version))
