@@ -177,6 +177,7 @@ const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
 const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections";
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
 let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}};
+let fullDayDate=null;
 let currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false;
 let historyScope=null,historyGeneration=null,drawGeneration=0;
 let curveColors=new Map();
@@ -256,6 +257,11 @@ function selectedDateBounds(){
 }
 function localDateValue(date){
   return `${date.getFullYear()}-${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}`;
+}
+function fullDayTimeDomain(){
+  if(selected!=="Date"||selectedDate!==fullDayDate||selectedDate!==localDateValue(new Date()))return null;
+  const {startMs,endMs}=selectedDateBounds();
+  return [startMs/1000,endMs/1000];
 }
 function storedSelections(storage,key){try{return JSON.parse(storage.getItem(key)||"null")}catch{return null}}
 function restoreSelections(){
@@ -465,6 +471,15 @@ function setupControls(){
   syncControls();
   date.onclick=activateDateInput;
   date.onfocus=activateDateInput;
+  date.ondblclick=event=>{
+    // The native calendar icon shares the input's event target.
+    if(datePickerIsOpen(date)||event.clientX>=date.getBoundingClientRect().right-32)return;
+    const today=localDateValue(new Date());
+    if(selectedDate!==today){
+      selectedDate=today;selected="Date";saveSelections();syncControls();load(true);return;
+    }
+    fullDayDate=fullDayDate===today?null:today;drawAll();
+  };
   date.onchange=()=>{selectedDate=date.value>latestSelectableDate()?latestSelectableDate():date.value;if(selectedDate){selected="Date"}else{selected=previousRange||"24h"}saveSelections();setupControls();load(true)};
   const selector=document.getElementById("dateSelector");selector.onpointerenter=cancelDateLeaveTracking;selector.onpointerleave=startDateLeaveTracking;
   document.getElementById("prevDate").onclick=()=>shiftSelectedDate(-1);
@@ -746,7 +761,7 @@ function extent(values){
   return nums.length?nums.reduce(([low,high],value)=>[Math.min(low,value),Math.max(high,value)],[Infinity,-Infinity]):[0,1];
 }
 function denseMergeMetrics(id,list){
-  const rect=document.getElementById(id).getBoundingClientRect(), [minTime,maxTime]=extent(list.map(eventTimestamp).filter(Number.isFinite));
+  const rect=document.getElementById(id).getBoundingClientRect(), [minTime,maxTime]=fullDayTimeDomain()||extent(list.map(eventTimestamp).filter(Number.isFinite));
   return {plotWidth:Math.max(1,rect.width-CHART_MARGINS.l-CHART_MARGINS.r),minTime,maxTime,minDistance:10};
 }
 function denseDeltaDistance(a,b,metrics){
@@ -772,7 +787,8 @@ function chart(id, series, opts={}){
   if(!rect.width||!rect.height){if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);delete chartStates[id];return}
   c.width=rect.width*dpr;c.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);ctx.clearRect(0,0,rect.width,rect.height);
   const w=rect.width,h=rect.height,m=CHART_MARGINS;
-  if(series.reduce((count,s)=>count+s.points.filter(p=>Number.isFinite(p.x)&&Number.isFinite(p.y)).length,0)<(opts.minPoints||1)){
+  const insufficient=series.reduce((count,s)=>count+s.points.filter(p=>Number.isFinite(p.x)&&Number.isFinite(p.y)).length,0)<(opts.minPoints||1);
+  if(insufficient&&!opts.showEmptyAxis){
     if(chartStates[id]?.frame)cancelAnimationFrame(chartStates[id].frame);delete chartStates[id];
     ctx.fillStyle=css("--muted");ctx.textAlign="center";ctx.fillText(opts.insufficientMessage||"No data for this range",w/2,h/2);c.onmousemove=null;c.onmouseleave=hideTip;return;
   }
@@ -851,6 +867,7 @@ function chart(id, series, opts={}){
   const drawFrame=(progress,hit)=>{
     ctx.clearRect(0,0,w,h);
     drawAxes();updateLiveLineLayer(progress);drawLayer(previousLineLayer,1-progress);drawLayer(currentLineLayer,progress);
+    if(insufficient){ctx.fillStyle=css("--muted");ctx.textAlign="center";ctx.fillText(opts.insufficientMessage,w/2,h/2)}
     for(const transition of transitions){
       const x=transition.startX+(transition.endX-transition.startX)*progress, y=transition.startY+(transition.endY-transition.startY)*progress, r=transition.startR+(transition.endR-transition.startR)*progress, alpha=transition.startA+(transition.endA-transition.startA)*progress;
       if(r<=0||alpha<=0)continue;
@@ -908,12 +925,13 @@ function updateRate(id,list){
   document.getElementById(id).textContent=`Cost / 100%: ${percent>0?usd(cost/percent*100):"N/A"}`;
 }
 function drawDeltaChart(id,name,color,list,animate=false){
+  const fullDay=fullDayTimeDomain();
   const metrics=denseMergeMetrics(id,list), accounts=[...new Set(list.map(usageAccountId))], series=accounts.map(accountId=>{
     const merged=mergeDenseDeltaEvents(list.filter(point=>usageAccountId(point)===accountId),metrics);
     return {name:accountDisplayName(accountId,merged[0]?.accountLabel),color:accountCurveColor(accountId),points:merged.map(point=>({x:eventTimestamp(point),y:point.costPer100PercentUsd,ref:point}))};
   }).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:"base"})), points=series.flatMap(item=>item.points);
   const legend=document.getElementById(`${id}Legend`);legend.replaceChildren(...series.map(item=>{const entry=document.createElement("span"),dot=document.createElement("span");dot.className="dot";dot.style.background=item.color;entry.append(dot,item.name);return entry}));
-  chart(id,series,{xFmt:value=>new Date(value*1000).toLocaleString(),yFmt:usd,xDomain:extent(points.map(p=>p.x)),yDomain:extent(points.map(p=>p.y)),minPoints:1,insufficientMessage:"No cost and usage period for the selected scope",animate});
+  chart(id,series,{xFmt:value=>new Date(value*1000).toLocaleString(),yFmt:usd,xDomain:fullDay||extent(points.map(p=>p.x)),yDomain:extent(points.map(p=>p.y)),showEmptyAxis:!!fullDay,minPoints:1,insufficientMessage:"No cost and usage period for the selected scope",animate});
 }
 function quotaTimeDomain(points){
   if(selected==="Date"){
@@ -1127,12 +1145,16 @@ function drawUsageTimeChart(id,label,points,animate=false){
   const renderedValueOf=normalizedUsage?point=>plusEquivalentUsage(point,label,valueOf):valueOf;
   renderUsageLegend(id,groups,renderedValueOf);
   const labelLayer=document.createElement("canvas"), labelContext=labelLayer.getContext("2d");labelLayer.width=c.width;labelLayer.height=c.height;labelContext.setTransform(dpr,0,0,dpr,0,0);
+  const fullDay=fullDayTimeDomain();
   let currentSeries=[], currentFolds=[], mousemove=null, labelSignature="empty";
   if(!valid.length){labelContext.fillStyle=css("--muted");labelContext.textAlign="center";labelContext.fillText(points.length?"Not enough data for the selected scope":"No data for this range",w/2,h/2)}
-  else{
+  if(valid.length||fullDay){
     groups.forEach(([,accountPoints])=>accountPoints.sort(compareQuotaPoints));
     ctx.font="11px system-ui";
-    const timestamps=valid.map(eventTimestamp), values=valid.map(point=>Math.max(0,normalizedUsage?renderedValueOf(point):Math.min(100,renderedValueOf(point)))), xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1], dateOnly=x1-x0>=7*24*3600, crossesDate=!sameLocalDate(x0,x1), timeScale=usageTimeScale(x0,x1,usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width,collapseUsageGaps,collapseUsageFlat),m.l,w-m.r), X=timeScale.x, Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
+    const values=valid.map(point=>Math.max(0,normalizedUsage?renderedValueOf(point):Math.min(100,renderedValueOf(point))));
+    const [x0,x1]=fullDay||extent(valid.map(eventTimestamp)), [y0,y1]=extent(values), dateOnly=x1-x0>=7*24*3600, crossesDate=!sameLocalDate(x0,x1);
+    const folds=fullDay?[]:usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width,collapseUsageGaps,collapseUsageFlat);
+    const timeScale=usageTimeScale(x0,x1,folds,m.l,w-m.r), X=timeScale.x, Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b);
     currentFolds=timeScale.folds;
     ctx.strokeStyle=css("--border");ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(m.l,m.t);ctx.lineTo(m.l,h-m.b);ctx.lineTo(w-m.r,h-m.b);ctx.stroke();
     ctx.strokeStyle="rgba(255,255,255,.06)";ctx.font="11px system-ui";labelContext.fillStyle=css("--muted");labelContext.font="11px system-ui";labelContext.textAlign="right";
@@ -1233,7 +1255,8 @@ function costTimeSeries(plotWidth=734,activeSpan=null){
   const bounds=payload.costTimeBounds?.every(Number.isFinite)?payload.costTimeBounds:quotaTimeDomain(accountFilteredQuotaPoints(payload.quotaPoints||[]));
   if(!Array.isArray(bounds)||bounds.length!==2||!bounds.every(Number.isFinite))return {buckets:[],total:0};
   let [start,end]=bounds;
-  const rows=(payload.costTime||[]).filter(row=>Number.isFinite(row.timestamp)&&row.timestamp>=start&&(selected==="Date"?row.timestamp<end:row.timestamp<=end)&&costTimeAmount(row)!==null);
+  const dataEnd=fullDayTimeDomain()?Math.min(end,Date.now()/1000):end;
+  const rows=(payload.costTime||[]).filter(row=>Number.isFinite(row.timestamp)&&row.timestamp>=start&&(selected==="Date"?row.timestamp<dataEnd:row.timestamp<=end)&&costTimeAmount(row)!==null);
   if(rows.length){
     const resolution=payload.costTimeResolution||60;
     let first=end,last=start;
@@ -1245,7 +1268,7 @@ function costTimeSeries(plotWidth=734,activeSpan=null){
   const unit=Math.max(payload.costTimeResolution||60,target>=86400?86400:target>=3600?3600:60), seconds=Math.max(1,Math.round(target/unit))*unit;
   if(rows.length&&end>start){
     start=Math.max(bounds[0],Math.floor(start/seconds)*seconds);
-    end=Math.min(bounds[1],Math.ceil(end/seconds)*seconds);
+    end=Math.min(dataEnd,Math.ceil(end/seconds)*seconds);
   }
   const amounts=new Map();let count=0;
   for(const row of rows){
@@ -1286,14 +1309,14 @@ function costModelHover(start,end,time){
     spending:(prefix[search(times,end,end===payload.costTimeBounds?.[1]&&selected!=="Date")]-prefix[search(times,start)])/1e8,
     cumulative:prefix[search(times,time,true)]/1e8}));
 }
-function costTimeUsageSeries(start,end){
+function costTimeUsageSeries(start,end,includeAfter=true){
   const accounts=[...availableScopeAccounts.keys()].filter(accountId=>!selectedAccounts.size||selectedAccounts.has(accountId)).sort((a,b)=>compareAccountNames(a,b,availableScopeAccounts.get(a),availableScopeAccounts.get(b))), grouped=new Map(accounts.map(accountId=>[accountId,[]]));
   for(const point of accountFilteredQuotaPoints(payload.quotaPoints||[])){const points=grouped.get(usageAccountId(point));if(points&&Number.isFinite(eventTimestamp(point)))points.push(point)}
   for(const points of grouped.values())points.sort(compareQuotaPoints);
   return accounts.flatMap(accountId=>{
     return ["fiveHour","sevenDay"].map(label=>{
       const ordered=grouped.get(accountId).filter(point=>!point.resetWindow||point.resetWindow===label), invalidStart=Number.isNaN(Number(start)), invalidEnd=Number.isNaN(Number(end)), startIndex=costTimeUsageIndex(ordered,start), endIndex=costTimeUsageIndex(ordered,end,true);
-      const before=invalidStart?undefined:ordered[startIndex-1], after=invalidEnd?undefined:ordered[endIndex], points=invalidStart||invalidEnd?[]:[...(before?[before]:[]),...ordered.slice(startIndex,endIndex),...(after?[after]:[])], compactedRanges=compactedUsageRanges(points);
+      const before=invalidStart?undefined:ordered[startIndex-1], after=invalidEnd||!includeAfter?undefined:ordered[endIndex], points=invalidStart||invalidEnd?[]:[...(before?[before]:[]),...ordered.slice(startIndex,endIndex),...(after?[after]:[])], compactedRanges=compactedUsageRanges(points);
       const valueOf=point=>Number.isFinite(point[label]?.continuous)?normalizedUsage?plusEquivalentUsage(point,label,row=>row[label].continuous):point[label].continuous:null;
       return {accountId,label,valueOf,color:accountCurveColor(accountId),dash:label==="fiveHour"?[6,4]:[],compactedRanges,
         name:`${label==="fiveHour"?"5h":"7d"}${normalizedUsage?" normalized":""} · ${accountDisplayName(accountId,ordered[0]?.accountLabel)}`,
@@ -1357,8 +1380,10 @@ function drawCostTimeChart(animate=false){
   const canvas=document.getElementById("costTime"), ctx=canvas.getContext("2d"), rect=canvas.getBoundingClientRect(), dpr=devicePixelRatio||1;
   if(!rect.width||!rect.height){costTimeRenderSignature=null;return;}
   canvas.width=rect.width*dpr;canvas.height=rect.height*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);
+  const fullDay=fullDayTimeDomain(), now=fullDay?Date.now()/1000:null;
   let series=costTimeSeries(Math.max(1,rect.width-CHART_MARGINS.l-CHART_MARGINS.r));
-  const usage=costTimeUsageSeries(series.start,series.end), visibleUsage=usage.filter(item=>item.points.some(point=>Number.isFinite(item.valueOf(point))));
+  const usage=fullDay?costTimeUsageSeries(fullDay[0],now,false):costTimeUsageSeries(series.start,series.end);
+  const visibleUsage=usage.filter(item=>item.points.some(point=>Number.isFinite(item.valueOf(point))));
   const legends=[...(series.buckets.length?[{name:costTimeMode==="spending"?"Spending":"Cumulative cost",color:css("--orange")}]:[]),...visibleUsage];
   const legend=document.getElementById("costTimeLegend");legend.replaceChildren(...legends.map(item=>{
     const entry=document.createElement("span"), dot=document.createElement("span");
@@ -1367,7 +1392,7 @@ function drawCostTimeChart(animate=false){
   canvas.onmousemove=null;canvas.onmouseleave=hideTip;hideTip();
   canvas.setAttribute("aria-label",`${legends.map(item=>item.name).join(", ")||"No data"} over time. Total ${costUsd(series.total)}.`);
   document.getElementById("costTimeTotal").textContent=`Total: ${costUsd(series.total)}`;
-  if(!series.buckets.length&&!visibleUsage.length){
+  if(!fullDay&&!series.buckets.length&&!visibleUsage.length){
     costTimeRenderSignature=null;
     document.getElementById("costTimeInterval").textContent="";ctx.clearRect(0,0,rect.width,rect.height);ctx.fillStyle=css("--muted");ctx.textAlign="center";
     ctx.fillText("No timestamped cost events for the selected scope",rect.width/2,rect.height/2);return;
@@ -1377,15 +1402,15 @@ function drawCostTimeChart(animate=false){
   m.l=Math.max(m.l,ctx.measureText(costUsd(series.total*1.1)).width+12);
   const width=rect.width-m.l-m.r, height=rect.height-m.t-m.b;
   let folds=[];
-  for(let pass=0;pass<3;pass++){
+  for(let pass=0;!fullDay&&pass<3;pass++){
     folds=costTimeFolds(series,usage,m.l,rect.width-m.r,ctx.measureText("0").width);
     if(!folds.length)break;
     const next=costTimeSeries(Math.max(1,width-folds.reduce((sum,fold)=>sum+fold.width,0)),series.end-series.start-folds.reduce((sum,fold)=>sum+fold.duration,0));
     if(next.seconds===series.seconds)break;
     series=next;
   }
-  folds=costTimeFolds(series,usage,m.l,rect.width-m.r,ctx.measureText("0").width);
-  const first=series.start, last=series.buckets.at(-1)?.end??series.end;
+  if(!fullDay)folds=costTimeFolds(series,usage,m.l,rect.width-m.r,ctx.measureText("0").width);
+  const [first,last]=fullDay||[series.start,series.buckets.at(-1)?.end??series.end];
   const timeScale=usageTimeScale(first,last,folds,m.l,rect.width-m.r), X=timeScale.x;
   const maximum=Math.max(...series.buckets.map(bucket=>cumulative?bucket.cumulative:bucket.amount),0), yMax=maximum>0?maximum*1.1:1, Y=value=>m.t+height-value/yMax*height;
   const percentMax=Math.max(100,...visibleUsage.flatMap(item=>item.points.map(item.valueOf).filter(Number.isFinite))), P=value=>m.t+height-value/percentMax*height;
@@ -1397,9 +1422,10 @@ function drawCostTimeChart(animate=false){
     const ticks=Math.max(2,Math.min(5,Math.floor(width/140)));
     for(let i=0;i<ticks;i++){const x=m.l+width*i/(ticks-1), value=timeScale.timestampAt(x), date=new Date(value*1000);ctx.textAlign=i===0?"left":i===ticks-1?"right":"center";
       ctx.fillText(series.seconds<86400?date.toLocaleString([],{month:"short",day:"numeric",hour:"2-digit",minute:"2-digit"}):date.toLocaleDateString(),x,rect.height-10)}
+    if(!series.buckets.length&&!visibleUsage.length){ctx.textAlign="center";ctx.fillText("No timestamped cost events for the selected scope",rect.width/2,rect.height/2)}
     if(timeScale.folds.length)drawUsageTimeFolds(ctx,timeScale.folds,m.t,m.t+height);
     ctx.fillStyle=css("--orange");ctx.strokeStyle=css("--orange");ctx.lineWidth=2;
-    if(cumulative){ctx.beginPath();ctx.moveTo(X(series.start),Y(0));for(const bucket of series.buckets){ctx.lineTo(X(bucket.start),Y((bucket.cumulative-bucket.amount)*progress));ctx.lineTo(X(bucket.end),Y(bucket.cumulative*progress))}ctx.stroke()}
+    if(cumulative&&series.buckets.length){ctx.beginPath();ctx.moveTo(X(series.start),Y(0));for(const bucket of series.buckets){ctx.lineTo(X(bucket.start),Y((bucket.cumulative-bucket.amount)*progress));ctx.lineTo(X(bucket.end),Y(bucket.cumulative*progress))}ctx.stroke()}
     else for(const bucket of series.buckets){const x=X(bucket.start), barWidth=X(bucket.end)-x;ctx.fillRect(x+barWidth*.08,Y(bucket.amount*progress),barWidth*.84,height*bucket.amount/yMax*progress)}
     if(visibleUsage.length){
       ctx.save();ctx.beginPath();ctx.rect(m.l,m.t,width,height);ctx.clip();
@@ -1415,7 +1441,7 @@ function drawCostTimeChart(animate=false){
       ctx.restore();ctx.setLineDash([]);
     }
   };
-  const renderSignature=JSON.stringify([rect.width,rect.height,dpr,costTimeMode,series,timeScale.folds,visibleUsage.map(item=>[
+  const renderSignature=JSON.stringify([rect.width,rect.height,dpr,costTimeMode,first,last,series,timeScale.folds,visibleUsage.map(item=>[
     item.accountId,item.label,item.name,item.color,item.dash,item.points.map((point,index)=>[eventTimestamp(point),item.valueOf(point),
       !index||breakUsageCurve(item.points[index-1],point,item.label,item.valueOf,item.compactedRanges)])])]);
   const unchanged=costTimeRenderSignature===renderSignature;
@@ -1426,6 +1452,7 @@ function drawCostTimeChart(animate=false){
     canvas.onmousemove=event=>{
       if(event.offsetX<m.l||event.offsetX>rect.width-m.r||event.offsetY<m.t||event.offsetY>rect.height-m.b)return hideTip();
       const time=timeScale.timestampAt(event.offsetX), bucket=series.buckets.find((value,index)=>time>=value.start&&(time<value.end||index===series.buckets.length-1&&time===value.end));
+      if(fullDay&&time>now)return hideTip();
       if(!bucket&&!visibleUsage.length)return hideTip();
       const tip=document.getElementById("tip");
       renderTip(tip,[{text:bucket?`${new Date(bucket.start*1000).toLocaleString()} to ${new Date(bucket.end*1000).toLocaleString()}`:new Date(time*1000).toLocaleString(),strong:true},
@@ -1440,12 +1467,14 @@ function drawCostTimeChart(animate=false){
 function drawAll(animate=false){
   if(historyScope&&!historyGeneration)return;
   const generation=++drawGeneration;
-  const e=payload.costUsage||{}, fiveInRange=filteredEvents(e.fiveHour||[]), sevenInRange=filteredEvents(e.sevenDay||[]), quotaPoints=payload.quotaPoints||[], quotaInRange=quotaPointsInRange(quotaPoints,quotaTimeDomain(quotaPoints)), tokenSessions=filteredTokenSessions(payload.tokenSessions||[]);
+  const fullDay=fullDayTimeDomain(), now=fullDay?Date.now()/1000:Infinity, recorded=rows=>fullDay?rows.filter(row=>eventTimestamp(row)<=now):rows;
+  const e=payload.costUsage||{}, fiveInRange=filteredEvents(recorded(e.fiveHour||[])), sevenInRange=filteredEvents(recorded(e.sevenDay||[]));
+  const quotaPoints=recorded(payload.quotaPoints||[]), quotaInRange=quotaPointsInRange(quotaPoints,quotaTimeDomain(quotaPoints)), tokenSessions=filteredTokenSessions(payload.tokenSessions||[]);
   const palette=["#4f8cff","#4cc38a","#f3a43b","#ff6b6b","#a78bfa","#22d3ee","#f472b6","#a3e635"], labels=new Map([...quotaPoints,...fiveInRange,...sevenInRange].map(row=>[usageAccountId(row),row.accountLabel]));
   curveColors=new Map([...labels.keys()].sort((a,b)=>compareAccountNames(a,b,labels.get(a),labels.get(b))).map((id,index)=>[id,palette[index%palette.length]]));
   visibleTokenSessions=tokenSessions;
   const costBounds=payload.costTimeBounds??quotaTimeDomain(quotaPoints);
-  const costRows=(payload.costTime||[]).filter(row=>costBounds&&row.timestamp>=costBounds[0]&&(selected==="Date"?row.timestamp<costBounds[1]:row.timestamp<=costBounds[1]));
+  const costRows=recorded(payload.costTime||[]).filter(row=>costBounds&&row.timestamp>=costBounds[0]&&(selected==="Date"?row.timestamp<costBounds[1]:row.timestamp<=costBounds[1]));
   updateModelControls([...fiveInRange,...sevenInRange,...costRows]);
   updateAccountControls([...fiveInRange,...sevenInRange,...quotaInRange.filter(row=>selected!=="Date"||eventTimestamp(row)<costBounds[1]),...costRows]);
   const five=modelFilteredEvents(accountFilteredEvents(fiveInRange)), seven=modelFilteredEvents(accountFilteredEvents(sevenInRange)), quota=accountFilteredQuotaPoints(quotaInRange);

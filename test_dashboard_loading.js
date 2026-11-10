@@ -7,6 +7,20 @@ const { performance } = require("node:perf_hooks");
 const script = fs.readFileSync(`${__dirname}/dashboard.html`, "utf8").match(/<script>([\s\S]*?)<\/script>/)[1].split("restoreSelections();setupControls();setupDataView();")[0];
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
+test("flat usage folds preserve gaps in other selected accounts", () => {
+    const h = harness();
+    h.run(`point=(timestamp,value)=>({timestamp,fiveHour:{continuous:value}});
+        groups=[['a',[point(23400,0),point(37000,0),point(38000,3)]],['b',[point(0,0),{...point(38000,0),breakBefore:false}]]];
+        valueOf=point=>point.fiveHour.continuous;`);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,false,true).map(({start,end})=>[start,end]))")), [[23400, 37000]]);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,true,true).map(({start,end})=>[start,end]))")), [[0, 37000]]);
+    assert.ok(h.run("usageTimeFolds(groups,'fiveHour',valueOf,0,38000,0,800,6,false,true).length") > 0);
+    assert.equal(h.run("usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,true,false).length"), 0);
+    h.run("groups[1][1]=[point(23400,0),point(37000,0),point(38000,3)]");
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,false,true).map(({start,end})=>[start,end]))")), [[23400, 37000]]);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,true,false).map(({start,end})=>[start,end]))")), [[0, 23400]]);
+});
+
 test("reset baselines stay in their window and sort before simultaneous observations", () => {
     const h = harness();
     h.run(`payload.quotaPoints=[
@@ -61,11 +75,59 @@ function animationHarness() {
     const attach = canvas => { const ctx = context(canvas); canvas.getContext = () => ctx; return canvas; };
     const createElement = h.context.document.createElement;
     h.context.document.createElement = tag => tag === "canvas" ? attach(createElement(tag)) : createElement(tag);
-    for (const id of ["usageTime7d", "costTime", "scatter7d"]) attach(h.context.document.getElementById(id));
+    for (const id of ["usageTime5h", "usageTime7d", "costTime", "scatter5h", "scatter7d"]) attach(h.context.document.getElementById(id));
     return { ...h, frames, finish() {
         while (frames.size) { const pending = [...frames.values()]; frames.clear(); pending.forEach(callback => callback(performance.now() + 2000)); }
     } };
 }
+
+test("double-clicking the date field returns to today, then toggles the full-day axis", () => {
+    const h = harness();
+    h.run("load=()=>{drawCount++};setupControls()");
+    const input = h.elements.get("rangeDate"), today = h.run("localDateValue(new Date())");
+    input.getBoundingClientRect = () => ({ right: 138 });
+    input.matches = () => false;
+    input.ondblclick({ clientX: 120 });
+    assert.notEqual(input.value, today, "the native picker button does not change the chart");
+    input.matches = selector => selector === ":open";
+    input.ondblclick({ clientX: 40 });
+    assert.notEqual(input.value, today, "the open picker does not change the chart");
+    input.matches = () => false;
+    input.ondblclick({ clientX: 40 });
+    assert.equal(input.value, today);
+    assert.equal(h.run("fullDayTimeDomain()"), null);
+    input.ondblclick({ clientX: 40 });
+    assert.deepEqual(Array.from(h.run("fullDayTimeDomain()")), Array.from(h.run("Object.values(selectedDateBounds()).map(value=>value/1000)")));
+    input.ondblclick({ clientX: 40 });
+    assert.equal(h.run("fullDayTimeDomain()"), null);
+    assert.equal(h.context.drawCount, 3);
+});
+
+test("full-day charts end at next midnight and keep future data off the plots", () => {
+    const h = animationHarness(), now = new Date(2030, 0, 1, 12).getTime();
+    h.context.Date = class extends Date {
+        constructor(...args) { super(...(args.length ? args : [now])); }
+        static now() { return now; }
+    };
+    h.context.setTimeout = callback => callback();
+    h.run(`fullDayDate=selectedDate;
+        fixture=[Date.now()/1000-60,Date.now()/1000+60];
+        payload.quotaPoints=fixture.map((timestamp,index)=>({timestamp,usageAccountId:'a',fiveHour:{continuous:index+10}}));
+        payload.costUsage.fiveHour=fixture.map((timestamp,index)=>({timestamp,usageAccountId:'a',deltaPercent:1,deltaCostUsd:index+1,costPer100PercentUsd:index+1}));
+        payload.costTime=fixture.map((timestamp,index)=>({timestamp,usageAccountId:'a',costByModelUsd:{m:index+1}}));
+        costTimeMode='cumulative';`);
+    h.context.drawAll = h.drawAll;
+    h.run("drawAll()");
+    h.finish();
+    const bounds = Array.from(h.run("fullDayTimeDomain()"));
+    assert.deepEqual(Array.from(h.run("JSON.parse(chartStates.scatter5h.renderSignature).slice(3,5)")), bounds);
+    assert.equal(h.run("chartStates.scatter5h.series[0].points.length"), 1);
+    assert.equal(h.run("usageTimeChartStates.usageTime5h.series[0].points.length"), 1);
+    assert.ok(h.run("usageTimeChartStates.usageTime5h.series[0].points[0].x < (CHART_MARGINS.l+800-CHART_MARGINS.r)/2"));
+    assert.deepEqual(Array.from(h.run("JSON.parse(costTimeRenderSignature).slice(4,6)")), bounds);
+    assert.equal(h.run("costTimeSeries().total"), 1);
+    assert.ok(h.run("costTimeSeries().buckets.at(-1).end <= Date.now()/1000"));
+});
 
 test("local to merged keeps identical charts still despite different transport IDs", () => {
     const h = animationHarness(), fixture = bulkFixture(), start = new Date(2030, 0, 1).getTime() / 1000;
