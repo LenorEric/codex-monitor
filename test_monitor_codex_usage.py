@@ -4177,7 +4177,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertIn('function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth,collapseGaps=true,collapseFlat=true)', html)
         self.assertIn('usageTimeFoldMetrics(usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat)', html)
         self.assertIn('.map(range=>usageTimeEdgeFoldRange(range,x0,x1,left,right)).filter(Boolean)', html)
-        self.assertIn('timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?2:4)', html)
+        self.assertIn('timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?3:6)', html)
         self.assertIn('if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right)', html)
         self.assertIn('function usageTimeScale(x0,x1,folds,left,right)', html)
         self.assertIn('folds.reduce((sum,gap)=>sum+gap.width,0)', html)
@@ -4318,9 +4318,9 @@ const interleavedRanges=compactedUsageRanges([point(0,5),point(15305,5),point(18
 if(breakUsageCurve(point(0,5),point(15305,5),"fiveHour",valueOf,interleavedRanges))throw new Error("Interleaved local point was treated as a gap inside compacted coverage");
 const changingTail=(start,end,offset)=>Array.from({length:(end-start)/1000+1},(_,index)=>point(start+index*1000,offset+index));
 const gapAccount=[point(0,0),point(15000,1),...changingTail(16000,200000,2)], flatAccount=[...Array.from({length:16},(_,index)=>point(index*1000,10)),...changingTail(16000,200000,11)];
-if(!folds([["a",gapAccount],["b",gapAccount]],0,200000,true,false).some(fold=>fold.kind==="gap"))throw new Error("Pure gap did not pass 2x threshold");
-if(folds([["a",flatAccount],["b",flatAccount]],0,200000,false,true).length)throw new Error("Pure flat incorrectly passed 4x threshold");
-if(folds([["a",gapAccount],["b",flatAccount]],0,200000,true,true).length)throw new Error("Mixed fold incorrectly used 2x threshold");
+if(folds([["a",gapAccount],["b",gapAccount]],0,200000,true,false).length)throw new Error("Pure gap incorrectly passed 3x threshold");
+if(folds([["a",flatAccount],["b",flatAccount]],0,200000,false,true).length)throw new Error("Pure flat incorrectly passed 6x threshold");
+if(folds([["a",gapAccount],["b",flatAccount]],0,200000,true,true).length)throw new Error("Mixed fold incorrectly passed 6x threshold");
 const leadingGroups=[["a",[point(0,0),point(40000,1),...changingTail(41000,200000,2)]],["b",[point(0,10),point(10000,10),point(20000,10),point(30000,10),point(40000,10),...changingTail(41000,200000,11)]]];
 const leading=folds(leadingGroups,0,200000), leadingScale=usageTimeScale(0,200000,leading,0,1000);
 if(leading.length!==1||leading[0].kind!=="mixed"||Math.abs(leadingScale.folds[0].x0-10)>1e-9)throw new Error(`Leading mixed margin was not 10px: ${JSON.stringify(leadingScale.folds)}`);

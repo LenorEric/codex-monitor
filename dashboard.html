@@ -1070,7 +1070,7 @@ function usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right){
 function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth,collapseGaps=true,collapseFlat=true){
   const folds=[], candidates=usageTimeFoldMetrics(usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat).map(range=>usageTimeEdgeFoldRange(range,x0,x1,left,right)).filter(Boolean),x0,x1,left,right,charWidth);
   while(true){
-    const timeScale=usageTimeScale(x0,x1,folds,left,right), additions=candidates.filter(gap=>!folds.includes(gap)&&timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?2:4));
+    const timeScale=usageTimeScale(x0,x1,folds,left,right), additions=candidates.filter(gap=>!folds.includes(gap)&&timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?3:6));
     if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right);
     folds.push(...additions);folds.sort((a,b)=>a.start-b.start);
   }
@@ -1317,8 +1317,15 @@ function costTimeUsageSeries(start,end,includeAfter=true){
     return ["fiveHour","sevenDay"].map(label=>{
       const ordered=grouped.get(accountId).filter(point=>!point.resetWindow||point.resetWindow===label), invalidStart=Number.isNaN(Number(start)), invalidEnd=Number.isNaN(Number(end)), startIndex=costTimeUsageIndex(ordered,start), endIndex=costTimeUsageIndex(ordered,end,true);
       const before=invalidStart?undefined:ordered[startIndex-1], after=invalidEnd||!includeAfter?undefined:ordered[endIndex], points=invalidStart||invalidEnd?[]:[...(before?[before]:[]),...ordered.slice(startIndex,endIndex),...(after?[after]:[])], compactedRanges=compactedUsageRanges(points);
-      const valueOf=point=>Number.isFinite(point[label]?.continuous)?normalizedUsage?plusEquivalentUsage(point,label,row=>row[label].continuous):point[label].continuous:null;
-      return {accountId,label,valueOf,color:accountCurveColor(accountId),dash:label==="fiveHour"?[6,4]:[],compactedRanges,
+      const rawValueOf=point=>Number.isFinite(point[label]?.continuous)?normalizedUsage?plusEquivalentUsage(point,label,row=>row[label].continuous):point[label].continuous:null;
+      const cumulativeValues=new Map();let offset=0;
+      if(costTimeMode==="cumulative")points.forEach((point,index)=>{
+        const value=rawValueOf(point), previous=points[index-1], previousValue=previous?rawValueOf(previous):null;
+        if(value===0&&Number.isFinite(previousValue)&&previousValue!==0)offset+=previousValue;
+        cumulativeValues.set(point,Number.isFinite(value)?offset+value:null);
+      });
+      const valueOf=costTimeMode==="cumulative"?point=>cumulativeValues.get(point)??null:rawValueOf;
+      return {accountId,label,valueOf,rawValueOf,color:accountCurveColor(accountId),dash:label==="fiveHour"?[6,4]:[],compactedRanges,
         name:`${label==="fiveHour"?"5h":"7d"}${normalizedUsage?" normalized":""} · ${accountDisplayName(accountId,ordered[0]?.accountLabel)}`,
         points};
     });
@@ -1333,7 +1340,7 @@ function costTimeFoldCandidates(series,usage){
       const previous=item.points[index-1], current=item.points[index];
       if(!Number.isFinite(item.valueOf(previous))||item.valueOf(previous)!==item.valueOf(current))continue;
       flat.push({start:Math.max(series.start,eventTimestamp(previous)),end:Math.min(series.end,eventTimestamp(current)),
-        kind:breakUsageCurve(previous,current,item.label,item.valueOf,compacted)?"gap":"flat"});
+        kind:breakUsageCurve(previous,current,item.label,item.rawValueOf||item.valueOf,compacted)?"gap":"flat"});
     }
     ranges.push(flat.filter(range=>range.start<range.end));
   }
@@ -1354,7 +1361,7 @@ function costTimeFolds(series,usage,left,right,charWidth){
   const folds=[], candidates=usageTimeFoldMetrics(costTimeFoldCandidates(series,usage).map(range=>usageTimeEdgeFoldRange(range,series.start,series.end,left,right)).filter(Boolean),series.start,series.end,left,right,charWidth);
   while(true){
     const scale=usageTimeScale(series.start,series.end,folds,left,right);
-    const additions=candidates.filter(range=>!folds.includes(range)&&scale.x(range.end)-scale.x(range.start)>range.width*(range.kind==="gap"?2:4));
+    const additions=candidates.filter(range=>!folds.includes(range)&&scale.x(range.end)-scale.x(range.start)>range.width*(range.kind==="gap"?3:6));
     if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,series.start,series.end,left,right);
     folds.push(...additions);folds.sort((a,b)=>a.start-b.start);
   }
@@ -1365,7 +1372,7 @@ function costTimeUsageAt(item,time){
   const current=item.points[right];
   if(eventTimestamp(current)===time)return Number.isFinite(item.valueOf(current))?item.valueOf(current):null;
   const previous=item.points[right-1];
-  if(!previous||!Number.isFinite(item.valueOf(previous))||!Number.isFinite(item.valueOf(current))||breakUsageCurve(previous,current,item.label,item.valueOf,item.compactedRanges||compactedUsageRanges(item.points)))return null;
+  if(!previous||!Number.isFinite(item.valueOf(previous))||!Number.isFinite(item.valueOf(current))||breakUsageCurve(previous,current,item.label,item.rawValueOf||item.valueOf,item.compactedRanges||compactedUsageRanges(item.points)))return null;
   return item.valueOf(previous)+(item.valueOf(current)-item.valueOf(previous))*(time-eventTimestamp(previous))/(eventTimestamp(current)-eventTimestamp(previous));
 }
 function setupCostTimeControls(){
@@ -1434,7 +1441,7 @@ function drawCostTimeChart(animate=false){
         item.points.forEach((point,index)=>{
           const value=item.valueOf(point);if(!Number.isFinite(value))return;
           const previous=item.points[index-1], x=X(eventTimestamp(point)), y=P(value*progress);
-          if(!previous||!Number.isFinite(item.valueOf(previous))||breakUsageCurve(previous,point,item.label,item.valueOf,compacted))ctx.moveTo(x,y);else ctx.lineTo(x,y);
+          if(!previous||!Number.isFinite(item.valueOf(previous))||breakUsageCurve(previous,point,item.label,item.rawValueOf,compacted))ctx.moveTo(x,y);else ctx.lineTo(x,y);
         });
         ctx.stroke();
       }
@@ -1443,7 +1450,7 @@ function drawCostTimeChart(animate=false){
   };
   const renderSignature=JSON.stringify([rect.width,rect.height,dpr,costTimeMode,first,last,series,timeScale.folds,visibleUsage.map(item=>[
     item.accountId,item.label,item.name,item.color,item.dash,item.points.map((point,index)=>[eventTimestamp(point),item.valueOf(point),
-      !index||breakUsageCurve(item.points[index-1],point,item.label,item.valueOf,item.compactedRanges)])])]);
+      !index||breakUsageCurve(item.points[index-1],point,item.label,item.rawValueOf,item.compactedRanges)])])]);
   const unchanged=costTimeRenderSignature===renderSignature;
   costTimeRenderSignature=null;
   const mode=costTimeMode, generation=drawGeneration;

@@ -7,6 +7,22 @@ const { performance } = require("node:perf_hooks");
 const script = fs.readFileSync(`${__dirname}/dashboard.html`, "utf8").match(/<script>([\s\S]*?)<\/script>/)[1].split("restoreSelections();setupControls();setupDataView();")[0];
 const flush = () => new Promise(resolve => setImmediate(resolve));
 
+test("usage and spending folds require the configured width savings", () => {
+    const h = harness();
+    h.run(`usageTimeFoldMetrics=ranges=>ranges.map(range=>({...range,width:10}));
+        usageTimeFoldCandidates=()=>[{start:100,end:100+candidateWidth,duration:candidateWidth,kind:candidateKind}];
+        costTimeFoldCandidates=()=>[{start:100,end:100+candidateWidth,duration:candidateWidth,kind:candidateKind}];
+        candidateWidth=0;candidateKind='gap';`);
+    for (const [kind, threshold] of [["gap", 30], ["unchanged", 60], ["mixed", 60]]) {
+        h.context.candidateKind = kind;
+        for (const [width, expected] of [[threshold, 0], [threshold + 1, 1]]) {
+            h.context.candidateWidth = width;
+            assert.equal(h.run("usageTimeFolds([], 'fiveHour', null, 0, 1000, 0, 1000, 6).length"), expected, `${kind} usage at ${width}px`);
+            assert.equal(h.run("costTimeFolds({start:0,end:1000}, [], 0, 1000, 6).length"), expected, `${kind} spending at ${width}px`);
+        }
+    }
+});
+
 test("flat usage folds preserve gaps in other selected accounts", () => {
     const h = harness();
     h.run(`point=(timestamp,value)=>({timestamp,fiveHour:{continuous:value}});
@@ -348,6 +364,32 @@ function combinedCostHarness() {
     return h;
 }
 
+test("cumulative cost chart carries quota usage across resets independently", () => {
+    const h = combinedCostHarness();
+    h.run(`payload.quotaPoints=[5,0,5,6,0,3].map((value,index)=>({timestamp:index*60,usageAccountId:'a',
+        fiveHour:{continuous:value,multiplier:2},sevenDay:{continuous:[2,0,1,0,0,4][index],multiplier:1}}));
+        payload.quotaPoints.push(...[10,0,4,5,0,1].map((value,index)=>({timestamp:index*60,usageAccountId:'b',fiveHour:{continuous:value}})));
+        updateAccountControls(payload.quotaPoints);costTimeMode='cumulative';`);
+    const values = expression => JSON.parse(h.run(`JSON.stringify(${expression})`));
+    assert.deepEqual(values("costTimeUsageSeries(0,300)[0].points.map(costTimeUsageSeries(0,300)[0].valueOf)"), [5, 5, 10, 11, 11, 14]);
+    assert.deepEqual(values("costTimeUsageSeries(0,300)[1].points.map(costTimeUsageSeries(0,300)[1].valueOf)"), [2, 2, 3, 3, 3, 7]);
+    assert.deepEqual(values("costTimeUsageSeries(0,300)[2].points.map(costTimeUsageSeries(0,300)[2].valueOf)"), [10, 10, 14, 15, 15, 16]);
+    h.run("normalizedUsage=true");
+    assert.deepEqual(values("costTimeUsageSeries(0,300)[0].points.map(costTimeUsageSeries(0,300)[0].valueOf)"), [10, 10, 20, 22, 22, 28]);
+    h.run("costTimeMode='spending';normalizedUsage=false");
+    assert.deepEqual(values("costTimeUsageSeries(0,300)[0].points.map(costTimeUsageSeries(0,300)[0].valueOf)"), [5, 0, 5, 6, 0, 3]);
+});
+
+test("cumulative cost chart preserves missing quota readings and curve breaks", () => {
+    const h = combinedCostHarness();
+    h.run(`payload.quotaPoints=[5,0,null,0,3].map((value,index)=>({timestamp:index*60,usageAccountId:'a',
+        breakBefore:index===1,fiveHour:{continuous:value}}));updateAccountControls(payload.quotaPoints);costTimeMode='cumulative';
+        usage=costTimeUsageSeries(0,240)[0];`);
+    assert.deepEqual(JSON.parse(h.run("JSON.stringify(usage.points.map(usage.valueOf))")), [5, 5, null, 5, 8]);
+    assert.equal(h.run("costTimeUsageAt(usage,30)"), null);
+    assert.equal(h.run("costTimeUsageAt(usage,210)"), 6.5);
+});
+
 test("combined chart collapses only zero spending with BOTH quota windows unchanged", () => {
     const h = combinedCostHarness();
     assert.equal(h.run("costTimeFoldCandidates(fixture,costTimeUsageSeries(0,36000)).length"), 1);
@@ -408,6 +450,9 @@ test("combined canvas keeps quota curves and excludes quota from cost tooltips",
     h.run("costTimeMode='cumulative';drawCostTimeChart()");
     h.elements.get("costTime").onmousemove({ offsetX: 55, offsetY: 30 });
     assert.ok(h.context.tooltipRows.every(row => typeof row !== "string" || !row.includes("%")));
+    labels.length = 0;
+    h.run("payload.quotaPoints.forEach((point,index)=>point.fiveHour.continuous=[80,0,80,90][index]);payload.costTime.push({timestamp:35999,usageAccountId:'a',costByModelUsd:{m:1}});drawCostTimeChart()");
+    assert.ok(labels.includes("170%"), "the quota axis expands for cumulative values above 100%");
     h.run("payload.costTime=[];drawCostTimeChart()");
     assert.doesNotMatch(h.elements.get("costTimeLegend").textContent, /Spending|Cumulative/);
     assert.match(h.elements.get("costTimeLegend").textContent, /5h.*7d/);
