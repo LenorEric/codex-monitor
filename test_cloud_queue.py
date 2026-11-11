@@ -334,7 +334,7 @@ class CloudQueueIntegrationTests(unittest.TestCase):
         fake_server = mock.Mock()
         fake_server.serve_forever.side_effect = KeyboardInterrupt
         with mock.patch.object(monitor_dashboard, "DashboardInstanceLock"), mock.patch.object(monitor_dashboard, "DashboardHTTPServer", return_value=fake_server) as server_factory, mock.patch.object(monitor_dashboard, "UsageDashboardState", return_value=fake_state), mock.patch.object(monitor_dashboard.threading, "Thread"), mock.patch("sys.stdout", new=io.StringIO()):
-            monitor_dashboard.serve_dashboard(SimpleNamespace(data_home=self.cloud.private_root, dashboard=False, timeout=1), None)
+            monitor_dashboard.serve_dashboard(SimpleNamespace(data_home=self.cloud.private_root, dashboard=False), None)
         self.cloud._queue = CloudOperationQueue()
         self.addCleanup(self.cloud.operation_queue.close)
         server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), server_factory.call_args.args[1])

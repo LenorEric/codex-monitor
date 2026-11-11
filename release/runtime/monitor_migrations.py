@@ -125,8 +125,8 @@ def _migrate_history_to_v19(paths: dict[str, Path]) -> None:
 DATA_MIGRATIONS = {version: _noop_migration for version in range(1, DATA_CONTRACT_VERSION + 1)}
 
 
-def _restore_data_backup(backup: Path, path: Path) -> None:
-    if path.suffix == ".sqlite3":
+def _restore_data_backup(backup: Path, path: Path, *, sqlite_database: bool) -> None:
+    if sqlite_database:
         import sqlite3
         from contextlib import closing
         with closing(sqlite3.connect(backup)) as source, closing(sqlite3.connect(path)) as target:
@@ -183,7 +183,7 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
             backup = Path(journal["backups"][name]) if name in journal["backups"] else None
             if name in journal["existing"]:
                 if backup is not None and backup.exists():
-                    _restore_data_backup(backup, path)
+                    _restore_data_backup(backup, path, sqlite_database=name == "processing_index" or path.suffix == ".sqlite3")
                 elif not path.exists():
                     raise MigrationError(f"Cannot recover migrated data file: {path}")
             else:
@@ -194,6 +194,9 @@ def _recover_data_migration(journal_path: Path, state_path: Path, paths: dict[st
 
 
 def _run_data_migration(migration, paths: dict[str, Path], version: int, state_path: Path, journal_path: Path) -> None:
+    if migration is _noop_migration:
+        _atomic_write(state_path, (json.dumps({"dataContractVersion": version}, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8"))
+        return
     protected_paths = {"processing_index": paths["processing_index"]} if version == 19 else paths
     if version in {23, 24, 25, 26, 27}:
         protected_paths = {"processing_index": paths["processing_index"]}
@@ -208,7 +211,7 @@ def _run_data_migration(migration, paths: dict[str, Path], version: int, state_p
             descriptor, backup = tempfile.mkstemp(prefix=f".{paths[name].name}.", suffix=".migration-backup", dir=paths[name].parent)
             os.close(descriptor)
             try:
-                if paths[name].suffix == ".sqlite3":
+                if name == "processing_index" or paths[name].suffix == ".sqlite3":
                     import sqlite3
                     from contextlib import closing
                     with closing(sqlite3.connect(paths[name])) as source, closing(sqlite3.connect(backup)) as target:
@@ -233,7 +236,7 @@ def _run_data_migration(migration, paths: dict[str, Path], version: int, state_p
         for name, path in protected_paths.items():
             try:
                 if name in backups:
-                    _restore_data_backup(backups[name], path)
+                    _restore_data_backup(backups[name], path, sqlite_database=name == "processing_index" or path.suffix == ".sqlite3")
                 elif name not in existing:
                     path.unlink(missing_ok=True)
             except OSError as rollback_exc:
@@ -250,9 +253,9 @@ def _run_data_migration(migration, paths: dict[str, Path], version: int, state_p
 
 
 def migrate_history_data(
-    data_home: Path, history_path: Path, quota_history_path: Path, token_session_history_path: Path, token_ledger_path: Path, sample_log_path: Path,
+    data_home: Path, history_path: Path, quota_history_path: Path, token_session_history_path: Path, sample_log_path: Path,
     target_version: int | None = None, runtime_state_path: Path | None = None, dashboard_cache_path: Path | None = None,
-    usage_sync_cache_path: Path | None = None, cloud_state_path: Path | None = None, codex_home: Path | None = None,
+    usage_sync_cache_path: Path | None = None, cloud_state_path: Path | None = None, codex_home: Path | None = None, *, database_path: Path | None = None,
 ) -> list[int]:
     """Migrate every configured history store to the latest data contract once."""
     data_home = Path(data_home)
@@ -264,7 +267,7 @@ def migrate_history_data(
         raise MigrationError(f"Unsupported target data contract version: {target_version!r}")
     paths = {
         "history": Path(history_path), "quota_history": Path(quota_history_path), "token_session_history": Path(token_session_history_path),
-        "token_ledger": Path(token_ledger_path), "sample_log": Path(sample_log_path), "runtime_state": Path(runtime_state_path) if runtime_state_path is not None else data_home / "usage_monitor_state.json",
+        "token_ledger": data_home / "usage_monitor_token_events.jsonl", "sample_log": Path(sample_log_path), "runtime_state": Path(runtime_state_path) if runtime_state_path is not None else data_home / "usage_monitor_state.json",
         "dashboard_cache": Path(dashboard_cache_path) if dashboard_cache_path is not None else data_home / "usage_monitor_dashboard_cache.json",
         "usage_sync_cache": Path(usage_sync_cache_path) if usage_sync_cache_path is not None else data_home / "usage_monitor_sync_cache.json",
         "cloud_state": Path(cloud_state_path) if cloud_state_path is not None else data_home / "cloud-state.json",
@@ -276,7 +279,7 @@ def migrate_history_data(
     ):
         if paths[current_name].resolve() == (data_home / current_filename).resolve():
             paths[name] = data_home / legacy_filename
-    paths["processing_index"] = paths["usage_sync_cache"].with_name(f"{paths['usage_sync_cache'].stem}-v4.sqlite3")
+    paths["processing_index"] = Path(database_path) if database_path is not None else paths["usage_sync_cache"].with_name(f"{paths['usage_sync_cache'].stem}-v4.sqlite3")
     paths["account_manifest"] = data_home / "accounts" / "accounts.json"
     if codex_home is not None:
         paths["legacy_account_manifest"] = Path(codex_home) / "usage-monitor-accounts" / "accounts.json"
@@ -342,20 +345,15 @@ def migrate_history_data(
 
 
 def migrate_installed_data(
-    runtime_dir: Path, data_home: Path, quota_history_path: Path | None = None, token_ledger_path: Path | None = None,
-    sample_log_path: Path | None = None, target_version: int | None = None, runtime_state_path: Path | None = None,
-    dashboard_cache_path: Path | None = None, usage_sync_cache_path: Path | None = None, cloud_state_path: Path | None = None,
-    codex_home: Path | None = None,
+    runtime_dir: Path, data_home: Path, *, runtime_state_path: Path | None = None, codex_home: Path | None = None, database_path: Path | None = None,
 ) -> list[int]:
     from monitor_history import default_history_path, default_quota_history_path, default_sample_log_path
-    from monitor_token_ledger import default_token_ledger_path
 
     migrate_default_monitor_data(runtime_dir, data_home)
     history = default_history_path(data_home)
     return migrate_history_data(
-        data_home, history, quota_history_path or default_quota_history_path(history), Path(data_home) / "usage_monitor_token_sessions.jsonl",
-        token_ledger_path or default_token_ledger_path(history), sample_log_path or default_sample_log_path(history),
-        installed_data_contract_version(runtime_dir) if target_version is None else target_version, runtime_state_path, dashboard_cache_path, usage_sync_cache_path, cloud_state_path, codex_home,
+        data_home, history, default_quota_history_path(history), Path(data_home) / "usage_monitor_token_sessions.jsonl", default_sample_log_path(history),
+        target_version=installed_data_contract_version(runtime_dir), runtime_state_path=runtime_state_path, codex_home=codex_home, database_path=database_path,
     )
 
 

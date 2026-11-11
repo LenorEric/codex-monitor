@@ -98,7 +98,7 @@ class CanonicalSourceIngestor:
         return {"source": "codex_session_logs", "home": str(home), "filesScanned": len(saved.keys() | self.pending.keys()), **usage, "errors": [], "incremental": True}
 
     @serialized
-    def sync_ledger(self, path, slot, label, timeline, provenance, normalize, machine_id):
+    def sync_ledger(self, slot, label, timeline, provenance):
         from monitor_token_ledger import _usage_records
         with self.index.transaction() as db:
             for source, (state, events, first_block) in self.pending.items():

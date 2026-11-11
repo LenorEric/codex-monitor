@@ -22,7 +22,7 @@ class CanonicalSamplingTests(unittest.TestCase):
         self.open_store()
 
     def open_store(self):
-        self.store = CanonicalDataStore(self.root / "quota.jsonl", self.root / "tokens.jsonl", "device", lambda slot: slot, threading.RLock())
+        self.store = CanonicalDataStore(self.root / "usage.sqlite3", "device", lambda slot: slot, threading.RLock())
         self.addCleanup(self.store.index.close)
 
     def windows(self, view="local", label="5h", account="v3:a"):

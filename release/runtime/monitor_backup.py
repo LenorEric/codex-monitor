@@ -3,9 +3,10 @@
 
 import json
 import os
-import sys
 import threading
 from pathlib import Path
+
+from monitor_common import console_log
 
 
 def replace_quota_backup(path, body):
@@ -70,5 +71,5 @@ class BackupRecorder:
                         db.executemany("DELETE FROM processing_backup_queue WHERE id=?", ((row[0],) for row in pending))
             error = "; ".join(errors) or None
             if error and self.error != error:
-                print(f"Backup log write failed; committed SQLite data is safe and backup delivery will retry: {error}", file=sys.stderr, flush=True)
+                console_log(f"Backup log write failed; committed SQLite data is safe and backup delivery will retry: {error}", level="error")
             self.error = error

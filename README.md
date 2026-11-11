@@ -138,7 +138,7 @@ Restart existing Codex terminals after switching accounts because a running proc
 
 ### Switch, rename, and delete
 
-- **Switch** replaces only the live Codex `auth.json`; it never changes shared `config.toml`, sessions, prompts, MCP servers, or skills.
+- **Switch** replaces the live Codex `auth.json` and applies the destination's provider configuration. Fully quit the desktop before a switch that carries over local projects and chat grouping, then reopen it. ChatGPT cloud projects and chats stay with their owning account.
 - **Rename** rewrites the local label across persisted monitor history.
 - **Delete** is local-only and cannot delete the active account or the sole remaining local account.
 - Before an outgoing signed-in account is saved, its live and vaulted `id_token` and `account_id` must match exactly.
@@ -278,6 +278,8 @@ Direct public-IP access uses unencrypted HTTP, so prefer a trusted VPN or an HTT
 
 ## Command-line reference
 
+The daemon polls the active account's remote quota every 90 seconds.
+
 ```console
 python codex_monitor_daemon.py --help
 ```
@@ -287,15 +289,10 @@ python codex_monitor_daemon.py --help
 | `--dashboard` | Open the dashboard after the server starts. |
 | `--codex-home PATH` | Use a different Codex home containing `sessions/` and usually `auth.json`. |
 | `--auth PATH` | Override the live authentication file. |
-| `--interval SECONDS` | Set the remote usage polling interval; default is 90 seconds. |
-| `--timeout SECONDS` | Set the per-request timeout; default is 10 seconds. |
-| `--quota-history PATH` | Set the legacy quota path used to derive custom data paths; no recorder is written. |
-| `--token-ledger PATH` | Set the legacy token path used to derive custom data paths; no recorder is written. |
+| `--database PATH` | Open the SQLite usage database at this path. Defaults to `~/.codex-switch/usage_monitor_sync_cache-v4.sqlite3`. |
 | `--raw-quota-log PATH` | Override the raw quota-response log path; enable logging in management settings. |
-| `--local-only` | Scan local session logs without calling ChatGPT usage endpoints. |
-| `--no-token-scan` | Disable local session token scanning. |
-| `--reencrypt-cloud` | Refresh nonces and verify all encrypted WebDAV payloads using the configured key, then exit. |
-| `--retry-limit N` | Set bounded HTTP/dashboard retries; network outages continue retrying. |
+
+If you previously used a custom `--quota-history` path such as `quota.jsonl`, point `--database` to the existing SQLite file, such as `quota.sync-cache-v4.sqlite3`. Remove `--token-ledger` and its value from startup commands.
 
 ## Troubleshooting
 

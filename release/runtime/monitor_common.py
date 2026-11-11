@@ -45,6 +45,7 @@ MIN_DELTA_COST_PER_PERCENT_USD = 0.01
 RATIO_DEVIATION_MULTIPLIER = 3.0
 RESET_TIME_JITTER_SECONDS = 60
 DEFAULT_RETRY_LIMIT = 3
+DEFAULT_REQUEST_TIMEOUT_SECONDS = 10
 TOKEN_REFRESH_REMAINING_FRACTION = 0.30
 TOKEN_REFRESH_FALLBACK_SECONDS = 60
 TOKEN_REFRESH_MAX_MARGIN_SECONDS = 10 * 60
@@ -241,7 +242,7 @@ def retry_operation(operation, retries: int = DEFAULT_RETRY_LIMIT, delay_seconds
                 raise
             time.sleep(delay_seconds)
 
-def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, headers: dict, body: dict | None = None, timeout: int = 10, retries: int = DEFAULT_RETRY_LIMIT, retry_network_errors_forever: bool = True, response_callback=None) -> tuple[int, dict]:
+def request_json(opener: urllib.request.OpenerDirector, method: str, url: str, headers: dict, body: dict | None = None, timeout: int = DEFAULT_REQUEST_TIMEOUT_SECONDS, retries: int = DEFAULT_RETRY_LIMIT, retry_network_errors_forever: bool = True, response_callback=None) -> tuple[int, dict]:
     data = None if body is None else json.dumps(body).encode("utf-8")
     redirected_headers = {key: value for key, value in headers.items() if key.lower() not in {"authorization", "proxy-authorization", "chatgpt-account-id"}}
     request = urllib.request.Request(url, data=data, method=method, headers=redirected_headers | ({"Content-Type": "application/json"} if body is not None else {}))
@@ -320,7 +321,7 @@ def refresh_access_token(auth: dict, opener: urllib.request.OpenerDirector, auth
         raise UsageError("Incompatible token refresh API response: expected nonempty token and account_id strings when present")
     new_account_id = token_account_id(refreshed)
     if not old_account_id or new_account_id != old_account_id:
-        print("Token refresh ignored because the refreshed account_id does not match the recorded account_id.", file=sys.stderr, flush=True)
+        console_log("Token refresh ignored because the refreshed account_id does not match the recorded account_id.", level="warning")
         raise UsageError("token refresh returned credentials for an unverifiable or different account")
     tokens.update({k: refreshed[k] for k in ("access_token", "id_token", "refresh_token") if refreshed.get(k)})
     auth["last_refresh"] = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
@@ -348,6 +349,23 @@ def parse_timestamp(value: str | int | float | None) -> int | float | None:
         return int(datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp())
     except ValueError:
         return None
+
+def format_console_timestamp(value: str | int | float | None) -> str | None:
+    try:
+        epoch = parse_timestamp(value)
+        if epoch is not None:
+            local_time = datetime.fromtimestamp(epoch, timezone.utc).astimezone().isoformat(sep=" ", timespec="seconds")
+            return f"{local_time[:19]} {local_time[19:]}"
+    except (OSError, OverflowError, ValueError):
+        pass
+    return None
+
+def format_console_log(message: str, *, level: str = "event", at: str | int | float | None = None) -> str:
+    local_time = format_console_timestamp(at) or format_console_timestamp(time.time())
+    return f"[{level}]({local_time}) {message}"
+
+def console_log(message: str, *, level: str = "event", at: str | int | float | None = None) -> None:
+    print(format_console_log(message, level=level, at=at), file=sys.stderr if level in {"error", "warning"} else sys.stdout, flush=True)
 
 def coerce_float(value) -> float | None:
     try:

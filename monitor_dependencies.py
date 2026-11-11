@@ -8,12 +8,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from monitor_common import console_log
+
 
 def validate_dependencies(runtime_dir: Path) -> bool:
     try:
         requirements = (Path(runtime_dir) / "requirements.txt").read_text(encoding="utf-8")
     except OSError as exc:
-        print(f"Cannot validate Python libraries: {exc}", file=sys.stderr, flush=True)
+        console_log(f"Cannot validate Python libraries: {exc}", level="error")
         return False
     failures = []
     for requirement in requirements.splitlines():
@@ -34,13 +36,13 @@ def validate_dependencies(runtime_dir: Path) -> bool:
             failures.append(f"Cannot load Python library {name}: {exc}")
     if failures:
         for failure in failures:
-            print(failure, file=sys.stderr, flush=True)
-        print(f'Install required libraries with: {"& " if os.name == "nt" else ""}"{sys.executable}" -m pip install -r "{Path(runtime_dir) / "requirements.txt"}"', file=sys.stderr, flush=True)
+            console_log(failure, level="error")
+        console_log(f'Install required libraries with: {"& " if os.name == "nt" else ""}"{sys.executable}" -m pip install -r "{Path(runtime_dir) / "requirements.txt"}"', level="error")
         return False
     return True
 
 
 def install_dependencies(runtime_dir: Path) -> None:
-    print("Installing updated Python requirements...", flush=True)
+    console_log("Installing updated Python requirements...")
     subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(Path(runtime_dir) / "requirements.txt")], check=True)
-    print("Updated Python requirements installed successfully.", flush=True)
+    console_log("Updated Python requirements installed successfully.")

@@ -1202,12 +1202,6 @@ class CloudManager:
         return {"ok": True, "strongEtag": etag, "conditionalWrites": conditional_writes, "encryptedPayloadVerified": bool(inventory), "optimisticWrites": not conditional_writes, "warning": None if conditional_writes else "The server ignores conditional writes; conflict prevention is best-effort.", "checks": checks}
 
     @staticmethod
-    def _reencrypt_object(client: WebDavClient, box: CryptoBox, path: str, purpose: str) -> None:
-        encrypted, etag = client.get(path)
-        plaintext = box.decrypt(purpose, encrypted)
-        client.put(path, box.encrypt(purpose, plaintext), etag=etag)
-
-    @staticmethod
     def _optional_remote_list(client: WebDavClient, path: str) -> list[str]:
         try:
             return client.list(path)
@@ -1253,20 +1247,6 @@ class CloudManager:
         client.put("crypto.json", new_descriptor, etag=descriptor_etag)
         commit()
         return {"reencrypted": len(staged), "paths": [item["path"] for item in staged], "uploadedAt": _timestamp()}
-
-    @_serialized_cloud_operation
-    def reencrypt_remote_data(self) -> dict:
-        if self._state.get("pendingAccountOperation"):
-            raise CloudError("Finish the pending account operation before re-encrypting cloud data", 409)
-        client, box = self._connection()
-        refreshed = []
-        for path, purpose in self._encrypted_inventory(client):
-            self._reencrypt_object(client, box, path, purpose)
-            refreshed.append(path)
-        self._state["remote"] = {"accounts": {}, "skills": {}}
-        self._state["skills"]["indexEtag"] = None
-        self._save_state()
-        return {"reencrypted": len(refreshed), "paths": refreshed, "uploadedAt": _timestamp()}
 
     @_serialized_cloud_operation
     def push(self, force_full: bool = False) -> dict:

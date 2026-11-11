@@ -21,6 +21,7 @@ RUNTIME_FILES = (
     "management.html",
     "codex_monitor_daemon.py",
     "monitor_accounts.py",
+    "monitor_desktop_sidebar.py",
     "monitor_migrations.py",
     "monitor_auto_update.py",
     "monitor_backup.py",

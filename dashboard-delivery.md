@@ -13,7 +13,7 @@ Canonical transactions enqueue changes through SQLite triggers, together with in
 | `delivery_pending` | Unconsumed token identities, quota old/new extents and account invalidations with increasing sequence |
 | `delivery_journal` | Sequenced wire messages, bounded to 24 hours and 64 MiB |
 
-Indexes support ordered output, interval predecessors/successors and overlapping ranges. Valid chart rows, including intervals with no costs, form the attribution directory. There is no token-to-interval membership table, separate prepared token/quota copy, or permanent full JSON/gzip snapshot.
+Indexes support ordered output, interval predecessors/successors and overlapping ranges. All quota-derived chart intervals form the attribution directory. Intervals hidden from snapshots and live updates have a null sort timestamp. There is no token-to-interval membership table, separate prepared token/quota copy, or permanent full JSON/gzip snapshot.
 
 ## Incremental processing
 
@@ -23,7 +23,7 @@ Only the new batch is grouped: API accounts use existing UTC minute groups; othe
 
 **Published token rows are immutable.** Adding `7` to `1234 / 56` produces `1234 / 56 / 7`. Later quota boundaries may resolve to `12 / 34 / 56 / 7`, but neither live output nor a refreshed snapshot splits the old `1234` row. Quota changes alter attribution charts only, preserving tokens, recorded costs and old display rows.
 
-Quota work retains discontinuous extents and merges only overlaps. The processor reads actual neighboring canonical records, updates usage connection flags and valid cost edges, and recalculates changed or neighboring attribution intervals. It scans candidate canonical tokens within each interval plus the existing 600-second nearest-assignment allowance, comparing neighboring edges to preserve the earlier-interval tie rule. This is not a fixed ±600-second quota invalidation: interval length and adjacent edges determine the affected region.
+Quota work retains discontinuous extents and merges only overlaps. The processor reads actual neighboring canonical records, updates usage connection flags and cost edges, and recalculates changed or neighboring attribution intervals. A chart interval is published if it has a same-account nonzero canonical cost event within its bounds extended by 500 seconds on each side. The chart attributes each event to its nearest interval within 390 seconds, preferring the earlier interval on ties. A late event can make multiple intervals visible, including intervals that receive none of its cost.
 
 At service startup, canonical-derived delivery rows are cleared and rebuilt once before dashboard workers start. A failure stops startup; the next startup retries the rebuild. The delivery epoch changes so clients request a fresh snapshot. Legacy delivery rows without canonical sources remain intact.
 

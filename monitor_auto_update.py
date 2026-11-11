@@ -16,6 +16,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 
+from monitor_common import console_log
 from monitor_dependencies import install_dependencies
 
 UPDATE_INTERVAL_SECONDS = 60 * 60
@@ -101,11 +102,11 @@ def check_startup_update(runtime_dir: Path, data_home: Path, opener_factory, tim
         except FileNotFoundError:
             config = {}
         if config.get("autoUpdate", {}).get("enabled") is not True:
-            print("Startup update check skipped: automatic updates are disabled.", flush=True)
+            console_log("Startup update check skipped: automatic updates are disabled.")
             return False
         return AutoUpdater(runtime_dir, lambda: True, opener_factory, timeout).check_for_update()
     except Exception as exc:
-        print(f"Startup update check failed; continuing startup: {exc}", file=sys.stderr, flush=True)
+        console_log(f"Startup update check failed; continuing startup: {exc}", level="error")
         return False
 
 
@@ -144,7 +145,7 @@ class AutoUpdater:
                 enabled = self.enabled() is True
             except Exception as exc:
                 enabled = False
-                print(f"Automatic update configuration check failed: {exc}", file=sys.stderr, flush=True)
+                console_log(f"Automatic update configuration check failed: {exc}", level="error")
             now = self.clock()
             if enabled and (not was_enabled or now >= next_check):
                 next_check = now + self.interval
@@ -153,7 +154,7 @@ class AutoUpdater:
                         self.request_restart()
                         return
                 except Exception as exc:
-                    print(f"Automatic update failed: {exc}", file=sys.stderr, flush=True)
+                    console_log(f"Automatic update failed: {exc}", level="error")
             was_enabled = enabled
             wait_seconds = min(max(next_check - self.clock(), 0.0), 60.0) if enabled else 60.0
             self._wake.wait(wait_seconds)
@@ -179,16 +180,16 @@ class AutoUpdater:
 
     def check_for_update_details(self) -> dict:
         with self._check_lock:
-            print("Checking for Codex Monitor updates...", flush=True)
+            console_log("Checking for Codex Monitor updates...")
             opener = self.opener_factory()
             version, files = self._manifest(opener)
             current_version = installed_version(self.runtime_dir)
             if parse_version(version) <= parse_version(current_version):
-                print(f"Update check complete: installed v{current_version}, published v{version}; no newer update.", flush=True)
+                console_log(f"Update check complete: installed v{current_version}, published v{version}; no newer update.")
                 return {"currentVersion": current_version, "latestVersion": version, "updated": False}
-            print(f"Update available: v{current_version} -> v{version}.", flush=True)
+            console_log(f"Update available: v{current_version} -> v{version}.")
             self._install(opener, version, files)
-            print(f"Codex Monitor updated to v{version}; restarting.", flush=True)
+            console_log(f"Codex Monitor updated to v{version}; restarting.")
             return {"currentVersion": current_version, "latestVersion": version, "updated": True}
 
     def request_restart(self) -> None:
@@ -203,7 +204,7 @@ class AutoUpdater:
         staging.mkdir(parents=True)
         try:
             for number, (name, descriptor) in enumerate(files.items(), 1):
-                print(f"Downloading and verifying update file {number}/{len(files)}: {name}", flush=True)
+                console_log(f"Downloading and verifying update file {number}/{len(files)}: {name}")
                 data = self._read(opener, RUNTIME_FILE_URL.format(name=urllib.parse.quote(name)), descriptor["size"])
                 if len(data) != descriptor["size"] or hashlib.sha256(data).hexdigest() != descriptor["sha256"]:
                     raise AutoUpdateError(f"Runtime file verification failed: {name}")

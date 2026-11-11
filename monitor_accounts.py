@@ -18,7 +18,8 @@ from pathlib import Path
 import tomlkit
 
 from monitor_common import atomic_write_bytes as _write_atomic_bytes
-from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, codex_switch_home, auth_account_id, jwt_payload, now_iso as timestamp, parse_timestamp
+from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, codex_switch_home, console_log, auth_account_id, jwt_payload, now_iso as timestamp, parse_timestamp
+from monitor_desktop_sidebar import DesktopSidebarError, prepare_desktop_sidebar
 
 
 LATEST_SESSION_PROVIDER_UPDATE_LIMIT = 200
@@ -743,11 +744,11 @@ class AccountManager:
                 live_auth = parse_auth_bytes(live_data)
             except (OSError, AccountError):
                 atomic_write_bytes(self.auth_path, saved_data)
-                print(f"External auth.json update was incomplete; restored saved credentials for {active['label']!r}.", flush=True)
+                console_log(f"External auth.json update was incomplete; restored saved credentials for {active['label']!r}.", level="warning")
                 return False, None
             if not is_complete_auth(live_auth):
                 atomic_write_bytes(self.auth_path, saved_data)
-                print(f"External auth.json update was incomplete; restored saved credentials for {active['label']!r}.", flush=True)
+                console_log(f"External auth.json update was incomplete; restored saved credentials for {active['label']!r}.", level="warning")
                 return False, None
             saved_identity, live_identity = auth_identity(saved_auth), auth_identity(live_auth)
             saved_account_id, live_account_id = auth_account_id(saved_auth), auth_account_id(live_auth)
@@ -766,9 +767,9 @@ class AccountManager:
                 None,
             )
             if target is None:
-                print(f"External auth.json update belonged to an unrecorded account; restored saved credentials for {active['label']!r}.", flush=True)
+                console_log(f"External auth.json update belonged to an unrecorded account; restored saved credentials for {active['label']!r}.", level="warning")
                 return False, None
-            print(f"External auth.json update matched {target['label']!r}; restored {active['label']!r} and started background credential validation.", flush=True)
+            console_log(f"External auth.json update matched {target['label']!r}; restored {active['label']!r} and started background credential validation.")
             return False, {"id": target["id"], "label": target["label"], "data": live_data, "fingerprint": auth_fingerprint(self._account_path(target["id"]).read_bytes())}
 
     def sync_active_from_live(self) -> bool:
@@ -1032,55 +1033,36 @@ class AccountManager:
                     self.reconcile_pending_login()
                 return self.status()
             update_session_providers = self._model_provider(self._compose_toml_parts(common_toml, self._header_for(active))) != self._model_provider(merged_toml)
-            if active is None:
-                old_live = self.auth_path.read_bytes() if self.auth_path.exists() else None
-                old_config = self.config_path.read_bytes() if self.config_path.exists() else None
-                old_manifest = json.loads(json.dumps(self.manifest))
-                old_sessions = {}
-                try:
-                    if target.get("ready"):
-                        data = self._account_path(target["id"]).read_bytes()
-                        parse_auth_bytes(data)
-                        atomic_write_bytes(self.auth_path, data)
-                    elif self.auth_path.exists():
-                        self.auth_path.unlink()
-                    self.manifest["activeAccountId"] = target["id"]
-                    self._record_activation(target["id"])
-                    self._apply_config_for(target, common_toml)
-                    if update_session_providers:
-                        old_sessions = self._rewrite_recent_session_model_providers(merged_toml)
-                    self._save_manifest()
-                    return self.status()
-                except Exception as exc:
-                    self.manifest = old_manifest
-                    if old_live is None:
-                        if self.auth_path.exists():
-                            self.auth_path.unlink()
-                    else:
-                        atomic_write_bytes(self.auth_path, old_live)
-                    if old_config is not None:
-                        atomic_write_bytes(self.config_path, old_config)
-                    self._restore_session_model_providers(old_sessions)
-                    if isinstance(exc, AccountError):
-                        raise
-                    raise AccountError(f"Account switch failed and the previous login was restored: {exc}", 500) from exc
-            if active.get("ready"):
+            if active and active.get("ready"):
                 _, external_update = self.reconcile_active_from_live()
                 if external_update is not None and external_update_callback is not None:
                     external_update_callback(external_update)
             old_live = self.auth_path.read_bytes() if self.auth_path.exists() else None
             old_config = self.config_path.read_bytes() if self.config_path.exists() else None
             old_manifest = json.loads(json.dumps(self.manifest))
+            data = None
+            sidebar = None
+            if target.get("ready"):
+                credential_path = self._account_path(target["id"])
+                if not credential_path.exists():
+                    raise AccountError("Saved credentials for this account are missing", 409)
+                data = credential_path.read_bytes()
+                incoming = parse_auth_bytes(data)
+                if active and active.get("ready") and old_live is not None:
+                    outgoing = parse_auth_bytes(old_live)
+                    try:
+                        sidebar = prepare_desktop_sidebar(self.auth_path, outgoing, incoming, outgoing_api=is_api_auth(outgoing), incoming_api=is_api_auth(incoming))
+                        if sidebar is not None:
+                            sidebar.apply()
+                    except DesktopSidebarError as exc:
+                        raise AccountError(str(exc), 409) from exc
+                    except OSError as exc:
+                        raise AccountError("Could not write the desktop sidebar before switching accounts.", 500) from exc
             old_sessions = {}
-            self.manifest["activeAccountId"] = target["id"]
-            self._record_activation(target["id"])
             try:
-                if target.get("ready"):
-                    credential_path = self._account_path(target["id"])
-                    if not credential_path.exists():
-                        raise AccountError("Saved credentials for this account are missing", 409)
-                    data = credential_path.read_bytes()
-                    parse_auth_bytes(data)
+                self.manifest["activeAccountId"] = target["id"]
+                self._record_activation(target["id"])
+                if data is not None:
                     atomic_write_bytes(self.auth_path, data)
                 elif self.auth_path.exists():
                     self.auth_path.unlink()
@@ -1090,14 +1072,22 @@ class AccountManager:
                 self._save_manifest()
             except Exception as exc:
                 self.manifest = old_manifest
-                if old_live is None:
-                    if self.auth_path.exists():
-                        self.auth_path.unlink()
-                else:
-                    atomic_write_bytes(self.auth_path, old_live)
-                if old_config is not None:
-                    atomic_write_bytes(self.config_path, old_config)
-                self._restore_session_model_providers(old_sessions)
+                try:
+                    if old_live is None:
+                        self.auth_path.unlink(missing_ok=True)
+                    else:
+                        atomic_write_bytes(self.auth_path, old_live)
+                    if old_config is not None:
+                        atomic_write_bytes(self.config_path, old_config)
+                    self._restore_session_model_providers(old_sessions)
+                finally:
+                    if sidebar is not None:
+                        try:
+                            restored = sidebar.restore()
+                        except OSError as restore_error:
+                            raise AccountError(f"Account switch failed ({exc}). Could not restore the desktop sidebar: {restore_error}", 500) from exc
+                if sidebar is not None and not restored:
+                    raise AccountError(f"Account switch failed ({exc}). The desktop sidebar changed during the switch and was left as-is.", 500) from exc
                 if isinstance(exc, AccountError):
                     raise
                 raise AccountError(f"Account switch failed and the previous login was restored: {exc}", 500) from exc

@@ -17,12 +17,12 @@ class CanonicalIngestionTests(unittest.TestCase):
         source.parent.mkdir()
         original = b"{}" + b" " * BLOCK_BYTES + b"\n"
         source.write_bytes(original)
-        store = CanonicalDataStore(root / "quota.jsonl", root / "tokens.jsonl", "device", lambda slot: slot, threading.RLock())
+        store = CanonicalDataStore(root / "usage.sqlite3", "device", lambda slot: slot, threading.RLock())
         self.addCleanup(store.index.close)
 
         def capture():
             store.sources.scan(root)
-            store.sources.sync_ledger(root / "tokens.jsonl", "slot", "Slot", [], lambda row: row, None, "device")
+            store.sources.sync_ledger("slot", "Slot", [], lambda row: row)
 
         capture()
         with store.index.transaction() as db:

@@ -1,16 +1,10 @@
 #!/usr/bin/env python3
 
-from pathlib import Path
-
 from monitor_common import UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, empty_cost_totals, empty_token_totals, parse_timestamp
 from monitor_tokens import add_cost_delta, add_token_delta, normalize_codex_model, normalize_saved_token_totals, pricing_epoch_for_model, sum_cost_totals
 
 LEDGER_SCHEMA_VERSION = 2
 TOKEN_KEYS = tuple(empty_token_totals())
-
-def default_token_ledger_path(history_path: Path) -> Path:
-    return history_path.with_name("usage_monitor_token_events.jsonl") if history_path.name in {"usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_quota_readings.jsonl"} else history_path.with_suffix(".token-ledger.jsonl")
-
 
 def _add_tokens(target: dict, value: dict | None) -> None:
     value = normalize_saved_token_totals(value)

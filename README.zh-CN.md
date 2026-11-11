@@ -134,7 +134,7 @@ code --install-extension release/codex-usage-monitor-1.5.13.vsix
 
 ### 切换、重命名与删除
 
-- **Switch** 只替换实时 Codex `auth.json`，不会修改共享的 `config.toml`、会话、提示词、MCP 服务器或技能。
+- **Switch** 替换当前 Codex 的 `auth.json` 并应用目标账号的提供商配置。若切换涉及迁移本地项目和会话分组，请先完全退出桌面端，切换后再打开。ChatGPT 云端项目和会话仍归属原账号。
 - **Rename** 会同步重写已保存监控历史中的本地标签。
 - **Delete** 仅影响本机，并且不能删除当前账号或唯一剩余的本地账号。
 - 保存已登录的离开账号前，实时与保险库中的 `id_token` 和 `account_id` 必须完全一致。
@@ -260,6 +260,8 @@ Local、对应的 Merged 变更、上传缓冲和解析检查点在同一事务�
 
 ## 命令行参考
 
+守护进程每 90 秒轮询一次当前账号的远端额度。
+
 ```console
 python codex_monitor_daemon.py --help
 ```
@@ -269,15 +271,10 @@ python codex_monitor_daemon.py --help
 | `--dashboard` | 服务启动后自动打开仪表盘。 |
 | `--codex-home PATH` | 使用另一个包含 `sessions/`，通常也包含 `auth.json` 的 Codex 主目录。 |
 | `--auth PATH` | 覆盖实时认证文件。 |
-| `--interval SECONDS` | 设置远端额度轮询间隔，默认 90 秒。 |
-| `--timeout SECONDS` | 设置单次请求超时，默认 10 秒。 |
-| `--quota-history PATH` | 设置用于推导自定义数据路径的旧额度路径，不再写记录文件。 |
-| `--token-ledger PATH` | 设置用于推导自定义数据路径的旧 Token 路径，不再写记录文件。 |
+| `--database PATH` | 指定 SQLite 用量数据库路径，默认为 `~/.codex-switch/usage_monitor_sync_cache-v4.sqlite3`。 |
 | `--raw-quota-log PATH` | 覆盖原始额度响应日志路径；需在管理页显式启用日志。 |
-| `--local-only` | 只扫描本地会话日志，不访问 ChatGPT 使用量接口。 |
-| `--no-token-scan` | 禁用本地会话 Token 扫描。 |
-| `--reencrypt-cloud` | 使用当前密钥刷新随机数并验证所有 WebDAV 加密对象后退出。 |
-| `--retry-limit N` | 设置有限的 HTTP/仪表盘重试次数；网络断线仍会持续重试。 |
+
+如果之前通过 `--quota-history` 指定了自定义路径（如 `quota.jsonl`），请将 `--database` 指向现有的 SQLite 文件（如 `quota.sync-cache-v4.sqlite3`）。请从启动命令中删除 `--token-ledger` 及其参数值。
 
 ## 常见问题
 

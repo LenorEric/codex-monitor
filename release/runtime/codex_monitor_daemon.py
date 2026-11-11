@@ -6,82 +6,59 @@ from pathlib import Path
 if sys.version_info < (3, 12):
     raise SystemExit("Codex Usage Monitor requires Python 3.12 or newer.")
 
+from monitor_common import console_log
 from monitor_dependencies import validate_dependencies
 
-print("Startup: validating Python libraries...", flush=True)
+console_log("Startup: validating Python libraries...")
 if not validate_dependencies(Path(__file__).resolve().parent):
     raise SystemExit(1)
 
 from monitor_auto_update import AUTO_UPDATE_RESTART, check_startup_update, installed_version, restart_process
+from monitor_canonical import CanonicalIndex, default_database_path
 from monitor_migrations import migrate_installed_data
-from monitor_cloud import CloudManager
 from monitor_common import *
 from monitor_dashboard import *
 from monitor_events import *
 from monitor_history import *
 from monitor_quota import *
-from monitor_skills import SkillManager
-from monitor_token_ledger import default_token_ledger_path
 from monitor_tokens import *
-from monitor_usage_sync import default_usage_sync_cache_path
 
 
 def _main(instance_lock) -> int:
-    print(f"Codex Usage Monitor v{installed_version(Path(__file__).resolve().parent)}", flush=True)
+    console_log(f"Codex Usage Monitor v{installed_version(Path(__file__).resolve().parent)}")
     parser = argparse.ArgumentParser(description="Poll Codex ChatGPT-account usage/rate-limit data and local Codex session token usage.")
     parser.add_argument("--auth", type=Path, default=codex_home() / "auth.json")
     parser.add_argument("--codex-home", type=Path, default=codex_home(), help="Codex config directory containing sessions/. Defaults to CODEX_HOME or ~/.codex.")
-    parser.add_argument("--interval", type=int, default=90)
-    parser.add_argument("--timeout", type=int, default=10, help="Per-request timeout in seconds.")
-    parser.add_argument("--quota-history", type=Path, help="Legacy quota path used to locate the canonical database; canonical JSONL output is retired.")
-    parser.add_argument("--token-ledger", type=Path, help="Legacy token ledger path retained for migration and custom data locations.")
+    parser.add_argument("--database", type=Path, help="Path to the SQLite usage database. Defaults to ~/.codex-switch/usage_monitor_sync_cache-v4.sqlite3.")
     parser.add_argument("--raw-quota-log", type=Path, help="Optional raw quota API response JSONL path; writing requires the management setting to be enabled.")
     parser.add_argument("--dashboard", action="store_true", help="Open the local dashboard in the default browser after starting the server.")
-    parser.add_argument("--reencrypt-cloud", action="store_true", help="Re-encrypt and verify every encrypted WebDAV payload with the configured hash key, then exit.")
-    parser.add_argument("--local-only", action="store_true", help="Only scan local Codex session logs; do not call ChatGPT usage endpoints.")
-    parser.add_argument("--no-token-scan", action="store_true", help="Disable local Codex session token usage scanning.")
-    parser.add_argument("--retry-limit", type=int, default=DEFAULT_RETRY_LIMIT, help="Retries for HTTP and dashboard polling failures before raising; network errors retry indefinitely. Defaults to 3.")
     args = parser.parse_args()
-    print("Startup: acquiring the single-instance lock...", flush=True)
+    console_log("Startup: acquiring the single-instance lock...")
     if not instance_lock.acquire():
-        print("Cannot start dashboard: another monitor instance is already running.", file=sys.stderr, flush=True)
+        console_log("Cannot start dashboard: another monitor instance is already running.", level="error")
         return 1
     args.instance_lock = instance_lock
 
     args.data_home = codex_switch_home()
-    print("Startup: checking for runtime updates...", flush=True)
-    if check_startup_update(Path(__file__).resolve().parent, args.data_home, lambda: opener_for(args.auth.parent), args.timeout):
+    console_log("Startup: checking for runtime updates...")
+    if check_startup_update(Path(__file__).resolve().parent, args.data_home, lambda: opener_for(args.auth.parent)):
         instance_lock.release()
         restart_process(Path(sys.argv[0]).resolve())
         return 0
     args.startup_update_checked = True
-    legacy_history = default_history_path(args.data_home)
-    args.quota_history = args.quota_history or default_quota_history_path(legacy_history)
-    args.token_ledger = args.token_ledger or default_token_ledger_path(legacy_history)
-    args.usage_sync_cache = default_usage_sync_cache_path(args.quota_history)
+    args.database = args.database or default_database_path(args.data_home)
     args.state = args.data_home / "usage_monitor_state.json"
-    args.dashboard_cache = default_dashboard_cache_path(args.quota_history)
-    print("Startup: checking and applying pending data migrations...", flush=True)
+    console_log("Startup: checking and applying pending data migrations...")
     migrate_installed_data(
-        Path(__file__).resolve().parent, args.data_home, args.quota_history, args.token_ledger,
-        runtime_state_path=args.state, dashboard_cache_path=args.dashboard_cache, usage_sync_cache_path=args.usage_sync_cache,
-        codex_home=args.codex_home,
+        Path(__file__).resolve().parent, args.data_home, runtime_state_path=args.state, codex_home=args.codex_home, database_path=args.database,
     )
     args.account_root = args.data_home / "accounts"
-    from monitor_canonical import CanonicalIndex
-    print("Startup: initializing the processing index...", flush=True)
-    index = CanonicalIndex(args.usage_sync_cache.with_name(f"{args.usage_sync_cache.stem}-v4.sqlite3"))
+    console_log("Startup: initializing the processing index...")
+    index = CanonicalIndex(args.database)
     index.close()
-    if args.reencrypt_cloud:
-        result = CloudManager(args.data_home, SkillManager(args.codex_home, args.data_home), None).reencrypt_remote_data()
-        print(f"Re-encrypted and verified {result['reencrypted']} cloud payloads.")
-        return 0
-
-    opener = None
-    if not args.local_only:
-        opener = opener_for(args.auth.parent)
+    opener = opener_for(args.auth.parent)
     entry = Path(sys.argv[0]).resolve()
-    result = serve_dashboard(args, opener, lambda: opener or opener_for(args.auth.parent), entry.parent)
+    result = serve_dashboard(args, opener, lambda: opener, entry.parent)
     if result == AUTO_UPDATE_RESTART:
         restart_process(entry)
         return 0

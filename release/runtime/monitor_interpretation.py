@@ -81,13 +81,13 @@ def valid_intervals(runs):
     return result
 
 
-def nearest(intervals, stamp, ends=None):
+def nearest(intervals, stamp, ends=None, max_distance=MAX_ATTRIBUTION_DISTANCE_SECONDS):
     if not intervals:
         return None
     index = bisect.bisect_right(ends if ends is not None else [row[2] for row in intervals], stamp)
     candidates = range(max(0, index - 1), min(len(intervals), index + 1))
     index = min(candidates, key=lambda i: (max(intervals[i][1] - stamp, stamp - intervals[i][2], 0), intervals[i][1]))
-    return index if max(intervals[index][1] - stamp, stamp - intervals[index][2], 0) <= MAX_ATTRIBUTION_DISTANCE_SECONDS else None
+    return index if max(intervals[index][1] - stamp, stamp - intervals[index][2], 0) <= max_distance else None
 
 
 def weighted(rows):
@@ -112,11 +112,11 @@ def aggregate_tokens(rows, intervals, api=False):
     return sorted(result, key=lambda row: (row[1], row[0]))
 
 
-def chart_rows(events, intervals):
+def chart_rows(events, intervals, max_distance=MAX_ATTRIBUTION_DISTANCE_SECONDS):
     groups = defaultdict(list)
     ends = [row[2] for row in intervals]
     for row in events:
-        index = nearest(intervals, row[1], ends)
+        index = nearest(intervals, row[1], ends, max_distance)
         if index is not None:
             groups[index].append(row)
     result = []

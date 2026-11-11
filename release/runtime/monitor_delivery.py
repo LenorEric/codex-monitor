@@ -17,10 +17,12 @@ import uuid
 from collections import defaultdict
 from contextlib import closing, contextmanager
 
-from monitor_interpretation import MAX_ATTRIBUTION_DISTANCE_SECONDS, connected, nearest, valid_intervals
+from monitor_interpretation import connected, nearest, valid_intervals
 
 
 CHANNELS = ("tokens", "usage:5h", "usage:7d", "chart:5h", "chart:7d")
+CHART_ATTRIBUTION_SECONDS = 390
+CHART_EVIDENCE_SECONDS = 500
 ITEM_COLUMNS = "view,account,channel,id,at,first,last,body"
 ITEM_DDL = "(view TEXT,account TEXT,channel TEXT,id TEXT,at REAL,first REAL,last REAL,body TEXT,PRIMARY KEY(view,account,channel,id))"
 DAY = 86400
@@ -139,7 +141,7 @@ class Snapshot:
             os.unlink(self.path)
 
 
-def token_projection(db, view, account, low=None, high=None, pending=None):
+def token_projection(db, view, account, low=None, high=None, pending=None, cost_evidence=False):
     sql = "SELECT c.event_id,c.occurred_at,c.raw_model,c.service_tier,c.token_freshInputTokens,c.token_cachedInputTokens," \
         "c.token_outputTokens,c.token_cacheWriteInputTokens,c.cost_totalCostUsd FROM "
     args = []
@@ -159,7 +161,8 @@ def token_projection(db, view, account, low=None, high=None, pending=None):
         args.extend((math.floor(low), math.floor(high), low, high))
     sql += " ORDER BY c.first,c.occurred_at,c.event_id"
     for row in db.execute(sql, args):
-        yield [*row[:-1], round(row[-1] * 100_000_000)]
+        projected = [*row[:-1], round(row[-1] * 100_000_000)]
+        yield (projected, row[-1] != 0) if cost_evidence else projected
 
 
 class FinalDelivery:
@@ -225,14 +228,14 @@ class FinalDelivery:
 
     @staticmethod
     def _item(db, view, account, channel, key):
-        return db.execute("SELECT body FROM items WHERE view=? AND account=? AND channel=? AND id=?", (view, account, channel, key)).fetchone()
+        return db.execute("SELECT body,at FROM items WHERE view=? AND account=? AND channel=? AND id=?", (view, account, channel, key)).fetchone()
 
-    def _set(self, db, view, account, channel, row, first=None, last=None):
+    def _set(self, db, view, account, channel, row, first=None, last=None, *, visible=True):
         body = encoded(row).decode()
+        at = row[3 if channel.startswith("chart:") else 1] if visible else None
         before = self._item(db, view, account, channel, str(row[0]))
-        if before and before[0] == body:
+        if before == (body, at):
             return False
-        at = row[1] if channel == "tokens" else row[3] if channel.startswith("chart:") else row[1]
         first = at if first is None else first
         last = first if last is None else last
         db.execute("INSERT OR REPLACE INTO stage.edits VALUES(?,?,?,?,?,?,?,?)", (view, account, channel, str(row[0]), at, first, last, body))
@@ -295,7 +298,7 @@ class FinalDelivery:
                 old = self._interval(before) if before else None
                 if old != interval:
                     self._mark_neighbors(db, view, account, "chart:" + window, interval[1], interval[2])
-                    self._set(db, view, account, "chart:" + window, [interval[0], interval[1], interval[2], int(interval[2]), interval[4], interval[3], []], interval[1], interval[2])
+                    self._set(db, view, account, "chart:" + window, [interval[0], interval[1], interval[2], int(interval[2]), interval[4], interval[3], []], interval[1], interval[2], visible=False)
                     self._mark_neighbors(db, view, account, "chart:" + window, interval[1], interval[2])
                     db.execute("INSERT OR IGNORE INTO stage.recalc VALUES(?,?,?,?)", (view, account, "chart:" + window, interval[0]))
             prior = current
@@ -324,17 +327,29 @@ class FinalDelivery:
         if after:
             values.append(self._interval(after))
         totals = Totals()
-        for row in token_projection(db, view, account, interval[1] - MAX_ATTRIBUTION_DISTANCE_SECONDS, interval[2] + MAX_ATTRIBUTION_DISTANCE_SECONDS):
+        visible = False
+        for row, has_cost in token_projection(db, view, account, interval[1] - CHART_EVIDENCE_SECONDS, interval[2] + CHART_EVIDENCE_SECONDS, cost_evidence=True):
             self.metrics["sourceTokenRowsRead"] += 1
-            if nearest(values, row[1]) == position:
+            visible |= has_cost
+            if nearest(values, row[1], max_distance=CHART_ATTRIBUTION_SECONDS) == position:
                 totals.add(row)
-        self._set(db, view, account, channel, totals.chart(interval), interval[1], interval[2])
+        self._set(db, view, account, channel, totals.chart(interval), interval[1], interval[2], visible=visible)
+
+    @classmethod
+    def _mark_cost_evidence(cls, db, view, account, channel, stamp):
+        low, high = stamp - CHART_EVIDENCE_SECONDS, stamp + CHART_EVIDENCE_SECONDS
+        # Intervals do not overlap. Only the predecessor can cross the lower bound.
+        before = cls.ordered_items(db, view, account, channel, "first<?", (low,), "first DESC,id", 1).fetchone()
+        if before and before[2] >= low:
+            db.execute("INSERT OR IGNORE INTO stage.recalc VALUES(?,?,?,?)", (view, account, channel, before[3]))
+        db.executemany("INSERT OR IGNORE INTO stage.recalc VALUES(?,?,?,?)", ((view, account, channel, item[3]) for item in
+            cls.ordered_items(db, view, account, channel, "first>=? AND first<=? AND at IS NULL", (low, high), "first,id")))
 
     @classmethod
     def grouped(cls, db, view, account, rows, api=False, staged=True):
         """Merge ordered event and interval cursors; retain two edges per window."""
         cursors = None
-        for row in rows:
+        for row, has_cost in rows:
             if cursors is None:
                 cursors = []
                 for window in ("5h", "7d"):
@@ -357,13 +372,15 @@ class FinalDelivery:
                         if stamp <= row[1]:
                             boundary = max(boundary, stamp) if boundary is not None else stamp
             key = ("minute", math.floor(row[1] / 60)) if api else (boundary, *[value[0] if value else None for value in assignments]) if has_intervals else ("event", row[0])
-            yield row, key, assignments
+            yield row, key, assignments, has_cost
 
     def _tokens(self, db, view, account, cutoff, bootstrap=False):
         state = self._working_state or {}
         api = any(row.get("usageAccountId") == account and row.get("isApiAccount") for row in state.get("accounts", {}).get("items", []))
         group, totals, number = None, None, 0
-        for row, key, assignments in self.grouped(db, view, account, token_projection(db, view, account, pending=None if bootstrap else cutoff), api):
+        evidence_stamp = None
+        rows = token_projection(db, view, account, pending=None if bootstrap else cutoff, cost_evidence=True)
+        for row, key, assignments, has_cost in self.grouped(db, view, account, rows, api):
             self.metrics["sourceTokenRowsRead"] += 1
             if totals is not None and group != key:
                 self._set(db, view, account, "tokens", totals.tokens(f"append:{cutoff}:{number}"))
@@ -372,9 +389,14 @@ class FinalDelivery:
             if totals is None:
                 group, totals = key, Totals()
             totals.add(row)
-            for window, interval in zip(("5h", "7d"), assignments):
-                if interval:
-                    db.execute("INSERT OR IGNORE INTO stage.recalc VALUES(?,?,?,?)", (view, account, "chart:" + window, interval[0]))
+            if not bootstrap:
+                for window, interval in zip(("5h", "7d"), assignments):
+                    if interval and interval[1] - CHART_ATTRIBUTION_SECONDS <= row[1] <= interval[2] + CHART_ATTRIBUTION_SECONDS:
+                        db.execute("INSERT OR IGNORE INTO stage.recalc VALUES(?,?,?,?)", (view, account, "chart:" + window, interval[0]))
+                    if has_cost and row[1] != evidence_stamp:
+                        self._mark_cost_evidence(db, view, account, "chart:" + window, row[1])
+                if has_cost:
+                    evidence_stamp = row[1]
         if totals is not None:
             self._set(db, view, account, "tokens", totals.tokens(f"append:{cutoff}:{number}"))
 
@@ -433,15 +455,21 @@ class FinalDelivery:
                 db.execute("INSERT INTO delivery_accounts VALUES(?,?,'[]',?) ON CONFLICT(view,account) DO UPDATE SET label=excluded.label", (view, account, label))
             db.execute("INSERT OR IGNORE INTO delivery_models SELECT name FROM output.models")
             for view, account, channel, key, at, first, last, body in db.execute("SELECT " + ITEM_COLUMNS + " FROM output.edits ORDER BY view,account,channel,at,id"):
-                old = db.execute("SELECT body FROM delivery_items WHERE view=? AND account=? AND channel=? AND id=?", (view, account, channel, key)).fetchone()
-                if (old[0] if old else None) == body:
+                old = db.execute("SELECT body,at FROM delivery_items WHERE view=? AND account=? AND channel=? AND id=?", (view, account, channel, key)).fetchone()
+                if (old or (None, None)) == (body, at):
                     continue
                 if body is None:
                     db.execute("DELETE FROM delivery_items WHERE view=? AND account=? AND channel=? AND id=?", (view, account, channel, key))
                 else:
                     db.execute("INSERT OR REPLACE INTO delivery_items VALUES(?,?,?,?,?,?,?,?)", (view, account, channel, key, at, first, last, body))
                 self.metrics["outputRowsWritten"] += 1
-                row = json.loads(body) if body else None
+                old_body, old_at = old or (None, None)
+                if channel.startswith("chart:"):
+                    body = body if at is not None else None
+                    old_body = old_body if old_at is not None else None
+                if old_body == body:
+                    continue
+                row = json.loads(body) if body is not None else None
                 data = [row] if channel == "tokens" else [row[1]] if channel.startswith("quota:") else {"set": [row] if row else [], "remove": [] if row else [key]}
                 self._packet(db, view, channel, account, data, now)
             db.execute("DELETE FROM delivery_pending WHERE seq<=?", (cutoff,))
@@ -555,7 +583,8 @@ class FinalDelivery:
                     yield b"," + encoded(channel) + b":["
                     first_row = True
                     order = "at,json_extract(body,'$[3]') IS NULL,json_extract(body,'$[3]'),id" if channel.startswith("usage:") else "at,id"
-                    for body, in db.execute("SELECT body FROM delivery_items WHERE view=? AND account=? AND channel=? ORDER BY " + order, (view, account, channel)):
+                    visible = " AND at IS NOT NULL" if channel.startswith("chart:") else ""
+                    for body, in db.execute("SELECT body FROM delivery_items WHERE view=? AND account=? AND channel=?" + visible + " ORDER BY " + order, (view, account, channel)):
                         row = json.loads(body)
                         if channel == "tokens" or channel.startswith("chart:"):
                             for entry in row[2 if channel == "tokens" else 6]:

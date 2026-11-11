@@ -25,7 +25,7 @@ from monitor_accounts import AccountError, AccountManager, auth_fingerprint, is_
 from monitor_auto_update import AUTO_UPDATE_RESTART, AutoUpdater, installed_version
 from monitor_cloud import CloudError, CloudManager, control_password_is_compromised, control_password_is_configured, control_password_matches, load_server_config
 from monitor_cloud_queue import OperationSkipped
-from monitor_common import DEFAULT_RETRY_LIMIT, UsageError, coerce_float, empty_cost_totals, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
+from monitor_common import DEFAULT_REQUEST_TIMEOUT_SECONDS, UsageError, coerce_float, console_log, empty_cost_totals, format_console_timestamp, is_client_disconnect, now_iso, parse_timestamp, poll_sleep_seconds, retry_operation
 from monitor_device_auth import DeviceAuthManager
 from monitor_events import (
     historical_console_events, hydrate_delta_state_from_events,
@@ -33,18 +33,19 @@ from monitor_events import (
 )
 from monitor_quota import fetch_usage
 from monitor_history import (
-    collect_usage_sample, default_dashboard_cache_path,
+    collect_usage_sample,
     make_history_sample, normalize_quota_history_row, replace_account_label, reset_runtime_baselines, write_state,
 )
 from monitor_skills import SkillError, SkillManager
 from monitor_session_refresh import refresh_session
-from monitor_token_ledger import default_token_ledger_path, token_cost_snapshot, token_sessions_from_ledger
+from monitor_token_ledger import token_cost_snapshot, token_sessions_from_ledger
 from monitor_usage_sync import add_record_provenance
 
 DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
 MANAGEMENT_HTML_PATH = Path(__file__).with_name("management.html")
 DASHBOARD_PORT = 8765
 DASHBOARD_INSTANCE_NAME = f"CodexUsageMonitorDashboard-{DASHBOARD_PORT}"
+ACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS = 90
 INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS = 10 * 60
 SESSION_REFRESH_MAX_ATTEMPTS = 10
 SESSION_REFRESH_FAILURE_RETRY_SECONDS = 60 * 60
@@ -321,39 +322,31 @@ class UsageDashboardState:
     def __init__(self, args, opener: urllib.request.OpenerDirector | None):
         self.args = args
         data_home = Path(getattr(self.args, "data_home", getattr(self.args, "history", Path.cwd()).parent))
-        if not getattr(self.args, "quota_history", None):
-            self.args.quota_history = data_home / "usage_monitor_quota_readings.jsonl"
-        if not getattr(self.args, "token_ledger", None):
-            self.args.token_ledger = default_token_ledger_path(self.args.quota_history)
-        if not getattr(self.args, "dashboard_cache", None):
-            self.args.dashboard_cache = default_dashboard_cache_path(self.args.quota_history)
         self.opener = opener
         self.lock = threading.RLock()
-        print("Startup: loading accounts, skills, and cloud configuration...", flush=True)
+        console_log("Startup: loading accounts, skills, and cloud configuration...")
         self.accounts = AccountManager(args.auth, getattr(args, "account_root", None) or data_home / "accounts")
         self.device_auth = DeviceAuthManager(args.codex_home, args.auth)
         self.skills = SkillManager(args.codex_home, getattr(args, "data_home", None) or args.auth.parent / ".codex-switch", getattr(args, "gemini_skills", None))
         self.cloud = CloudManager(self.skills.private_root, self.skills, self.accounts)
         self.accounts.cloud = self.cloud
-        from monitor_canonical import CanonicalDataStore
+        from monitor_canonical import CanonicalDataStore, default_database_path
         self.usage_data = CanonicalDataStore(
-            self.args.quota_history, self.args.token_ledger, self.cloud.machine_id, self.cloud.usage_account_id, self.lock, self.cloud.local_usage_account,
-            getattr(self.args, "usage_sync_cache", None),
+            getattr(args, "database", None) or default_database_path(data_home), self.cloud.machine_id, self.cloud.usage_account_id, self.lock, self.cloud.local_usage_account,
         )
         self.args.raw_quota_log = getattr(args, "raw_quota_log", None) or data_home / "usage_monitor_quota_api_responses.jsonl"
         self.args.save_raw_quota_responses = lambda: self.cloud.config().get("saveRawQuotaResponses", False)
         self.args.raw_quota_response_callback = self._record_raw_quota_response
         self._raw_quota_log_lock = threading.Lock()
-        self.args.usage_sync_cache = self.usage_data.cache_path
         self.args.source_ingestor = self.usage_data.sources
-        print("Startup: initializing usage processing and dashboard stores...", flush=True)
+        console_log("Startup: initializing usage processing and dashboard stores...")
         self.usage_data.sources.on_new_cost = self.accounts.promote_active_slot_on_cost
         from monitor_delivery import DashboardDelivery
         self.delivery = DashboardDelivery(self.usage_data.index)
-        print("Startup: rebuilding dashboard delivery from canonical data...", flush=True)
+        console_log("Startup: rebuilding dashboard delivery from canonical data...")
         self.delivery.rebuild()
         self.cloud.configure_usage_sync(self.usage_data)
-        print("Startup: recovering account transitions and reconciling managed skills...", flush=True)
+        console_log("Startup: recovering account transitions and reconciling managed skills...")
         try:
             self.cloud.recover_account_transition()
         except CloudError as exc:
@@ -392,7 +385,7 @@ class UsageDashboardState:
         self.external_auth_validation_threads = set()
         self.external_auth_validation_fingerprints = set()
         self.dashboard_cache_event.set()
-        print("Startup: restoring runtime state and reconciling live authentication...", flush=True)
+        console_log("Startup: restoring runtime state and reconciling live authentication...")
         with self.usage_data.index.transaction() as db:
             self.runtime_state = reset_runtime_baselines(self.usage_data.index.get(db, "runtimeState", {}))
         self.restore_console_event_state()
@@ -495,7 +488,7 @@ class UsageDashboardState:
                 with self.args.raw_quota_log.open("a", encoding="utf-8") as output:
                     output.write(json.dumps({"capturedAt": int(time.time()), "accountId": account_id, "status": status, "response": response}, ensure_ascii=False, separators=(",", ":")) + "\n")
         except OSError as exc:
-            print(f"Raw quota response logging failed: {exc}", file=sys.stderr, flush=True)
+            console_log(f"Raw quota response logging failed: {exc}", level="error")
 
     def _update_account_status_locked(self, account_id: str | None, sample: dict) -> bool:
         row = normalize_quota_history_row(sample)
@@ -590,7 +583,7 @@ class UsageDashboardState:
                 if cloud_refresh:
                     with self._dashboard_signal_lock:
                         self._dashboard_cloud_pending = True
-                print(f"Dashboard display cache maintenance failed: {exc}", file=sys.stderr, flush=True)
+                console_log(f"Dashboard display cache maintenance failed: {exc}", level="error")
 
     def _signal_dashboard_cache(self, reason: str = "local") -> None:
         if reason == "cloud" and hasattr(self, "_dashboard_signal_lock"):
@@ -621,21 +614,20 @@ class UsageDashboardState:
                 token_usage = self.usage_data.sources.scan(self.args.codex_home)
                 status = self.accounts.status()
                 label = next((row["label"] for row in status["items"] if row["id"] == status["activeAccountId"]), "Unknown")
-                cost, by_model = self.usage_data.sources.sync_ledger(self.args.token_ledger, status["activeAccountId"], label, self.accounts.attribution_timeline(),
-                    lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
-                    self.usage_data.normalize_new_ledger, self.cloud.machine_id)
+                cost, by_model = self.usage_data.sources.sync_ledger(status["activeAccountId"], label, self.accounts.attribution_timeline(),
+                    lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))))
                 with self.lock:
                     self.args.token_capture_snapshot = token_usage
                     self.runtime_state.update({"tokenUsage": token_usage, "cost": cost, "costByModel": by_model})
                     self._signal_dashboard_cache()
             except Exception as exc:
-                print(f"Token capture failed: {exc}", file=sys.stderr, flush=True)
-            self.token_capture_event.wait(min(max(self.args.interval, 1), 5))
+                console_log(f"Token capture failed: {exc}", level="error")
+            self.token_capture_event.wait(5)
             self.token_capture_event.clear()
 
     def poll_once(self) -> dict:
         account_status = self.accounts.status()
-        if not self.args.local_only and account_status["awaitingLogin"]:
+        if account_status["awaitingLogin"]:
             with self.lock:
                 self.last_error = account_status["error"] or "Waiting for Codex login to create auth.json"
                 self.last_acquire_started_at = time.monotonic()
@@ -669,9 +661,8 @@ class UsageDashboardState:
                 sample["cost"], sample["costByModel"] = self.runtime_state.get("cost") or empty_cost_totals(), self.runtime_state.get("costByModel") or {}
             elif token_usage.get("incremental"):
                 sample["cost"], sample["costByModel"] = self.usage_data.sources.sync_ledger(
-                    self.args.token_ledger, account_status["activeAccountId"], sample["accountLabel"], self.accounts.attribution_timeline(),
+                    account_status["activeAccountId"], sample["accountLabel"], self.accounts.attribution_timeline(),
                     lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
-                    self.usage_data.normalize_new_ledger, self.cloud.machine_id,
                 )
             elif token_usage:
                 from monitor_token_ledger import reconcile_token_ledger
@@ -721,7 +712,7 @@ class UsageDashboardState:
 
         debug = {"_response_callback": self._record_raw_quota_response}
         output = fetch_usage(
-            auth, self.opener, None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials,
+            auth, self.opener, None, DEFAULT_REQUEST_TIMEOUT_SECONDS, debug, refreshed_callback=commit_refreshed_credentials,
         )
         usage_account_id = self.cloud.usage_account_id(credential["id"])
         output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"], "usageAccountId": usage_account_id,
@@ -747,7 +738,7 @@ class UsageDashboardState:
         return list(groups.values())
 
     def poll_due_inactive_accounts(self, now: float | None = None) -> int:
-        if self.args.local_only or self.opener is None:
+        if self.opener is None:
             return 0
         now = time.monotonic() if now is None else now
         polled = 0
@@ -773,7 +764,7 @@ class UsageDashboardState:
             except Exception as exc:
                 with self.lock:
                     self.inactive_account_poll_errors[credential["usageAccountId"]] = {"at": now_iso(), "error": str(exc)}
-                print(f"Inactive account usage polling failed for {credential['label']!r}: {exc}", file=sys.stderr, flush=True)
+                console_log(f"Inactive account usage polling failed for {credential['label']!r}: {exc}", level="error")
         if polled:
             with self.lock:
                 self._signal_dashboard_cache()
@@ -846,7 +837,7 @@ class UsageDashboardState:
 
         debug = {"_response_callback": self._record_raw_quota_response}
         output = fetch_usage(
-            auth, self.opener, auth_path if credential["active"] else None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT),
+            auth, self.opener, auth_path if credential["active"] else None, DEFAULT_REQUEST_TIMEOUT_SECONDS, debug,
             auth_lock=self.accounts.lock if credential["active"] else None, refreshed_callback=commit_refreshed_credentials,
         )
         output.update({"checkedAt": now_iso(), "accountSlotId": credential["id"], "accountLabel": credential["label"], "remoteUsage": debug})
@@ -901,7 +892,7 @@ class UsageDashboardState:
                     self.session_refresh_suppressed_reset_at.pop(key, None)
                 if self.session_refresh_attempts.get(key, 0) >= SESSION_REFRESH_MAX_ATTEMPTS:
                     if key not in self.session_refresh_failed:
-                        print(f"Manual refresh failed for {credential['label']!r} ({label}) after {SESSION_REFRESH_MAX_ATTEMPTS} attempts; token API-equivalent cost: {session_refresh_cost_text(self.session_refresh_costs.get(key))}.", flush=True)
+                        console_log(f"Manual refresh failed for {credential['label']!r} ({label}) after {SESSION_REFRESH_MAX_ATTEMPTS} attempts; token API-equivalent cost: {session_refresh_cost_text(self.session_refresh_costs.get(key))}.", level="error")
                         self.session_refresh_failed[key] = now
                     continue
                 if key not in self.session_refresh_procedures or self._session_refresh_window_allows(credential, label, now):
@@ -937,7 +928,7 @@ class UsageDashboardState:
             try:
                 remove_directory(refresh_home)
             except OSError as exc:
-                print(f"Session refresh workspace cleanup failed: {exc}", file=sys.stderr, flush=True)
+                console_log(f"Session refresh workspace cleanup failed: {exc}", level="error")
 
     def run_session_refreshing(self) -> None:
         while self.running:
@@ -959,9 +950,9 @@ class UsageDashboardState:
                         continue
                     window = ((self.account_statuses.get(credential["id"]) or {}).get("windows", {}).get(label) or {})
                     if self._session_refresh_window_allows(credential, label, time.time()):
-                        print(f"Manual refresh needed for {credential['label']!r} ({label}; next refresh at {window.get('resetAt') or 'unknown'}); starting manual refresh procedure.", flush=True)
+                        console_log(f"Manual refresh needed for {credential['label']!r} ({label}; next refresh at {format_console_timestamp(window.get('resetAt')) or 'unknown'}); starting manual refresh procedure.", level="warning")
                     else:
-                        print(f"Manual refresh needed for {credential['label']!r} ({label}; next refresh at {window.get('resetAt') or 'unknown'}); queued until an allowed UTC window.", flush=True)
+                        console_log(f"Manual refresh needed for {credential['label']!r} ({label}; next refresh at {format_console_timestamp(window.get('resetAt')) or 'unknown'}); queued until an allowed UTC window.", level="warning")
                     self.session_refresh_procedures.add(key)
                     self.session_refresh_costs[key] = 0.0
                     self.session_refresh_reset_at[key] = reset_at
@@ -982,7 +973,10 @@ class UsageDashboardState:
                         self.accounts.commit_polled_credentials(credential["id"], credential["fingerprint"], auth_data)
                     reset_at = self._retrieve_session_refresh_reset_at(credential, label)
                     if self._session_refresh_succeeded(self.session_refresh_reset_at.get(key), reset_at):
-                        print(f"Manual refresh succeeded for {credential['label']!r} ({label}) after {self.session_refresh_attempts.get(key, 0) + 1} times; token API-equivalent cost: {session_refresh_cost_text(self.session_refresh_costs.get(key))}.", flush=True)
+                        console_log(
+                            f"Manual refresh succeeded for {credential['label']!r} ({label}) after {self.session_refresh_attempts.get(key, 0) + 1} times; "
+                            f"token API-equivalent cost: {session_refresh_cost_text(self.session_refresh_costs.get(key))}."
+                        )
                         self.session_refresh_suppressed_reset_at[key] = reset_at
                         self.session_refresh_attempts.pop(key, None)
                         self.session_refresh_costs.pop(key, None)
@@ -1004,16 +998,16 @@ class UsageDashboardState:
     def run(self) -> None:
         while self.running:
             if self.last_acquire_started_at is not None:
-                self.wake_event.wait(poll_sleep_seconds(self.last_acquire_started_at, self.args.interval))
+                self.wake_event.wait(poll_sleep_seconds(self.last_acquire_started_at, ACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS))
                 self.wake_event.clear()
                 if not self.running:
                     break
             try:
-                retry_operation(self.poll_once, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT))
+                retry_operation(self.poll_once)
             except Exception as exc:
                 with self.lock:
                     self.last_error = str(exc)
-                print(f"Dashboard polling failed: {exc}", file=sys.stderr, flush=True)
+                console_log(f"Dashboard polling failed: {exc}", level="error")
 
     def run_cloud_maintenance(self) -> None:
         while self.running:
@@ -1021,7 +1015,7 @@ class UsageDashboardState:
                 result = self.cloud.maintenance_tick()
             except Exception as exc:
                 if not isinstance(exc, CloudError) or exc.category != "network" or not self.cloud_maintenance_connection_failed:
-                    print(f"Cloud maintenance failed: {exc}", file=sys.stderr, flush=True)
+                    console_log(f"Cloud maintenance failed: {exc}", level="error")
                 self.cloud_maintenance_connection_failed = isinstance(exc, CloudError) and exc.category == "network"
             else:
                 if any(result.values()):
@@ -1043,7 +1037,7 @@ class UsageDashboardState:
                     self.skill_scan_snapshot = self.skills.scan(refresh=True)
                     self.skill_scan_at = time.monotonic()
                 except Exception as exc:
-                    print(f"Background skill scan failed: {exc}", file=sys.stderr, flush=True)
+                    console_log(f"Background skill scan failed: {exc}", level="error")
             self.config_monitor_event.wait(5)
             self.config_monitor_event.clear()
 
@@ -1087,7 +1081,7 @@ class UsageDashboardState:
 
                 auth = json.loads(external_update["data"].decode("utf-8"))
                 debug = {"_response_callback": self._record_raw_quota_response}
-                output = fetch_usage(auth, self.opener, None, max(self.args.timeout, 1), debug, getattr(self.args, "retry_limit", DEFAULT_RETRY_LIMIT), refreshed_callback=commit_refreshed_credentials)
+                output = fetch_usage(auth, self.opener, None, DEFAULT_REQUEST_TIMEOUT_SECONDS, debug, refreshed_callback=commit_refreshed_credentials)
                 data = (json.dumps(auth, indent=2) + "\n").encode("utf-8")
                 if not self.accounts.commit_polled_credentials(external_update["id"], expected_fingerprint, data):
                     raise UsageError("recorded credentials changed during external auth validation")
@@ -1098,9 +1092,9 @@ class UsageDashboardState:
                     self._record_quota_sample_locked(sample)
                     self._update_account_status_locked(external_update["id"], sample)
                     self._signal_dashboard_cache()
-                print(f"External credentials for {external_update['label']!r} were validated and saved.", flush=True)
+                console_log(f"External credentials for {external_update['label']!r} were validated and saved.")
             except Exception as exc:
-                print(f"External credentials for {external_update['label']!r} were not saved because background validation failed: {exc}", file=sys.stderr, flush=True)
+                console_log(f"External credentials for {external_update['label']!r} were not saved because background validation failed: {exc}", level="error")
             finally:
                 with self.lock:
                     self.external_auth_validation_fingerprints.discard(fingerprint)
@@ -1128,9 +1122,9 @@ class UsageDashboardState:
         self.sync_device_auth(result)
         self._account_changed(refresh_usage_data=True)
         if previous["activeAccountId"] is None:
-            print(f"Account event: prepared {str(label).strip()!r} for sign-in.", flush=True)
+            console_log(f"Account event: prepared {str(label).strip()!r} for sign-in.")
         else:
-            print(f"Account event: saved {next(account['label'] for account in previous['items'] if account['id'] == previous['activeAccountId'])!r} and prepared {str(label).strip()!r} for sign-in.", flush=True)
+            console_log(f"Account event: saved {next(account['label'] for account in previous['items'] if account['id'] == previous['activeAccountId'])!r} and prepared {str(label).strip()!r} for sign-in.")
         return result
 
     def switch_account(self, account_id: str) -> dict:
@@ -1140,9 +1134,9 @@ class UsageDashboardState:
         self.sync_device_auth(result)
         if result["activeAccountId"] != previous_id:
             self._account_changed()
-            print(
+            console_log(
                 f"Account event: switched from {next(account['label'] for account in previous_status['items'] if account['id'] == previous_id)!r} "
-                f"to {next(account['label'] for account in result['items'] if account['id'] == result['activeAccountId'])!r}.", flush=True,
+                f"to {next(account['label'] for account in result['items'] if account['id'] == result['activeAccountId'])!r}."
             )
         return result
 
@@ -1156,7 +1150,7 @@ class UsageDashboardState:
             replace_account_label(self.account_statuses.get(str(account_id)), str(account_id), renamed_label)
             self.usage_data.refresh_accounts()
             self._signal_dashboard_cache()
-        print(f"Account event: renamed {account['label'] if account else None!r} to {str(label).strip()!r}.", flush=True)
+        console_log(f"Account event: renamed {account['label'] if account else None!r} to {str(label).strip()!r}.")
         return result
 
     def delete_account(self, account_id: str) -> dict:
@@ -1169,7 +1163,7 @@ class UsageDashboardState:
             self._signal_dashboard_cache()
         if result["activeAccountId"] != previous_status["activeAccountId"]:
             self._account_changed()
-        print(f"Account event: deleted {deleted['label']!r}.", flush=True)
+        console_log(f"Account event: deleted {deleted['label']!r}.")
         return result
 
 def dashboard_html() -> str:
@@ -1306,17 +1300,17 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
     try:
         server_config = load_server_config(Path(args.data_home) / "config.json")
     except CloudError as exc:
-        print(f"Cannot start dashboard: {exc}.", file=sys.stderr, flush=True)
+        console_log(f"Cannot start dashboard: {exc}.", level="error")
         return 1
     server_host = server_config["host"]
     instance_lock = getattr(args, "instance_lock", None) or DashboardInstanceLock()
     try:
         instance_acquired = bool(getattr(args, "instance_lock", None)) or instance_lock.acquire()
     except OSError as exc:
-        print(f"Cannot start dashboard instance lock: {exc}.", file=sys.stderr, flush=True)
+        console_log(f"Cannot start dashboard instance lock: {exc}.", level="error")
         return 1
     if not instance_acquired:
-        print("Cannot start dashboard: another monitor instance is already running.", file=sys.stderr, flush=True)
+        console_log("Cannot start dashboard: another monitor instance is already running.", level="error")
         return 1
 
     serialized_body_cache = {}
@@ -1600,11 +1594,11 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
             return
 
     try:
-        print(f"Startup: binding dashboard server to {server_host}:{DASHBOARD_PORT}...", flush=True)
+        console_log(f"Startup: binding dashboard server to {server_host}:{DASHBOARD_PORT}...")
         server = DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)
     except OSError as exc:
         instance_lock.release()
-        print(f"Cannot start dashboard: {server_host}:{DASHBOARD_PORT} is unavailable ({exc}).", file=sys.stderr, flush=True)
+        console_log(f"Cannot start dashboard: {server_host}:{DASHBOARD_PORT} is unavailable ({exc}).", level="error")
         return 1
     try:
         state = UsageDashboardState(args, opener)
@@ -1617,12 +1611,10 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         from monitor_common import REQUEST_STOP
         REQUEST_STOP.event = getattr(state, "stop_event", None)
         operation()
-    token_thread = None
-    print("Startup: starting token capture, quota polling, session refresh, dashboard, cloud, and configuration workers...", flush=True)
-    if hasattr(state, "usage_data") and not getattr(args, "no_token_scan", True):
-        args.background_token_capture = True
-        token_thread = threading.Thread(target=managed_worker, args=(state.run_token_capture,), name="token-capture", daemon=True)
-        token_thread.start()
+    console_log("Startup: starting token capture, quota polling, session refresh, dashboard, cloud, and configuration workers...")
+    args.background_token_capture = True
+    token_thread = threading.Thread(target=managed_worker, args=(state.run_token_capture,), name="token-capture", daemon=True)
+    token_thread.start()
     thread = threading.Thread(target=managed_worker, args=(state.run,), daemon=True)
     thread.start()
     inactive_account_thread = threading.Thread(target=managed_worker, args=(state.run_inactive_account_polling,), daemon=True)
@@ -1638,14 +1630,14 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
     runtime_dir = Path(runtime_dir or Path(__file__).resolve().parent).resolve()
     state.program_version = installed_version(runtime_dir)
     auto_updater = AutoUpdater(
-        runtime_dir, lambda: state.cloud.config()["autoUpdate"]["enabled"], update_opener_factory, args.timeout,
+        runtime_dir, lambda: state.cloud.config()["autoUpdate"]["enabled"], update_opener_factory,
     ) if update_opener_factory is not None else None
     state.auto_updater = auto_updater
-    print("Startup: starting device authentication and scheduling automatic updates...", flush=True)
+    console_log("Startup: starting device authentication and scheduling automatic updates...")
     state.device_auth.start()
-    print("Startup: initialization complete; dashboard ready.", flush=True)
+    console_log("Startup: initialization complete; dashboard ready.")
     url = f"http://127.0.0.1:{DASHBOARD_PORT}/"
-    print(f"Dashboard: {url}", flush=True)
+    console_log(f"Dashboard: {url}")
     if args.dashboard:
         webbrowser.open(url)
     if auto_updater is not None:
@@ -1659,9 +1651,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
             auto_updater.stop()
         try:
             state.sync_active_account_from_live()
-            state.wait_for_external_auth_validations(max(getattr(args, "timeout", 10), 1) + 1)
+            state.wait_for_external_auth_validations(DEFAULT_REQUEST_TIMEOUT_SECONDS + 1)
         except Exception as exc:
-            print(f"Final auth.json reconciliation failed: {exc}", file=sys.stderr, flush=True)
+            console_log(f"Final auth.json reconciliation failed: {exc}", level="error")
         state.running = False
         if hasattr(state, "stop_event"):
             state.stop_event.set()
@@ -1672,12 +1664,10 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         state.dashboard_cache_event.set()
         state.cloud_maintenance_event.set()
         state.config_monitor_event.set()
-        if hasattr(state, "token_capture_event"):
-            state.token_capture_event.set()
+        state.token_capture_event.set()
         state.cloud.operation_queue.close()
         cloud_thread.join()
-        if token_thread is not None:
-            token_thread.join()
+        token_thread.join()
         for worker in (thread, inactive_account_thread, session_refresh_thread, dashboard_cache_thread, config_thread):
             worker.join()
         server.server_close()

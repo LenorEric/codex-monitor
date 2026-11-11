@@ -77,11 +77,12 @@ class AutoUpdateTests(unittest.TestCase):
     def test_startup_checks_before_migration_failure_and_restarts_before_migration(self):
         import codex_monitor_daemon as daemon
 
-        with mock.patch.object(daemon.sys, "argv", [str(Path(daemon.__file__))]), mock.patch.object(daemon, "check_startup_update", return_value=False) as check, mock.patch.object(daemon, "migrate_installed_data", side_effect=RuntimeError("migration failed")) as migrate:
+        with mock.patch.object(daemon.sys, "argv", [str(Path(daemon.__file__)), "--database", "custom.sqlite3"]), mock.patch.object(daemon, "check_startup_update", return_value=False) as check, mock.patch.object(daemon, "migrate_installed_data", side_effect=RuntimeError("migration failed")) as migrate:
             with self.assertRaisesRegex(RuntimeError, "migration failed"):
                 daemon._main(mock.Mock())
             check.assert_called_once()
             migrate.assert_called_once()
+            self.assertEqual(migrate.call_args.kwargs["database_path"], Path("custom.sqlite3"))
             check.reset_mock()
             migrate.reset_mock()
             check.return_value = True
@@ -104,7 +105,7 @@ class AutoUpdateTests(unittest.TestCase):
 
     def test_history_data_migration_runs_each_intermediate_version_and_checkpoints(self):
         with temporary_directory() as data_home:
-            paths = [data_home / name for name in ("history", "quota", "sessions", "ledger", "samples")]
+            paths = [data_home / name for name in ("history", "quota", "sessions", "samples")]
             (data_home / DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":1}\n', encoding="utf-8")
             applied = []
             with mock.patch.object(monitor_migrations, "DATA_CONTRACT_VERSION", 3), mock.patch.object(monitor_migrations, "DATA_MIGRATIONS", {2: lambda _paths: applied.append(2), 3: lambda _paths: applied.append(3)}):
@@ -294,12 +295,12 @@ class AutoUpdateTests(unittest.TestCase):
 
     def test_restart_uses_same_interpreter_entry_and_arguments(self):
         with mock.patch.object(monitor_auto_update.os, "execv") as execute, mock.patch.object(monitor_auto_update.sys, "executable", "C:/Python/python.exe"):
-            restart_process(Path("renamed/runtime/codex_monitor_daemon.py"), ["--local-only", "--interval", "12"])
+            restart_process(Path("renamed/runtime/codex_monitor_daemon.py"), ["--dashboard", "--database", "custom.sqlite3"])
         command = execute.call_args.args
         self.assertEqual(command[0], "C:/Python/python.exe")
         self.assertEqual(command[1][0], "C:/Python/python.exe")
         self.assertTrue(Path(command[1][1]).is_absolute())
-        self.assertEqual(command[1][2:], ["--local-only", "--interval", "12"])
+        self.assertEqual(command[1][2:], ["--dashboard", "--database", "custom.sqlite3"])
 
     def test_release_manifest_covers_runtime_files_deterministically(self):
         with temporary_directory() as temporary:
@@ -342,7 +343,7 @@ sys.path.insert(0, sys.argv[1])
 import monitor_dashboard
 from monitor_usage_sync import UsageDataStore
 root = Path(sys.argv[2])
-store = UsageDataStore(root / "quota.jsonl", root / "ledger.jsonl", "machine", lambda _: "v3:a", threading.RLock())
+store = UsageDataStore(root / "usage.sqlite3", "machine", lambda _: "v3:a", threading.RLock())
 store.record_quota({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 10}}})
 assert len(store.datasets()[0]) == 1
 assert all(Path(module.__file__).parent == Path(sys.argv[1]) for name, module in sys.modules.items() if name.startswith("monitor_") and getattr(module, "__file__", None))

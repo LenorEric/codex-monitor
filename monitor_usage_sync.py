@@ -29,11 +29,6 @@ def content_hash(value) -> str:
     return hashlib.sha256(canonical_json(value)).hexdigest()
 
 
-def default_usage_sync_cache_path(data_path: Path) -> Path:
-    data_path = Path(data_path)
-    return data_path.with_name("usage_monitor_sync_cache.json") if data_path.name in {"usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_token_ledger.jsonl", "usage_monitor_quota_readings.jsonl", "usage_monitor_token_events.jsonl"} else data_path.with_suffix(".sync-cache.json")
-
-
 def sync_meta(row: dict) -> dict:
     value = row.get(SYNC_META_KEY)
     return value if isinstance(value, dict) else {}

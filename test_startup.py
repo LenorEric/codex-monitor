@@ -70,13 +70,14 @@ class StartupDependencyTests(unittest.TestCase):
 
         with startup_test_directory() as root:
             output = StringIO()
-            with mock.patch.object(monitor_dashboard, "DashboardHTTPServer"), mock.patch.object(monitor_dashboard, "UsageDashboardState"), mock.patch.object(monitor_dashboard, "ControlAuth"), mock.patch.object(monitor_dashboard.threading, "Thread"), redirect_stdout(output):
-                self.assertEqual(monitor_dashboard.serve_dashboard(SimpleNamespace(data_home=root, no_token_scan=True, dashboard=False, timeout=10, instance_lock=mock.Mock()), None), 0)
+            with mock.patch.object(monitor_dashboard, "DashboardHTTPServer"), mock.patch.object(monitor_dashboard, "UsageDashboardState") as state, mock.patch.object(monitor_dashboard, "ControlAuth"), mock.patch.object(monitor_dashboard.threading, "Thread") as thread, redirect_stdout(output):
+                self.assertEqual(monitor_dashboard.serve_dashboard(SimpleNamespace(data_home=root, dashboard=False, instance_lock=mock.Mock()), None), 0)
+            self.assertTrue(any(call.kwargs.get("name") == "token-capture" and call.kwargs["args"] == (state.return_value.run_token_capture,) for call in thread.call_args_list))
             lines = output.getvalue().splitlines()
-            self.assertTrue(lines[0].startswith("Startup: binding dashboard server"))
+            self.assertRegex(lines[0], r"^\[event\]\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2}\) Startup: binding dashboard server")
             self.assertTrue(any("starting token capture" in line for line in lines))
-            self.assertEqual(lines[-2], "Startup: initialization complete; dashboard ready.")
-            self.assertEqual(lines[-1], "Dashboard: http://127.0.0.1:8765/")
+            self.assertTrue(lines[-2].endswith(") Startup: initialization complete; dashboard ready."))
+            self.assertTrue(lines[-1].endswith(") Dashboard: http://127.0.0.1:8765/"))
 
     def test_update_keeps_installed_files_when_dependency_installation_fails(self):
         for fail in (False, True):

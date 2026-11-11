@@ -45,7 +45,7 @@ class FinalDeliveryTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(prefix="codex-final-test-")
         self.root = Path(self.directory.name)
         self.addCleanup(self.directory.cleanup)
-        self.store = CanonicalDataStore(self.root / "quota.jsonl", self.root / "token.jsonl", "test", lambda _: "v3:account", threading.RLock())
+        self.store = CanonicalDataStore(self.root / "usage.sqlite3", "test", lambda _: "v3:account", threading.RLock())
         self.addCleanup(self.store.index.close)
         self.delivery = DashboardDelivery(self.store.index)
         self.addCleanup(self.delivery.close)
@@ -80,8 +80,10 @@ class FinalDeliveryTests(unittest.TestCase):
         with self.store.index.transaction() as db:
             quotas = CanonicalRepository.rows(db, view, "quota", "v3:account")
             from monitor_delivery import token_projection
-            tokens = list(token_projection(db, view, "v3:account"))
-        return chart_rows(tokens, valid_intervals(usage_runs([quota_point(row) for row in quotas], window)))
+            tokens = list(token_projection(db, view, "v3:account", cost_evidence=True))
+        intervals = valid_intervals(usage_runs([quota_point(row) for row in quotas], window))
+        return [row for row in chart_rows([event for event, _ in tokens], intervals, max_distance=390)
+            if any(has_cost and row[1] - 500 <= event[1] <= row[2] + 500 for event, has_cost in tokens)]
 
     def assert_charts(self):
         for view in ("local", "merged"):
@@ -200,13 +202,86 @@ class FinalDeliveryTests(unittest.TestCase):
         self.delivery.prepare()
         self.assert_charts()
 
-    def test_zero_cost_ties_600_seconds_and_dense_same_timestamp(self):
+    def test_zero_cost_ties_and_dense_same_timestamp(self):
         for stamp, value in ((1000, 10), (1200, 20), (2000, 30), (2200, 40)):
             self.put_quota(stamp, value)
         for index, stamp in enumerate((399, 400, 1200, 1600, 2200, 2800, 2801, 1600.5)):
             self.token(str(index), stamp, cost=0 if index % 2 else .12345678)
         self.delivery.prepare()
         self.assert_charts()
+
+    def test_chart_cutoffs_before_start_and_after_end(self):
+        for window, start, end, direction in (("5h", 1000, 2000, -1), ("7d", 5000, 6000, 1)):
+            with self.subTest(window=window):
+                self.put_quota(start, 10, window)
+                self.put_quota(end, 20, window)
+                boundary = start if direction < 0 else end
+                channel = "chart:" + window
+                self.token(f"outside-{window}", boundary + direction * 501)
+                self.token(f"free-{window}", boundary, cost=0)
+                self.delivery.prepare()
+                self.assertEqual(self.view()[channel], [])
+                # Even a cost rounded to zero qualifies for display.
+                self.token(f"evidence-{window}", boundary + direction * 500, cost=1e-10)
+                self.delivery.prepare()
+                chart, = self.view()[channel]
+                self.assertEqual(sum(model[1] for model in chart[6]), 0)
+                self.token(f"unassigned-{window}", boundary + direction * 391)
+                self.delivery.prepare()
+                chart, = self.view()[channel]
+                self.assertEqual(sum(model[1] for model in chart[6]), 0)
+                self.token(f"assigned-{window}", boundary + direction * 390)
+                self.delivery.prepare()
+                chart, = self.view()[channel]
+                self.assertEqual(sum(model[1] for model in chart[6]), 100_000_000)
+        self.assert_charts()
+
+    def test_late_merged_cost_reveals_multiple_intervals_and_replays(self):
+        for window in ("5h", "7d"):
+            for value, stamp in enumerate((100, 1000, 1100, 1200, 1300, 1400, 1500)):
+                self.put_quota(stamp, value, window)
+        other = make_test_ledger(event="other") | {"occurredAt": 1450, "sync": {"version": 1, "originMachineId": "remote", "accountId": "z-other"}}
+        late = make_test_ledger(event="late") | {"occurredAt": 1450, "sync": {"version": 1, "originMachineId": "remote", "accountId": "v3:account"}}
+        with self.store.index.transaction() as db:
+            self.store._save(db, "merged", "tokenLedger", other)
+        self.delivery.prepare()
+        baseline = self.bulk()
+        self.assertEqual(self.view("merged")["chart:5h"], [])
+        self.assertEqual(self.view("merged")["chart:7d"], [])
+        with self.store.index.transaction() as db:
+            self.store._save(db, "merged", "tokenLedger", late)
+        self.delivery.prepare()
+        packets = self.delivery.replay(baseline["epoch"], baseline["cursors"])
+        before_rebuild = {}
+        for channel in ("chart:5h", "chart:7d"):
+            self.assertEqual(self.view()[channel], [])
+            chart = self.view("merged")[channel]
+            self.assertEqual(len(chart), 6)
+            self.assertEqual([sum(model[1] for model in row[6]) for row in chart], [0] * 5 + [100_000_000])
+            live = [row for packet in packets if packet["stream"] == "merged" and packet["channel"] == channel for row in packet["data"]["set"]]
+            models = self.bulk()["models"]
+            self.assertEqual(sorted(live), sorted([*row[:6], [[models[entry[0]], *entry[1:]] for entry in row[6]]] for row in chart))
+            before_rebuild[channel] = chart
+        self.delivery.rebuild()
+        for channel, chart in before_rebuild.items():
+            self.assertEqual(self.view("merged")[channel], chart)
+
+    def test_chart_sends_remove_when_same_interval_loses_cost_evidence(self):
+        self.put_quota(1000, 10)
+        self.put_quota(2000, 20)
+        self.token("near", 550)
+        self.delivery.prepare()
+        baseline = self.bulk()
+        chart, = self.view()["chart:5h"]
+        with self.store.index.transaction() as db:
+            db.execute("UPDATE canonical_quota SET last=1100,range_last=1100 WHERE first=1000")
+        self.delivery.prepare()
+        self.assertEqual(self.view()["chart:5h"], [])
+        packets = self.delivery.replay(baseline["epoch"], baseline["cursors"])
+        self.assertEqual([packet["data"] for packet in packets if packet["stream"] == "local" and packet["channel"] == "chart:5h"],
+            [{"set": [], "remove": [chart[0]]}])
+        with self.store.index.transaction() as db:
+            self.assertEqual(db.execute("SELECT at FROM delivery_items WHERE view='local' AND channel='chart:5h' AND id=?", (chart[0],)).fetchone(), (None,))
 
     def test_unchanged_and_tail_extension_do_not_scan_historical_tokens(self):
         self.put_quota(1000, 10, last=2000)

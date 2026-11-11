@@ -151,15 +151,15 @@ class CanonicalIndex(IndexState):
             return self.get(db, "canonicalRevision", 0)
 
 
+def default_database_path(data_home: Path) -> Path:
+    return data_home / "usage_monitor_sync_cache-v4.sqlite3"
+
+
 class CanonicalDataStore(NormalizedRecords):
-    def __init__(self, quota_path, token_ledger_path, machine_id, account_id_resolver, lock, account_mapper=None, cache_path=None):
-        from monitor_usage_sync import default_usage_sync_cache_path
-        self.quota_path, self.token_ledger_path = Path(quota_path), Path(token_ledger_path)
-        self.cache_path = Path(cache_path) if cache_path is not None else default_usage_sync_cache_path(self.quota_path)
-        self.v4_cache_path = self.cache_path.with_name(f"{self.cache_path.stem}-v4.sqlite3")
+    def __init__(self, database_path, machine_id, account_id_resolver, lock, account_mapper=None):
         self.machine_id, self.account_id_resolver, self.lock = machine_id, account_id_resolver, lock
         self.account_mapper = account_mapper
-        self.index = CanonicalIndex(self.v4_cache_path)
+        self.index = CanonicalIndex(database_path)
         from monitor_quota_preprocessing import QuotaPreprocessor
         self.quota_preprocessor = QuotaPreprocessor(self.index)
         from monitor_canonical_ingestion import CanonicalSourceIngestor

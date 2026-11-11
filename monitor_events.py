@@ -4,7 +4,7 @@ from datetime import datetime
 
 from monitor_common import (
     MIN_DELTA_COST_PER_PERCENT_USD, PLAN_MULTIPLIERS, RATIO_DEVIATION_MULTIPLIER, RESET_TIME_JITTER_SECONDS,
-    UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, coerce_float, parse_timestamp,
+    UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, coerce_float, console_log, format_console_log, format_console_timestamp, parse_timestamp,
 )
 from monitor_history import compact_debug_state, compact_sample_for_state, compact_token_usage_for_state, is_delta_event_row
 from monitor_tokens import normalize_codex_model
@@ -643,36 +643,32 @@ def normalized_window_status(sample: dict, label: str) -> dict:
         "planMultiplier": multiplier,
     }
 
-def format_console_timestamp(value: str | None) -> str:
-    if not value:
-        return "-"
-    try:
-        return f"{value} (local {datetime.fromisoformat(value.replace('Z', '+00:00')).astimezone().isoformat(timespec='seconds')})"
-    except ValueError:
-        return value
-
 def format_valid_delta_event(event: dict, sample: dict | None = None) -> str:
     sample = sample or {}
     five = normalized_window_status(sample, "5h")
     seven = normalized_window_status(sample, "7d")
-    return (
-        f"[delta] {format_console_timestamp(event['checkedAt'])} {event['window']} {event_model(event)} "
+    return format_console_log(
+        f"{event['window']} {event_model(event)} "
         f"+{event['deltaPercent']:.4g}% / +${event['deltaCostUsd']:.6g}; "
         f"ratio ${event.get('costPercentRatio', cost_percent_ratio(event['deltaCostUsd'], event['deltaPercent'])):.6g}/%; "
         f"cumulative {event['cumulativePercent']:.4g}% / ${event['cumulativeCostUsd']:.6g}; "
         f"event plan {event.get('plan') or 'unknown'} ({coerce_float(event.get('planMultiplier')) or 1.0:g}x); "
         f"current 5h {format_percent(five['normalizedPercent'])} [{five['plan']} {five['planMultiplier']:g}x], "
-        f"7d {format_percent(seven['normalizedPercent'])} [{seven['plan']} {seven['planMultiplier']:g}x]"
+        f"7d {format_percent(seven['normalizedPercent'])} [{seven['plan']} {seven['planMultiplier']:g}x]",
+        level="delta", at=event.get("checkedAt"),
     )
 
 def format_ratio_warning(event: dict) -> str:
-    return (
-        f"[warning] {format_console_timestamp(event['checkedAt'])} {event['window']} {event_model(event)} cost/percent ratio "
+    return format_console_log(
+        f"{event['window']} {event_model(event)} cost/percent ratio "
         f"${event['costPercentRatio']:.6g}/% deviates from average ${event['averageCostPercentRatio']:.6g}/% "
-        f"({event['ratioDeviation']:.6g}x)"
+        f"({event['ratioDeviation']:.6g}x)", level="warning", at=event.get("checkedAt"),
     )
 
 def format_special_event(event: dict) -> str:
+    return format_console_log(special_event_message(event), at=event.get("checkedAt"))
+
+def special_event_message(event: dict) -> str:
     previous = event.get("previous") or {}
     current = event.get("current") or {}
     extra = event.get("extra") or {}
@@ -685,10 +681,10 @@ def format_special_event(event: dict) -> str:
     old_plan = previous.get("baselinePlan") or "unknown"
     new_plan = current.get("baselinePlan") or old_plan
     parts = [
-        f"[event] {format_console_timestamp(event.get('checkedAt'))} {label} {reason};",
+        f"{label} {reason};",
         f"baseline {format_percent(previous_percent)} -> {format_percent(current_percent)},",
         f"cost ${previous_cost:g} -> ${(current_cost if current_cost is not None else previous_cost):g},",
-        f"reset {previous.get('baselineResetAt') or '-'} -> {current.get('baselineResetAt') or previous.get('baselineResetAt') or '-'},",
+        f"reset {format_console_timestamp(previous.get('baselineResetAt')) or '-'} -> {format_console_timestamp(current.get('baselineResetAt') or previous.get('baselineResetAt')) or '-'},",
         f"plan {old_plan} ({coerce_float(previous.get('baselineMultiplier')) or 1:g}x) -> {new_plan} ({coerce_float(current.get('baselineMultiplier')) or coerce_float(previous.get('baselineMultiplier')) or 1:g}x)",
     ]
     if "deltaPercent" in extra or "deltaCostUsd" in extra:
@@ -704,4 +700,4 @@ def print_special_events(events: list[dict]) -> None:
     for event in events:
         if (event.get("extra") or {}).get("suppressConsole"):
             continue
-        print(format_special_event(event), flush=True)
+        console_log(special_event_message(event), at=event.get("checkedAt"))

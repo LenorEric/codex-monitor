@@ -7,7 +7,7 @@ import urllib.request
 
 from monitor_common import atomic_write_bytes as _write_atomic_bytes
 from monitor_common import (
-    DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, TARGET_WINDOWS, UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
+    DEFAULT_REQUEST_TIMEOUT_SECONDS, DEFAULT_RETRY_LIMIT, PLAN_MULTIPLIERS, TARGET_WINDOWS, UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, UsageError, codex_switch_home, coerce_float, empty_cost_totals,
     load_json, now_iso, parse_timestamp,
 )
 from monitor_accounts import is_api_auth
@@ -27,9 +27,6 @@ def default_sample_log_path(history_path: Path) -> Path:
 
 def default_quota_history_path(history_path: Path) -> Path:
     return history_path.with_name("usage_monitor_quota_readings.jsonl") if history_path.name == "usage_monitor_history.jsonl" else history_path.with_suffix(".quota.jsonl")
-
-def default_dashboard_cache_path(history_path: Path) -> Path:
-    return history_path.with_name("usage_monitor_dashboard_cache.json") if history_path.name in {"usage_monitor_history.jsonl", "usage_monitor_quota_history.jsonl", "usage_monitor_quota_readings.jsonl"} else history_path.with_suffix(".dashboard-cache.json")
 
 def normalize_token_session_row(row: dict) -> dict | None:
     if not isinstance(row, dict) or not row.get("sessionId") or not isinstance(row.get("tokens"), dict):
@@ -485,21 +482,20 @@ def compact_history(path: Path, retain_days: int | None) -> None:
     kept = [row for row in load_history(path) if parse_timestamp(row.get("checkedAt")) is None or parse_timestamp(row.get("checkedAt")) >= cutoff]
     write_history(path, kept)
 
-def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, previous_token_usage: dict | None, previous_cost: dict | None = None, runtime_state: dict | None = None, skip_remote: bool = False) -> dict:
+def collect_usage_sample(args, opener: urllib.request.OpenerDirector | None, previous_token_usage: dict | None, previous_cost: dict | None = None, runtime_state: dict | None = None) -> dict:
     output = {}
-    auth = load_json(args.auth) if not args.local_only and not skip_remote else None
-    if not args.local_only and not skip_remote and not is_api_auth(auth or {}):
+    auth = load_json(args.auth)
+    if not is_api_auth(auth):
         output["remoteUsage"] = {"_response_callback": getattr(args, "raw_quota_response_callback", None)}
         if opener is None:
             raise UsageError("no HTTP opener is available")
         if getattr(args, "account_attribution_callback", None):
             output.update(args.account_attribution_callback(auth))
         output.update(fetch_usage(
-            auth, opener, args.auth, max(args.timeout, 1), output["remoteUsage"], getattr(args, "retry_limit", DEFAULT_RETRY_LIMIT),
+            auth, opener, args.auth, DEFAULT_REQUEST_TIMEOUT_SECONDS, output["remoteUsage"], DEFAULT_RETRY_LIMIT,
             getattr(args, "auth_lock", None), getattr(args, "auth_refreshed_callback", None), False,
         ))
-    if not args.no_token_scan:
-        output["tokenUsage"] = getattr(args, "token_capture_snapshot", None) if getattr(args, "background_token_capture", False) else (
-            args.source_ingestor.scan(args.codex_home) if getattr(args, "source_ingestor", None) is not None else scan_codex_token_usage(args.codex_home))
+    output["tokenUsage"] = getattr(args, "token_capture_snapshot", None) if getattr(args, "background_token_capture", False) else (
+        args.source_ingestor.scan(args.codex_home) if getattr(args, "source_ingestor", None) is not None else scan_codex_token_usage(args.codex_home))
     output["checkedAt"] = (output.get("remoteUsage") or {}).get("completedAt") or now_iso()
     return make_history_sample(output, previous_token_usage, previous_cost, previous_cost_by_model=(runtime_state or {}).get("costByModel"))

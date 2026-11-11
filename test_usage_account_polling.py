@@ -15,7 +15,6 @@ class UsageAccountPollingTests(unittest.TestCase):
     def state(self, active="a1"):
         state = UsageDashboardState.__new__(UsageDashboardState)
         slots = {"a1": "a", "a2": "a", "b1": "b", "b2": "b", "c1": "c"}
-        state.args = SimpleNamespace(local_only=False)
         state.opener = object()
         state.accounts = SimpleNamespace(
             status=lambda: {"activeAccountId": active, "slotOrder": ["b1", "b2", "a1", "a2", "c1"],

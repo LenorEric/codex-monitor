@@ -95,7 +95,7 @@ def migrate_test_data(root, codex_home=None):
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     (root / DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":14}', encoding="utf-8")
-    migrate_history_data(root, *(root / name for name in ("history.jsonl", "quota.jsonl", "sessions.jsonl", "ledger.jsonl", "samples.jsonl")), target_version=15, codex_home=codex_home)
+    migrate_history_data(root, *(root / name for name in ("history.jsonl", "quota.jsonl", "sessions.jsonl", "samples.jsonl")), target_version=15, codex_home=codex_home)
 
 
 def combined_account(state, auth=b"{}"):
@@ -109,8 +109,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         version = json.loads((root / "package.json").read_text(encoding="utf-8"))["version"]
 
         self.assertEqual(completed.returncode, 0, completed.stderr)
-        self.assertEqual(completed.stdout.splitlines()[0], "Startup: validating Python libraries...")
-        self.assertIn(f"Codex Usage Monitor v{version}", completed.stdout.splitlines())
+        self.assertTrue(completed.stdout.splitlines()[0].endswith(") Startup: validating Python libraries..."))
+        self.assertTrue(any(line.endswith(f") Codex Usage Monitor v{version}") for line in completed.stdout.splitlines()))
 
     @classmethod
     def setUpClass(cls):
@@ -157,7 +157,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.running = True
         with mock.patch("sys.stderr", new_callable=StringIO) as stderr:
             state.run_cloud_maintenance()
-        self.assertEqual(stderr.getvalue().count("Cloud maintenance failed: offline"), 2)
+        lines = stderr.getvalue().splitlines()
+        self.assertEqual(len(lines), 2)
+        for line in lines:
+            self.assertRegex(line, r"^\[error\]\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} [+-]\d{2}:\d{2}\) Cloud maintenance failed: offline$")
 
     def test_proxy_config_uses_urllib_scheme_names_and_all_proxy_fallback(self):
         with self.account_directory() as directory:
@@ -198,8 +201,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     @contextmanager
     def account_directory(self):
-        path = Path(__file__).parent / f".account-test-{uuid.uuid4().hex}"
-        path.mkdir()
+        path = Path(__file__).parent / "tmp" / f"account-test-{uuid.uuid4().hex}"
+        path.mkdir(parents=True)
         try:
             yield path
         finally:
@@ -266,8 +269,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(monitor_history.default_history_path(data_home), data_home / "usage_monitor_history.jsonl")
             self.assertEqual(monitor_history.default_quota_history_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_quota_readings.jsonl")
             self.assertEqual(monitor_history.default_quota_history_path(data_home / "custom.jsonl"), data_home / "custom.quota.jsonl")
-            self.assertEqual(monitor_token_ledger.default_token_ledger_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_token_events.jsonl")
-            self.assertEqual(monitor_token_ledger.default_token_ledger_path(data_home / "custom.jsonl"), data_home / "custom.token-ledger.jsonl")
             for name, data in expected.items():
                 self.assertFalse((legacy_home / name).exists())
                 self.assertEqual((data_home / name).read_bytes(), data)
@@ -765,7 +766,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", sample_log=directory / "samples.jsonl",
-                codex_home=directory, local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                codex_home=directory, sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
             with mock.patch("builtins.print"):
@@ -806,7 +807,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-external")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
-                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                sample_log_max_bytes=1024, compact_history_days=None,
             )
 
             state = monitor_dashboard.UsageDashboardState(args, object())
@@ -821,7 +822,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "access_token": "partial-access"}}), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
-                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                sample_log_max_bytes=1024, compact_history_days=None,
             )
 
             with mock.patch("builtins.print"):
@@ -835,7 +836,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-original")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
-                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
 
@@ -881,7 +882,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-original")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
-                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
             state.accounts.manifest["cloudBindingEnabled"] = True
@@ -901,7 +902,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
-                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
 
@@ -929,7 +930,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
-                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
             with mock.patch("builtins.print"):
@@ -981,7 +982,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", sample_log=directory / "samples.jsonl",
-                codex_home=directory, local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                codex_home=directory, sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
             with mock.patch("builtins.print"):
@@ -1044,7 +1045,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     live_auth = auth_path.read_bytes()
                     state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
                     state.accounts = manager
-                    state.args = SimpleNamespace(auth=auth_path, timeout=10, retry_limit=0, quota_history=directory / "quota.jsonl")
+                    state.args = SimpleNamespace(auth=auth_path, quota_history=directory / "quota.jsonl")
                     state.opener = object()
                     state.lock = threading.RLock()
                     state.cloud = SimpleNamespace(machine_id="machine", usage_account_id=lambda account_id: account_id)
@@ -1176,11 +1177,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state._due_session_refreshes = mock.Mock(return_value=[(credential, "5h")])
         state._retrieve_session_refresh_reset_at = mock.Mock(return_value=monitor_dashboard.parse_timestamp("2030-01-01T09:00:01Z"))
         state._session_refresh_window_allows = mock.Mock(return_value=False)
-        with mock.patch.object(monitor_dashboard, "refresh_session") as refresh, mock.patch("builtins.print") as printed:
+        with mock.patch.object(monitor_dashboard, "refresh_session") as refresh, mock.patch.object(monitor_dashboard, "console_log") as logged:
             state.run_session_refreshing()
         refresh.assert_not_called()
         self.assertEqual(state.session_refresh_procedures, {("account", "5h")})
-        printed.assert_called_once_with("Manual refresh needed for 'Account' (5h; next refresh at 2030-01-01T09:00:00Z); queued until an allowed UTC window.", flush=True)
+        logged.assert_called_once_with(f"Manual refresh needed for 'Account' (5h; next refresh at {monitor_common.format_console_timestamp('2030-01-01T09:00:00Z')}); queued until an allowed UTC window.", level="warning")
 
     def test_session_refresh_schedule_waits_for_next_utc_start(self):
         state = object.__new__(monitor_dashboard.UsageDashboardState)
@@ -1298,11 +1299,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         state._retrieve_session_refresh_reset_at = mock.Mock(side_effect=retrieve_reset_at)
 
-        with mock.patch.object(monitor_dashboard, "refresh_session", return_value=(True, None, 0.01234567)) as refresh, mock.patch("builtins.print") as printed:
+        with mock.patch.object(monitor_dashboard, "refresh_session", return_value=(True, None, 0.01234567)) as refresh, mock.patch.object(monitor_dashboard, "console_log") as logged:
             state.run_session_refreshing()
 
-        printed.assert_any_call("Manual refresh needed for 'Account' (5h; next refresh at 2030-01-01T05:00:01Z); starting manual refresh procedure.", flush=True)
-        printed.assert_any_call("Manual refresh succeeded for 'Account' (5h) after 1 times; token API-equivalent cost: $0.01234567.", flush=True)
+        logged.assert_any_call(f"Manual refresh needed for 'Account' (5h; next refresh at {monitor_common.format_console_timestamp('2030-01-01T05:00:01Z')}); starting manual refresh procedure.", level="warning")
+        logged.assert_any_call("Manual refresh succeeded for 'Account' (5h) after 1 times; token API-equivalent cost: $0.01234567.")
         self.assertEqual(state._retrieve_session_refresh_reset_at.call_count, 2)
         refresh.assert_called_once()
         self.assertEqual(state.session_refresh_costs, {})
@@ -1328,11 +1329,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state._due_session_refreshes = mock.Mock(return_value=[(credential, "5h")])
         state._retrieve_session_refresh_reset_at = mock.Mock(return_value=monitor_dashboard.parse_timestamp(confirmed_reset_at))
 
-        with mock.patch.object(monitor_dashboard, "refresh_session", return_value=(False, None, None)) as refresh, mock.patch("builtins.print") as printed:
+        with mock.patch.object(monitor_dashboard, "refresh_session", return_value=(False, None, None)) as refresh, mock.patch.object(monitor_dashboard, "console_log") as logged:
             state.run_session_refreshing()
 
         refresh.assert_called_once()
-        printed.assert_called_once_with("Manual refresh needed for 'Account' (5h; next refresh at 2030-01-01T05:00:00Z); starting manual refresh procedure.", flush=True)
+        logged.assert_called_once_with(f"Manual refresh needed for 'Account' (5h; next refresh at {monitor_common.format_console_timestamp('2030-01-01T05:00:00Z')}); starting manual refresh procedure.", level="warning")
         self.assertEqual(state.session_refresh_attempts, {key: 1})
         self.assertEqual(state.session_refresh_costs, {key: None})
 
@@ -1401,11 +1402,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state._due_session_refreshes = mock.Mock(return_value=[(credential, "5h")])
         state._retrieve_session_refresh_reset_at = mock.Mock(return_value=monitor_dashboard.parse_timestamp(reset_at))
 
-        with mock.patch.object(monitor_dashboard, "refresh_session") as refresh, mock.patch("builtins.print") as printed:
+        with mock.patch.object(monitor_dashboard, "refresh_session") as refresh, mock.patch.object(monitor_dashboard, "console_log") as logged:
             state.run_session_refreshing()
 
         refresh.assert_not_called()
-        printed.assert_not_called()
+        logged.assert_not_called()
         self.assertEqual(state._retrieve_session_refresh_reset_at.call_count, 1)
         self.assertEqual(state.session_refresh_suppressed_reset_at, {("account", "5h"): monitor_dashboard.parse_timestamp(reset_at)})
 
@@ -1439,10 +1440,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.session_refresh_procedures = {("account", "7d")}
         state.session_refresh_failed = {}
         state.session_refresh_suppressed_reset_at = {}
-        with mock.patch("builtins.print") as printed, mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+        with mock.patch.object(monitor_dashboard, "console_log") as logged, mock.patch.object(monitor_dashboard.time, "time", return_value=now):
             due = state._due_session_refreshes()
         self.assertEqual(due, [])
-        printed.assert_called_once_with("Manual refresh failed for 'Account' (7d) after 10 attempts; token API-equivalent cost: $0.12345678.", flush=True)
+        logged.assert_called_once_with("Manual refresh failed for 'Account' (7d) after 10 attempts; token API-equivalent cost: $0.12345678.", level="error")
         with mock.patch.object(monitor_dashboard.time, "time", return_value=now + monitor_dashboard.SESSION_REFRESH_FAILURE_RETRY_SECONDS - 1):
             self.assertEqual(state._due_session_refreshes(), [])
         with mock.patch.object(monitor_dashboard.time, "time", return_value=now + monitor_dashboard.SESSION_REFRESH_FAILURE_RETRY_SECONDS):
@@ -1464,9 +1465,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.session_refresh_procedures = {("account", "7d")}
         state.session_refresh_failed = {}
         state.session_refresh_suppressed_reset_at = {}
-        with mock.patch("builtins.print") as printed, mock.patch.object(monitor_dashboard.time, "time", return_value=now):
+        with mock.patch.object(monitor_dashboard, "console_log") as logged, mock.patch.object(monitor_dashboard.time, "time", return_value=now):
             state._due_session_refreshes()
-        printed.assert_called_once_with("Manual refresh failed for 'Account' (7d) after 10 attempts; token API-equivalent cost: unavailable (Codex CLI did not report token usage).", flush=True)
+        logged.assert_called_once_with("Manual refresh failed for 'Account' (7d) after 10 attempts; token API-equivalent cost: unavailable (Codex CLI did not report token usage).", level="error")
 
     def test_session_refresh_uses_sol_for_one_probe(self):
         with self.account_directory() as directory:
@@ -1503,7 +1504,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", sample_log=directory / "samples.jsonl",
-                codex_home=directory, local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                codex_home=directory, sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
             with mock.patch("builtins.print"):
@@ -1547,7 +1548,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", quota_history=directory / "quota.jsonl", sample_log=directory / "samples.jsonl",
-                codex_home=directory, local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                codex_home=directory, sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
             with mock.patch("builtins.print"):
@@ -1571,7 +1572,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-secret-a")), encoding="utf-8")
             args = SimpleNamespace(
                 auth=auth_path, state=directory / "state.json", history=directory / "history.jsonl", sample_log=directory / "samples.jsonl", codex_home=directory,
-                local_only=False, no_token_scan=True, interval=90, timeout=10, retry_limit=0, sample_log_max_bytes=1024, compact_history_days=None,
+                sample_log_max_bytes=1024, compact_history_days=None,
             )
             state = monitor_dashboard.UsageDashboardState(args, object())
             with mock.patch("builtins.print") as printed:
@@ -2352,7 +2353,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 }),
             }
 
-            sample = collect_usage_sample(SimpleNamespace(local_only=False, no_token_scan=True, auth=Path("auth.json"), timeout=10), object(), None)
+            sample = collect_usage_sample(SimpleNamespace(auth=Path("auth.json"), background_token_capture=True), object(), None)
 
             self.assertEqual(sample["windows"]["5h"]["usedPercent"], 12)
             self.assertEqual(sample["windows"]["7d"]["usedPercent"], 34)
@@ -2397,7 +2398,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             monitor_history.fetch_usage = fake_fetch_usage
 
             sample = collect_usage_sample(
-                SimpleNamespace(local_only=False, no_token_scan=True, auth=Path("auth.json"), timeout=10),
+                SimpleNamespace(auth=Path("auth.json"), background_token_capture=True),
                 object(),
                 None,
                 runtime_state={
@@ -3142,7 +3143,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         text = format_valid_delta_event(event, sample_row)
 
-        self.assertIn("2030-01-01T02:00:00Z (local " + datetime.fromisoformat("2030-01-01T02:00:00+00:00").astimezone().isoformat(timespec="seconds") + ")", text)
+        local_time = datetime.fromisoformat("2030-01-01T02:00:00+00:00").astimezone().isoformat(sep=" ", timespec="seconds")
+        self.assertTrue(text.startswith(f"[delta]({local_time[:19]} {local_time[19:]}) 5h "))
         self.assertIn("+5% / +$3", text)
         self.assertIn("ratio $0.6/%", text)
         self.assertIn("current 5h 25%", text)
@@ -3474,7 +3476,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(state["_specialEvents"][0]["reason"], "account-switch")
         text = format_special_event(state["_specialEvents"][0])
         self.assertIn("account-switch", text)
-        self.assertIn("2030-01-01T01:00:00Z (local " + datetime.fromisoformat("2030-01-01T01:00:00+00:00").astimezone().isoformat(timespec="seconds") + ")", text)
+        local_time = datetime.fromisoformat("2030-01-01T01:00:00+00:00").astimezone().isoformat(sep=" ", timespec="seconds")
+        self.assertTrue(text.startswith(f"[event]({local_time[:19]} {local_time[19:]}) 5h account-switch;"))
         self.assertIn("plan plus (1x) -> pro_lite (5x)", text)
         self.assertIn("baseline 5% -> 150%", text)
 
@@ -3905,7 +3908,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertLess(serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'), serve_source.index("state = UsageDashboardState(args, opener)"))
         self.assertIn("allow_reuse_address = True", source)
         self.assertLess(serve_source.index("instance_lock.acquire()"), serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'))
-        self.assertIn("self.wake_event.wait(poll_sleep_seconds(self.last_acquire_started_at, self.args.interval))", source)
+        self.assertIn("self.wake_event.wait(poll_sleep_seconds(self.last_acquire_started_at, ACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS))", source)
         self.assertIn("threading.Thread(target=state.run_cloud_maintenance, name=\"cloud-maintenance\", daemon=True)", source)
         self.assertIn("threading.Thread(target=managed_worker, args=(state.run_inactive_account_polling,), daemon=True)", source)
         self.assertIn("self.cloud_maintenance_event.wait(5)", source)
@@ -5986,44 +5989,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(stored["crypto.json"], original["crypto.json"])
             self.assertEqual(json.loads(cloud.config_path.read_text(encoding="utf-8"))["webdav"]["encryptionPassphraseHash"], old_hash)
 
-    def test_cloud_reencrypt_uploads_without_fetching_for_verification(self):
-        with self.account_directory() as directory:
-            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
-            encryption_hash = passphrase_hash("passphrase", "https://example.test", "user")
-            box = CryptoBox(encryption_hash, CryptoBox.descriptor(encryption_hash))
-            purposes = {
-                "skills/packages/package.enc": "skill-package:package", "skills/current.enc": "skills-pointer",
-                "accounts/account.enc": "account:account",
-            }
-            original = {path: box.encrypt(purpose, path.encode()) for path, purpose in purposes.items()}
-            stored = dict(original)
-
-            class Client:
-                def get(self, path):
-                    if path not in stored:
-                        raise CloudError("WebDAV GET failed with HTTP 404", 502)
-                    return stored[path], f'"{hashlib.sha256(stored[path]).hexdigest()}"'
-
-                def put(self, path, data, etag=None):
-                    stored[path] = data
-                    return f'"{hashlib.sha256(data).hexdigest()}"'
-
-                def list(self, path):
-                    return {
-                        "skills": ["current.enc"], "skills/packages": ["package.enc"], "accounts": ["account.enc"],
-
-                    }.get(path, [])
-
-            with mock.patch.object(cloud, "_connection", return_value=(Client(), box)), mock.patch.object(cloud, "fetch", return_value={"verified": True}) as fetch:
-                result = cloud.reencrypt_remote_data()
-
-            self.assertEqual(result["reencrypted"], len(purposes))
-            self.assertNotIn("fetch", result)
-            fetch.assert_not_called()
-            for path, purpose in purposes.items():
-                self.assertNotEqual(stored[path], original[path])
-                self.assertEqual(box.decrypt(purpose, stored[path]), path.encode())
-
     def test_control_auth_rejects_wrong_password_tampering_and_expired_cookie(self):
         salt = new_control_password_salt()
         auth = monitor_dashboard.ControlAuth({"passwordHash": hash_control_password("123456", salt), "passwordSalt": salt, "cookieSecret": "a" * 32})
@@ -6683,7 +6648,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "windows": {"5h": {"usedPercent": 5 if index < 5 else 6, "resetAt": "2030-01-01T05:00:00Z"}, "7d": {"usedPercent": 20, "resetAt": "2030-01-08T00:00:00Z"}},
                 "sync": {"version": 1, "originMachineId": "machine-a", "accountId": "v3:usage-a", "recordId": f"quota-{index}"},
             } for index in range(6)]
-            store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
+            store = UsageDataStore(directory / "usage.sqlite3", "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
 
             for row in rows:
                 store.record_quota(row)
@@ -6704,7 +6669,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             history.write_text("", encoding="utf-8")
             tokens.write_text("", encoding="utf-8")
             make_row = lambda index: {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 5, "resetAt": "2030-01-01T05:00:00Z"}}}
-            store = UsageDataStore(quota, tokens, "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
+            store = UsageDataStore(directory / "usage.sqlite3", "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
             for index in range(3):
                 store.record_quota(make_row(index))
             first, _ = store.snapshot()
@@ -6731,7 +6696,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 "checkedAt": f"2030-01-01T00:0{index}:30Z", "accountSlotId": "account-b", "accountLabel": "B",
                 "windows": {"5h": {"usedPercent": 5, "plan": "plus", "resetAt": "2030-01-01T05:00:00Z"}},
             } for index in range(3)]
-            store = UsageDataStore(quota, tokens, "machine-a", lambda slot: "v3:usage-a" if slot == "account-a" else "v3:usage-b", threading.Lock())
+            store = UsageDataStore(directory / "usage.sqlite3", "machine-a", lambda slot: "v3:usage-a" if slot == "account-a" else "v3:usage-b", threading.Lock())
 
             for row in sorted(rows, key=lambda row: row["checkedAt"]):
                 store.record_quota(row)

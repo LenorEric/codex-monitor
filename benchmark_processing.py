@@ -17,7 +17,7 @@ def benchmark(count):
     root = Path.cwd() / f".processing-benchmark-{uuid.uuid4().hex}"
     root.mkdir()
     try:
-        store = CanonicalDataStore(root / "quota.jsonl", root / "ledger.jsonl", "machine", lambda _: "v3:account", threading.RLock())
+        store = CanonicalDataStore(root / "usage.sqlite3", "machine", lambda _: "v3:account", threading.RLock())
         def sample(index):
             return {"checkedAt": datetime.fromtimestamp(1893456000 + index, timezone.utc).isoformat(), "accountSlotId": "slot", "accountLabel": "Account",
                 "windows": {"5h": {"usedPercent": 0, "plan": "plus"}, "7d": {"usedPercent": 0, "plan": "plus"}}}

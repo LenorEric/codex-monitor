@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 
 import math
-import sys
 from pathlib import Path
 import time
 import urllib.request
 
-from monitor_common import DEFAULT_RETRY_LIMIT, TARGET_WINDOWS, USAGE_ENDPOINT, UsageError, UsageHttpError, now_iso, refresh_access_token, request_json
+from monitor_common import DEFAULT_RETRY_LIMIT, TARGET_WINDOWS, USAGE_ENDPOINT, UsageError, UsageHttpError, console_log, now_iso, refresh_access_token, request_json
 
 def compact_quota(data: dict) -> dict:
     """Validate each quota window independently. reset_at is the only reset authority."""
@@ -54,7 +53,7 @@ def fetch_usage(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Pa
             try:
                 response_callback(body, status, account_id)
             except Exception as exc:
-                print(f"Raw quota response logging failed: {exc}", file=sys.stderr, flush=True)
+                console_log(f"Raw quota response logging failed: {exc}", level="error")
         try:
             status, body = request_json(opener, "GET", USAGE_ENDPOINT, headers, timeout=timeout, retries=retries,
                 **({"response_callback": capture} if response_callback else {}))
