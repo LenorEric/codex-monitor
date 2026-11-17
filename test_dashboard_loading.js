@@ -49,15 +49,19 @@ test("reset baselines stay in their window and sort before simultaneous observat
     assert.equal(h.run("costTimeUsageSeries(61,62)[1].points[0].sevenDay.continuous"), 12);
 });
 
-test("nearby cost points chain across horizontal gaps up to 10px", () => {
-    const h = harness();
-    h.run(`mergePoints=[0,10,17,18,28,39,49].map((timestamp,index)=>({timestamp,costPer100PercentUsd:index%2?1000:1,deltaPercent:1,deltaCostUsd:1}));
-        mergeMetrics={plotWidth:100,minTime:0,maxTime:100,minDistance:denseMergeMetrics('scatter5h',mergePoints).minDistance};
-        mergedPoints=mergeDenseDeltaEvents(mergePoints,mergeMetrics)`);
-    assert.equal(h.run("mergeMetrics.minDistance"), 10);
-    assert.deepEqual(JSON.parse(h.run("JSON.stringify(mergedPoints.map(point=>point.rawKeys))")), [["0", "10", "17", "18", "28"], ["39", "49"]]);
-    assert.equal(h.run("mergedPoints.reduce((sum,point)=>sum+point.deltaPercent,0)"), 7);
-    assert.equal(h.run("mergedPoints.reduce((sum,point)=>sum+point.deltaCostUsd,0)"), 7);
+test("cost dots keep at least 10px between centers within each account", () => {
+    const h = animationHarness();
+    h.elements.get("scatter5h").getBoundingClientRect = () => ({ width: 166, height: 300 });
+    h.run(`selected='All';
+        mergePoints=[0,8,11,19,28,47,57,100].map((timestamp,index)=>({timestamp,costPer100PercentUsd:index%2?50:100,deltaPercent:index%2?2:1,deltaCostUsd:1}));
+        drawDeltaChart('scatter5h','','',mergePoints)`);
+    const points = JSON.parse(h.run("JSON.stringify(chartStates.scatter5h.series[0].points)"));
+    assert.deepEqual(points.map(point => point.rawKeys), [["0", "8", "11"], ["19", "28"], ["47"], ["57"], ["100"]]);
+    assert.ok(points.slice(1).every((point, index) => point.x - points[index].x >= 10));
+    assert.equal(points[3].x - points[2].x, 10);
+    assert.deepEqual(points.map(point => point.ref.costPer100PercentUsd), [75, 2 / 3 * 100, 50, 100, 50]);
+    assert.equal(points.reduce((sum, point) => sum + point.ref.deltaPercent, 0), 12);
+    assert.equal(points.reduce((sum, point) => sum + point.ref.deltaCostUsd, 0), 8);
 });
 
 function harness(overrides = {}) {

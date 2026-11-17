@@ -762,22 +762,26 @@ function extent(values){
 }
 function denseMergeMetrics(id,list){
   const rect=document.getElementById(id).getBoundingClientRect(), [minTime,maxTime]=fullDayTimeDomain()||extent(list.map(eventTimestamp).filter(Number.isFinite));
-  return {plotWidth:Math.max(1,rect.width-CHART_MARGINS.l-CHART_MARGINS.r),minTime,maxTime,minDistance:10};
-}
-function denseDeltaDistance(a,b,metrics){
-  return Math.abs(eventTimestamp(b)-eventTimestamp(a))/Math.max(1,metrics.maxTime-metrics.minTime)*metrics.plotWidth;
+  return {plotWidth:Math.max(1,rect.width-CHART_MARGINS.l-CHART_MARGINS.r),minTime,maxTime,minDistance:2*NODE_RADIUS};
 }
 function mergeDenseDeltaEvents(list,metrics){
-  const result=[];
-  let group=[];
+  const result=[], minTimeGap=(metrics.maxTime-metrics.minTime||1)*metrics.minDistance/metrics.plotWidth;
+  let group=[], timestampSum=0;
   const flush=()=>{
     if(!group.length)return;
-    const timestamp=group.reduce((sum,p)=>sum+eventTimestamp(p),0)/group.length, ratio=group.reduce((sum,p)=>sum+p.costPer100PercentUsd,0)/group.length;
-    result.push({...group[group.length-1],checkedAt:new Date(timestamp*1000).toISOString(),timestamp,costPer100PercentUsd:ratio,deltaPercent:group.reduce((sum,p)=>sum+(p.deltaPercent||0),0),deltaCostUsd:group.reduce((sum,p)=>sum+(p.deltaCostUsd||0),0),mergedCount:group.length,mergedFrom:new Date(eventTimestamp(group[0])*1000).toISOString(),mergedTo:new Date(eventTimestamp(group[group.length-1])*1000).toISOString(),rawKeys:group.map(p=>p._key||String(eventTimestamp(p)))});group=[];
+    const timestamp=timestampSum/group.length;
+    const deltaPercent=group.reduce((sum,p)=>sum+(p.deltaPercent||0),0), deltaCostUsd=group.reduce((sum,p)=>sum+(p.deltaCostUsd||0),0);
+    result.push({...group[group.length-1],checkedAt:new Date(timestamp*1000).toISOString(),timestamp,costPer100PercentUsd:deltaPercent>0?deltaCostUsd/deltaPercent*100:null,deltaPercent,deltaCostUsd,
+      mergedCount:group.length,mergedFrom:new Date(eventTimestamp(group[0])*1000).toISOString(),mergedTo:new Date(eventTimestamp(group[group.length-1])*1000).toISOString(),rawKeys:group.map(p=>p._key||String(eventTimestamp(p)))});
+    group=[];
+    timestampSum=0;
   };
   for(const point of list.sort((a,b)=>eventTimestamp(a)-eventTimestamp(b))){
-    if(group.length&&denseDeltaDistance(group[group.length-1],point,metrics)>metrics.minDistance)flush();
+    const timestamp=eventTimestamp(point);
+    // A merged dot moves only to the right, increasing its distance from the previous dot.
+    if(group.length&&timestamp-timestampSum/group.length>=minTimeGap)flush();
     group.push(point);
+    timestampSum+=timestamp;
   }
   flush();
   return result;
@@ -931,7 +935,7 @@ function drawDeltaChart(id,name,color,list,animate=false){
     return {name:accountDisplayName(accountId,merged[0]?.accountLabel),color:accountCurveColor(accountId),points:merged.map(point=>({x:eventTimestamp(point),y:point.costPer100PercentUsd,ref:point}))};
   }).sort((a,b)=>a.name.localeCompare(b.name,undefined,{numeric:true,sensitivity:"base"})), points=series.flatMap(item=>item.points);
   const legend=document.getElementById(`${id}Legend`);legend.replaceChildren(...series.map(item=>{const entry=document.createElement("span"),dot=document.createElement("span");dot.className="dot";dot.style.background=item.color;entry.append(dot,item.name);return entry}));
-  chart(id,series,{xFmt:value=>new Date(value*1000).toLocaleString(),yFmt:usd,xDomain:fullDay||extent(points.map(p=>p.x)),yDomain:extent(points.map(p=>p.y)),showEmptyAxis:!!fullDay,minPoints:1,insufficientMessage:"No cost and usage period for the selected scope",animate});
+  chart(id,series,{xFmt:value=>new Date(value*1000).toLocaleString(),yFmt:usd,xDomain:[metrics.minTime,metrics.maxTime],yDomain:extent(points.map(p=>p.y)),showEmptyAxis:!!fullDay,minPoints:1,insufficientMessage:"No cost and usage period for the selected scope",animate});
 }
 function quotaTimeDomain(points){
   if(selected==="Date"){
