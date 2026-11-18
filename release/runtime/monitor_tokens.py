@@ -9,6 +9,8 @@ from pathlib import Path
 from monitor_common import empty_cost_totals, empty_token_totals, parse_timestamp
 
 MODEL_PRICES_PER_MILLION = {
+    "gpt-6.2-astra": {"input": 8.00, "cachedInput": 0.40, "cacheWriteInput": 10.00, "output": 40.00},
+    "gpt-6.2-sol": {"input": 2.00, "cachedInput": 0.10, "cacheWriteInput": 2.50, "output": 10.00},
     "gpt-6": {"input": 10.00, "cachedInput": 1.00, "cacheWriteInput": 12.50, "output": 50.00},
     "gpt-6-astra": {"input": 10.00, "cachedInput": 1.00, "cacheWriteInput": 12.50, "output": 50.00},
     "gpt-6.1-sol": {"input": 2.00, "cachedInput": 0.10, "cacheWriteInput": 2.50, "output": 10.00},

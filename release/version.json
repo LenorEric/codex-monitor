@@ -1,5 +1,5 @@
 {
-  "version": "1.6.11",
+  "version": "1.6.12",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 3497,
@@ -146,8 +146,8 @@
       "sha256": "7643724fd5bd76864f4918a90c371919ca741af3b3bebd46fc25ef2c5be4a13c"
     },
     "monitor_tokens.py": {
-      "size": 24983,
-      "sha256": "d94ad009c386d4863bb88ad69142be2bc89bc41a543bae5b73f716956a9a8d0d"
+      "size": 25184,
+      "sha256": "45f092b1715f5968bf1eef15a55f673ecd14575c67ad9383dba8987a6ec5e17a"
     },
     "monitor_usage_sync.py": {
       "size": 21540,
@@ -167,7 +167,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "ff2b1cce2bb00dab4d9e5545d66b5762c8ece292bf38dcbbaa84887ffb4f7e5e"
+      "sha256": "2670d4667ad97b5e69cca5051898b0533b9435d0b939bab11cc66d0b4d6103db"
     }
   }
 }

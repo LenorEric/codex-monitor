@@ -2534,6 +2534,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_gpt_6_models_use_model_specific_prices(self):
         for model, prices, total in (
+            ("gpt-6.2-astra", {"input": 8.0, "cachedInput": 0.4, "cacheWriteInput": 10.0, "output": 40.0}, 58.4),
+            ("gpt-6.2-sol", {"input": 2.0, "cachedInput": 0.1, "cacheWriteInput": 2.5, "output": 10.0}, 14.6),
             ("gpt-6.1-sol", {"input": 2.0, "cachedInput": 0.1, "cacheWriteInput": 2.5, "output": 10.0}, 14.6),
             ("gpt-6.1-terra", {"input": 1.0, "cachedInput": 0.05, "cacheWriteInput": 1.25, "output": 5.0}, 7.3),
             ("gpt-6-sol", {"input": 2.0, "cachedInput": 0.2, "cacheWriteInput": 2.5, "output": 10.0}, 14.7),
