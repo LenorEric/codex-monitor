@@ -296,7 +296,8 @@ class FinalDelivery:
                 db.execute("INSERT OR IGNORE INTO wanted_chart VALUES(?)", (interval[0],))
                 before = self._item(db, view, account, "chart:" + window, interval[0])
                 old = self._interval(before) if before else None
-                if old != interval:
+                # The endpoint IDs identify the original percentages and multiplier.
+                if old is None or old[:3] != interval[:3]:
                     self._mark_neighbors(db, view, account, "chart:" + window, interval[1], interval[2])
                     self._set(db, view, account, "chart:" + window, [interval[0], interval[1], interval[2], int(interval[2]), interval[4], interval[3], []], interval[1], interval[2], visible=False)
                     self._mark_neighbors(db, view, account, "chart:" + window, interval[1], interval[2])
@@ -314,25 +315,52 @@ class FinalDelivery:
                     self._mark_neighbors(db, view, account, channel, first, last)
                 self._remove(db, view, account, channel, key)
 
+    def _chart_neighbor(self, db, view, account, channel, interval, before):
+        condition, stamp, order = ("last<=?", interval[1], "last DESC,id") if before else ("first>=?", interval[2], "first,id")
+        row = self.ordered_items(db, view, account, channel, condition, (stamp,), order, 1).fetchone()
+        return self._interval(row) if row else None
+
+    @staticmethod
+    def _can_transfer(previous, following):
+        return (previous and following and following[1] - previous[2] <= CHART_ATTRIBUTION_SECONDS
+            and previous[0].split(">", 1)[1] == following[0].split(">", 1)[0])
+
+    def _chart_has_cost(self, db, view, account, interval, before, after):
+        neighbors = [value for value in (before, interval, after) if value is not None]
+        for row, has_cost in token_projection(db, view, account, interval[1] - CHART_ATTRIBUTION_SECONDS, interval[2] + CHART_ATTRIBUTION_SECONDS, cost_evidence=True):
+            self.metrics["sourceTokenRowsRead"] += 1
+            if has_cost and nearest(neighbors, row[1], max_distance=CHART_ATTRIBUTION_SECONDS) == int(before is not None):
+                return True
+        return False
+
+    def _chart_delta(self, db, view, account, channel, interval):
+        # Chart rows may already include a transfer. Read the original endpoints.
+        first, last = (json.loads(self._item(db, view, account, "usage:" + channel[6:], key)[0]) for key in interval[0].split(">", 1))
+        return (last[3] - first[3]) * interval[4]
+
     def _rechart(self, db, view, account, channel, key):
         body = self._item(db, view, account, channel, key)
         if body is None:
             return
         interval = self._interval(body)
-        before = self.ordered_items(db, view, account, channel, "last<=? AND id!=?", (interval[1], key), "last DESC,id", 1).fetchone()
-        after = self.ordered_items(db, view, account, channel, "first>=? AND id!=?", (interval[2], key), "first,id", 1).fetchone()
-        values = [self._interval(before)] if before else []
-        position = len(values)
-        values.append(interval)
-        if after:
-            values.append(self._interval(after))
+        before = self._chart_neighbor(db, view, account, channel, interval, True)
+        after = self._chart_neighbor(db, view, account, channel, interval, False)
+        values = [value for value in (before, interval, after) if value is not None]
+        position = int(before is not None)
         totals = Totals()
-        visible = False
+        visible = assigned_cost = False
         for row, has_cost in token_projection(db, view, account, interval[1] - CHART_EVIDENCE_SECONDS, interval[2] + CHART_EVIDENCE_SECONDS, cost_evidence=True):
             self.metrics["sourceTokenRowsRead"] += 1
             visible |= has_cost
             if nearest(values, row[1], max_distance=CHART_ATTRIBUTION_SECONDS) == position:
                 totals.add(row)
+                assigned_cost |= has_cost
+        interval[3] = self._chart_delta(db, view, account, channel, interval)
+        if assigned_cost and self._can_transfer(interval, after):
+            if not self._chart_has_cost(db, view, account, after, interval, self._chart_neighbor(db, view, account, channel, after, False)):
+                interval[3] += self._chart_delta(db, view, account, channel, after)
+        elif visible and not assigned_cost and self._can_transfer(before, interval):
+            visible = not self._chart_has_cost(db, view, account, before, self._chart_neighbor(db, view, account, channel, before, True), interval)
         self._set(db, view, account, channel, totals.chart(interval), interval[1], interval[2], visible=visible)
 
     @classmethod
@@ -432,6 +460,19 @@ class FinalDelivery:
             # shape remains [reset], not a new history channel.
             self._set(db, view, account, "quota:" + window, [window, latest[0] if latest else None], 0, 0)
         self._tokens(db, view, account, cutoff, bootstrap)
+        if not bootstrap:
+            # A changed assignment can change the displayed delta of its neighbors.
+            db.execute("CREATE TEMP TABLE IF NOT EXISTS changed_charts(channel TEXT,id TEXT)")
+            db.execute("DELETE FROM changed_charts")
+            db.execute("INSERT INTO changed_charts SELECT channel,id FROM stage.recalc WHERE view=? AND account=?", (view, account))
+            for channel, key in db.execute("SELECT channel,id FROM changed_charts"):
+                if body := self._item(db, view, account, channel, key):
+                    interval = self._interval(body)
+                    before = self._chart_neighbor(db, view, account, channel, interval, True)
+                    after = self._chart_neighbor(db, view, account, channel, interval, False)
+                    for neighbor, eligible in ((before, self._can_transfer(before, interval)), (after, self._can_transfer(interval, after))):
+                        if eligible:
+                            db.execute("INSERT OR IGNORE INTO stage.recalc VALUES(?,?,?,?)", (view, account, channel, neighbor[0]))
         for channel, key in db.execute("SELECT channel,id FROM stage.recalc WHERE view=? AND account=? ORDER BY channel,id", (view, account)):
             self._rechart(db, view, account, channel, key)
         self.metrics["accountsPrepared"] += 1
@@ -484,16 +525,21 @@ class FinalDelivery:
                 db.execute("DELETE FROM delivery_journal WHERE rowid IN (SELECT rowid FROM "
                     "(SELECT rowid,SUM(length(body)) OVER (ORDER BY created DESC,stream DESC,seq DESC) AS bytes FROM delivery_journal) WHERE bytes>?)", (JOURNAL_BYTES,))
 
-    def rebuild(self):
+    def rebuild(self, *, preserve_charts=False):
         """Clear derived rows and rebuild from canonical data before workers start."""
-        with self.lock, self.index.lock, closing(self._connect()) as db, db:
-            db.execute("DELETE FROM delivery_items WHERE channel IN ('tokens','usage:5h','usage:7d','chart:5h','chart:7d','quota:5h','quota:7d')")
-            db.execute("DELETE FROM delivery_journal")
-            db.execute("UPDATE delivery_meta SET value=? WHERE name='epoch'", (uuid.uuid4().hex,))
-            db.execute("UPDATE delivery_meta SET value='0' WHERE name IN ('local','merged','state')")
-            db.execute("INSERT INTO delivery_pending(view,account,kind) SELECT dataset,account,'bootstrap' FROM canonical_quota "
-                "UNION SELECT dataset,account,'bootstrap' FROM canonical_tokens")
-        self.prepare()
+        with self.lock:
+            if preserve_charts:
+                self.prepare()  # Apply outstanding work before grouping all existing tokens again.
+            with self.index.lock, closing(self._connect()) as db, db:
+                db.execute("DELETE FROM delivery_items WHERE channel IN ('tokens','usage:5h','usage:7d','quota:5h','quota:7d')")
+                if not preserve_charts:
+                    db.execute("DELETE FROM delivery_items WHERE channel IN ('chart:5h','chart:7d')")
+                db.execute("DELETE FROM delivery_journal")
+                db.execute("UPDATE delivery_meta SET value=? WHERE name='epoch'", (uuid.uuid4().hex,))
+                db.execute("UPDATE delivery_meta SET value='0' WHERE name IN ('local','merged','state')")
+                db.execute("INSERT INTO delivery_pending(view,account,kind) SELECT dataset,account,'bootstrap' FROM canonical_quota "
+                    "UNION SELECT dataset,account,'bootstrap' FROM canonical_tokens")
+            self.prepare()
 
     def prepare(self, now=None, status=None, force=False):
         from monitor_dashboard import dashboard_safe_json

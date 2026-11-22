@@ -344,7 +344,7 @@ class UsageDashboardState:
         from monitor_delivery import DashboardDelivery
         self.delivery = DashboardDelivery(self.usage_data.index)
         console_log("Startup: rebuilding dashboard delivery from canonical data...")
-        self.delivery.rebuild()
+        self.delivery.rebuild(preserve_charts=True)
         self.cloud.configure_usage_sync(self.usage_data)
         console_log("Startup: recovering account transitions and reconciling managed skills...")
         try:

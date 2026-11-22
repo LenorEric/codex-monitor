@@ -25,7 +25,9 @@ Only the new batch is grouped: API accounts use existing UTC minute groups; othe
 
 Quota work retains discontinuous extents and merges only overlaps. The processor reads actual neighboring canonical records, updates usage connection flags and cost edges, and recalculates changed or neighboring attribution intervals. A chart interval is published if it has a same-account nonzero canonical cost event within its bounds extended by 500 seconds on each side. The chart attributes each event to its nearest interval within 390 seconds, preferring the earlier interval on ties. A late event can make multiple intervals visible, including intervals that receive none of its cost.
 
-At service startup, canonical-derived delivery rows are cleared and rebuilt once before dashboard workers start. A failure stops startup; the next startup retries the rebuild. The delivery epoch changes so clients request a fresh snapshot. Legacy delivery rows without canonical sources remain intact.
+If an interval has no assigned nonzero cost, its normalized usage increase is attributed to the immediately preceding interval when that interval has assigned cost, they share a quota run, and their gap is at most 390 seconds. The donor is hidden from cost charts and remains in the attribution directory. Late quota or cost records can revise both intervals.
+
+At service startup, outstanding delivery work is processed before rebuilding token, quota and usage rows. Saved chart attribution is retained, and missing chart rows are derived from canonical data. A failure stops startup; the next startup retries the rebuild. The delivery epoch changes so clients request a fresh snapshot. Legacy delivery rows without canonical sources remain intact.
 
 Usage IDs depend on window, start and business state, not a moving range end/reset deadline. Chart IDs depend on both endpoint usage IDs. An unchanged range tail extends the usage row and current reset without scanning historical tokens unless its actual adjacency changes. Empty time gaps do not produce buckets, work or loops.
 

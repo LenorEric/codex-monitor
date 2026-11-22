@@ -16,7 +16,7 @@ from monitor_canonical import CanonicalDataStore, CanonicalIndex
 from monitor_canonical_store import CanonicalRepository
 from monitor_delivery import DashboardDelivery
 from monitor_delivery import Totals, encoded
-from monitor_interpretation import chart_rows, usage_runs, valid_intervals
+from monitor_interpretation import chart_rows, nearest, usage_runs, valid_intervals
 from monitor_live import send_bulk
 from monitor_sampling import quota_point
 from test_support_delivery import released_delivery
@@ -82,8 +82,15 @@ class FinalDeliveryTests(unittest.TestCase):
             from monitor_delivery import token_projection
             tokens = list(token_projection(db, view, "v3:account", cost_evidence=True))
         intervals = valid_intervals(usage_runs([quota_point(row) for row in quotas], window))
+        assigned = {nearest(intervals, event[1], max_distance=390) for event, has_cost in tokens if has_cost}
+        transferred = set()
+        for index, (previous, current) in enumerate(zip(intervals, intervals[1:])):
+            if (index in assigned and index + 1 not in assigned and current[1] - previous[2] <= 390
+                    and previous[0].split(">", 1)[1] == current[0].split(">", 1)[0]):
+                previous[3] += current[3]
+                transferred.add(current[0])
         return [row for row in chart_rows([event for event, _ in tokens], intervals, max_distance=390)
-            if any(has_cost and row[1] - 500 <= event[1] <= row[2] + 500 for event, has_cost in tokens)]
+            if row[0] not in transferred and any(has_cost and row[1] - 500 <= event[1] <= row[2] + 500 for event, has_cost in tokens)]
 
     def assert_charts(self):
         for view in ("local", "merged"):
@@ -160,6 +167,35 @@ class FinalDeliveryTests(unittest.TestCase):
         self.assertEqual(self.view()["tokens"], tokens)
         self.assert_charts()
         self.assertEqual(sum(model[1] for row in self.view()["chart:5h"] for model in row[6]), 300000000)
+
+    def test_delayed_quota_increase_transfers_once_until_its_cost_arrives(self):
+        for window, gap in (("5h", 390), ("7d", 391)):
+            self.put_quota(1000, 10, window)
+            self.put_quota(1100, 12, window, last=1100 + gap)
+            self.put_quota(1600, 15, window)
+        self.token("early", 1100)
+        self.delivery.prepare()
+        early, = self.view()["chart:5h"]
+        self.assertEqual(early[5:], [5, [[0, 100_000_000, 5]]])
+        self.assertEqual([row[5] for row in self.view()["chart:7d"]], [2, 3])
+        self.assertFalse(self.delivery.prepare())
+        self.token("late", 1550)
+        self.delivery.prepare()
+        early_after, late = self.view()["chart:5h"]
+        self.assertEqual(early_after[0], early[0])
+        self.assertEqual(early_after[5:], [2, [[0, 100_000_000, 2]]])
+        self.assertEqual(late[5:], [3, [[0, 100_000_000, 3]]])
+        self.assert_charts()
+
+    def test_startup_keeps_saved_chart_attribution(self):
+        for first, value in ((1000, 10), (1100, 12), (1200, 15)):
+            self.put_quota(first, value)
+        self.token("early", 1100)
+        with mock.patch.object(self.delivery, "_can_transfer", return_value=False):
+            self.delivery.prepare()
+        before = self.view()["chart:5h"]
+        self.delivery.rebuild(preserve_charts=True)
+        self.assertEqual(self.view()["chart:5h"], before)
 
     def test_full_rebuild_clears_delivery_and_retries_after_failure(self):
         self.put_quota(1000, 0, reset=10000)
