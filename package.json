@@ -2,7 +2,7 @@
   "name": "codex-usage-monitor",
   "displayName": "Codex Usage Monitor",
   "description": "Shows Python-backed Codex rate-limit usage in the VS Code status bar and a details view.",
-  "version": "1.6.14",
+  "version": "1.6.15",
   "dataContractVersion": 27,
   "cloudDataContractVersion": 5,
   "publisher": "lenor",
@@ -46,7 +46,7 @@
     "vscode:prepublish": "node --check extension.js",
     "check": "node --check extension.js",
     "release": "python build_release.py",
-    "test": "python -m unittest discover -p test_*.py && node test_management_queue.js && node test_dashboard_loading.js"
+    "test": "python -m unittest discover -p test_*.py && node test_dashboard_loading.js"
   },
   "dependencies": {
     "ws": "^8.22.0"

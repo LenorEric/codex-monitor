@@ -176,7 +176,7 @@ const vscode=typeof acquireVsCodeApi==="function"?acquireVsCodeApi():null;
 const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections";
 const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections";
 const DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000, DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000;
-let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={points:[],quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}};
+let selected="Date", previousRange="24h", selectedDate=localDateValue(new Date()), selectedModels=new Set(), selectedAccounts=new Set(), dataView="merged", collapseUsageGaps=true, collapseUsageFlat=true, normalizedUsage=false, payload={quotaPoints:[],tokenSessions:[],costUsage:{fiveHour:[],sevenDay:[]}};
 let fullDayDate=null;
 let currentStatus=null, actionBusy=false, actionSequence=0, refreshErrorShown=false;
 let historyScope=null,historyGeneration=null,drawGeneration=0;
@@ -995,7 +995,7 @@ function drawXAxisTickLabels(ctx,labels,start,pixels,y){
 }
 function plusEquivalentUsage(point,label,valueOf){return valueOf(point)*(point[label]?.multiplier??1)}
 function compactedUsageRanges(points){
-  return points.map(point=>({start:point.overviewBucket?.start??point.compactedFrom,end:point.overviewBucket?.end??eventTimestamp(point)})).filter(range=>Number.isFinite(range.start)&&Number.isFinite(range.end)&&range.start<range.end).sort((a,b)=>a.start-b.start||a.end-b.end).reduce((merged,range)=>{
+  return points.map(point=>({start:point.compactedFrom,end:eventTimestamp(point)})).filter(range=>Number.isFinite(range.start)&&Number.isFinite(range.end)&&range.start<range.end).sort((a,b)=>a.start-b.start||a.end-b.end).reduce((merged,range)=>{
     const previous=merged.at(-1);
     if(previous&&range.start<=previous.end)previous.end=Math.max(previous.end,range.end);
     else merged.push(range);
@@ -1071,14 +1071,16 @@ function usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right){
   const secondsPerPixel=unfoldedDuration/flexibleWidth;
   return folds.map(fold=>{const start=fold.sourceStart+fold.leadingMargin*secondsPerPixel, end=fold.sourceEnd-fold.trailingMargin*secondsPerPixel;return {...fold,start,end,duration:end-start}});
 }
-function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth,collapseGaps=true,collapseFlat=true){
-  if(x1-x0<12*3600)return [];
-  const folds=[], candidates=usageTimeFoldMetrics(usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat).map(range=>usageTimeEdgeFoldRange(range,x0,x1,left,right)).filter(Boolean),x0,x1,left,right,charWidth);
+function resolveTimeFolds(candidates,x0,x1,left,right){
+  const folds=[];
   while(true){
     const timeScale=usageTimeScale(x0,x1,folds,left,right), additions=candidates.filter(gap=>!folds.includes(gap)&&timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?3:6));
     if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right);
     folds.push(...additions);folds.sort((a,b)=>a.start-b.start);
   }
+}
+function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth,collapseGaps=true,collapseFlat=true){
+  return x1-x0<12*3600?[]:resolveTimeFolds(usageTimeFoldMetrics(usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat).map(range=>usageTimeEdgeFoldRange(range,x0,x1,left,right)).filter(Boolean),x0,x1,left,right,charWidth),x0,x1,left,right);
 }
 function usageTimeScale(x0,x1,folds,left,right){
   if(x0===x1)return {x:()=>left+(right-left)/2,timestampAt:()=>x0,folds:[]};
@@ -1363,14 +1365,7 @@ function costTimeFoldCandidates(series,usage){
   return candidates;
 }
 function costTimeFolds(series,usage,left,right,charWidth){
-  if(series.end-series.start<12*3600)return [];
-  const folds=[], candidates=usageTimeFoldMetrics(costTimeFoldCandidates(series,usage).map(range=>usageTimeEdgeFoldRange(range,series.start,series.end,left,right)).filter(Boolean),series.start,series.end,left,right,charWidth);
-  while(true){
-    const scale=usageTimeScale(series.start,series.end,folds,left,right);
-    const additions=candidates.filter(range=>!folds.includes(range)&&scale.x(range.end)-scale.x(range.start)>range.width*(range.kind==="gap"?3:6));
-    if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,series.start,series.end,left,right);
-    folds.push(...additions);folds.sort((a,b)=>a.start-b.start);
-  }
+  return series.end-series.start<12*3600?[]:resolveTimeFolds(usageTimeFoldMetrics(costTimeFoldCandidates(series,usage).map(range=>usageTimeEdgeFoldRange(range,series.start,series.end,left,right)).filter(Boolean),series.start,series.end,left,right,charWidth),series.start,series.end,left,right);
 }
 function costTimeUsageAt(item,time){
   const right=costTimeUsageIndex(item.points,time);
@@ -1493,8 +1488,8 @@ function drawAll(animate=false){
   const five=modelFilteredEvents(accountFilteredEvents(fiveInRange)), seven=modelFilteredEvents(accountFilteredEvents(sevenInRange)), quota=accountFilteredQuotaPoints(quotaInRange);
   const selectedTokenSessions=accountFilteredEvents(tokenSessions);
   updateTokenSummary(selectedTokenSessions);
-  updateRate("rate5h",payload.rateRows?modelFilteredEvents(accountFilteredEvents(payload.rateRows.fiveHour)):five);
-  updateRate("rate7d",payload.rateRows?modelFilteredEvents(accountFilteredEvents(payload.rateRows.sevenDay)):seven);
+  updateRate("rate5h",five);
+  updateRate("rate7d",seven);
   const jobs=[()=>drawUsageTimeChart("usageTime5h","fiveHour",quota,animate),()=>drawUsageTimeChart("usageTime7d","sevenDay",quota,animate),
     ()=>drawDeltaChart("scatter5h","5h cost vs usage",css("--blue"),five,animate),()=>drawDeltaChart("scatter7d","7d cost vs usage",css("--green"),seven,animate),
     ()=>drawCostTimeChart(animate)];

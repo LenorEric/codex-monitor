@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 
-import hashlib
 import json
-import threading
-from datetime import datetime, timezone
 from pathlib import Path
 
 from monitor_common import empty_cost_totals, empty_token_totals, parse_timestamp
@@ -54,9 +51,6 @@ FAST_MODE_COST_MULTIPLIER_HISTORY = {
 }
 DEFAULT_FAST_MODE_COST_MULTIPLIER = 2.0
 MAX_CODEX_APPEND_DRAIN_READS = 3
-
-_CODEX_SESSION_SCAN_CACHE: dict[str, dict[str, dict]] = {}
-_CODEX_SESSION_SCAN_LOCK = threading.RLock()
 
 def normalize_codex_model(raw: str) -> str:
     name = raw.lower()
@@ -388,99 +382,6 @@ def _update_codex_file_state(path: Path, state: dict | None, retry_race: bool = 
     state["size"] = state["offset"]
     state["mtimeNs"] = final_stat.st_mtime_ns
     return state
-
-def _scan_codex_token_events_unlocked(home: Path) -> tuple[list[dict], int, float | None, dict]:
-    files = collect_codex_session_files(home)
-    file_keys = [(path, str(path.resolve())) for path in files]
-    cache = _CODEX_SESSION_SCAN_CACHE.setdefault(str(home.resolve()), {})
-    current_paths = {key for _, key in file_keys}
-    for cached_path in cache.keys() - current_paths:
-        del cache[cached_path]
-    for path, key in file_keys:
-        state = _update_codex_file_state(path, cache.get(key))
-        if state is None:
-            cache.pop(key, None)
-        else:
-            cache[key] = state
-    usage_events = []
-    seen_event_ids = set()
-    latest_timestamp = None
-    complete_sessions, incomplete_sessions, source_files = set(), set(), set()
-    for _, key in file_keys:
-        state = cache.get(key)
-        if state is None:
-            continue
-        source_file = Path(key).name
-        if state["invalidLines"] or not state["hasSessionMeta"]:
-            incomplete_sessions.add(state["sessionId"])
-            continue
-        source_files.add(source_file)
-        complete_sessions.add(state["sessionId"])
-        for cached_event in state["events"]:
-            identity = [state["sessionId"], cached_event["checkedAt"], cached_event["cumulative"]]
-            event_id = f'{state["sessionId"]}:{hashlib.sha256(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest()[:24]}'
-            if event_id in seen_event_ids:
-                continue
-            seen_event_ids.add(event_id)
-            event = {"eventId": event_id, "sessionId": state["sessionId"], "sourceFile": source_file, **{key: value for key, value in cached_event.items() if key not in {"index", "lineIndex", "cumulative"}}}
-            usage_events.append(event)
-            latest_timestamp = max(latest_timestamp or 0, event.get("timestamp") or 0) or latest_timestamp
-    return usage_events, len(files), latest_timestamp, {
-        "completeSessionIds": sorted(complete_sessions - incomplete_sessions), "incompleteSessionIds": sorted(incomplete_sessions),
-        "sourceFiles": sorted(source_files),
-    }
-
-def _scan_codex_token_events(home: Path) -> tuple[list[dict], int, float | None, dict]:
-    with _CODEX_SESSION_SCAN_LOCK:
-        return _scan_codex_token_events_unlocked(home)
-
-def token_sessions_from_events(usage_events: list[dict]) -> list[dict]:
-    sessions = {}
-    for event in usage_events:
-        session = sessions.setdefault(event["sessionId"], {"sessionId": event["sessionId"], "startedAt": event.get("checkedAt"), "updatedAt": event.get("checkedAt"), "tokens": _session_totals(), "byModel": {}, "fastByModel": {}})
-        if (event.get("timestamp") or 0) < (parse_timestamp(session.get("startedAt")) or float("inf")):
-            session["startedAt"] = event.get("checkedAt")
-        if (event.get("timestamp") or 0) >= (parse_timestamp(session.get("updatedAt")) or 0):
-            session["updatedAt"] = event.get("checkedAt")
-        add_token_delta(session["tokens"], event["tokens"])
-        add_token_delta(session["byModel"].setdefault(event["model"], _session_totals()), event["tokens"])
-        if event.get("serviceTier") == "fast":
-            add_token_delta(session["fastByModel"].setdefault(event["model"], _session_totals()), event["tokens"])
-    for session in sessions.values():
-        model_tokens = {}
-        fast_by_model = session.pop("fastByModel")
-        for model, tokens in session.pop("byModel").items():
-            model_tokens[model] = {"tokens": tokens, "cost": calculate_token_costs({"byModel": {model: tokens}, "fastByModel": {model: fast_by_model[model]} if model in fast_by_model else {}})}
-            if model in fast_by_model:
-                model_tokens[model]["fastTokens"] = fast_by_model[model]
-        session["byModel"] = model_tokens
-        session["cost"] = calculate_token_costs({"byModel": {model: values["tokens"] for model, values in model_tokens.items()}, "fastByModel": fast_by_model})
-    return sorted(sessions.values(), key=lambda session: (parse_timestamp(session.get("updatedAt")) or 0, session["sessionId"]))
-
-def scan_codex_token_usage(home: Path) -> dict:
-    usage_events, files_scanned, latest_timestamp, scan_status = _scan_codex_token_events(home)
-    totals = _session_totals()
-    by_model: dict[str, dict] = {}
-    fast_by_model: dict[str, dict] = {}
-    for event in usage_events:
-        add_token_delta(totals, event["tokens"])
-        add_token_delta(by_model.setdefault(event["model"], _session_totals()), event["tokens"])
-        if event.get("serviceTier") == "fast":
-            add_token_delta(fast_by_model.setdefault(event["model"], _session_totals()), event["tokens"])
-
-    return {
-        "source": "codex_session_logs",
-        "home": str(home),
-        "filesScanned": files_scanned,
-        "latestEventAt": datetime.fromtimestamp(latest_timestamp, timezone.utc).isoformat().replace("+00:00", "Z") if latest_timestamp else None,
-        "totals": totals,
-        "byModel": by_model,
-        "fastByModel": fast_by_model,
-        "sessions": token_sessions_from_events(usage_events),
-        "events": usage_events,
-        **scan_status,
-        "errors": [],
-    }
 
 def token_progress(current: dict, previous: dict | None) -> dict:
     if previous is None:

@@ -86,38 +86,3 @@ def token_cost_snapshot(sessions: list[dict]) -> tuple[dict, dict[str, dict]]:
             normalized = normalize_codex_model(model)
             by_model[normalized] = sum_cost_totals(by_model.get(normalized), value.get("cost") if isinstance(value, dict) else None)
     return sum_cost_totals(*(session.get("cost") for session in sessions)), by_model
-
-def reconcile_token_ledger(rows, events, account_slot_id, account_label, account_timeline=None, record_provenance=None, source_files=None, own_machine_id=None):
-    """Calculate ledger corrections from database rows and original source events."""
-    timeline = sorted(account_timeline or [], key=lambda row: parse_timestamp(row.get("checkedAt")) or 0)
-    canonical_token_ledger_rows(rows)
-    usages = _usage_records(events, account_slot_id, account_label, timeline)
-    source_files = set(source_files or ())
-    canonical = {row["eventId"]: row for row in usages if row.get("eventId")}
-    retained, existing = [], {}
-    for row in rows:
-        if row.get("recordType") != "usage":
-            retained.append(row)
-            continue
-        event_id = str(row.get("eventId") or "")
-        local_origin = own_machine_id is None or not (row.get("sync") or {}).get("originMachineId") or (row.get("sync") or {}).get("originMachineId") == own_machine_id
-        if local_origin and (event_id in canonical or row.get("sourceFile") in source_files):
-            if event_id in canonical:
-                existing[event_id] = row
-            continue
-        retained.append(row)
-    reconciled, new_costs = [], []
-    for usage in usages:
-        if (previous := existing.get(usage["eventId"])) is not None:
-            if previous.get("accountSlotId") not in {None, "", UNKNOWN_EVENT_ACCOUNT_ID}:
-                usage = usage | {"accountSlotId": previous["accountSlotId"], "accountLabel": previous.get("accountLabel") or usage["accountLabel"]}
-            if previous.get("sync") and previous.get("accountSlotId") not in {None, "", UNKNOWN_EVENT_ACCOUNT_ID}:
-                usage["sync"] = previous["sync"]
-            elif record_provenance is not None:
-                usage = record_provenance(usage)
-        else:
-            if record_provenance is not None:
-                usage = record_provenance(usage)
-            new_costs.append(usage)
-        reconciled.append(usage)
-    return retained + reconciled, new_costs

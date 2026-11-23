@@ -3,7 +3,7 @@
 - Run commands from the repository root with Python 3.12+ and Node.js. Install Python dependencies with `python -m pip install -r requirements.txt`.
 - Run focused Python tests with `python -m unittest test_<module>`; run the Python suite with `python -m unittest discover -p "test_*.py"`.
 - For dashboard changes, run `node test_dashboard_loading.js`; for extension syntax, run `npm run check`.
-- `npm test` currently references the missing `test_management_queue.js`; use the Python suite and dashboard command directly until that script is repaired.
+- Run `npm test` to execute the Python suite (`python -m unittest discover -p test_*.py`) followed by `node test_dashboard_loading.js`.
 - Isolate integration fixtures from real credentials and saved data. `CODEX_HOME` changes Codex inputs but does not relocate the monitor's `~/.codex-switch` store; use explicit temporary roots or patched path helpers.
 - Stop every test instance after the test finishes, including instances started for live traffic or integration testing.
 
@@ -15,9 +15,8 @@
 
 # Data boundaries
 
-- Keep ingestion and business calculations in the Python backend. Dashboard and extension clients consume prepared account-based bulk snapshots and sequenced WebSocket updates; `/api/series` is retired (410).
+- Keep ingestion and business calculations in the Python backend. Dashboard and extension clients consume prepared account-based bulk snapshots and sequenced WebSocket updates.
 - Preserve canonical histories and synchronization ownership when rebuilding derived projections or delivery artifacts. Cloud-downloaded history must not be appended to local recorder files.
-- Use `monitor_sample_store.connect()` when querying compatibility views such as `processing_facts`, `local_records`, and `remote_records`; their JSON columns require registered codec functions. Plain SQLite clients should inspect typed physical tables.
 - Consult `data-pipeline.zh-CN.md` for pipeline semantics, `sampled-storage.md` for typed storage, and `dashboard-delivery.md` for delivery behavior. Verify version claims against code and successful releases; design documents contain historical targets.
 
 # WebDAV notifications

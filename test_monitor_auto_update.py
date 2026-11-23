@@ -341,7 +341,7 @@ import sys, threading
 from pathlib import Path
 sys.path.insert(0, sys.argv[1])
 import monitor_dashboard
-from monitor_usage_sync import UsageDataStore
+from monitor_canonical import CanonicalDataStore as UsageDataStore
 root = Path(sys.argv[2])
 store = UsageDataStore(root / "usage.sqlite3", "machine", lambda _: "v3:a", threading.RLock())
 store.record_quota({"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "slot", "windows": {"5h": {"usedPercent": 10}}})

@@ -3,14 +3,13 @@
 from datetime import datetime
 
 from monitor_common import (
-    MIN_DELTA_COST_PER_PERCENT_USD, PLAN_MULTIPLIERS, RATIO_DEVIATION_MULTIPLIER, RESET_TIME_JITTER_SECONDS,
-    UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, coerce_float, console_log, format_console_log, format_console_timestamp, parse_timestamp,
+    MIN_DELTA_COST_PER_PERCENT_USD, RATIO_DEVIATION_MULTIPLIER, RESET_TIME_JITTER_SECONDS,
+    UNKNOWN_EVENT_ACCOUNT_ID, UNKNOWN_EVENT_ACCOUNT_LABEL, coerce_float, console_log, format_console_timestamp, parse_timestamp,
 )
-from monitor_history import compact_debug_state, compact_sample_for_state, compact_token_usage_for_state, is_delta_event_row
+from monitor_history import compact_sample_for_state, compact_token_usage_for_state
 from monitor_tokens import normalize_codex_model
 
 DEFAULT_EVENT_MODEL = "gpt-5.5"
-COST_INTERVAL_TYPE = "costInterval"
 
 def reset_moved_forward(previous_reset: str | None, current_reset: str | None) -> bool:
     previous_ts = parse_timestamp(previous_reset)
@@ -117,147 +116,6 @@ def record_special_event(state: dict, reason: str, sample: dict, label: str, pre
         "extra": event_extra,
     })
 
-def build_delta_event_series(history: list[dict], label: str) -> list[dict]:
-    events = []
-    baseline_percent = None
-    baseline_cost = None
-    baseline_reset = None
-    baseline_plan = None
-    baseline_multiplier = None
-    previous_cost = None
-    cumulative_percent = 0.0
-    cumulative_cost = 0.0
-    awaiting_trusted_percent_baseline = False
-
-    for sample in sorted(history, key=lambda item: item.get("checkedAt") or ""):
-        checked_at = sample.get("checkedAt")
-        if not checked_at:
-            continue
-        window = (sample.get("windows") or {}).get(label) or {}
-        if window.get("unavailable"):
-            baseline_percent = None
-            baseline_cost = None
-            baseline_reset = None
-            baseline_plan = None
-            baseline_multiplier = None
-            previous_cost = None
-            awaiting_trusted_percent_baseline = False
-            continue
-        raw = coerce_float(window.get("usedPercent"))
-        if raw is None:
-            continue
-        plan = window.get("plan") or "unknown"
-        multiplier = coerce_float(window.get("planMultiplier")) or PLAN_MULTIPLIERS["unknown"]
-        normalized = raw * multiplier
-        total_cost = event_cost_usd(sample)
-        reset_at = window.get("resetAt")
-
-        if baseline_percent is None:
-            baseline_percent = normalized
-            baseline_cost = total_cost
-            baseline_reset = reset_at
-            previous_cost = total_cost
-            baseline_plan = plan
-            baseline_multiplier = multiplier
-            awaiting_trusted_percent_baseline = requires_trusted_percent_baseline(label, plan)
-            events.append({
-                "checkedAt": checked_at,
-                "timestamp": parse_timestamp(checked_at),
-                "window": label,
-                "model": DEFAULT_EVENT_MODEL,
-                **event_account(sample),
-                "rawPercent": raw,
-                "normalizedPercent": normalized,
-                "plan": plan,
-                "planMultiplier": multiplier,
-                "resetAt": reset_at,
-                "deltaPercent": 0.0,
-                "deltaCostUsd": 0.0,
-                "cumulativePercent": 0.0,
-                "cumulativeCostUsd": 0.0,
-                "sampleCostUsd": total_cost,
-            })
-            continue
-
-        if plan != baseline_plan or multiplier != baseline_multiplier:
-            baseline_percent = normalized
-            baseline_cost = total_cost
-            baseline_reset = reset_at
-            baseline_plan = plan
-            baseline_multiplier = multiplier
-            previous_cost = total_cost
-            awaiting_trusted_percent_baseline = requires_trusted_percent_baseline(label, plan)
-            continue
-
-        if awaiting_trusted_percent_baseline:
-            if normalized > baseline_percent:
-                awaiting_trusted_percent_baseline = False
-            baseline_percent = normalized
-            baseline_cost = total_cost
-            baseline_reset = reset_at
-            previous_cost = total_cost
-            continue
-
-        if normalized < baseline_percent:
-            baseline_percent = 0.0
-            baseline_cost = previous_cost if previous_cost is not None else total_cost
-            baseline_reset = reset_at
-
-        if normalized > baseline_percent:
-            delta_percent = normalized - baseline_percent
-            delta_cost = max(0.0, total_cost - (baseline_cost if baseline_cost is not None else total_cost))
-            if valid_delta_cost_rate(delta_percent, delta_cost):
-                ratio = cost_percent_ratio(delta_cost, delta_percent)
-                average_ratio = cost_percent_ratio(cumulative_cost, cumulative_percent)
-                cumulative_percent += delta_percent
-                cumulative_cost += delta_cost
-                events.append({
-                    "checkedAt": checked_at,
-                    "timestamp": parse_timestamp(checked_at),
-                    "window": label,
-                    "model": DEFAULT_EVENT_MODEL,
-                    **event_account(sample),
-                    "rawPercent": raw,
-                    "normalizedPercent": normalized,
-                    "plan": plan,
-                    "planMultiplier": multiplier,
-                    "resetAt": reset_at,
-                    "deltaPercent": round(delta_percent, 8),
-                    "deltaCostUsd": round(delta_cost, 8),
-                    "costPercentRatio": round(ratio, 8),
-                    "averageCostPercentRatio": None if average_ratio is None else round(average_ratio, 8),
-                    "ratioDeviation": None if ratio_deviation(ratio, average_ratio) is None else round(ratio_deviation(ratio, average_ratio), 8),
-                    "ratioDeviationWarning": ratio_deviation_warning(ratio, average_ratio),
-                    "cumulativePercent": round(cumulative_percent, 8),
-                    "cumulativeCostUsd": round(cumulative_cost, 8),
-                    "sampleCostUsd": total_cost,
-                })
-            else:
-                awaiting_trusted_percent_baseline = requires_trusted_percent_baseline(label, plan)
-            baseline_percent = normalized
-            baseline_cost = total_cost
-            baseline_reset = reset_at
-        else:
-            if raw >= 100:
-                baseline_cost = total_cost
-            if reset_moved_forward(baseline_reset, reset_at):
-                baseline_reset = reset_at
-
-        previous_cost = total_cost
-
-    return events
-
-def derive_history_events(history: list[dict]) -> dict:
-    from monitor_usage_sync import aggregate_cost_intervals, is_cost_interval_row
-    if any(is_cost_interval_row(row) for row in history):
-        return delta_event_log_events([row for row in history if is_delta_event_row(row)] + aggregate_cost_intervals(history))
-    if not history or all(is_delta_event_row(row) for row in history):
-        return delta_event_log_events(history)
-    return {
-        "fiveHour": build_delta_event_series(history, "5h"),
-        "sevenDay": build_delta_event_series(history, "7d"),
-    }
-
 def compact_delta_event(event: dict) -> dict:
     return {
         "checkedAt": event["checkedAt"],
@@ -267,14 +125,6 @@ def compact_delta_event(event: dict) -> dict:
         "deltaPercent": round(event["deltaPercent"], 8),
         "deltaCostUsd": round(event["deltaCostUsd"], 8),
         "costPercentRatio": round(event["costPercentRatio"], 8),
-    }
-
-def sample_debug_log_row(sample: dict, events: list[dict], state: dict) -> dict:
-    return {
-        "checkedAt": sample["checkedAt"],
-        "sample": sample,
-        "events": [compact_delta_event(event) for event in events],
-        "state": compact_debug_state(state),
     }
 
 def baseline_delta_event(label: str) -> dict:
@@ -368,7 +218,7 @@ def historical_console_events(points, ledger, slot_usage_accounts=None):
 def hydrate_delta_state_from_events(state: dict, rows: list[dict]) -> None:
     for label in ("5h", "7d"):
         state.setdefault("windows", {}).setdefault(label, {})
-    events_by_window = derive_history_events(rows)
+    events_by_window = delta_event_log_events(rows)
     for label, key in (("5h", "fiveHour"), ("7d", "sevenDay")):
         event = events_by_window[key][-1]
         state["windows"][label]["cumulativePercent"] = event["cumulativePercent"]
@@ -431,26 +281,6 @@ def allocate_model_delta_events(common: dict, delta_percent: float, delta_cost: 
         used_percent += model_percent
         used_cost += model_cost
     return events
-
-def cost_interval_from_sample(sample: dict, label: str, normalized: float, delta_cost: float, total_cost_by_model: dict[str, float], window_state: dict, plan: str, multiplier: float, reset_at: str | None) -> dict | None:
-    start = coerce_float(window_state.get("baselinePercent"))
-    if start is None or normalized <= start or delta_cost <= 0:
-        return None
-    baseline = window_state.get("baselineCostByModelUsd") or {}
-    costs = {normalize_codex_model(model): max(0.0, cost - baseline.get(model, 0.0)) for model, cost in total_cost_by_model.items()}
-    costs = {model: cost for model, cost in costs.items() if cost > 0}
-    attributed = sum(costs.values())
-    if attributed < delta_cost - 0.00000001:
-        costs["unknown"] = costs.get("unknown", 0.0) + delta_cost - attributed
-    elif attributed > delta_cost:
-        costs = {model: cost * delta_cost / attributed for model, cost in costs.items()}
-    return {
-        "recordType": COST_INTERVAL_TYPE, "startedAt": window_state.get("baselineObservedAt"), "checkedAt": sample["checkedAt"], "window": label,
-        "accountSlotId": sample.get("accountSlotId") or UNKNOWN_EVENT_ACCOUNT_ID, "accountLabel": sample.get("accountLabel") or UNKNOWN_EVENT_ACCOUNT_LABEL,
-        "startPercent": round(start, 8), "endPercent": round(normalized, 8), "plan": plan, "planMultiplier": multiplier, "resetAt": reset_at,
-        "modelCostsUsd": {model: round(cost, 8) for model, cost in sorted(costs.items())}, "deltaCostUsd": round(delta_cost, 8),
-        "sync": {"version": 1, "originMachineId": sample.get("originMachineId"), "accountId": sample.get("usageAccountId"), "recordId": sample.get("usageRecordId")},
-    }
 
 def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list[dict]:
     if label in (sample.get("rejectedWindows") or {}):
@@ -543,8 +373,6 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
 
     delta_percent = normalized - window_state["baselinePercent"]
     delta_cost = max(0.0, total_cost - window_state["baselineCostUsd"])
-    if interval := cost_interval_from_sample(sample, label, normalized, delta_cost, total_cost_by_model, window_state, plan, multiplier, reset_at):
-        state.setdefault("_pendingCostIntervals", []).append(interval)
     if not valid_delta_cost_rate(delta_percent, delta_cost):
         record_special_event(state, "low-cost-delta-discarded", sample, label, window_state, {
             "baselinePercent": normalized,
@@ -582,17 +410,13 @@ def build_delta_event_from_sample(state: dict, sample: dict, label: str) -> list
     })
     return events
 
-def process_sample_delta_events(state: dict, sample: dict, existing_events: list[dict] | None) -> list[dict]:
+def process_sample_delta_events(state: dict, sample: dict) -> list[dict]:
     state["_specialEvents"] = []
-    state["_pendingCostIntervals"] = []
-    if existing_events is not None:
-        hydrate_delta_state_from_events(state, existing_events)
-    else:
-        for label in ("5h", "7d"):
-            window = state.setdefault("windows", {}).setdefault(label, {})
-            window.setdefault("cumulativePercent", 0.0)
-            window.setdefault("cumulativeCostUsd", 0.0)
-            window.setdefault("models", {})
+    for label in ("5h", "7d"):
+        window = state.setdefault("windows", {}).setdefault(label, {})
+        window.setdefault("cumulativePercent", 0.0)
+        window.setdefault("cumulativeCostUsd", 0.0)
+        window.setdefault("models", {})
     if sample.get("remoteUsage"):
         sample["remoteUsage"]["accepted"] = not bool(sample.get("rejectedWindows"))
     sample.setdefault("percentCheckedAt", sample["checkedAt"])
@@ -606,67 +430,6 @@ def process_sample_delta_events(state: dict, sample: dict, existing_events: list
     state["lastSample"] = compact_sample_for_state(sample)
     state["updatedAt"] = sample["checkedAt"]
     return events
-
-def event_identity(event: dict) -> tuple:
-    return (
-        event["window"],
-        event_model(event),
-        event_account(event)["accountSlotId"],
-        event["checkedAt"],
-        round(event["deltaPercent"], 8),
-        round(event["deltaCostUsd"], 8),
-        round(event.get("costPercentRatio") or cost_percent_ratio(event["deltaCostUsd"], event["deltaPercent"]) or 0, 8),
-        event.get("plan"),
-        coerce_float(event.get("planMultiplier")) or 1.0,
-    )
-
-def valid_delta_events(events: dict) -> list[dict]:
-    rows = []
-    for label in ("fiveHour", "sevenDay"):
-        for event in events[label]:
-            if event["deltaPercent"] > 0:
-                rows.append(event)
-    return sorted(rows, key=lambda item: (item["checkedAt"] or "", item["window"]))
-
-def new_valid_delta_events(before: list[dict], after: list[dict]) -> list[dict]:
-    seen = {event_identity(event) for event in valid_delta_events(derive_history_events(before))}
-    return [event for event in valid_delta_events(derive_history_events(after)) if event_identity(event) not in seen]
-
-def normalized_window_status(sample: dict, label: str) -> dict:
-    window = (sample.get("windows") or {}).get(label) or {}
-    raw = coerce_float(window.get("usedPercent"))
-    multiplier = coerce_float(window.get("planMultiplier")) or PLAN_MULTIPLIERS["unknown"]
-    return {
-        "rawPercent": raw,
-        "normalizedPercent": None if raw is None else raw * multiplier,
-        "plan": window.get("plan") or "unknown",
-        "planMultiplier": multiplier,
-    }
-
-def format_valid_delta_event(event: dict, sample: dict | None = None) -> str:
-    sample = sample or {}
-    five = normalized_window_status(sample, "5h")
-    seven = normalized_window_status(sample, "7d")
-    return format_console_log(
-        f"{event['window']} {event_model(event)} "
-        f"+{event['deltaPercent']:.4g}% / +${event['deltaCostUsd']:.6g}; "
-        f"ratio ${event.get('costPercentRatio', cost_percent_ratio(event['deltaCostUsd'], event['deltaPercent'])):.6g}/%; "
-        f"cumulative {event['cumulativePercent']:.4g}% / ${event['cumulativeCostUsd']:.6g}; "
-        f"event plan {event.get('plan') or 'unknown'} ({coerce_float(event.get('planMultiplier')) or 1.0:g}x); "
-        f"current 5h {format_percent(five['normalizedPercent'])} [{five['plan']} {five['planMultiplier']:g}x], "
-        f"7d {format_percent(seven['normalizedPercent'])} [{seven['plan']} {seven['planMultiplier']:g}x]",
-        level="delta", at=event.get("checkedAt"),
-    )
-
-def format_ratio_warning(event: dict) -> str:
-    return format_console_log(
-        f"{event['window']} {event_model(event)} cost/percent ratio "
-        f"${event['costPercentRatio']:.6g}/% deviates from average ${event['averageCostPercentRatio']:.6g}/% "
-        f"({event['ratioDeviation']:.6g}x)", level="warning", at=event.get("checkedAt"),
-    )
-
-def format_special_event(event: dict) -> str:
-    return format_console_log(special_event_message(event), at=event.get("checkedAt"))
 
 def special_event_message(event: dict) -> str:
     previous = event.get("previous") or {}
@@ -689,8 +452,6 @@ def special_event_message(event: dict) -> str:
     ]
     if "deltaPercent" in extra or "deltaCostUsd" in extra:
         parts.append(f"discarded delta +{coerce_float(extra.get('deltaPercent')) or 0:.4g}% / +${coerce_float(extra.get('deltaCostUsd')) or 0:.6g}")
-    if extra.get("reasons"):
-        parts.append("reasons " + "; ".join(str(reason) for reason in extra["reasons"]))
     return " ".join(parts)
 
 def format_percent(value: float | None) -> str:

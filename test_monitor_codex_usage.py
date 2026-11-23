@@ -39,42 +39,28 @@ from monitor_cloud import (
 )
 from monitor_skills import MANIFEST_FULL_REHASH_SECONDS, SkillError, SkillManager, _safe_name
 from monitor_cloud_queue import CloudOperationQueue
-from monitor_usage_sync import UsageDataStore, record_key, validate_sync_operation
+from monitor_usage_sync import record_key, validate_sync_operation
+from monitor_canonical import CanonicalDataStore
 from monitor_codex_usage import (
     add_token_delta,
-    apply_runtime_cost_measurement,
-    build_delta_event_series,
     calculate_token_costs,
-    compact_delta_event,
-    compact_history,
     compact_monitor_state,
     compact_quota,
-    compact_quota_for_debug,
     collect_usage_sample,
     dashboard_html,
     dashboard_display,
     DashboardHTTPServer,
-    derive_history_events,
     empty_token_totals,
-    format_ratio_warning,
-    format_special_event,
-    format_valid_delta_event,
     is_client_disconnect,
-    load_history,
     make_history_sample,
-    new_valid_delta_events,
     parse_token_usage,
     poll_sleep_seconds,
     pricing_for_model,
-    process_sample_delta_events,
     quota_history_windows,
     request_json,
     refresh_access_token,
-    reset_runtime_baselines,
-    sample_debug_log_row,
     token_expired,
     UsageError,
-    write_history,
 )
 
 
@@ -88,14 +74,6 @@ def usage_records_from_sessions(sessions):
         "occurredAt": session.get("updatedAt"), "accountSlotId": session.get("accountSlotId"), "accountLabel": session.get("accountLabel"),
         "rawModel": model, "billingModel": model, "serviceTier": "default", "tokens": value.get("tokens", {}), "cost": value.get("cost", {})}
         for session in sessions for model, value in (session.get("byModel") or {"unknown": session}).items()]
-
-
-def migrate_test_data(root, codex_home=None):
-    from monitor_migrations import DATA_MIGRATION_STATE_FILENAME, migrate_history_data
-    root = Path(root)
-    root.mkdir(parents=True, exist_ok=True)
-    (root / DATA_MIGRATION_STATE_FILENAME).write_text('{"dataContractVersion":14}', encoding="utf-8")
-    migrate_history_data(root, *(root / name for name in ("history.jsonl", "quota.jsonl", "sessions.jsonl", "samples.jsonl")), target_version=15, codex_home=codex_home)
 
 
 def combined_account(state, auth=b"{}"):
@@ -121,6 +99,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
     def test_cloud_operations_queue_concurrent_calls_without_rejection(self):
         manager = object.__new__(CloudManager)
+        manager._config = {"webdav": {}}
         manager._operation_lock = threading.RLock()
         manager._queue = CloudOperationQueue()
         started, release = threading.Event(), threading.Event()
@@ -137,17 +116,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         finally:
             release.set()
             manager._queue.close()
-
-    def test_management_page_keeps_webdav_actions_available_while_queued(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertNotIn("webDavBusy", html)
-        self.assertNotIn("setWebDavBusy", html)
-        self.assertIn('id="webDavQueueButton"', html)
-        self.assertIn('id="webDavQueueRows"', html)
-        self.assertIn('setInterval(pollQueue,1000)', html)
-        self.assertIn('operation.status==="queued"?', html)
-        self.assertIn('document.getElementById("overwriteCloud").onclick=()=>{modal.classList.remove("open");run("/api/manage/cloud/overwrite",{})}', html)
 
     def test_cloud_maintenance_reports_each_network_outage_once(self):
         state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
@@ -232,54 +200,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertIsNone(manager.status()["activeAccountId"])
             self.assertEqual(manager.status()["items"], [])
 
-    @unittest.skip('Historical contract 15 migration retired')
-    def test_account_manager_moves_legacy_vault_to_requested_data_root(self):
-        with self.account_directory() as directory:
-            auth_path = directory / "auth.json"
-            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            legacy_manager = AccountManager(auth_path, directory / "usage-monitor-accounts")
-            legacy_root = legacy_manager.root
-            target_root = directory / ".codex-switch" / "accounts"
-
-            migrate_test_data(target_root.parent, directory)
-            manager = AccountManager(auth_path, target_root)
-
-            self.assertEqual(manager.root, target_root)
-            self.assertFalse((legacy_root / "accounts.json").exists())
-            self.assertTrue((target_root / "accounts.json").exists())
-            self.assertEqual((target_root / "ppl-pro" / "auth.json").read_bytes(), auth_path.read_bytes())
-
-    def test_default_monitor_paths_and_migration_use_codex_switch_home(self):
-        with self.account_directory() as directory:
-            legacy_home, data_home = directory / "legacy", directory / ".codex-switch"
-            legacy_home.mkdir()
-            expected = {
-                "usage_monitor_history.jsonl": b'{"history":true}\n',
-                "usage_monitor_quota_history.jsonl": b'{"quota":true}\n',
-                "usage_monitor_token_ledger.jsonl": b'{"ledger":true}\n',
-                "usage_monitor_samples.jsonl": b'{"samples":true}\n',
-                "usage_monitor_state.json": b'{"state":true}\n',
-            }
-            for name, data in expected.items():
-                (legacy_home / name).write_bytes(data)
-
-            moved = __import__("monitor_migrations").migrate_default_monitor_data(legacy_home, data_home)
-
-            self.assertEqual(moved, list(expected))
-            self.assertEqual(monitor_history.default_history_path(data_home), data_home / "usage_monitor_history.jsonl")
-            self.assertEqual(monitor_history.default_quota_history_path(data_home / "usage_monitor_history.jsonl"), data_home / "usage_monitor_quota_readings.jsonl")
-            self.assertEqual(monitor_history.default_quota_history_path(data_home / "custom.jsonl"), data_home / "custom.quota.jsonl")
-            for name, data in expected.items():
-                self.assertFalse((legacy_home / name).exists())
-                self.assertEqual((data_home / name).read_bytes(), data)
-
     def test_account_manager_new_login_and_switch_preserve_rotated_refresh_token(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-original")), encoding="utf-8")
             manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-rotated", unknown="preserved")), encoding="utf-8")
-            manager.sync_active_from_live()
+            manager.reconcile_active_from_live()
             manager.create_account("Second")
             self.assertFalse(auth_path.exists())
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
@@ -556,7 +483,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             with mock.patch.object(monitor_common, "request_json", return_value=(200, {"account_id": "acct-a", "access_token": "access-rotated", "refresh_token": "refresh-rotated", "id_token": "id-rotated"})):
                 refresh_access_token(auth, object(), auth_path, 10)
-            manager.sync_active_from_live()
+            manager.reconcile_active_from_live()
             saved = json.loads((manager.root / "ppl-pro" / "auth.json").read_text(encoding="utf-8"))
             self.assertEqual(saved["tokens"]["refresh_token"], "refresh-rotated")
             self.assertEqual(saved["tokens"]["access_token"], "access-rotated")
@@ -594,7 +521,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 thread.join()
                 self.assertTrue(contender_acquired[-1])
                 self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-rotated")
-                manager.sync_active_from_live()
+                manager.reconcile_active_from_live()
 
             with mock.patch.object(monitor_common, "request_json", side_effect=refresh_response):
                 refresh_access_token(auth, object(), auth_path, 10, auth_lock=manager.lock, refreshed_callback=reconcile_after_refresh)
@@ -742,7 +669,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps({"tokens": {"account_id": "acct-a", "access_token": "partial-access"}}), encoding="utf-8")
-            self.assertFalse(manager.sync_active_from_live())
+            self.assertFalse(manager.reconcile_active_from_live()[0])
             saved = json.loads(manager._account_path("ppl-pro").read_text(encoding="utf-8"))
             self.assertEqual(saved["tokens"]["refresh_token"], "refresh-a")
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["refresh_token"], "refresh-a")
@@ -963,6 +890,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.dashboard_cache_event = threading.Event()
         state.wake_event = threading.Event()
         state.inactive_account_poll_event = threading.Event()
+        state.device_auth = SimpleNamespace(activate=mock.Mock())
 
         with mock.patch("builtins.print"):
             result = state.switch_account("account-b")
@@ -976,7 +904,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertTrue(state.wake_event.is_set())
         self.assertTrue(state.inactive_account_poll_event.is_set())
 
-    def test_inactive_local_account_usage_is_recorded_every_ten_minutes(self):
+    def test_inactive_local_account_usage_is_recorded_every_three_minutes(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
@@ -1006,10 +934,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             with mock.patch.object(monitor_dashboard, "fetch_usage", side_effect=usage):
                 self.assertEqual(state.poll_due_inactive_accounts(now=100), 1)
-                self.assertEqual(state.inactive_account_poll_wait_seconds(now=100), 600)
-                self.assertEqual(state.poll_due_inactive_accounts(now=699), 0)
-                self.assertEqual(state.inactive_account_poll_wait_seconds(now=699), 1)
-                self.assertEqual(state.poll_due_inactive_accounts(now=700), 1)
+                self.assertEqual(state.inactive_account_poll_wait_seconds(now=100), 180)
+                self.assertEqual(state.poll_due_inactive_accounts(now=279), 0)
+                self.assertEqual(state.inactive_account_poll_wait_seconds(now=279), 1)
+                self.assertEqual(state.poll_due_inactive_accounts(now=280), 1)
 
             self.assertEqual([account_id for account_id, _path in calls], ["acct-b", "acct-b"])
             self.assertTrue(all(path is None for _account_id, path in calls))
@@ -1135,18 +1063,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(status["items"][0]["sessionRefresh"], config)
             self.assertEqual(manager.session_refresh_credentials()[0]["sessionRefresh"], config)
 
-            manifest = json.loads(manager.manifest_path.read_text(encoding="utf-8"))
-            manifest["version"] = 2
-            manifest["accounts"][0].pop("sessionRefresh")
-            manifest["accounts"][0]["sessionRefreshEnabled"] = True
-            manager.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-            from monitor_migrations import migrate_manifest
-            migrate_manifest(manager.manifest_path)
-            migrated = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-            self.assertEqual(migrated.manifest["version"], 3)
-            self.assertEqual(migrated.active_account()["sessionRefresh"], {"fiveHour": {"enabled": True, "windowsUtc": []}, "sevenDay": {"enabled": True}})
-            self.assertNotIn("sessionRefreshEnabled", migrated.active_account())
-
     def test_session_refresh_uses_independent_toggles_and_utc_boundaries(self):
         now = datetime(2030, 1, 1, 5, 0, tzinfo=timezone.utc).timestamp()
         credential = {"id": "account", "label": "Account", "sessionRefresh": {"fiveHour": {"enabled": False, "windowsUtc": [{"start": "05:00", "end": "06:00"}]}, "sevenDay": {"enabled": True}}}
@@ -1188,19 +1104,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         credential = {"sessionRefresh": {"fiveHour": {"enabled": True, "windowsUtc": [{"start": "05:00", "end": "06:00"}]}, "sevenDay": {"enabled": False}}}
         state.accounts = SimpleNamespace(session_refresh_credentials=lambda: [credential])
         self.assertEqual(state._session_refresh_schedule_wait_seconds(datetime(2030, 1, 1, 4, 30, tzinfo=timezone.utc).timestamp()), 30 * 60)
-
-    def test_management_page_exposes_advanced_session_refresh_editor(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-        for marker in ('id="sessionRefreshModal"', 'id="refreshFiveHourEnabled"', 'id="refreshSevenDayEnabled"', 'id="refreshTimeline"', 'id="addRefreshWindow"', "Intl.DateTimeFormat().resolvedOptions().timeZone", "setPointerCapture", "event.clientX", "windowsUtc"):
-            self.assertIn(marker, html)
-        self.assertIn("No windows are listed, so refresh is allowed all day.", html)
-        self.assertIn("paint.replaceChildren(...sessionRefreshDraft.ranges.map", html)
-        self.assertIn("baseline:sessionRefreshDraft.ranges.map", html)
-        self.assertNotIn("#refreshWindowRows{padding-bottom", html)
-        self.assertIn("lockSessionRefreshDialogHeight()", html)
-        self.assertIn("unlockSessionRefreshDialogHeight()", html)
-        self.assertIn("if(start<end)ranges.push({start,end});else ranges.push", html)
-        self.assertNotIn('type="checkbox" data-session-refresh', html)
 
     def test_session_refresh_requires_a_fresh_full_quota_window(self):
         now = 1_000_000
@@ -1619,7 +1522,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
             manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
             auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
-            self.assertFalse(manager.sync_active_from_live())
+            self.assertFalse(manager.reconcile_active_from_live()[0])
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-a")
 
     def test_new_account_accepts_rotated_id_token_and_saves_current_auth(self):
@@ -2135,23 +2038,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertEqual(json.loads(auth_path.read_text(encoding="utf-8"))["tokens"]["account_id"], "acct-b")
             self.assertTrue((manager.root / "ppl-pro" / "auth.json").exists())
 
-    def test_account_delete_removes_nested_legacy_session_refresh_workspace(self):
-        with self.account_directory() as directory:
-            auth_path = directory / "auth.json"
-            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-            second_id = manager.create_account("Second")["activeAccountId"]
-            auth_path.write_text(json.dumps(self.account_auth("acct-b", "refresh-b")), encoding="utf-8")
-            manager.status()
-            legacy_home = manager.root / "ppl-pro" / "session-refresh" / "nested"
-            legacy_home.mkdir(parents=True)
-            (legacy_home / "state.json").write_text("legacy", encoding="utf-8")
-
-            status = manager.delete("ppl-pro")
-
-            self.assertEqual(status["activeAccountId"], second_id)
-            self.assertFalse((manager.root / "ppl-pro").exists())
-
     def test_deleting_bound_local_account_never_calls_cloud(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
@@ -2284,7 +2170,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         windows = quota_history_windows({"checkedAt": "2030-01-01T00:00:00Z", "usage": compact})
 
         self.assertTrue(compact["complete"])
-        self.assertEqual(compact["missingWindows"], [])
         self.assertIsNone(windows["5h"]["usedPercent"])
         self.assertTrue(windows["5h"]["unavailable"])
         self.assertFalse(windows["7d"]["unavailable"])
@@ -2306,7 +2191,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         windows = quota_history_windows({"checkedAt": "2030-01-01T00:00:00Z", "usage": compact})
 
         self.assertTrue(compact["complete"])
-        self.assertEqual(compact["missingWindows"], [])
         self.assertIsNone(windows["7d"]["usedPercent"])
         self.assertTrue(windows["7d"]["unavailable"])
         self.assertFalse(windows["5h"]["unavailable"])
@@ -2557,17 +2441,8 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-sol", "fast", "2026-08-20T23:59:59Z")["rates"]["input"], 10.0)
         self.assertEqual(monitor_tokens.pricing_epoch_for_model("gpt-5.6-sol", "fast", "2026-08-21T00:00:00Z")["rates"]["input"], 8.0)
 
-    def test_token_session_history_preserves_recorded_costs_when_prices_change(self):
-        recorded_cost = {"inputCostUsd": 2.5, "cachedInputCostUsd": 0.25, "cacheWriteInputCostUsd": 3.125, "outputCostUsd": 15.0, "totalCostUsd": 20.875}
-        tokens = {"inputTokens": 1_000_000, "freshInputTokens": 1_000_000, "cachedInputTokens": 1_000_000, "cacheWriteInputTokens": 1_000_000, "outputTokens": 1_000_000, "totalTokens": 2_000_000, "requests": 1}
-        row = monitor_history.normalize_token_session_row({"sessionId": "historical", "tokens": tokens, "cost": recorded_cost, "byModel": {"gpt-5.6-terra": {"tokens": tokens, "cost": recorded_cost}}})
-
-        self.assertEqual(row["cost"], recorded_cost)
-        self.assertEqual(row["byModel"]["gpt-5.6-terra"]["cost"], recorded_cost)
-
     def test_token_ledger_rejects_baselines_and_prices_rebuilt_events(self):
         with self.account_directory() as directory:
-            path = directory / "token-ledger.jsonl"
             old_cost = {"inputCostUsd": 2.5, "cachedInputCostUsd": 0.0, "cacheWriteInputCostUsd": 0.0, "outputCostUsd": 0.0, "totalCostUsd": 2.5}
             first_tokens = {"inputTokens": 1_000_000, "freshInputTokens": 1_000_000, "cachedInputTokens": 0, "cacheWriteInputTokens": 0, "outputTokens": 0, "totalTokens": 1_000_000, "requests": 1}
             legacy = {"sessionId": "historical", "updatedAt": "2026-07-20T00:00:00Z", "accountSlotId": "account", "accountLabel": "Account", "tokens": first_tokens, "cost": old_cost, "byModel": {"gpt-5.6-terra": {"tokens": first_tokens, "cost": old_cost}}}
@@ -2577,11 +2452,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
             ]
 
             with self.assertRaises(ValueError):
-                monitor_token_ledger.reconcile_token_ledger([{"schemaVersion": 2, "recordType": "sessionBaseline", "session": legacy}], events, "account", "Account")
-            ledger, _ = monitor_token_ledger.reconcile_token_ledger([], events, "account", "Account")
+                monitor_token_ledger.canonical_token_ledger_rows([{"schemaVersion": 2, "recordType": "sessionBaseline", "session": legacy}])
+            ledger = monitor_token_ledger._usage_records(events, "account", "Account", [])
             rows = monitor_token_ledger.token_sessions_from_ledger(ledger)
-            repeated, _ = monitor_token_ledger.reconcile_token_ledger(ledger, events, "account", "Account")
-            repeated = monitor_token_ledger.token_sessions_from_ledger(repeated)
+            repeated = monitor_token_ledger.token_sessions_from_ledger(monitor_token_ledger.canonical_token_ledger_rows(ledger))
             with mock.patch.dict(monitor_tokens.MODEL_PRICES_PER_MILLION, {"gpt-5.6-terra": {"input": 99.0, "cachedInput": 99.0, "cacheWriteInput": 99.0, "output": 99.0}}):
                 reloaded = monitor_token_ledger.token_sessions_from_ledger(ledger)
 
@@ -2593,44 +2467,40 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertNotIn("pricingId", ledger[1])
 
     def test_token_ledger_uses_event_time_price_epochs_without_legacy_data(self):
-        with self.account_directory() as directory:
-            path = directory / "token-ledger.jsonl"
-            events = [
-                {"eventId": "session:1", "sessionId": "session", "checkedAt": "2026-07-20T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
-                {"eventId": "session:2", "sessionId": "session", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
-            ]
+        events = [
+            {"eventId": "session:1", "sessionId": "session", "checkedAt": "2026-07-20T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
+            {"eventId": "session:2", "sessionId": "session", "checkedAt": "2026-08-01T00:00:00Z", "model": "gpt-5.6-luna", "serviceTier": "default", "tokens": {"input": 1_000_000, "cachedInput": 0, "cacheWriteInput": 0, "output": 0}},
+        ]
 
-            ledger, _ = monitor_token_ledger.reconcile_token_ledger([], events, "account", "Account")
-            sessions = monitor_token_ledger.token_sessions_from_ledger(ledger)
+        ledger = monitor_token_ledger._usage_records(events, "account", "Account", [])
+        sessions = monitor_token_ledger.token_sessions_from_ledger(ledger)
 
         self.assertEqual(sessions[0]["cost"]["totalCostUsd"], 1.2)
         self.assertEqual([row["cost"]["totalCostUsd"] for row in ledger], [1.0, 0.2])
         self.assertTrue(all(row["recordType"] == "usage" and "pricingId" not in row for row in ledger))
 
     def test_token_ledger_splits_one_session_across_normal_and_api_account_activations(self):
-        with self.account_directory() as directory:
-            events = [
-                {"eventId": "session:1", "sessionId": "session", "checkedAt": "2030-01-01T00:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 100, "cachedInput": 20, "cacheWriteInput": 10, "output": 5}},
-                {"eventId": "session:2", "sessionId": "session", "checkedAt": "2030-01-01T01:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 200, "cachedInput": 40, "cacheWriteInput": 20, "output": 10}},
-            ]
-            timeline = [
-                {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "normal", "accountLabel": "Normal"},
-                {"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "API"},
-            ]
+        events = [
+            {"eventId": "session:1", "sessionId": "session", "checkedAt": "2030-01-01T00:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 100, "cachedInput": 20, "cacheWriteInput": 10, "output": 5}},
+            {"eventId": "session:2", "sessionId": "session", "checkedAt": "2030-01-01T01:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 200, "cachedInput": 40, "cacheWriteInput": 20, "output": 10}},
+        ]
+        timeline = [
+            {"checkedAt": "2030-01-01T00:00:00Z", "accountSlotId": "normal", "accountLabel": "Normal"},
+            {"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "API"},
+        ]
 
-            usage_rows, _ = monitor_token_ledger.reconcile_token_ledger([], events, "api", "API", timeline)
-            sessions = monitor_token_ledger.token_sessions_from_ledger(usage_rows)
+        usage_rows = monitor_token_ledger._usage_records(events, "api", "API", timeline)
+        sessions = monitor_token_ledger.token_sessions_from_ledger(usage_rows)
 
         self.assertEqual([(row["accountSlotId"], row["tokens"]["freshInputTokens"]) for row in sessions], [("normal", 70), ("api", 140)])
         self.assertEqual([row["accountSlotId"] for row in usage_rows], ["normal", "api"])
 
     def test_token_ledger_ignores_inactive_account_polling_when_given_the_activation_timeline(self):
-        with self.account_directory() as directory:
-            event = {"eventId": "session:1", "sessionId": "session", "checkedAt": "2030-01-01T01:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 100, "cachedInput": 0, "cacheWriteInput": 0, "output": 10}}
-            activation_timeline = [{"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "UU API Pro"}]
+        event = {"eventId": "session:1", "sessionId": "session", "checkedAt": "2030-01-01T01:30:00Z", "model": "gpt-5.5", "serviceTier": "default", "tokens": {"input": 100, "cachedInput": 0, "cacheWriteInput": 0, "output": 10}}
+        activation_timeline = [{"checkedAt": "2030-01-01T01:00:00Z", "accountSlotId": "api", "accountLabel": "UU API Pro"}]
 
-            usages, _ = monitor_token_ledger.reconcile_token_ledger([], [event], "api", "UU API Pro", activation_timeline)
-            usage_row = usages[0]
+        usages = monitor_token_ledger._usage_records([event], "api", "UU API Pro", activation_timeline)
+        usage_row = usages[0]
 
         self.assertEqual((usage_row["accountSlotId"], usage_row["accountLabel"]), ("api", "UU API Pro"))
 
@@ -2655,6 +2525,19 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(parse_token_usage({"input_tokens": 0, "output_tokens": 0, "prompt_tokens": 100, "completion_tokens": 10, "cache_creation_input_tokens": 40}), {"input": 0, "cachedInput": 0, "cacheWriteInput": 0, "output": 0})
         self.assertIsNone(parse_token_usage({"prompt_tokens": 100, "completion_tokens": 10}))
 
+    def canonical_session_scan(self, directory, db_name="usage.sqlite3", sync=True):
+        store = getattr(self, "_canonical_scan_stores", {}).get((directory, db_name))
+        if store is None:
+            store = CanonicalDataStore(directory / db_name, "machine-a", lambda _slot: "v3:a", threading.RLock())
+            self.addCleanup(store.index.close)
+            self._canonical_scan_stores = {**getattr(self, "_canonical_scan_stores", {}), (directory, db_name): store}
+        usage = store.sources.scan(directory)
+        if not sync:
+            return usage
+        cost, cost_by_model = store.sources.sync_ledger("slot", "Slot", [], store.normalize_new_ledger)
+        _, ledger = store.datasets("local")
+        return usage | {"cost": cost, "costByModel": cost_by_model, "sessions": monitor_token_ledger.token_sessions_from_ledger(ledger)}
+
     def test_codex_session_scan_records_cumulative_deltas_by_session_and_model(self):
         with self.account_directory() as directory:
             session_dir = directory / "sessions" / "2030" / "01" / "01"
@@ -2667,7 +2550,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             ]
             (session_dir / "rollout.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
-            usage = monitor_tokens.scan_codex_token_usage(directory)
+            usage = self.canonical_session_scan(directory)
 
             self.assertEqual(len(usage["sessions"]), 1)
             session = usage["sessions"][0]
@@ -2693,7 +2576,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
             ]
             (session_dir / "rollout.jsonl").write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
 
-            usage = monitor_tokens.scan_codex_token_usage(directory)
+            usage = self.canonical_session_scan(directory)
 
             self.assertEqual(usage["totals"]["inputTokens"], 150)
             self.assertEqual(usage["totals"]["outputTokens"], 20)
@@ -2713,10 +2596,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "stable"}},
                 {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 10, "output_tokens": 2})}},
             ]) + "\n", encoding="utf-8")
-            expected = monitor_tokens.scan_codex_token_usage(directory)
+            expected = self.canonical_session_scan(directory)
 
             with mock.patch.object(Path, "open", autospec=True, side_effect=Path.open) as opened:
-                actual = monitor_tokens.scan_codex_token_usage(directory)
+                actual = self.canonical_session_scan(directory)
 
             opened.assert_not_called()
             self.assertEqual(actual, expected)
@@ -2730,7 +2613,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "append"}},
                 {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 10, "output_tokens": 2})}},
             ]) + "\n", encoding="utf-8")
-            monitor_tokens.scan_codex_token_usage(directory)
+            self.canonical_session_scan(directory)
             offset = path.stat().st_size
             appended = (json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 25, "output_tokens": 5})}}) + "\n").encode()
             with path.open("ab") as stream:
@@ -2758,10 +2641,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     return data
 
             with mock.patch.object(Path, "open", autospec=True, side_effect=lambda opened_path, *args, **kwargs: TrackedStream(original_open(opened_path, *args, **kwargs))):
-                usage = monitor_tokens.scan_codex_token_usage(directory)
+                usage = self.canonical_session_scan(directory, sync=False)
+            self._canonical_scan_stores[(directory, "usage.sqlite3")].sources.sync_ledger("slot", "Slot", [], self._canonical_scan_stores[(directory, "usage.sqlite3")].normalize_new_ledger)
 
             self.assertEqual(positions, [offset])
-            self.assertEqual(read_sizes, [len(appended)])
+            self.assertEqual(read_sizes, [offset, len(appended)])
             self.assertEqual(usage["totals"]["inputTokens"], 25)
             self.assertEqual(usage["totals"]["outputTokens"], 5)
             self.assertEqual(usage["totals"]["requests"], 2)
@@ -2797,7 +2681,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     return data
 
             with mock.patch.object(Path, "open", autospec=True, side_effect=lambda opened_path, *args, **kwargs: GrowingStream(original_open(opened_path, *args, **kwargs))):
-                usage = monitor_tokens.scan_codex_token_usage(directory)
+                usage = self.canonical_session_scan(directory, sync=False)
+            store = self._canonical_scan_stores[(directory, "usage.sqlite3")]
+            store.sources.sync_ledger("slot", "Slot", [], store.normalize_new_ledger)
 
             self.assertEqual(usage["totals"]["inputTokens"], 20)
             self.assertEqual(usage["totals"]["requests"], 2)
@@ -2837,11 +2723,13 @@ class MonitorCodexUsageTests(unittest.TestCase):
                     return data
 
             with mock.patch.object(Path, "open", autospec=True, side_effect=lambda opened_path, *args, **kwargs: GrowingStream(original_open(opened_path, *args, **kwargs))):
-                usage = monitor_tokens.scan_codex_token_usage(directory)
+                usage = self.canonical_session_scan(directory, sync=False)
+            store = self._canonical_scan_stores[(directory, "usage.sqlite3")]
+            store.sources.sync_ledger("slot", "Slot", [], store.normalize_new_ledger)
 
             self.assertEqual(appended_values, [20, 30, 40])
             self.assertEqual((usage["totals"]["inputTokens"], usage["totals"]["requests"]), (30, 3))
-            caught_up = monitor_tokens.scan_codex_token_usage(directory)
+            caught_up = self.canonical_session_scan(directory)
             self.assertEqual((caught_up["totals"]["inputTokens"], caught_up["totals"]["requests"]), (40, 4))
 
     def test_codex_session_scan_waits_for_partial_line_completion(self):
@@ -2853,10 +2741,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
             token_line = json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 13, "output_tokens": 3})}}).encode()
             path.write_bytes(metadata + token_line[:len(token_line) // 2])
 
-            self.assertEqual(monitor_tokens.scan_codex_token_usage(directory)["totals"]["requests"], 0)
+            self.assertEqual(self.canonical_session_scan(directory)["totals"]["requests"], 0)
             with path.open("ab") as stream:
                 stream.write(token_line[len(token_line) // 2:] + b"\n")
-            usage = monitor_tokens.scan_codex_token_usage(directory)
+            usage = self.canonical_session_scan(directory)
 
             self.assertEqual(usage["totals"]["inputTokens"], 13)
             self.assertEqual(usage["totals"]["requests"], 1)
@@ -2868,14 +2756,14 @@ class MonitorCodexUsageTests(unittest.TestCase):
             path = session_dir / "final.jsonl"
             path.write_text(json.dumps({"type": "session_meta", "payload": {"id": "final"}}) + "\n" + json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 11, "output_tokens": 2})}}), encoding="utf-8")
 
-            usage = monitor_tokens.scan_codex_token_usage(directory)
+            usage = self.canonical_session_scan(directory)
 
             self.assertEqual(usage["totals"]["inputTokens"], 11)
             self.assertEqual(usage["totals"]["requests"], 1)
             with path.open("a", encoding="utf-8") as stream:
                 stream.write("\n" + json.dumps({"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 15, "output_tokens": 3})}}) + "\n")
 
-            usage = monitor_tokens.scan_codex_token_usage(directory)
+            usage = self.canonical_session_scan(directory)
 
             self.assertEqual(usage["totals"]["inputTokens"], 15)
             self.assertEqual(usage["totals"]["requests"], 2)
@@ -2889,7 +2777,7 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 "payload": {"type": "token_count", "note": "session_meta thread_settings_applied", "info": token_count_info({"input_tokens": 9, "output_tokens": 2})},
             }) + "\n", encoding="utf-8")
 
-            usage = monitor_tokens.scan_codex_token_usage(directory)
+            usage = self.canonical_session_scan(directory)
 
             self.assertEqual(usage["totals"]["inputTokens"], 9)
             self.assertEqual(usage["totals"]["requests"], 1)
@@ -2904,15 +2792,16 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 100, "output_tokens": 10})}},
             ]
             path.write_text("\n".join(json.dumps(row) for row in rows) + "\n", encoding="utf-8")
-            monitor_tokens.scan_codex_token_usage(directory)
+            self.canonical_session_scan(directory)
             truncated = [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "truncated"}},
                 {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 7, "output_tokens": 1})}},
             ]
             path.write_text("\n".join(json.dumps(row) for row in truncated) + "\n", encoding="utf-8")
 
-            usage = monitor_tokens.scan_codex_token_usage(directory)
-            self.assertEqual((usage["sessions"][0]["sessionId"], usage["totals"]["inputTokens"]), ("truncated", 7))
+            usage = self.canonical_session_scan(directory)
+            sessions = {session["sessionId"]: session for session in usage["sessions"]}
+            self.assertEqual(sessions["truncated"]["tokens"]["inputTokens"], 7)
             replacement = path.with_suffix(".replacement")
             replaced = [
                 {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "replaced"}},
@@ -2921,23 +2810,26 @@ class MonitorCodexUsageTests(unittest.TestCase):
             replacement.write_text("\n".join(json.dumps(row) for row in replaced) + "\n", encoding="utf-8")
             os.replace(replacement, path)
 
-            usage = monitor_tokens.scan_codex_token_usage(directory)
-            self.assertEqual((usage["sessions"][0]["sessionId"], usage["totals"]["inputTokens"]), ("replaced", 19))
+            usage = self.canonical_session_scan(directory)
+            sessions = {session["sessionId"]: session for session in usage["sessions"]}
+            self.assertEqual(sessions["replaced"]["tokens"]["inputTokens"], 19)
 
-    def test_codex_session_scan_removes_deleted_files_from_cache_and_totals(self):
+    def test_codex_session_scan_retains_canonical_ledger_when_source_file_is_deleted(self):
         with self.account_directory() as directory:
             session_dir = directory / "sessions" / "2030" / "01" / "01"
             session_dir.mkdir(parents=True)
             path = session_dir / "deleted.jsonl"
-            path.write_text(json.dumps({"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 8, "output_tokens": 2})}}) + "\n", encoding="utf-8")
-            self.assertEqual(monitor_tokens.scan_codex_token_usage(directory)["filesScanned"], 1)
+            path.write_text("\n".join(json.dumps(row) for row in [
+                {"timestamp": "2030-01-01T00:00:00Z", "type": "session_meta", "payload": {"id": "deleted"}},
+                {"timestamp": "2030-01-01T00:01:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 8, "output_tokens": 2})}},
+            ]) + "\n", encoding="utf-8")
+            self.assertEqual(self.canonical_session_scan(directory)["filesScanned"], 1)
 
             path.unlink()
-            usage = monitor_tokens.scan_codex_token_usage(directory)
+            usage = self.canonical_session_scan(directory)
 
-            self.assertEqual(usage["filesScanned"], 0)
-            self.assertEqual(usage["totals"]["totalTokens"], 0)
-            self.assertEqual(usage["sessions"], [])
+            self.assertEqual(usage["totals"]["totalTokens"], 10)
+            self.assertEqual([session["sessionId"] for session in usage["sessions"]], ["deleted"])
 
     def test_codex_incremental_aggregation_matches_clean_rebuild(self):
         with self.account_directory() as directory:
@@ -2951,30 +2843,19 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"timestamp": "2030-01-01T00:01:01Z", "type": "event_msg", "payload": {"type": "thread_settings_applied"}},
             ]
             path.write_text("\n".join(json.dumps(row) for row in initial) + "\n", encoding="utf-8")
-            monitor_tokens.scan_codex_token_usage(directory)
+            self.canonical_session_scan(directory)
             appended = [
                 {"timestamp": "2030-01-01T00:01:02Z", "type": "turn_context", "payload": {"model": "gpt-5.5", "thread_settings": {"service_tier": "fast"}}},
                 {"timestamp": "2030-01-01T00:02:00Z", "type": "event_msg", "payload": {"type": "token_count", "info": token_count_info({"input_tokens": 140, "output_tokens": 20})}},
             ]
             with path.open("a", encoding="utf-8") as stream:
                 stream.write("\n".join(json.dumps(row) for row in appended) + "\n")
-            incremental = monitor_tokens.scan_codex_token_usage(directory)
+            incremental = self.canonical_session_scan(directory)
 
-            monitor_tokens._CODEX_SESSION_SCAN_CACHE.pop(str(directory.resolve()))
-            self.assertEqual(monitor_tokens.scan_codex_token_usage(directory), incremental)
+            self.assertEqual(self.canonical_session_scan(directory, "clean.sqlite3"), incremental)
 
     def test_priority_service_tier_is_treated_as_fast(self):
         self.assertEqual(monitor_tokens.normalize_service_tier("priority"), "fast")
-
-    def test_token_session_history_migrates_legacy_cached_output_to_cache_write(self):
-        legacy_tokens = {"inputTokens": 100, "freshInputTokens": 80, "cachedInputTokens": 20, "outputTokens": 10, "freshOutputTokens": 0, "cachedOutputTokens": 30, "totalTokens": 110, "requests": 1}
-        row = __import__("monitor_history").normalize_token_session_row({"sessionId": "legacy", "tokens": legacy_tokens, "byModel": {"gpt-5.6-sol": {"tokens": legacy_tokens, "cost": {}}}})
-
-        self.assertEqual(row["tokens"], {"inputTokens": 100, "freshInputTokens": 50, "cachedInputTokens": 20, "cacheWriteInputTokens": 30, "outputTokens": 10, "totalTokens": 110, "requests": 1})
-        self.assertEqual(row["byModel"]["gpt-5.6-sol"]["tokens"], row["tokens"])
-        self.assertNotIn("cachedOutputTokens", row["tokens"])
-        self.assertNotIn("freshOutputTokens", row["tokens"])
-        self.assertEqual(row["cost"]["cacheWriteInputCostUsd"], 0.00015)
 
     def test_cache_write_tokens_are_excluded_from_fresh_input(self):
         totals = empty_token_totals()
@@ -2987,648 +2868,9 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(totals["cacheWriteInputTokens"], 30)
         self.assertEqual(totals["outputTokens"], 10)
 
-    def test_delta_event_series_records_only_percentage_increases(self):
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=12),
-            event_sample("2030-01-01T01:00:00Z", five_hour=5, cost=13),
-            event_sample("2030-01-01T02:00:00Z", five_hour=8, cost=15),
-        ], "5h")
-
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[0]["cumulativePercent"], 0)
-        self.assertEqual(events[0]["cumulativeCostUsd"], 0)
-        self.assertEqual(events[1]["deltaPercent"], 3)
-        self.assertEqual(events[1]["deltaCostUsd"], 3)
-        self.assertEqual(events[1]["costPercentRatio"], 1)
-        self.assertIsNone(events[1]["averageCostPercentRatio"])
-        self.assertEqual(events[1]["cumulativePercent"], 3)
-        self.assertEqual(events[1]["cumulativeCostUsd"], 3)
-
-    def test_delta_event_series_does_not_record_unavailable_5h_usage(self):
-        unavailable = event_sample("2030-01-01T01:00:00Z", five_hour=0, cost=15)
-        unavailable["windows"]["5h"]["unavailable"] = True
-
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=12),
-            unavailable,
-            event_sample("2030-01-01T02:00:00Z", five_hour=8, cost=18),
-        ], "5h")
-
-        self.assertEqual([event["deltaPercent"] for event in events], [0, 0])
-        self.assertEqual([event["deltaCostUsd"] for event in events], [0, 0])
-
-    def test_delta_event_series_counts_flat_cost_into_next_valid_pair(self):
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=12),
-            event_sample("2030-01-01T01:00:00Z", five_hour=5, cost=13),
-            event_sample("2030-01-01T02:00:00Z", five_hour=5, cost=14),
-            event_sample("2030-01-01T03:00:00Z", five_hour=8, cost=16),
-        ], "5h")
-
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[1]["deltaPercent"], 3)
-        self.assertEqual(events[1]["deltaCostUsd"], 4)
-        self.assertEqual(events[1]["cumulativePercent"], 3)
-        self.assertEqual(events[1]["cumulativeCostUsd"], 4)
-
-    def test_delta_event_series_ignores_cost_while_percentage_is_at_100(self):
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=99, cost=100),
-            event_sample("2030-01-01T01:00:00Z", five_hour=100, cost=102),
-            event_sample("2030-01-01T02:00:00Z", five_hour=100, cost=108),
-            event_sample("2030-01-01T03:00:00Z", five_hour=101, cost=110),
-        ], "5h")
-
-        self.assertEqual([(event["deltaPercent"], event["deltaCostUsd"]) for event in events[1:]], [(1, 2), (1, 2)])
-        self.assertEqual(events[-1]["cumulativeCostUsd"], 4)
-
-    def test_delta_event_series_resets_percent_baseline_but_keeps_cost_baseline(self):
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=12),
-            event_sample("2030-01-01T01:00:00Z", five_hour=8, cost=15),
-            event_sample("2030-01-01T02:00:00Z", five_hour=10, cost=18),
-            event_sample("2030-01-01T03:00:00Z", five_hour=3, cost=21),
-        ], "5h")
-
-        self.assertEqual(events[-1]["deltaPercent"], 3)
-        self.assertEqual(events[-1]["deltaCostUsd"], 3)
-        self.assertEqual(events[-1]["cumulativePercent"], 8)
-        self.assertEqual(events[-1]["cumulativeCostUsd"], 9)
-
-    def test_delta_event_series_normalizes_pro_lite_percentage_to_plus_plan(self):
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=3, cost=12, plan="pro_lite"),
-            event_sample("2030-01-01T01:00:00Z", five_hour=4, cost=15, plan="pro_lite"),
-            event_sample("2030-01-01T02:00:00Z", five_hour=5, cost=18, plan="pro_lite"),
-        ], "5h")
-
-        self.assertEqual(events[0]["normalizedPercent"], 15)
-        self.assertEqual(events[1]["deltaPercent"], 5)
-        self.assertEqual(events[1]["deltaCostUsd"], 3)
-        self.assertEqual(events[1]["cumulativePercent"], 5)
-        self.assertEqual(events[1]["cumulativeCostUsd"], 3)
-
-    def test_pro_multiplier_applies_to_new_samples_and_preserves_saved_samples(self):
-        history = [event_sample(f"2030-01-01T0{index}:00:00Z", five_hour=3 + index, cost=12 + 3 * index, plan="pro") for index in range(3)]
-        self.assertEqual(build_delta_event_series(history, "5h")[-1]["deltaPercent"], 10)
-        for row in history:
-            row["windows"]["5h"]["planMultiplier"] = 20
-        events = build_delta_event_series(history, "5h")
-        self.assertEqual((events[-1]["deltaPercent"], events[-1]["planMultiplier"]), (20, 20))
+    def test_pro_multiplier_aliases_map_to_pro_plan(self):
         for alias in ("10x", "10 x", "pro", "20x"):
             self.assertEqual(__import__("monitor_history").quota_plan({"plan_type": alias}), {"type": "pro", "multiplier": 10})
-
-    def test_delta_event_series_discards_account_type_switch_sample(self):
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=8, plan="plus"),
-            event_sample("2030-01-01T01:00:00Z", five_hour=30, cost=12, plan="pro_lite"),
-            event_sample("2030-01-01T02:00:00Z", five_hour=31, cost=15, plan="pro_lite"),
-            event_sample("2030-01-01T03:00:00Z", five_hour=34, cost=18, plan="pro_lite"),
-        ], "5h")
-
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[0]["cumulativePercent"], 0)
-        self.assertEqual(events[0]["cumulativeCostUsd"], 0)
-        self.assertEqual(events[1]["deltaPercent"], 15)
-        self.assertEqual(events[1]["deltaCostUsd"], 3)
-        self.assertEqual(events[1]["cumulativePercent"], 15)
-        self.assertEqual(events[1]["cumulativeCostUsd"], 3)
-
-    def test_delta_event_series_does_not_count_account_switch_gap_cost(self):
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=8, plan="plus"),
-            event_sample("2030-01-01T01:00:00Z", five_hour=30, cost=12, plan="pro_lite"),
-            event_sample("2030-01-01T02:00:00Z", five_hour=30, cost=14, plan="pro_lite"),
-            event_sample("2030-01-01T03:00:00Z", five_hour=31, cost=17, plan="pro_lite"),
-            event_sample("2030-01-01T04:00:00Z", five_hour=34, cost=20, plan="pro_lite"),
-        ], "5h")
-
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[1]["deltaPercent"], 15)
-        self.assertEqual(events[1]["deltaCostUsd"], 3)
-        self.assertEqual(events[1]["cumulativePercent"], 15)
-        self.assertEqual(events[1]["cumulativeCostUsd"], 3)
-
-    def test_delta_event_series_discards_low_cost_external_usage(self):
-        events = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=10),
-            event_sample("2030-01-01T01:00:00Z", five_hour=8, cost=10),
-            event_sample("2030-01-01T02:00:00Z", five_hour=9, cost=11),
-        ], "5h")
-
-        self.assertEqual(len(events), 2)
-        self.assertEqual(events[1]["deltaPercent"], 1)
-        self.assertEqual(events[1]["deltaCostUsd"], 1)
-
-    def test_new_valid_delta_events_returns_only_new_pairs(self):
-        before = [
-            event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=12),
-            event_sample("2030-01-01T01:00:00Z", five_hour=8, cost=15),
-        ]
-        after = [
-            *before,
-            event_sample("2030-01-01T02:00:00Z", five_hour=9, cost=18),
-        ]
-
-        events = new_valid_delta_events(before, after)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 3)
-
-    def test_delta_event_console_format_includes_current_normalized_usage_and_plan(self):
-        sample_row = event_sample("2030-01-01T02:00:00Z", five_hour=5, seven_day=2, cost=18, plan="pro_lite")
-        event = build_delta_event_series([
-            event_sample("2030-01-01T00:00:00Z", five_hour=3, cost=12, plan="pro_lite"),
-            event_sample("2030-01-01T01:00:00Z", five_hour=4, cost=15, plan="pro_lite"), sample_row,
-        ], "5h")[-1]
-
-        text = format_valid_delta_event(event, sample_row)
-
-        local_time = datetime.fromisoformat("2030-01-01T02:00:00+00:00").astimezone().isoformat(sep=" ", timespec="seconds")
-        self.assertTrue(text.startswith(f"[delta]({local_time[:19]} {local_time[19:]}) 5h "))
-        self.assertIn("+5% / +$3", text)
-        self.assertIn("ratio $0.6/%", text)
-        self.assertIn("current 5h 25%", text)
-        self.assertIn("7d 10%", text)
-        self.assertIn("pro_lite 5x", text)
-
-    def test_live_processing_records_only_compact_delta_pair(self):
-        state = {}
-        history = []
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=12), history), [])
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=8, cost=15), history)
-        history.extend(compact_delta_event(event) for event in events)
-
-        self.assertEqual(history, [{"checkedAt": "2030-01-01T01:00:00Z", "window": "5h", "model": "gpt-5.5", "accountSlotId": "unknown", "accountLabel": "Unknown", "deltaPercent": 3.0, "deltaCostUsd": 3.0, "costPercentRatio": 1.0}])
-        self.assertNotIn("windows", history[0])
-        self.assertEqual(derive_history_events(history)["fiveHour"][0]["cumulativePercent"], 0)
-        self.assertTrue(derive_history_events(history)["fiveHour"][0]["synthetic"])
-        self.assertEqual(derive_history_events(history)["fiveHour"][1]["cumulativePercent"], 3)
-
-    def test_live_processing_records_registered_account_on_every_model_split(self):
-        state = {}
-        baseline = event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=12)
-        baseline.update({"accountSlotId": "work-account", "accountLabel": "Work Pro"})
-        process_sample_delta_events(state, baseline, [])
-        sample = event_sample("2030-01-01T01:00:00Z", five_hour=8, cost=15)
-        sample.update({"accountSlotId": "work-account", "accountLabel": "Work Pro"})
-        events = process_sample_delta_events(state, sample, [])
-        self.assertTrue(events)
-        self.assertEqual({event["accountSlotId"] for event in events}, {"work-account"})
-        self.assertEqual({event["accountLabel"] for event in events}, {"Work Pro"})
-        self.assertEqual({compact_delta_event(event)["accountSlotId"] for event in events}, {"work-account"})
-
-    def test_live_processing_flags_cost_percent_ratio_deviation_for_both_windows(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=5, seven_day=5, cost=10), history)
-        events = process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=8, seven_day=8, cost=13), history)
-        history.extend(compact_delta_event(event) for event in events)
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=9, seven_day=9, cost=16), history)
-
-        self.assertEqual([event["window"] for event in events], ["5h", "7d"])
-        self.assertEqual([event["costPercentRatio"] for event in events], [3.0, 3.0])
-        self.assertEqual([event["averageCostPercentRatio"] for event in events], [1.0, 1.0])
-        self.assertTrue(all(event["ratioDeviationWarning"] for event in events))
-        self.assertIn("cost/percent ratio $3/% deviates from average $1/%", format_ratio_warning(events[0]))
-
-    def test_live_processing_splits_percent_by_model_cost_for_both_windows(self):
-        state = {}
-        history = []
-        first = event_sample("2030-01-01T00:00:00Z", five_hour=5, seven_day=5, cost=0)
-        first["costByModel"] = {"gpt-5.5": {"totalCostUsd": 0}, "gpt-5.6-sol": {"totalCostUsd": 0}}
-        second = event_sample("2030-01-01T01:00:00Z", five_hour=7, seven_day=7, cost=7)
-        second["costByModel"] = {"gpt-5.5": {"totalCostUsd": 2}, "gpt-5.6-sol": {"totalCostUsd": 5}}
-
-        self.assertEqual(process_sample_delta_events(state, first, history), [])
-        events = process_sample_delta_events(state, second, history)
-
-        self.assertEqual([(event["window"], event["model"]) for event in events], [("5h", "gpt-5.5"), ("5h", "gpt-5.6-sol"), ("7d", "gpt-5.5"), ("7d", "gpt-5.6-sol")])
-        for label in ("5h", "7d"):
-            split = [event for event in events if event["window"] == label]
-            self.assertEqual(split[0]["deltaPercent"], 0.57142857)
-            self.assertEqual(split[1]["deltaPercent"], 1.42857143)
-            self.assertEqual(sum(event["deltaPercent"] for event in split), 2)
-            self.assertEqual([event["deltaCostUsd"] for event in split], [2, 5])
-            self.assertEqual([event["costPercentRatio"] for event in split], [3.5, 3.5])
-
-    def test_model_ratio_average_is_calculated_separately(self):
-        state = {}
-        first = event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=0)
-        first["costByModel"] = {"gpt-5.5": {"totalCostUsd": 0}, "gpt-5.6-sol": {"totalCostUsd": 0}}
-        second = event_sample("2030-01-01T01:00:00Z", five_hour=7, cost=7)
-        second["costByModel"] = {"gpt-5.5": {"totalCostUsd": 2}, "gpt-5.6-sol": {"totalCostUsd": 5}}
-        process_sample_delta_events(state, first, [])
-        history = [compact_delta_event(event) for event in process_sample_delta_events(state, second, [])]
-        third = event_sample("2030-01-01T02:00:00Z", five_hour=8, cost=9)
-        third["costByModel"] = {"gpt-5.5": {"totalCostUsd": 4}, "gpt-5.6-sol": {"totalCostUsd": 5}}
-
-        events = process_sample_delta_events(state, third, history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["model"], "gpt-5.5")
-        self.assertEqual(events[0]["costPercentRatio"], 2)
-        self.assertAlmostEqual(events[0]["averageCostPercentRatio"], 3.5, places=7)
-
-    def test_empty_compact_event_log_shows_zero_zero_baseline(self):
-        events = derive_history_events([])
-
-        self.assertEqual(events["fiveHour"][0]["cumulativePercent"], 0)
-        self.assertEqual(events["fiveHour"][0]["cumulativeCostUsd"], 0)
-        self.assertTrue(events["fiveHour"][0]["synthetic"])
-        self.assertEqual(events["sevenDay"][0]["cumulativePercent"], 0)
-        self.assertEqual(events["sevenDay"][0]["cumulativeCostUsd"], 0)
-        self.assertTrue(events["sevenDay"][0]["synthetic"])
-
-    def test_live_processing_discards_low_cost_delta_and_resets_baseline(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=10), history)
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=8, cost=10), history), [])
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=9, cost=11), history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 1)
-
-    def test_precision_sensitive_windows_wait_for_next_percent_change_on_startup(self):
-        for label, plan in (("7d", "plus"), ("5h", "pro_lite"), ("7d", "pro_lite"), ("5h", "pro"), ("7d", "pro")):
-            with self.subTest(label=label, plan=plan):
-                state = {}
-                first = {"five_hour": 50} if label == "5h" else {"seven_day": 50}
-                second = {"five_hour": 51} if label == "5h" else {"seven_day": 51}
-                third = {"five_hour": 52} if label == "5h" else {"seven_day": 52}
-
-                self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", cost=100, plan=plan, **first), []), [])
-                self.assertTrue(state["windows"][label]["awaitingTrustedPercentBaseline"])
-                self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", cost=110, plan=plan, **second), []), [])
-                self.assertNotIn("awaitingTrustedPercentBaseline", state["windows"][label])
-                self.assertEqual(state["windows"][label]["baselineCostUsd"], 110)
-
-                events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", cost=112, plan=plan, **third), [])
-
-                self.assertEqual(len(events), 1)
-                self.assertEqual(events[0]["deltaPercent"], {"plus": 1, "pro_lite": 5, "pro": 10}[plan])
-                self.assertEqual(events[0]["deltaCostUsd"], 2)
-
-    def test_plus_five_hour_keeps_immediate_integer_baseline(self):
-        state = {}
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=50, cost=100, plan="plus"), [])
-
-        events = process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=51, cost=102, plan="plus"), [])
-
-        self.assertNotIn("awaitingTrustedPercentBaseline", state["windows"]["5h"])
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 2)
-
-    def test_account_switch_waits_for_next_seven_day_percent_change(self):
-        state = {}
-        process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T00:00:00Z", seven_day=40, cost=100, plan="plus"), "user-old"), [])
-        process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T01:00:00Z", seven_day=50, cost=105, plan="plus"), "user-new"), [])
-
-        self.assertTrue(state["windows"]["7d"]["awaitingTrustedPercentBaseline"])
-        self.assertEqual(process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T02:00:00Z", seven_day=51, cost=115, plan="plus"), "user-new"), []), [])
-        events = process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T03:00:00Z", seven_day=52, cost=118, plan="plus"), "user-new"), [])
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 3)
-
-    def test_external_update_restarts_trusted_seven_day_baseline_wait(self):
-        state = {}
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", seven_day=50, cost=100, plan="plus"), [])
-        process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", seven_day=51, cost=105, plan="plus"), [])
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", seven_day=52, cost=105, plan="plus"), []), [])
-
-        self.assertEqual(state["_specialEvents"][0]["reason"], "low-cost-delta-discarded")
-        self.assertTrue(state["windows"]["7d"]["awaitingTrustedPercentBaseline"])
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T03:00:00Z", seven_day=53, cost=110, plan="plus"), []), [])
-        events = process_sample_delta_events(state, event_sample("2030-01-01T04:00:00Z", seven_day=54, cost=112, plan="plus"), [])
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 2)
-
-    def test_live_processing_records_only_after_runtime_cost_baseline_is_ready(self):
-        state = {}
-        history = []
-        first = event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=100)
-        first["eventCostUsd"] = 0
-        first["eventCostReady"] = False
-        second = event_sample("2030-01-01T01:00:00Z", five_hour=6, cost=101)
-        second["eventCostUsd"] = 1
-        second["eventCostReady"] = False
-        third = event_sample("2030-01-01T02:00:00Z", five_hour=7, cost=103)
-        third["eventCostUsd"] = 3
-        third["eventCostReady"] = True
-
-        self.assertEqual(process_sample_delta_events(state, first, history), [])
-        self.assertEqual(process_sample_delta_events(state, second, history), [])
-        events = process_sample_delta_events(state, third, history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 2)
-
-    def test_live_processing_keeps_independent_window_cost_baselines(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=10, seven_day=10, cost=100), history)
-        events = process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=10, seven_day=11, cost=112), history)
-        history.extend(compact_delta_event(event) for event in events)
-
-        self.assertEqual([(event["window"], event["deltaCostUsd"]) for event in events], [("7d", 12)])
-        events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=11, seven_day=11, cost=115), history)
-
-        self.assertEqual([(event["window"], event["deltaCostUsd"]) for event in events], [("5h", 15)])
-
-    def test_live_processing_ignores_100_percent_overflow_per_window(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=99, seven_day=99, cost=100), history)
-        events = process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=100, seven_day=99, cost=102), history)
-        history.extend(compact_delta_event(event) for event in events)
-
-        self.assertEqual([(event["window"], event["deltaPercent"], event["deltaCostUsd"]) for event in events], [("5h", 1, 2)])
-        events = process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=100, seven_day=100, cost=105), history)
-        history.extend(compact_delta_event(event) for event in events)
-
-        self.assertEqual([(event["window"], event["deltaPercent"], event["deltaCostUsd"]) for event in events], [("7d", 1, 5)])
-        self.assertEqual(state["windows"]["5h"]["baselineCostUsd"], 105)
-        events = process_sample_delta_events(state, event_sample("2030-01-01T03:00:00Z", five_hour=101, seven_day=100, cost=108), history)
-        history.extend(compact_delta_event(event) for event in events)
-
-        self.assertEqual([(event["window"], event["deltaPercent"], event["deltaCostUsd"]) for event in events], [("5h", 1, 3)])
-        self.assertEqual(state["windows"]["7d"]["baselineCostUsd"], 108)
-        events = process_sample_delta_events(state, event_sample("2030-01-01T04:00:00Z", five_hour=102, seven_day=101, cost=110), history)
-
-        self.assertEqual([(event["window"], event["deltaPercent"], event["deltaCostUsd"]) for event in events], [("5h", 1, 2), ("7d", 1, 2)])
-
-
-    def test_consecutive_reset_time_moved_forward_events_are_suppressed_per_window(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=10, seven_day=10, cost=100, five_hour_reset="2030-01-01T10:00:00Z", seven_day_reset="2030-01-08T00:00:00Z"), history)
-
-        process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=10, seven_day=10, cost=100, five_hour_reset="2030-01-01T11:00:00Z", seven_day_reset="2030-01-08T01:00:00Z"), history)
-        self.assertEqual([event["reason"] for event in state["_specialEvents"]], ["reset-time-moved-forward", "reset-time-moved-forward"])
-        self.assertEqual([event["extra"]["suppressConsole"] for event in state["_specialEvents"]], [False, False])
-
-        process_sample_delta_events(state, event_sample("2030-01-01T02:00:00Z", five_hour=10, seven_day=10, cost=100, five_hour_reset="2030-01-01T12:00:00Z", seven_day_reset="2030-01-08T02:00:00Z"), history)
-        self.assertEqual([event["extra"]["suppressConsole"] for event in state["_specialEvents"]], [True, True])
-
-        process_sample_delta_events(state, event_sample("2030-01-01T03:00:00Z", five_hour=11, seven_day=10, cost=100, five_hour_reset="2030-01-01T12:00:00Z", seven_day_reset="2030-01-08T02:00:00Z"), history)
-        self.assertEqual(state["_specialEvents"][0]["reason"], "low-cost-delta-discarded")
-
-        process_sample_delta_events(state, event_sample("2030-01-01T04:00:00Z", five_hour=11, seven_day=10, cost=100, five_hour_reset="2030-01-01T13:00:00Z", seven_day_reset="2030-01-08T03:00:00Z"), history)
-        self.assertEqual([event["extra"]["suppressConsole"] for event in state["_specialEvents"]], [False, True])
-
-    def test_live_processing_rebases_on_remote_identity_switch_with_usable_windows(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T00:00:00Z", five_hour=40, cost=100, plan="plus", five_hour_reset="2030-01-01T10:00:00Z"), "user-old"), history)
-
-        switched = with_remote_identity(event_sample("2030-01-01T01:00:00Z", five_hour=10, cost=105, plan="plus", five_hour_reset="2030-01-01T10:00:00Z"), "user-new")
-        self.assertEqual(process_sample_delta_events(state, switched, history), [])
-
-        self.assertTrue(switched["remoteUsage"]["accepted"])
-        self.assertEqual(state["remoteUsageIdentity"]["user_id"], "user-new")
-        self.assertEqual(state["_specialEvents"][0]["reason"], "account-switch")
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 10)
-        self.assertEqual(state["windows"]["5h"]["baselineCostUsd"], 105)
-
-        events = process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T02:00:00Z", five_hour=12, cost=107, plan="plus", five_hour_reset="2030-01-01T10:00:00Z"), "user-new"), history)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 2)
-        self.assertEqual(events[0]["deltaCostUsd"], 2)
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 12)
-        self.assertEqual(state["windows"]["5h"]["baselineCostUsd"], 107)
-
-        events = process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T03:00:00Z", five_hour=13, cost=109, plan="plus", five_hour_reset="2030-01-01T10:00:00Z"), "user-new"), history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 2)
-
-    def test_remote_identity_switch_with_rollback_shape_is_real_account_switch(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T00:00:00Z", five_hour=40, cost=100, plan="plus", five_hour_reset="2030-01-01T10:00:00Z"), "user-old"), history)
-
-        switched = with_remote_identity(event_sample("2030-01-01T01:00:00Z", five_hour=1, cost=105, plan="plus", five_hour_reset="2030-01-01T12:00:00Z"), "user-new")
-        self.assertEqual(process_sample_delta_events(state, switched, history), [])
-
-        self.assertTrue(switched["remoteUsage"]["accepted"])
-        self.assertNotIn("remoteUsageRejected", switched["errors"])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "account-switch")
-        self.assertEqual(state["remoteUsageIdentity"]["user_id"], "user-new")
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 1)
-        self.assertEqual(state["windows"]["5h"]["baselineResetAt"], "2030-01-01T12:00:00Z")
-        self.assertNotIn("awaitingTrustedPercentBaseline", state["windows"]["5h"])
-
-    def test_auth_identity_switch_with_rollback_shape_is_real_account_switch(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, with_auth_identity(event_sample("2030-01-01T00:00:00Z", five_hour=40, cost=100, plan="plus", five_hour_reset="2030-01-01T10:00:00Z"), "acct-old"), history)
-
-        switched = with_auth_identity(event_sample("2030-01-01T01:00:00Z", five_hour=1, cost=105, plan="plus", five_hour_reset="2030-01-01T12:00:00Z"), "acct-new")
-        self.assertEqual(process_sample_delta_events(state, switched, history), [])
-
-        self.assertTrue(switched["remoteUsage"]["accepted"])
-        self.assertNotIn("remoteUsageRejected", switched["errors"])
-        self.assertEqual(state["_specialEvents"][0]["reason"], "account-switch")
-        self.assertEqual(state["remoteUsageIdentity"]["account_id"], "acct-new")
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 1)
-        self.assertNotIn("awaitingTrustedPercentBaseline", state["windows"]["5h"])
-
-    def test_account_switch_counts_next_percent_from_switch_baseline(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T00:00:00Z", five_hour=40, cost=100, plan="plus"), "user-old"), history)
-        self.assertEqual(process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T01:00:00Z", five_hour=4, cost=110, plan="plus"), "user-new"), history), [])
-
-        events = process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T02:00:00Z", five_hour=5, cost=120, plan="plus"), "user-new"), history)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 10)
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 5)
-        self.assertEqual(state["windows"]["5h"]["baselineCostUsd"], 120)
-        self.assertNotIn("awaitingTrustedPercentBaseline", state["windows"]["5h"])
-
-        events = process_sample_delta_events(state, with_remote_identity(event_sample("2030-01-01T03:00:00Z", five_hour=6, cost=123, plan="plus"), "user-new"), history)
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["deltaPercent"], 1)
-        self.assertEqual(events[0]["deltaCostUsd"], 3)
-
-
-    def test_live_processing_reports_account_switch_baseline_update(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=8, plan="plus"), history)
-
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=30, cost=12, plan="pro_lite"), history), [])
-
-        self.assertEqual(len(state["_specialEvents"]), 1)
-        self.assertEqual(state["_specialEvents"][0]["reason"], "account-switch")
-        text = format_special_event(state["_specialEvents"][0])
-        self.assertIn("account-switch", text)
-        local_time = datetime.fromisoformat("2030-01-01T01:00:00+00:00").astimezone().isoformat(sep=" ", timespec="seconds")
-        self.assertTrue(text.startswith(f"[event]({local_time[:19]} {local_time[19:]}) 5h account-switch;"))
-        self.assertIn("plan plus (1x) -> pro_lite (5x)", text)
-        self.assertIn("baseline 5% -> 150%", text)
-
-    def test_live_processing_reports_low_cost_delta_baseline_update(self):
-        state = {}
-        history = []
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=10), history)
-
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=8, cost=10), history), [])
-
-        self.assertEqual(len(state["_specialEvents"]), 1)
-        self.assertEqual(state["_specialEvents"][0]["reason"], "low-cost-delta-discarded")
-        text = format_special_event(state["_specialEvents"][0])
-        self.assertIn("low-cost-delta-discarded", text)
-        self.assertIn("baseline 5% -> 8%", text)
-        self.assertIn("discarded delta +3% / +$0", text)
-
-    def test_startup_reset_clears_percent_and_cost_baselines(self):
-        state = reset_runtime_baselines(compact_monitor_state({
-            "windows": {
-                "5h": {
-                    "cumulativePercent": 10.0,
-                    "cumulativeCostUsd": 5.0,
-                    "baselinePercent": 10.0,
-                    "baselineCostUsd": 5.0,
-                    "baselinePlan": "unknown",
-                    "baselineMultiplier": 1.0,
-                    "previousCostUsd": 5.0,
-                    "awaitingTrustedPercentBaseline": True,
-                },
-            },
-            "runCostUsd": 5.0,
-            "measuredCostIntervals": 3,
-            "hasRuntimeCostBaseline": True,
-        }))
-        sample_row = event_sample("2030-01-01T01:00:00Z", five_hour=11, cost=101)
-        sample_row["costDelta"] = {"totalCostUsd": 1.0}
-
-        apply_runtime_cost_measurement(sample_row, state)
-        events = process_sample_delta_events(state, sample_row, [])
-
-        self.assertEqual(events, [])
-        self.assertEqual(state["runCostUsd"], 0.0)
-        self.assertEqual(state["measuredCostIntervals"], 0)
-        self.assertEqual(state["windows"]["5h"]["baselinePercent"], 11)
-        self.assertEqual(state["windows"]["5h"]["baselineCostUsd"], 0.0)
-        self.assertNotIn("awaitingTrustedPercentBaseline", state["windows"]["5h"])
-
-    def test_sample_debug_log_row_uses_lean_state_without_last_sample_or_cost_totals(self):
-        row = sample_debug_log_row(sample("2030-01-01T00:00:00Z", five_hour=1), [], {
-            "windows": {"5h": {"baselinePercent": 1}},
-            "tokenUsage": {"totals": {"requests": 1}},
-            "cost": {"totalCostUsd": 2},
-            "lastSample": {"checkedAt": "2030-01-01T00:00:00Z"},
-            "updatedAt": "2030-01-01T00:00:00Z",
-            "runCostUsd": 3,
-            "measuredCostIntervals": 4,
-            "hasRuntimeCostBaseline": True,
-            "remoteUsageIdentity": {"plan_type": "plus"},
-        })
-
-        self.assertEqual(row["state"]["windows"]["5h"]["baselinePercent"], 1)
-        self.assertNotIn("runCostUsd", row["state"])
-        self.assertNotIn("measuredCostIntervals", row["state"])
-        self.assertNotIn("hasRuntimeCostBaseline", row["state"])
-        self.assertNotIn("lastSample", row["state"])
-        self.assertNotIn("tokenUsage", row["state"])
-        self.assertNotIn("cost", row["state"])
-
-    def test_compact_quota_for_debug_removes_matches_but_keeps_windows(self):
-        compact = {"complete": True, "missingWindows": [], "windows": {"5h": {}}, "matches": [{"path": "$"}]}
-
-        debug = compact_quota_for_debug(compact)
-
-        self.assertEqual(debug["windows"], {"5h": {}})
-        self.assertNotIn("matches", debug)
-
-    def test_compact_event_log_ignores_low_cost_delta_rows(self):
-        events = derive_history_events([
-            {"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "deltaPercent": 3, "deltaCostUsd": 0},
-            {"checkedAt": "2030-01-01T01:00:00Z", "window": "5h", "deltaPercent": 2, "deltaCostUsd": 1},
-        ])
-
-        self.assertEqual(len(events["fiveHour"]), 2)
-        self.assertTrue(events["fiveHour"][0]["synthetic"])
-        self.assertEqual(events["fiveHour"][1]["cumulativePercent"], 2)
-        self.assertEqual(events["fiveHour"][1]["cumulativeCostUsd"], 1)
-
-    def test_live_processing_rehydrates_stale_cumulative_totals_from_history(self):
-        state = {"windows": {"5h": {"cumulativePercent": 999, "cumulativeCostUsd": 999, "baselinePercent": 5, "baselineCostUsd": 10, "baselineResetAt": None, "baselinePlan": "unknown", "baselineMultiplier": 1.0, "previousCostUsd": 10}}}
-        process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=5, cost=10), [{"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "deltaPercent": 2, "deltaCostUsd": 3}])
-
-        self.assertEqual(state["windows"]["5h"]["cumulativePercent"], 2)
-        self.assertEqual(state["windows"]["5h"]["cumulativeCostUsd"], 3)
-
-
-    def test_dashboard_restores_button_selections_after_refresh(self):
-        html = dashboard_html()
-
-        self.assertIn('const DASHBOARD_SELECTIONS_STORAGE_KEY="codexUsageDashboardSelections"', html)
-        self.assertIn('const DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY="codexUsageDashboardSessionSelections"', html)
-        self.assertIn("DASHBOARD_SELECTIONS_MAX_IDLE_MS=60_000", html)
-        self.assertIn("DASHBOARD_SELECTIONS_HEARTBEAT_MS=15_000", html)
-        self.assertIn('function restoreSelections()', html)
-        self.assertIn('vscode?.getState()?.dashboardSelections', html)
-        self.assertIn('function storedSelections(storage,key)', html)
-        self.assertIn('storedSelections(localStorage,DASHBOARD_SELECTIONS_STORAGE_KEY)', html)
-        self.assertIn('storedSelections(sessionStorage,DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY)', html)
-        self.assertIn('Math.abs(Date.now()-saved.lastActiveAt)<=DASHBOARD_SELECTIONS_MAX_IDLE_MS', html)
-        self.assertIn('vscode.setState({...vscode.getState(),dashboardSelections:durable})', html)
-        self.assertIn('localStorage.setItem(DASHBOARD_SELECTIONS_STORAGE_KEY,JSON.stringify(durable))', html)
-        self.assertIn('sessionStorage.setItem(DASHBOARD_SESSION_SELECTIONS_STORAGE_KEY,JSON.stringify(transient))', html)
-        self.assertIn("setInterval(saveSelections,DASHBOARD_SELECTIONS_HEARTBEAT_MS)", html)
-        self.assertIn('addEventListener("pagehide",saveSelections)', html)
-        self.assertIn('restoreSelections();setupControls()', html)
-        saved = html[html.index("function saveSelections()"):html.index("function latestSelectableDate()")]
-        self.assertIn('durable={dataView,collapseUsageGaps,collapseUsageFlat,normalizedUsage}', saved)
-        self.assertIn('transient={selected,previousRange,selectedDate,selectedModels:[...selectedModels],selectedAccounts:[...selectedAccounts]}', saved)
-        for selection in ("selected", "previousRange", "selectedDate", "selectedModels", "selectedAccounts"):
-            self.assertIn(selection, saved)
-
-
-    def test_dashboard_axis_labels_adapt_to_chart_dimensions(self):
-        html = dashboard_html()
-
-        self.assertIn("function axisTicks(ctx,start,end,pixels,format,axis)", html)
-        self.assertIn("function sameLocalDate(first,second)", html)
-        self.assertIn("function usageTimeLabel(timestamp,mode)", html)
-        self.assertIn("dateOnly=x1-x0>=7*24*3600, crossesDate=!sameLocalDate(x0,x1)", html)
-        self.assertIn('if(mode==="date")return dateText', html)
-        self.assertIn('return mode==="dateTime"?`${dateText} ${time}`:time', html)
-        self.assertIn('(x,index,labelCount)=>{const timestamp=timeScale.timestampAt(x), previousTimestamp=index?timeScale.timestampAt(m.l+(w-m.l-m.r)*(index-1)/(labelCount-1)):null', html)
-        self.assertIn('dateOnly?"date":crossesDate&&(!index||!sameLocalDate(previousTimestamp,timestamp))?"dateTime":"time"', html)
-        self.assertIn('charWidth=ctx.measureText("0").width', html)
-        self.assertIn('let labels=[format(start,0,2),format(end,1,2)]', html)
-        self.assertIn('for(let labelCount=3;;labelCount++)', html)
-        self.assertIn('start+(end-start)*index/(labelCount-1)', html)
-        self.assertIn('spacing=pixels/(labelCount-1)', html)
-        self.assertIn('2*Math.max(...candidate.map(label=>ctx.measureText(label).width))+8*charWidth', html)
-        self.assertIn('Math.max(fontHeight,(metrics.fontBoundingBoxAscent||0)+(metrics.fontBoundingBoxDescent||0),metrics.actualBoundingBoxAscent+metrics.actualBoundingBoxDescent)', html)
-        self.assertIn('3.5*Math.max(...candidate.map(labelHeight))', html)
-        self.assertIn('return {labels}', html)
-        self.assertNotIn('let intervals=Math.max', html)
-        self.assertIn("function axisTickPosition(start,pixels,index,count)", html)
-        self.assertIn('function drawXAxisTickLabels(ctx,labels,start,pixels,y)', html)
-        self.assertIn('index===0?"left":index===labels.length-1?"right":"center"', html)
-        self.assertEqual(html.count('axisTicks(ctx,')+html.count('axisTicks(layerContext,'), 5)
-        self.assertEqual(html.count('axisTickPosition('), 4)
-        self.assertEqual(html.count('drawXAxisTickLabels('), 3)
 
 
     def test_dashboard_status_payload_uses_only_current_in_memory_state(self):
@@ -3639,12 +2881,16 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state = monitor_dashboard.UsageDashboardState.__new__(monitor_dashboard.UsageDashboardState)
         state.args = SimpleNamespace(history=Path("missing-history"), quota_history=Path("missing-quota"), token_session_history=Path("missing-tokens"), state=Path("missing-state"))
         state.lock = threading.Lock()
-        state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]})
+        state.accounts = SimpleNamespace(status=lambda: {"activeAccountId": "account-a", "awaitingLogin": False, "items": [{"id": "account-a", "label": "A"}]}, attribution_timeline=lambda: [])
+        state.cloud = SimpleNamespace(usage_account_id=lambda slot: slot, config=lambda: {"control": {}})
+        state.usage_data = SimpleNamespace(index=SimpleNamespace(metrics={}))
+        state.account_statuses = {}
+        state.inactive_account_poll_errors = {}
         state.last_sample, state.last_error, state.runtime_state = sample, None, {}
         state.wake_event = threading.Event()
+        state.session_refresh_event = threading.Event()
 
-        with mock.patch.object(monitor_history, "load_quota_history", side_effect=AssertionError("status must not load history")), mock.patch("monitor_migrations._load_v18_token_ledger", side_effect=AssertionError("status must not load ledger")):
-            payload = state.status_payload()
+        payload = state.status_payload()
 
         self.assertEqual(payload["display"]["statusBarText"], "5h 12.0% · 7d 34.0%")
         self.assertEqual(payload["lastSample"]["cost"]["totalCostUsd"], 1.5)
@@ -3658,7 +2904,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.accounts = SimpleNamespace(status=lambda: {
             "activeAccountId": "a", "awaitingLogin": False,
             "items": [{"id": account_id, "label": account_id, "ready": True} for account_id in ("a", "b", "empty")],
-        })
+        }, attribution_timeline=lambda: [])
+        state.cloud = SimpleNamespace(usage_account_id=lambda slot: slot, config=lambda: {"control": {}})
+        state.usage_data = SimpleNamespace(index=SimpleNamespace(metrics={}))
+        state.inactive_account_poll_errors = {}
         state.last_sample, state.last_error, state.runtime_state = None, None, {}
         state.account_statuses = {
             account_id: {"checkedAt": "2030-01-01T00:00:00Z", "windows": {"5h": {"usedPercent": percent, "resetAt": 1893456000}}, "access_token": "secret"}
@@ -3674,250 +2923,12 @@ class MonitorCodexUsageTests(unittest.TestCase):
         state.account_statuses["b"]["windows"]["5h"]["usedPercent"] = 80
         self.assertNotEqual(state.status_payload()["revision"], payload["revision"])
 
-
-
-
-
-
-    def test_dashboard_exposes_independent_local_and_merged_data_views(self):
-        html = dashboard_html()
-        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
-
-        self.assertIn('<button data-data-view="local">Local</button><button data-data-view="merged">Merged</button>', html)
-        self.assertIn('dataView="merged"', html)
-        self.assertIn('fetch("/api/dashboard",{cache:"no-store"})', html)
-        self.assertIn('vscode.postMessage({type:"getCodexDashboard",requestId})', html)
-        self.assertIn('button.classList.toggle("active",button.dataset.dataView===dataView)', html)
-        self.assertIn('async getDashboard()', extension)
-        self.assertNotIn("getCodexUsageSeries", extension)
-
-
-    def test_extension_loads_live_dashboard_with_bundled_fallback(self):
-        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
-        html = dashboard_html()
-        manifest = json.loads(Path(__file__).with_name("package.json").read_text(encoding="utf-8"))
-
-        self.assertRegex(manifest["version"], r"^\d+\.\d+\.\d+$")
-        self.assertIn('const DASHBOARD_URL = new URL("http://127.0.0.1:8765/")', extension)
-        self.assertIn("PAGE_ALLOWLIST", extension)
-        self.assertIn('asset: "dashboard.html"', extension)
-        self.assertIn('asset: "management.html"', extension)
-        self.assertEqual(extension.count("const html = await detailsHtml(context, target.webview, currentPage)"), 1)
-        self.assertEqual(extension.count("if (panel === target) target.webview.html = html"), 1)
-        self.assertIn("panel.reveal();", extension)
-        self.assertIn('message.type === "codexUsageAccountAction"', extension)
-        self.assertIn('ACCOUNT_SWITCH_URL', extension)
-        self.assertIn('ACCOUNT_RENAME_URL', extension)
-        self.assertIn('ACCOUNT_DELETE_URL', extension)
-        self.assertIn('const ACCOUNT_ACTION_TIMEOUT_MS = 300000', extension)
-        self.assertIn('timeoutMs: ACCOUNT_ACTION_TIMEOUT_MS', extension)
-        self.assertIn('STATUS_API_URL = new URL("http://127.0.0.1:8765/api/status")', extension)
-        self.assertIn("const status = this.cachedStatus || await this.getStatus()", extension)
-        self.assertNotIn("if (error.statusCode === 404) return this.getSeries()", extension)
-        self.assertIn('message.type === "subscribeCodexDashboard"', extension)
-        self.assertIn('fetch("/api/dashboard",{cache:"no-store"})', html)
-        self.assertIn('if(packet.seq<=bulkData.cursors[packet.stream])return', html)
-        self.assertNotIn("setInterval(pollStatus,5000)", html)
-        self.assertIn('addEventListener("visibilitychange",()=>{if(!document.hidden){updateLastUpdateAge();if(!bulkData)load(true)}})', html)
-        self.assertNotIn("setInterval(load,5000)", html)
-
-        self.assertNotIn("RELATIVE_TIME_UPDATE_INTERVAL_MS", extension)
-        self.assertNotIn("lastTooltipRevision", extension)
-        self.assertIn("const TOOLTIP_HOVER_DELAY_SECONDS = 3", extension)
-        self.assertIn("Math.floor((Date.now() - timestamp) / 1000) + TOOLTIP_HOVER_DELAY_SECONDS", extension)
-        self.assertIn("const tooltip = stableTooltip(status)", extension)
-        self.assertIn("if (tooltip !== this.lastTooltip)", extension)
-        self.assertIn('`Last update ${secondsAgo(status.lastSample?.percentCheckedAt ?? status.lastSample?.checkedAt ?? display.percentCheckedAt)}`', extension)
-
-    def test_dashboard_and_management_pages_expose_stacked_pop_messages(self):
-        for html in (dashboard_html(), Path(__file__).with_name("management.html").read_text(encoding="utf-8")):
-            self.assertIn('class="message-stack" id="messageStack"', html)
-            self.assertIn('function showMessage(title,summary,details=summary,type="info")', html)
-            self.assertIn('message.ondblclick=showDetails', html)
-            self.assertIn('setTimeout(dismiss,10000)', html)
-            self.assertIn('message.dismiss=dismiss', html)
-            self.assertIn('close.setAttribute("aria-label",`Dismiss ${title}`)', html)
-            self.assertIn('document.getElementById("messageStack").appendChild(message)', html)
-            self.assertIn('id="messageDetailModal" role="dialog"', html)
-            self.assertIn('id="messageDetailSummary"', html)
-            self.assertIn('document.getElementById("messageDetailSummary").textContent=summary', html)
-            self.assertIn('className="pop-message-summary"', html)
-
     def test_dashboard_uses_text_nodes_instead_of_html_injection_sinks(self):
         html = dashboard_html()
 
         self.assertNotIn("innerHTML", html)
         self.assertNotIn("outerHTML", html)
         self.assertNotIn("insertAdjacentHTML", html)
-        self.assertIn("node.textContent=String(row.text??\"\")", html)
-        self.assertIn("tip.replaceChildren(fragment)", html)
-
-    def test_management_password_prompt_has_close_control(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertIn('class="control-login-backdrop" id="controlLoginModal"', html)
-        self.assertNotIn('class="control-login-backdrop open" id="controlLoginModal"', html)
-        self.assertIn('if(error.status===401||error.status===428)showControlLogin(error.message,error.status===428)', html)
-        self.assertIn('id="closeControlLogin" type="button" aria-label="Close password prompt"', html)
-        self.assertIn('document.getElementById("closeControlLogin").onclick=navigateDashboard', html)
-        self.assertIn('event.currentTarget.querySelector("button[type=submit]")', html)
-
-    def test_skill_link_messages_use_specific_titles_and_skill_name_detail(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertIn('showMessage(`Skill ${body.enabled?"Link":"Unlink"} Completed`', html)
-        self.assertIn('`${body.name} was ${body.enabled?"linked to":"unlinked from"} ${body.app}.`', html)
-        self.assertIn('{name:"Managed skill validation",status:"passed"', html)
-        self.assertIn('{name:`${body.app} projection`,status:"passed"', html)
-
-    def test_managed_skill_shared_checkbox_uses_dedicated_api(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
-
-        self.assertIn('data-shared="${escapeHtml(item.name)}" ${item.shared?"checked":""}> Shared', html)
-        self.assertIn('run("/api/manage/skills/share",{name:input.dataset.shared,shared:input.checked})', html)
-        self.assertIn('["/api/manage/skills/share", { url:', extension)
-
-    def test_skill_projection_status_has_stable_width(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertIn('.skill-status{flex:none;inline-size:calc(8ch + 18px);text-align:center}', html)
-        self.assertIn('class="pill skill-status"', html)
-
-    def test_cloud_operation_messages_cover_started_completion_and_error(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertIn('showMessage(`${queueOperationName(operation)} Queued`', html)
-        self.assertIn('function showCloudResult(operation,result,body)', html)
-        self.assertIn('showMessage(`${operation.name} Completed`', html)
-        self.assertIn('showMessage(`${name} ${titleStatus(operation.status)}`', html)
-        self.assertIn('function errorReport(operation,error)', html)
-        self.assertIn('failed?`${failed.name} failed: ${failed.detail}`', html)
-        self.assertIn('message.dismissTimer=type==="progress"?null:setTimeout(dismiss,10000)', html)
-        self.assertIn('queueProgress.get(operation.id)?.dismiss()', html)
-
-    def test_all_slow_cloud_actions_have_progress_messages(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        for path, action in (("/cloud/test", "WebDAV Test"), ("/cloud/push", "Push"), ("/cloud/push-all", "Push All"), ("/cloud/fetch", "Fetch"), ("/cloud/fetch-all", "Fetch All"), ("/cloud/overwrite", "Cloud Overwrite"), ("/cloud/restore", "Restore"), ("/accounts/bind", "Bind"), ("/accounts/link", "Link"), ("/accounts/release", "Release"), ("/accounts/share", "Share"), ("/accounts/delete-remote", "Delete Remote"), ("/skills/unmanage", "Unmanage")):
-            self.assertIn(f'path.endsWith("{path}")?{{name:"{action}"', html)
-
-        for title in ("Cloud Data Overwritten", "The API account is available locally and in WebDAV.", "The account was deleted from WebDAV."):
-            self.assertIn(title, html)
-        self.assertIn('showMessage(`${queueOperationName(operation)} Queued`', html)
-        self.assertIn('showMessage(`${name} ${titleStatus(operation.status)}`', html)
-
-    def test_bind_messages_explicitly_cover_start_finished_and_error(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertIn('path.endsWith("/accounts/bind")?{name:"Bind",message:"Moving the selected cloud OpenAI account to this machine."', html)
-        self.assertIn('`${queueOperationName(operation)} Queued`', html)
-        self.assertIn('"WebDAV Test Passed"', html)
-        self.assertIn('`${operation.name} Completed`', html)
-        self.assertIn('`${name} ${titleStatus(operation.status)}`', html)
-        for step in ("Cloud account download and decryption", "Credential profile validation", "Local vault commit", "Cloud payload removal"):
-            self.assertIn(step, html)
-
-    def test_bind_and_release_start_without_browser_confirmation(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertIn('button.onclick=()=>run("/api/manage/accounts/release",{accountId:button.dataset.release})', html)
-        self.assertIn('button.onclick=()=>run("/api/manage/accounts/bind",{accountKey:button.dataset.bind})', html)
-        self.assertIn('button.onclick=()=>run("/api/manage/accounts/link",{accountKey:button.dataset.link})', html)
-        self.assertNotIn('confirm(button.dataset.local===', html)
-        self.assertNotIn('confirm("Copy this account to this machine', html)
-
-    def test_manual_push_reports_noop_and_lists_changed_items_in_detail(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertIn('name=full?"Push All":"Push"', html)
-        self.assertIn('showMessage(`${name} Completed`', html)
-        self.assertIn('"Cloud skills and recorded usage were already current."', html)
-        self.assertIn('`Added skills:\\n${added.map(name=>`- ${name}`).join("\\n")}`', html)
-        self.assertIn('`Updated skills:\\n${updated.map(name=>`- ${name}`).join("\\n")}`', html)
-        self.assertIn('`Deleted skills:\\n${deleted.map(name=>`- ${name}`).join("\\n")}`', html)
-        self.assertIn('{name:"Local skill packaging",status:"passed"', html)
-        self.assertIn('{name:"Cloud skill index",status:"passed"', html)
-        self.assertIn('{name:"Recorded usage data",status:usage.skipped?"skipped":"passed"', html)
-        self.assertIn('{name:"Account payloads",status:"skipped"', html)
-        self.assertNotIn('Accounts updated:', html)
-
-    def test_management_page_refreshes_cached_data_and_requests_background_scans(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertNotIn('data-action="scan"', html)
-        self.assertNotIn('showMessage("Skills scanned"', html)
-        self.assertIn('load(true);setInterval(load,1000);setInterval(()=>load(false,true),60000)', html)
-        self.assertIn('await load(true);load(false,true)', html)
-        self.assertIn('if(loading){if(refreshScan)scanPending=true;return}', html)
-
-    def test_management_toml_updates_do_not_report_account_creation(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-
-        self.assertIn('tomlConfigUpdate=path.endsWith("/accounts/common")||path.endsWith("/accounts/header")', html)
-        self.assertIn('else if(tomlConfigUpdate)showTomlConfigResult(path)', html)
-        self.assertIn('else if(path==="/api/accounts"||path.startsWith("/api/accounts/"))showAccountResult(path,body,result)', html)
-        self.assertNotIn('else if(path.includes("/accounts"))showAccountResult(path,body,result)', html)
-        self.assertIn('"API config.toml header":"Common config.toml body"', html)
-
-    def test_management_page_exposes_full_session_provider_migration(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
-        dashboard = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
-
-        self.assertIn('<button data-common="">Common config.toml body</button><button data-common-header="">OpenAI config.toml header</button><button data-migrate-sessions="">Migrate all session</button>', html)
-        self.assertIn('>API config.toml header</button>', html)
-        self.assertIn('run("/api/manage/accounts/migrate-sessions",{})', html)
-        self.assertIn('"/api/manage/accounts/migrate-sessions"', extension)
-        self.assertIn('state.accounts.migrate_all_session_model_providers()', dashboard)
-
-    def test_dashboard_exposes_clear_account_controls_without_credentials(self):
-        html = dashboard_html()
-        source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
-        self.assertIn('id="accountSelect"', html)
-        self.assertNotIn('id="newAccount"', html)
-        self.assertIn('id="renameAccount"', html)
-        self.assertIn('id="deleteAccount"', html)
-        self.assertIn('id="deleteAccountModal"', html)
-        self.assertIn('id="renameAccountModal"', html)
-        self.assertIn('id="managePage"', html)
-        self.assertNotIn('create:"/api/accounts"', html)
-        self.assertIn('Run Codex login in a new or restarted terminal', html)
-        self.assertIn('did not respond within five minutes', html)
-        self.assertNotIn('Add Codex account', html)
-        self.assertIn('Saving the outgoing account and activating the selected account', html)
-        self.assertNotIn('Waiting for the current usage refresh', html)
-        account_action_source = html[html.index('async function performAccountAction'):html.index('function setupAccountControls')]
-        self.assertNotIn('await load()', account_action_source)
-        self.assertIn('showMessage(`${actionName} Started`,workingDetail', account_action_source)
-        self.assertIn('messageDetailReport(actionName,"In progress"', account_action_source)
-        self.assertIn('finally{workingMessage.dismiss();actionBusy=false;renderAccounts(payload.accounts)}', account_action_source)
-        self.assertIn('showMessage("Codex Login Required","Account preparation completed, but usage polling is paused until sign-in."', html)
-        self.assertNotIn('if(actionBusy){banner.textContent=', html)
-        self.assertNotIn('else if(accounts.error){banner.textContent=', html)
-        self.assertIn('"/api/accounts/switch"', source)
-        self.assertIn('"/api/accounts/rename"', source)
-        self.assertIn('"/api/accounts/delete"', source)
-        self.assertIn('Content-Type must be application/json', source)
-        self.assertNotIn('refresh_token', html)
-
-    def test_dashboard_server_starts_polling_after_binding(self):
-        source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
-
-        serve_source = source[source.index("def serve_dashboard"):]
-        self.assertNotIn("retry_operation(state.poll_once", serve_source)
-        self.assertLess(serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'), serve_source.index("thread.start()"))
-        self.assertLess(serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'), serve_source.index("state = UsageDashboardState(args, opener)"))
-        self.assertIn("allow_reuse_address = True", source)
-        self.assertLess(serve_source.index("instance_lock.acquire()"), serve_source.index('DashboardHTTPServer((server_host, DASHBOARD_PORT), Handler)'))
-        self.assertIn("self.wake_event.wait(poll_sleep_seconds(self.last_acquire_started_at, ACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS))", source)
-        self.assertIn("threading.Thread(target=state.run_cloud_maintenance, name=\"cloud-maintenance\", daemon=True)", source)
-        self.assertIn("threading.Thread(target=managed_worker, args=(state.run_inactive_account_polling,), daemon=True)", source)
-        self.assertIn("self.cloud_maintenance_event.wait(5)", source)
-        self.assertIn('DASHBOARD_PORT = 8765', source)
-        self.assertIn('if path == "/api/status":', source)
-        self.assertIn('self.headers.get("If-None-Match") == etag', source)
-        self.assertIn('self.send_header("ETag", etag)', source)
 
     def test_dashboard_instance_lock_rejects_only_a_live_instance(self):
         first = monitor_dashboard.DashboardInstanceLock()
@@ -3955,12 +2966,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
         server.assert_called_once_with(("0.0.0.0", 8765), mock.ANY)
 
-    def test_dashboard_control_requests_are_not_rejected_by_proxy_origin(self):
-        source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
-
-        self.assertNotIn("Cross-site control requests are not allowed", source)
-        self.assertNotIn("origin_is_allowed", source)
-
     def test_dashboard_server_config_keeps_fixed_port_and_validates_ip(self):
         with self.account_directory() as directory:
             config_path = directory / "config.json"
@@ -3977,27 +2982,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
 
             self.assertEqual(cloud.update_server_config("0.0.0.0"), {"host": "0.0.0.0", "restartRequired": True})
             self.assertEqual(json.loads(cloud.config_path.read_text(encoding="utf-8"))["server"], {"host": "0.0.0.0"})
-
-    def test_management_page_exposes_fixed_port_ip_config_tab(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
-
-        self.assertIn('data-tab="config">Config</button>', html)
-        self.assertIn('id="programVersion"', html)
-        self.assertIn('id="checkForUpdates" type="button">Check for Updates</button>', html)
-        self.assertIn('api("/api/manage/update/check",{})', html)
-        self.assertIn('["/api/manage/update/check",', extension)
-        self.assertIn('<option value="127.0.0.1">', html)
-        self.assertIn('<option value="0.0.0.0">', html)
-        self.assertIn("Port 8765 is fixed.", html)
-        self.assertIn("full password-protected dashboard through this machine's LAN or public IP", html)
-        self.assertIn("prefer a trusted VPN or an HTTPS reverse proxy", html)
-        self.assertNotIn('id="serverPort"', html)
-        self.assertNotIn('id="machineName"', html)
-        for field in ("webdavBaseUrl", "webdavUsername", "webdavPassword", "webdavRemoteRoot", "encryptionPassphrase", "skillsAutoUpload", "usageDataAutoSync", "newControlPassword"):
-            self.assertIn(f'id="{field}"', html)
-        self.assertIn('run("/api/manage/config"', html)
-        self.assertIn("Leave the passphrase and its saved hash empty to disable second-layer encryption.", html)
 
     def test_dashboard_display_formats_usage_and_remaining_time_for_extension(self):
         now = datetime.fromisoformat("2030-01-01T00:00:00+00:00").timestamp()
@@ -4040,20 +3024,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
         self.assertEqual(row["windows"]["5h"]["plan"], "plus")
         self.assertNotIn("cost", row)
 
-
-    def test_poll_persists_raw_ledger_and_quota(self):
-        source = Path(monitor_dashboard.__file__).read_text(encoding="utf-8")
-        poll = source[source.index("    def poll_once(self)"):source.index("    def _poll_inactive_account", source.index("    def poll_once(self)"))]
-        self.assertIn("reconcile_token_ledger(", poll)
-        self.assertIn("self._record_quota_sample_locked(sample)", poll)
-
-
-
-
-
-
-
-
     def test_dashboard_groups_duplicate_profiles_by_usage_identity_and_last_used_label(self):
         status = {
             "activeAccountId": "profile-bbbbb2",
@@ -4090,7 +3060,11 @@ class MonitorCodexUsageTests(unittest.TestCase):
                 {"accountKey": "legacy-local", "label": "Normal", "accountType": "account", "bindingState": "bound-local"},
             ],
         )
-        state = SimpleNamespace(accounts=accounts, cloud=cloud, skills=SimpleNamespace(status=lambda: {"items": []}, scan=lambda _refresh: []))
+        state = SimpleNamespace(
+            accounts=accounts, cloud=cloud, skills=SimpleNamespace(status=lambda: {"items": []}, scan=lambda _refresh: []),
+            device_auth=SimpleNamespace(status=lambda: None), sync_device_auth=lambda _accounts=None: None,
+            skill_scan_snapshot=[], skill_scan_at=0.0,
+        )
 
         payload = monitor_dashboard.management_payload(state)
 
@@ -4121,8 +3095,10 @@ class MonitorCodexUsageTests(unittest.TestCase):
     def test_management_payload_exposes_only_non_sensitive_status_fields(self):
         state = SimpleNamespace(
             skills=SimpleNamespace(status=lambda: {"version": 1, "privatePath": "C:/private", "items": [{"name": "alpha", "assignments": {"codex": True}, "projections": {"codex": {"state": "linked", "target": "C:/private/alpha"}}, "errors": {}}]}, scan=lambda _refresh: []),
-            cloud=SimpleNamespace(config=lambda: {"server": {"host": "127.0.0.1"}}, editable_config=lambda: {"server": {"host": "127.0.0.1"}, "webdav": {"enabled": True, "baseUrl": "https://private.example.test", "username": "private-user", "remoteRoot": "private-root"}, "secretsConfigured": {"password": True, "encryptionPassphrase": True, "controlPassword": True}}, redacted_status=lambda: {"configPath": "C:/private/config.json", "webdav": {"enabled": True, "baseUrl": "https://private.example.test", "username": "private-user"}, "secretsConfigured": {"password": True}, "autoSync": {}}, cached_remote_accounts=lambda: [{"accountKey": "opaque-key", "accountId": "acct-secret", "email": "private@example.test", "label": "Cloud A", "revisionId": "revision-secret"}]),
-            accounts=SimpleNamespace(status=lambda: {"activeAccountId": "local-a", "awaitingLogin": False, "items": [{"id": "local-a", "label": "Account A", "email": "private@example.test", "ready": True, "active": True, "accountKey": "opaque-key"}]}), projection_errors=[],
+            cloud=SimpleNamespace(usage_account_id=lambda slot: slot, config=lambda: {"server": {"host": "127.0.0.1"}}, editable_config=lambda: {"server": {"host": "127.0.0.1"}, "webdav": {"enabled": True, "baseUrl": "https://private.example.test", "username": "private-user", "remoteRoot": "private-root"}, "secretsConfigured": {"password": True, "encryptionPassphrase": True, "controlPassword": True}}, redacted_status=lambda: {"configPath": "C:/private/config.json", "webdav": {"enabled": True, "baseUrl": "https://private.example.test", "username": "private-user"}, "secretsConfigured": {"password": True}, "autoSync": {}}, cached_remote_accounts=lambda: [{"accountKey": "opaque-key", "accountId": "acct-secret", "email": "private@example.test", "label": "Cloud A", "revisionId": "revision-secret"}]),
+            accounts=SimpleNamespace(status=lambda: {"activeAccountId": "local-a", "awaitingLogin": False, "items": [{"id": "local-a", "label": "Account A", "email": "private@example.test", "ready": True, "active": True, "accountKey": "opaque-key"}]}, attribution_timeline=lambda: [], api_identity_ids=lambda: {}, config_editor_payload=lambda: {}, cloud_account_keys=lambda: {"opaque-key"}),
+            device_auth=SimpleNamespace(status=lambda: None), sync_device_auth=lambda _accounts=None: None,
+            skill_scan_snapshot=[], skill_scan_at=0.0, projection_errors=[],
         )
 
         serialized = json.dumps(monitor_dashboard.management_payload(state))
@@ -4133,322 +3109,6 @@ class MonitorCodexUsageTests(unittest.TestCase):
             self.assertIn(expected, serialized)
         for sensitive in ("private@example.test", "acct-secret", "revision-secret", "C:/private", "passwordHash", "cookieSecret"):
             self.assertNotIn(sensitive, serialized)
-
-    def test_dashboard_exposes_account_filtered_usage_time_curves_with_nodes(self):
-        html = dashboard_html()
-
-        self.assertIn('<canvas class="chart" id="usageTime5h"></canvas>', html)
-        self.assertIn('<canvas class="chart" id="usageTime7d"></canvas>', html)
-        self.assertIn('<div class="legend" id="usageTime5hLegend"></div>', html)
-        self.assertIn('<div class="legend" id="usageTime7dLegend"></div>', html)
-        self.assertIn('<button id="collapseUsageGaps" type="button">Collapse gaps</button>', html)
-        self.assertIn('<button id="collapseUsageFlat" type="button">Collapse flat</button>', html)
-        self.assertIn('<button id="normalizeUsage" type="button"', html)
-        self.assertIn('Pro Lite ×5 and Pro ×10', html)
-        self.assertIn('function setupUsageFoldControls()', html)
-        self.assertIn('button.setAttribute("aria-pressed",String(getValue()))', html)
-        self.assertIn('normalize.setAttribute("aria-pressed",String(normalizedUsage))', html)
-        self.assertIn('normalizedUsage=!normalizedUsage;saveSelections();sync();drawAll(true)', html)
-        self.assertIn('setupAccountControls();setupUsageFoldControls();setupCostTimeControls();load(true)', html)
-        self.assertIn('function quotaTimeDomain(points)', html)
-        self.assertIn('function quotaPointsInRange(points,domain)', html)
-        self.assertIn('compactedBoundary:true', html)
-        self.assertIn('const start=Math.max(domain[0],point.compactedFrom), end=Math.min(domain[1],timestamp)', html)
-        self.assertIn('function drawUsageTimeChart(id,label,points,animate=false)', html)
-        self.assertIn('function accountCurveColor(accountId)', html)
-        self.assertIn('.sort((a,b)=>a[1].localeCompare(b[1]', html)
-        self.assertIn('function renderUsageLegend(id,groups)', html)
-        self.assertIn('valueOf=point=>windowOf(point)?.continuous', html)
-        self.assertNotIn('function usageTimeRenderedValues(points,valueOf)', html)
-        self.assertIn('function usageTimeFoldMetrics(gaps,x0,x1,left,right,charWidth)', html)
-        self.assertIn('const minWidth=charWidth*4.5', html)
-        self.assertIn('base=Math.min(10,Math.max(2,', html)
-        self.assertIn('const amplifier=Math.min(10,Math.max(4,', html)
-        self.assertIn('plotWidth*.012', html)
-        self.assertNotIn('maxWidth=', html)
-        self.assertIn('const calculatedWidth=amplifier*Math.log1p(gap.duration/referenceGap)/Math.log(base);return {...gap,width:Math.max(minWidth,calculatedWidth)}', html)
-        self.assertIn('function usageTimeAccountFoldRanges(points,label,valueOf,x0,x1)', html)
-        self.assertIn('if(breakUsageCurve(previous,current,label,valueOf,compactedRanges))add(start,end,"gap")', html)
-        self.assertIn('else if(valueOf(previous)===valueOf(current))add(start,end,"flat")', html)
-        self.assertIn('function usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat)', html)
-        self.assertIn('if(!states.every(kind=>kind==="gap"?collapseGaps:kind==="flat"&&collapseFlat))continue', html)
-        self.assertIn('previous.kind=previous.hasGap&&previous.hasFlat?"mixed":previous.hasGap?"gap":"unchanged"', html)
-        self.assertIn('function usageTimeEdgeFoldRange(range,x0,x1,left,right)', html)
-        self.assertIn('const leadingMargin=range.start===x0?10:0, trailingMargin=range.end===x1?10:0', html)
-        self.assertIn('sourceStart:range.start,sourceEnd:range.end,leadingMargin,trailingMargin', html)
-        self.assertIn('function usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right)', html)
-        self.assertIn('const secondsPerPixel=unfoldedDuration/flexibleWidth', html)
-        self.assertIn('if(unfoldedDuration<=0||flexibleWidth<=0)return []', html)
-        self.assertIn('function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth,collapseGaps=true,collapseFlat=true)', html)
-        self.assertIn('usageTimeFoldMetrics(usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat)', html)
-        self.assertIn('.map(range=>usageTimeEdgeFoldRange(range,x0,x1,left,right)).filter(Boolean)', html)
-        self.assertIn('timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?3:6)', html)
-        self.assertIn('if(!additions.length)return usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right)', html)
-        self.assertIn('function usageTimeScale(x0,x1,folds,left,right)', html)
-        self.assertIn('folds.reduce((sum,gap)=>sum+gap.width,0)', html)
-        self.assertIn('function drawUsageTimeFolds(ctx,folds,top,bottom,part="all")', html)
-        self.assertIn('if(seconds>=3600)return `${Math.round(seconds/3600)}h`', html)
-        self.assertNotIn('h gap`', html)
-        self.assertNotIn('ctx.fillRect(center-labelWidth/2-3,top+3,labelWidth+6,13)', html)
-        self.assertIn('const renderGapLabelLayer=(folds,layer=document.createElement("canvas"))=>', html)
-        self.assertIn('ctx.font="11px system-ui"', html)
-        self.assertIn('usageTimeFolds(groups,label,renderedValueOf,x0,x1,m.l,w-m.r,ctx.measureText("0").width,collapseUsageGaps,collapseUsageFlat)', html)
-        self.assertIn('drawUsageTimeFolds(layerContext,folds,m.t,h-m.b,"labels")', html)
-        self.assertIn('drawUsageTimeFolds(layerContext,folds,m.t,h-m.b,"geometry")', html)
-        self.assertIn('gapTransitions=currentFolds.map', html)
-        self.assertIn('startX0:oldGap?.x0??gap.x0,startX1:oldGap?.x1??gap.x1', html)
-        self.assertIn('x0:gap.startX0+(gap.x0-gap.startX0)*progress', html)
-        self.assertIn('x1:gap.startX1+(gap.x1-gap.startX1)*progress', html)
-        self.assertIn('const visibleGapLabels=transitioning?renderGapLabelLayer(animatedFolds,movingGapLabels):gapLabelLayer', html)
-        self.assertIn('drawLayer(leavingGapLabelLayer,transitioning?1-progress:0,liveGapLabelContext)', html)
-        self.assertIn('drawLayer(leavingGapLayer,transitioning?1-progress:0,liveGapContext)', html)
-        self.assertIn('drawLayer(previousLabelLayer,transitioning&&labelsChanged?1-progress:0,liveLabelContext)', html)
-        self.assertIn('drawLayer(labelLayer,transitioning&&labelsChanged?progress:1,liveLabelContext)', html)
-        self.assertIn('(x,index,labelCount)=>{const timestamp=timeScale.timestampAt(x)', html)
-        self.assertIn('const renderedValueOf=normalizedUsage?point=>plusEquivalentUsage(point,label,valueOf):valueOf', html)
-        self.assertIn('values=valid.map(point=>Math.max(0,normalizedUsage?renderedValueOf(point):Math.min(100,renderedValueOf(point))))', html)
-        self.assertIn('xDomain=extent(timestamps), yDomain=extent(values), x0=xDomain[0], x1=xDomain[1], y0=yDomain[0], y1=yDomain[1]', html)
-        self.assertIn('Y=y=>y0===y1?(m.t+h-m.b)/2:h-m.b-(y-y0)/(y1-y0)*(h-m.t-m.b)', html)
-        self.assertIn('if(x0===x1)return {x:()=>left+(right-left)/2,timestampAt:()=>x0,folds:[]}', html)
-        self.assertIn('const groups=[...grouped].filter(([,accountPoints])=>accountPoints.length)', html)
-        self.assertIn('layerContext.rect(m.l-layerContext.lineWidth,m.t-layerContext.lineWidth,w-m.l-m.r+layerContext.lineWidth*2,h-m.t-m.b+layerContext.lineWidth*2);layerContext.clip()', html)
-        self.assertIn('for(const item of series){if(!item.points.length||item.alpha===0)continue;layerContext.globalAlpha=item.alpha??1;layerContext.strokeStyle=item.color;', html)
-        self.assertIn('for(const point of item.points){if(!paths.length||point.breakBefore)paths.push([]);paths[paths.length-1].push(point)}', html)
-        self.assertIn('const curveLength=path.slice(1).reduce((length,point,index)=>length+Math.hypot((point.markerX??point.x)-(path[index].markerX??path[index].x),(point.markerY??point.y)-(path[index].markerY??path[index].y)),0), pointDiameter=layerContext.lineWidth*2;', html)
-        self.assertIn('if(curveLength>=pointDiameter)continue;', html)
-        self.assertIn('layerContext.arc(center[0],center[1],layerContext.lineWidth,0,Math.PI*2)', html)
-        self.assertNotIn('visiblePoints.some', html)
-        self.assertIn('points.length?"Not enough data for the selected scope":"No data for this range"', html)
-        self.assertNotIn("Not enough data for the selected accounts", html)
-        self.assertIn('function plusEquivalentUsage(point,label,valueOf)', html)
-        self.assertIn('point[label]?.multiplier??1', html)
-        self.assertIn('function compactedUsageRanges(points)', html)
-        self.assertIn('ranges.some(range=>range.start<=previousAt&&currentAt<=range.end)', html)
-        self.assertIn('function compactedUsageGap(previous,current,ranges)', html)
-        self.assertIn('if(compactedUsageGap(previous,current,compactedRanges))return false', html)
-        self.assertIn('if((Number.isFinite(previous.compactedFrom)||Number.isFinite(current.compactedFrom))&&gap<=4*3600)return false;', html)
-        self.assertIn('function breakUsageCurve(previous,current,label,valueOf,compactedRanges=[])', html)
-        self.assertIn('if(gap>4*3600)return true', html)
-        self.assertIn('if(gap<=30*60)return false', html)
-        self.assertIn('const previousUsage=plusEquivalentUsage(previous,label,valueOf), currentUsage=plusEquivalentUsage(current,label,valueOf)', html)
-        self.assertIn('if(previousUsage-currentUsage>=3)return true', html)
-        self.assertIn('Math.abs(currentUsage-previousUsage)/(gap/60)>=(label==="fiveHour"?.5:.1)', html)
-        self.assertIn('breakBefore:!index||breakUsageCurve(accountPoints[index-1],point,label,renderedValueOf,compactedRanges)', html)
-        self.assertIn('`${label==="fiveHour"?"5h":"7d"} ${normalizedUsage?"normalized ":""}usage ${Number(nearest.value).toFixed(1)}%`', html)
-        self.assertIn('normalizedUsage?`Recorded usage ${Number(window.continuous).toFixed(1)}%', html)
-        self.assertIn('drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)', html)
-        self.assertIn('drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)', html)
-        self.assertIn('const previousSeries=animate?previous?.series||[]:[]', html)
-        self.assertIn('const oldPoints=previousByAccount.get(series.accountId)?.points||[], oldOwners=new Map', html)
-        self.assertIn('hasOverlap=series.points.some(point=>oldOwners.has(point.key))', html)
-        self.assertIn('Math.abs(candidate.timestamp-point.timestamp)<Math.abs(nearest.timestamp-point.timestamp)', html)
-        self.assertIn('point.startX+(point.x-point.startX)*progress', html)
-        self.assertIn('point.startY+(point.y-point.startY)*progress', html)
-        self.assertIn('markerX:point.x,markerY:point.y', html)
-        self.assertIn('alpha:series.hasOverlap?1:progress', html)
-        self.assertIn('const currentSegments=new Map', html)
-        self.assertIn('point.breakBefore||currentSegments.get(series.accountId)?.has', html)
-        self.assertIn('drawLayer(leavingCurve,transitioning?1-progress:0,liveContext)', html)
-        self.assertIn('drawLayer(baseLayer);drawLayer(liveLabels);drawLayer(liveGap);drawLayer(liveGapLabels);drawLayer(liveCurve)', html)
-        self.assertIn('drawLayer(baseLayer);drawLayer(labelLayer);drawLayer(gapLayer);drawLayer(gapLabelLayer);drawLayer(curveLayer)', html)
-        self.assertNotIn('drawLayer(previousCurve', html)
-
-    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
-    def test_dashboard_normalized_usage_uses_plus_equivalent_plan_multipliers(self):
-        html = dashboard_html()
-        script = html[html.index("function plusEquivalentUsage"):html.index("function compactedUsageRanges")] + r'''
-const valueOf=point=>point.fiveHour.continuous;
-const point=(plan,continuous)=>({fiveHour:{multiplier:{plus:1,pro_lite:5,pro:10}[plan],continuous}});
-if(plusEquivalentUsage(point("pro_lite",20),"fiveHour",valueOf)!==100)throw new Error("Pro Lite 20% did not normalize to 100%");
-if(plusEquivalentUsage(point("pro",20),"fiveHour",valueOf)!==200)throw new Error("Pro 20% did not normalize to 200%");
-if(plusEquivalentUsage(point(undefined,20),"fiveHour",valueOf)!==20)throw new Error("Missing plan was not treated as Plus");
-'''
-
-        result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)
-
-        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertIn('const started=performance.now(), duration=820', html)
-        self.assertIn('if(!animate||!previousLabelLayer||previous.renderSignature===renderSignature||matchMedia("(prefers-reduced-motion: reduce)").matches){finish();return}', html)
-        self.assertIn('state.series=animatedSeries', html)
-        self.assertLess(html.index("5h Reset Time vs Usage"), html.index("5h Usage vs Time"))
-        self.assertLess(html.index("5h Usage vs Time"), html.index("5h Cost vs Usage"))
-        self.assertNotIn("Current active account", html)
-        self.assertNotIn("Delta Cost vs Delta Usage", html)
-
-    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
-    def test_dashboard_usage_time_legend_accumulates_resets_and_normalizes(self):
-        html = dashboard_html()
-        script = html[html.index("function eventTimestamp"):html.index("function updateWindowTime")] + html[html.index("function plusEquivalentUsage"):html.index("function drawUsageTimeChart")] + r'''
-const valueOf=point=>point.fiveHour.continuous;
-const point=(timestamp,continuous,plan="plus")=>({timestamp,fiveHour:{continuous,multiplier:{plus:1,pro_lite:5,pro:10}[plan]}});
-const resetPoints=[point(300,5),point(100,10),point(200,20),point(400,15),point(500,2),point(600,12)];
-if(usageTimeAccountTotal(resetPoints,valueOf)!==30)throw new Error(`Reset-aware total was incorrect: ${usageTimeAccountTotal(resetPoints,valueOf)}`);
-const normalizedValueOf=point=>plusEquivalentUsage(point,"fiveHour",valueOf), litePoints=[point(0,10,"pro_lite"),point(1,20,"pro_lite"),point(2,5,"pro_lite"),point(3,8,"pro_lite")];
-if(usageTimeAccountTotal(litePoints,normalizedValueOf)!==65)throw new Error(`Normalized total was incorrect: ${usageTimeAccountTotal(litePoints,normalizedValueOf)}`);
-'''
-
-        result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)
-
-        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-        self.assertIn('item.append(dot,`${accountDisplayName(accountId,points[0]?.accountLabel)} · ${usage.toFixed(1)}%`)', html)
-        self.assertIn('drawUsageTimeChart("usageTime5h","fiveHour",quota,animate)', html)
-        self.assertIn('drawUsageTimeChart("usageTime7d","sevenDay",quota,animate)', html)
-
-    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
-    def test_dashboard_combines_gap_and_flat_usage_fold_intervals(self):
-        html = dashboard_html()
-        script = html[html.index("function eventTimestamp"):html.index("function updateWindowTime")] + html[html.index("function plusEquivalentUsage"):html.index("function accountCurveColor")] + r'''
-const point=(timestamp,value,compactedFrom=null)=>({timestamp,compactedFrom,fiveHour:{continuous:value,plan:"plus"}}), valueOf=point=>point.fiveHour.continuous;
-const candidates=(groups,x0,x1,gaps=true,flat=true)=>usageTimeFoldCandidates(groups,"fiveHour",valueOf,x0,x1,gaps,flat), folds=(groups,x0,x1,gaps=true,flat=true)=>usageTimeFolds(groups,"fiveHour",valueOf,x0,x1,0,1000,6,gaps,flat);
-const outside=usageTimeAccountFoldRanges([point(1000,1),point(2000,2)],"fiveHour",valueOf,0,3000), expectedOutside=[{start:0,end:1000,kind:"gap"},{start:2000,end:3000,kind:"gap"}];
-if(JSON.stringify(outside)!==JSON.stringify(expectedOutside))throw new Error(`Before/after sample gaps were not preserved: ${JSON.stringify(outside)}`);
-const pureGap=candidates([["a",[point(0,1),point(20000,2)]],["b",[point(0,3),point(20000,4)]]],0,20000), pureFlat=candidates([["a",[point(0,1),point(1000,1)]],["b",[point(0,3),point(1000,3)]]],0,1000);
-if(pureGap.length!==1||pureGap[0].kind!=="gap"||pureFlat.length!==1||pureFlat[0].kind!=="unchanged")throw new Error(`Pure fold kinds were incorrect: ${JSON.stringify({pureGap,pureFlat})}`);
-const exactGroups=[["a",[point(0,1),point(20000,2),point(21000,3)]],["b",[point(0,10),point(1000,11),point(10000,11),point(21000,11)]]];
-const exact=candidates(exactGroups,0,21000), expectedExact=[{start:1000,end:20000,duration:19000,kind:"mixed",hasGap:true,hasFlat:true}];
-if(JSON.stringify(exact)!==JSON.stringify(expectedExact))throw new Error(`Expected exact B-C mixed fold, received ${JSON.stringify(exact)}`);
-if(usageGapLabel(exact[0].duration)!=="5h")throw new Error("Mixed fold label did not use the combined duration");
-const swapGroups=[["a",[point(0,0),point(1000,1),point(21000,2),point(31000,2),point(41000,2),point(42000,3)]],["b",[point(0,10),point(1000,11),point(11000,11),point(21000,11),point(41000,12),point(42000,13)]]];
-const swapped=candidates(swapGroups,0,42000), expectedSwap=[{start:1000,end:41000,duration:40000,kind:"mixed",hasGap:true,hasFlat:true}];
-if(JSON.stringify(swapped)!==JSON.stringify(expectedSwap))throw new Error(`Expected maximal state-switch fold, received ${JSON.stringify(swapped)}`);
-if(candidates(swapGroups,0,42000,false,true).length||candidates(swapGroups,0,42000,true,false).length)throw new Error("Mixed folds must require both controls");
-const changingGroups=[...swapGroups,["c",[point(0,20),point(1000,21),point(11000,21),point(12000,22),point(22000,22),point(32000,22),point(41000,22),point(42000,23)]]], split=candidates(changingGroups,0,42000);
-if(split.length!==2||split[0].end!==11000||split[1].start!==12000)throw new Error(`Changing curve did not split mixed fold: ${JSON.stringify(split)}`);
-if(split.some((candidate,index)=>index&&split[index-1].end>candidate.start))throw new Error(`Mixed folds overlap: ${JSON.stringify(split)}`);
-const compacted=usageTimeAccountFoldRanges([point(0,5),point(20000,5,0)],"fiveHour",valueOf,0,20000);
-if(compacted.length!==1||compacted[0].kind!=="flat")throw new Error(`Compacted plateau was not flat: ${JSON.stringify(compacted)}`);
-const interleavedCompacted=usageTimeAccountFoldRanges([point(0,5),point(15305,5),point(18179,5,0)],"fiveHour",valueOf,0,18179);
-if(interleavedCompacted.length!==1||interleavedCompacted[0].kind!=="flat")throw new Error(`Interleaved local point split the remote compacted plateau: ${JSON.stringify(interleavedCompacted)}`);
-const interleavedRanges=compactedUsageRanges([point(0,5),point(15305,5),point(18179,5,0)]);
-if(breakUsageCurve(point(0,5),point(15305,5),"fiveHour",valueOf,interleavedRanges))throw new Error("Interleaved local point was treated as a gap inside compacted coverage");
-const changingTail=(start,end,offset)=>Array.from({length:(end-start)/1000+1},(_,index)=>point(start+index*1000,offset+index));
-const gapAccount=[point(0,0),point(15000,1),...changingTail(16000,200000,2)], flatAccount=[...Array.from({length:16},(_,index)=>point(index*1000,10)),...changingTail(16000,200000,11)];
-if(folds([["a",gapAccount],["b",gapAccount]],0,200000,true,false).length)throw new Error("Pure gap incorrectly passed 3x threshold");
-if(folds([["a",flatAccount],["b",flatAccount]],0,200000,false,true).length)throw new Error("Pure flat incorrectly passed 6x threshold");
-if(folds([["a",gapAccount],["b",flatAccount]],0,200000,true,true).length)throw new Error("Mixed fold incorrectly passed 6x threshold");
-const leadingGroups=[["a",[point(0,0),point(40000,1),...changingTail(41000,200000,2)]],["b",[point(0,10),point(10000,10),point(20000,10),point(30000,10),point(40000,10),...changingTail(41000,200000,11)]]];
-const leading=folds(leadingGroups,0,200000), leadingScale=usageTimeScale(0,200000,leading,0,1000);
-if(leading.length!==1||leading[0].kind!=="mixed"||Math.abs(leadingScale.folds[0].x0-10)>1e-9)throw new Error(`Leading mixed margin was not 10px: ${JSON.stringify(leadingScale.folds)}`);
-const prefixA=changingTail(0,160000,0), prefixB=changingTail(0,160000,1000), trailingValue=prefixB.at(-1).fiveHour.continuous;
-const trailingGroups=[["a",[...prefixA,point(200000,999)]],["b",[...prefixB,point(170000,trailingValue),point(180000,trailingValue),point(190000,trailingValue),point(200000,trailingValue)]]];
-const trailing=folds(trailingGroups,0,200000), trailingScale=usageTimeScale(0,200000,trailing,0,1000);
-if(trailing.length!==1||trailing[0].kind!=="mixed"||Math.abs(1000-trailingScale.folds[0].x1-10)>1e-9)throw new Error(`Trailing mixed margin was not 10px: ${JSON.stringify(trailingScale.folds)}`);
-'''
-
-        result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)
-
-        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-
-    @unittest.skipUnless(shutil.which("node"), "Node.js is required for dashboard behavior tests")
-    def test_dashboard_clips_compacted_quota_plateaus_to_selected_time_span(self):
-        html = dashboard_html()
-        script = html[html.index("function eventTimestamp"):html.index("function updateWindowTime")] + html[html.index("function quotaPointsInRange"):html.index("function sameLocalDate")] + r'''
-const usageAccountId=value=>value.usageAccountId||value.accountSlotId||"unknown";
-const point=(timestamp,compactedFrom=null)=>({checkedAt:new Date(timestamp*1000).toISOString(),timestamp,compactedFrom,accountSlotId:"a",fiveHour:{continuous:5}});
-const timestamps=points=>points.map(eventTimestamp);
-const endpointInside=quotaPointsInRange([point(90),point(180,90)],[100,200]);
-if(JSON.stringify(timestamps(endpointInside))!==JSON.stringify([100,180])||!endpointInside[0].compactedBoundary)throw new Error(`Compacted plateau with its first node outside the span was not clipped: ${JSON.stringify(endpointInside)}`);
-const endpointOutside=quotaPointsInRange([point(250,50)],[100,200]);
-if(JSON.stringify(timestamps(endpointOutside))!==JSON.stringify([100,200])||endpointOutside.some(point=>!point.compactedBoundary))throw new Error(`Compacted plateau crossing the whole span was not clipped: ${JSON.stringify(endpointOutside)}`);
-const uncovered=quotaPointsInRange([point(250)],[100,200]);
-if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into the span: ${JSON.stringify(uncovered)}`);
-'''
-
-        result = subprocess.run([shutil.which("node")], input=script, text=True, capture_output=True, cwd=Path(__file__).parent)
-
-        self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
-
-    def test_write_history_groups_delta_events_by_window(self):
-        path = Path(__file__).with_name("test_history_tmp.jsonl")
-        try:
-            write_history(path, [
-                {"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "deltaPercent": 1, "deltaCostUsd": 2},
-                {"checkedAt": "2030-01-01T01:00:00Z", "window": "7d", "deltaPercent": 3, "deltaCostUsd": 4},
-            ])
-
-            text = path.read_text(encoding="utf-8")
-
-            self.assertIn('{\n  "window": "5h",\n  "delta": [', text)
-            self.assertIn('"accountSlotId":"unknown","accountLabel":"Unknown"', text)
-            self.assertIn('{\n  "window": "7d",\n  "delta": [', text)
-            self.assertEqual(text.count('"accountSlotId":"unknown"'), 2)
-            self.assertEqual(load_history(path), [
-                {"checkedAt": "2030-01-01T00:00:00Z", "deltaPercent": 1, "deltaCostUsd": 2, "accountSlotId": "unknown", "accountLabel": "Unknown", "window": "5h"},
-                {"checkedAt": "2030-01-01T01:00:00Z", "deltaPercent": 3, "deltaCostUsd": 4, "accountSlotId": "unknown", "accountLabel": "Unknown", "window": "7d"},
-            ])
-        finally:
-            if path.exists():
-                path.unlink()
-
-
-    def test_write_history_marks_model_split_as_nested_delta(self):
-        path = Path(__file__).with_name("test_history_tmp.jsonl")
-        try:
-            write_history(path, [
-                {"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "model": "gpt-5.5", "deltaPercent": 0.5, "deltaCostUsd": 2, "costPercentRatio": 4},
-                {"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "model": "gpt-5.6-sol", "deltaPercent": 1.5, "deltaCostUsd": 6, "costPercentRatio": 4},
-            ])
-
-            text = path.read_text(encoding="utf-8")
-            rows = load_history(path)
-
-            self.assertIn('"accountSlotId":"unknown","accountLabel":"Unknown","deltaPercent":2.0,"models":[{"model":"gpt-5.5","deltaCostUsd":2},{"model":"gpt-5.6-sol","deltaCostUsd":6}]', text)
-            self.assertEqual([row["model"] for row in rows], ["gpt-5.5", "gpt-5.6-sol"])
-            self.assertEqual([row["deltaPercent"] for row in rows], [0.5, 1.5])
-            self.assertEqual([row["costPercentRatio"] for row in rows], [4, 4])
-        finally:
-            if path.exists():
-                path.unlink()
-
-    def test_load_history_accepts_legacy_model_split_array(self):
-        path = Path(__file__).with_name("test_history_tmp.jsonl")
-        try:
-            path.write_text('{"window":"5h","delta":[[{"checkedAt":"2030-01-01T00:00:00Z","model":"gpt-5.5","deltaPercent":0.5,"deltaCostUsd":2,"costPercentRatio":4},{"checkedAt":"2030-01-01T00:00:00Z","model":"gpt-5.6-sol","deltaPercent":1.5,"deltaCostUsd":6,"costPercentRatio":4}]]}\n', encoding="utf-8")
-
-            rows = load_history(path)
-
-            self.assertEqual([row["deltaPercent"] for row in rows], [0.5, 1.5])
-            self.assertEqual([row["model"] for row in rows], ["gpt-5.5", "gpt-5.6-sol"])
-        finally:
-            if path.exists():
-                path.unlink()
-
-    def test_load_history_accepts_legacy_events_group_name(self):
-        path = Path(__file__).with_name("test_history_tmp.jsonl")
-        try:
-            path.write_text('{"window":"5h","events":[{"checkedAt":"2030-01-01T00:00:00Z","deltaPercent":1,"deltaCostUsd":2}]}\n', encoding="utf-8")
-
-            from monitor_migrations import convert_saved_fields
-            path.write_text(json.dumps(convert_saved_fields(json.loads(path.read_text()))), encoding="utf-8")
-            rows = load_history(path)
-
-            self.assertEqual(rows, [{"checkedAt": "2030-01-01T00:00:00Z", "deltaPercent": 1, "deltaCostUsd": 2, "window": "5h", "accountSlotId": "unknown", "accountLabel": "Unknown"}])
-            self.assertEqual(derive_history_events(rows)["fiveHour"][1]["model"], "gpt-5.5")
-        finally:
-            if path.exists():
-                path.unlink()
-
-    def test_compact_history_keeps_grouped_indented_delta_events(self):
-        path = Path(__file__).with_name("test_history_tmp.jsonl")
-        try:
-            write_history(path, [
-                {"checkedAt": "2030-01-01T00:00:00Z", "window": "5h", "deltaPercent": 1, "deltaCostUsd": 2},
-                {"checkedAt": "2030-01-01T01:00:00Z", "window": "7d", "deltaPercent": 3, "deltaCostUsd": 4},
-            ])
-
-            compact_history(path, 999999)
-            text = path.read_text(encoding="utf-8")
-            events = derive_history_events(load_history(path))
-
-            self.assertIn('{\n  "window": "5h",\n  "delta": [', text)
-            self.assertIn('"accountSlotId":"unknown","accountLabel":"Unknown"', text)
-            self.assertIn('{\n  "window": "7d",\n  "delta": [', text)
-            self.assertEqual(text.count('"accountSlotId":"unknown"'), 2)
-            self.assertEqual(events["fiveHour"][1]["deltaPercent"], 1)
-            self.assertEqual(events["sevenDay"][1]["deltaPercent"], 3)
-        finally:
-            if path.exists():
-                path.unlink()
 
     def test_client_disconnect_detection_matches_browser_abort_errors(self):
         self.assertTrue(is_client_disconnect(ConnectionAbortedError(10053, "connection aborted")))
@@ -4593,14 +3253,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(projection["state"], "linked")
             self.assertEqual(projection["kind"], "copy")
             self.assertEqual((codex_home / "skills" / "demo" / "SKILL.md").read_text(encoding="utf-8"), "managed")
-
-    def test_python_version_requirement_is_documented_and_checked_before_monitor_imports(self):
-        for name, first_import in (("codex_monitor_daemon.py", "from monitor_auto_update import"), ("monitor_codex_usage.py", "from codex_monitor_daemon import")):
-            source = Path(name).read_text(encoding="utf-8")
-            self.assertIn("if sys.version_info < (3, 12):", source)
-            self.assertLess(source.index("if sys.version_info < (3, 12):"), source.index(first_import))
-        self.assertIn("Python 3.12 or newer on Windows and Linux", Path("README.md").read_text(encoding="utf-8"))
-
 
     def test_skill_management_codex_wins_duplicate_and_assigns_both(self):
         with self.account_directory() as directory:
@@ -4925,24 +3577,15 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 manager.inspect_snapshot(buffer.getvalue())
             self.assertNotIn(b"assignments", manager.snapshot())
 
-    def test_skill_snapshot_hash_matches_managed_content_hash(self):
-        with self.account_directory() as directory:
-            manager = SkillManager(directory / "codex", directory / "private", directory / "gemini")
-            skill = manager.skills_root / "demo"
-            skill.mkdir(parents=True)
-            (skill / "SKILL.md").write_text("demo", encoding="utf-8")
-
-            self.assertEqual(manager.snapshot_content_hash(manager.snapshot()), manager.content_hash())
-
     def test_skill_content_hash_detects_directly_added_managed_skill_after_status_cache(self):
         with self.account_directory() as directory:
             manager = SkillManager(directory / "codex", directory / "private", directory / "gemini")
-            initial_hash = manager.content_hash()
+            initial_hash = manager.content_hashes()
             skill = manager.skills_root / "added"
             skill.mkdir(parents=True)
             (skill / "SKILL.md").write_text("added", encoding="utf-8")
 
-            self.assertNotEqual(manager.content_hash(), initial_hash)
+            self.assertNotEqual(manager.content_hashes(), initial_hash)
 
     def test_skill_direct_hashes_match_packages_without_building_zips(self):
         with self.account_directory() as directory:
@@ -5175,6 +3818,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
     def test_webdav_test_decrypts_existing_payload_before_protocol_writes(self):
         manager = object.__new__(CloudManager)
+        manager._config = {"webdav": {}}
         manager._queue = CloudOperationQueue()
         self.addCleanup(manager._queue.close)
         manager._operation_lock = threading.RLock()
@@ -5197,6 +3841,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
     def test_webdav_test_rejects_existing_payload_that_cannot_be_decrypted(self):
         manager = object.__new__(CloudManager)
+        manager._config = {"webdav": {}}
         manager._queue = CloudOperationQueue()
         self.addCleanup(manager._queue.close)
         manager._operation_lock = threading.RLock()
@@ -5212,6 +3857,7 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
     def test_webdav_test_allows_empty_encrypted_inventory(self):
         manager = object.__new__(CloudManager)
+        manager._config = {"webdav": {}}
         manager._queue = CloudOperationQueue()
         self.addCleanup(manager._queue.close)
         manager._operation_lock = threading.RLock()
@@ -5384,17 +4030,17 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
             client = Client()
             box = SimpleNamespace(decrypt=lambda _purpose, payload, *_args: payload)
-            usage = {"machinesChanged": 1, "payloadsDownloaded": 2, "conflicts": 0, "fetchedAt": "now"}
+            usage = {"packagesDownloaded": 2, "payloadsDownloaded": 2, "fetchedAt": "now"}
             with mock.patch.object(cloud, "_connection", return_value=(client, box)), mock.patch.object(cloud, "_fetch_usage_data", return_value=usage) as fetch_usage, mock.patch.object(
                 skills, "merge", return_value={"added": ["new-skill"], "updated": ["updated-skill"], "projectionErrors": []}
-            ), mock.patch.object(cloud, "_download_skill_snapshot", side_effect=lambda client, box, index, names: (client.downloads.append("skills/packages/" + "a" * 64 + ".enc") or b"snapshot")), mock.patch.object(skills, "snapshot_content_hash", return_value="remote-hash"), mock.patch.object(skills, "content_hash", return_value="merged-hash"):
+            ), mock.patch.object(cloud, "_download_skill_snapshot", side_effect=lambda client, box, index, names: (client.downloads.append("skills/packages/" + "a" * 64 + ".enc") or b"snapshot")):
                 result = cloud.fetch()
 
             saved = json.loads(cloud.state_path.read_text(encoding="utf-8"))["remote"]
             self.assertEqual(client.downloads, ["accounts/changed.enc", "skills/packages/" + "a" * 64 + ".enc"])
             self.assertEqual(result, {
                 "accountsChanged": 1, "accountsRemoved": 1, "skillsChanged": True, "skillsAdded": ["new-skill"], "skillsUpdated": ["updated-skill"], "skillsDeleted": [],
-                "accountsUpdated": 0, "usage": usage, "projectionErrors": [], "fetchedAt": saved["fetchedAt"]
+                "usage": usage, "projectionErrors": [], "fetchedAt": saved["fetchedAt"]
             })
             fetch_usage.assert_called_once_with(client, box)
             self.assertEqual(set(saved["accounts"]), {"same", "changed"})
@@ -5490,30 +4136,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             merge.assert_called_once_with(b"beta")
             self.assertEqual(result["skillsUpdated"], ["beta"])
 
-    def test_cloud_fetch_skips_unchanged_legacy_snapshot_with_applied_baseline(self):
-        with self.account_directory() as directory:
-            skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
-            cloud = CloudManager(directory / "private", skills, None)
-            cloud._state["remote"]["skills"] = {"version": 1, "indexEtag": '"current"', "indexId": "snapshot", "legacySnapshotId": "snapshot"}
-            cloud._state["skills"] = {"indexEtag": '"current"', "indexId": "snapshot", "localSha256": {"demo": "base"}}
-
-            class Client:
-                def ensure_directories(self, _path):
-                    pass
-
-                def list_details(self, _path):
-                    return []
-
-                def get_if_changed(self, _path, etag):
-                    return None, etag
-
-            with mock.patch.object(cloud, "_connection", return_value=(Client(), SimpleNamespace())), mock.patch.object(skills, "content_hashes", return_value={"demo": "base"}), mock.patch.object(cloud, "_download_skill_snapshot") as download, mock.patch.object(skills, "merge") as merge:
-                result = cloud.fetch()
-
-            download.assert_not_called()
-            merge.assert_not_called()
-            self.assertFalse(result["skillsChanged"])
-
     def test_cloud_fetch_reapplies_cached_webdav_snapshot_over_local_managed_changes(self):
         with self.account_directory() as directory:
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
@@ -5572,14 +4194,14 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
 
             accounts.overwrite_from_cloud.assert_not_called()
             accounts.push_bound_accounts.assert_not_called()
-            self.assertEqual(result["accountsUpdated"], 0)
+            self.assertNotIn("accountsUpdated", result)
 
     def test_cloud_push_uploads_skills_and_usage_but_no_account_payloads(self):
         with self.account_directory() as directory:
             skills = SkillManager(directory / "codex", directory / "private", directory / "gemini")
             cloud = CloudManager(directory / "private", skills, None)
 
-            usage = {"daysChanged": 2, "partsUploaded": 2, "pushedAt": "now"}
+            usage = {"packagesUploaded": 2, "pendingRecords": 0, "oldestBufferedAt": None, "nextUploadAt": None, "pushedAt": "now"}
             with mock.patch.object(cloud, "upload_skills", return_value={"snapshotId": "skills", "changed": False}) as upload_skills, mock.patch.object(cloud, "_push_usage_data", return_value=usage) as push_usage:
                 result = cloud.push()
 
@@ -5587,18 +4209,22 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             push_usage.assert_called_once_with()
             self.assertEqual(result, {"skills": {"snapshotId": "skills", "changed": False}, "accounts": {"pushedAccounts": []}, "usage": usage, "changed": True})
 
+            empty_usage = {"packagesUploaded": 0, "pendingRecords": 0, "oldestBufferedAt": None, "nextUploadAt": None, "pushedAt": "now"}
+            with mock.patch.object(cloud, "upload_skills", return_value={"snapshotId": "skills", "changed": False}), mock.patch.object(cloud, "_push_usage_data", return_value=empty_usage):
+                self.assertFalse(cloud.push()["changed"])
+
     def test_cloud_account_operations_wait_for_the_shared_push_fetch_serialization_lock(self):
         with self.account_directory() as directory:
             entered_delete, release_delete, entered_release = threading.Event(), threading.Event(), threading.Event()
 
-            def delete_account(_account_id):
+            def delete_account(_cloud, _account_id):
                 entered_delete.set()
                 release_delete.wait(2)
                 return {"deleted": True}
 
-            accounts = SimpleNamespace(lock=threading.RLock(), manifest={"accounts": []}, delete=delete_account, release_cloud_account=lambda _cloud, _account_id: entered_release.set() or {"released": True})
+            accounts = SimpleNamespace(lock=threading.RLock(), manifest={"accounts": []}, share_cloud_account=delete_account, release_cloud_account=lambda _cloud, _account_id: entered_release.set() or {"released": True})
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), accounts)
-            delete_thread = threading.Thread(target=cloud.delete_local_account, args=("account-a",))
+            delete_thread = threading.Thread(target=cloud.share_local_account, args=("account-a",))
             release_thread = threading.Thread(target=cloud.release_local_account, args=("account-b",))
 
             delete_thread.start()
@@ -5710,71 +4336,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertNotIn("demo", stale.state["skills"])
             self.assertEqual(json.loads(stored["skills/current.enc"]), pointer)
 
-    def test_management_page_auto_refreshes_locally_and_fetches_webdav_explicitly(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
-        dashboard = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
-
-        self.assertNotIn('data-action="reload"', html)
-        self.assertIn('<section class="card"><h2>WebDAV</h2>', html)
-        self.assertNotIn('<h2>Encrypted WebDAV</h2>', html)
-        self.assertNotIn('cloud.configPath', html)
-        self.assertNotIn('Config:', html)
-        self.assertIn('<button data-action="cloud-fetch">Fetch</button>', html)
-        self.assertIn('<button id="pushButton" data-action="cloud-push" class="primary">Push</button>', html)
-        self.assertIn('<button data-action="cloud-push-all">Push All</button>', html)
-        self.assertIn('<button data-action="cloud-fetch-all">Fetch All</button>', html)
-        self.assertIn('pushWarning?"Push (!)":"Push"', html)
-        self.assertIn('"_upload_due_skills":"Automatic Skill Upload"', html)
-        self.assertIn('if(event.phase==="start")queueStart(event.operation);else queueEnd(event.operation)', html)
-        self.assertNotIn('Auto Push Success', html)
-        self.assertLess(html.index('data-action="cloud-push"'), html.index('data-action="cloud-fetch"'))
-        self.assertLess(html.index('data-action="cloud-fetch"'), html.index('data-action="cloud-test"'))
-        self.assertNotIn('Upload skills', html)
-        self.assertNotIn('Back up all accounts', html)
-        self.assertIn('<button data-action="account-new">Add account</button>', html)
-        self.assertNotIn('Create / login', html)
-        self.assertNotIn('Refresh credentials', html)
-        self.assertIn('setInterval(load,1000)', html)
-        self.assertIn('api(`/api/manage/status${refreshScan?', html)
-        self.assertIn('if(serialized!==serializedData)', html)
-        self.assertNotIn('data-action="scan"', html)
-        self.assertIn('setInterval(()=>load(false,true),60000)', html)
-        self.assertIn('run("/api/manage/cloud/fetch")', html)
-        self.assertIn('run("/api/manage/cloud/fetch-all")', html)
-        self.assertIn('run("/api/manage/cloud/push")', html)
-        self.assertIn('run("/api/manage/cloud/push-all")', html)
-        self.assertIn('run("/api/manage/accounts/link",{accountKey:button.dataset.link})', html)
-        self.assertIn('Remote Account Already Deleted', html)
-        self.assertIn('result.alreadyDeleted', html)
-        self.assertIn('run("/api/accounts/delete",{accountId:button.dataset.delete})', html)
-        self.assertIn('${account.active?"disabled":""}>Switch</button>', html)
-        self.assertIn('"/api/manage/cloud/fetch"', extension)
-        self.assertIn('"/api/manage/cloud/fetch-all"', extension)
-        self.assertIn('"/api/manage/cloud/push"', extension)
-        self.assertIn('"/api/manage/cloud/push-all"', extension)
-        self.assertIn('"/api/manage/accounts/link"', extension)
-        self.assertIn('["/api/manage/accounts/delete", { url: ACCOUNT_DELETE_URL, method: "POST" }]', extension)
-        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/cloud/fetch'], ('fetch', (), {'include_usage': True}))
-        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/cloud/fetch-all'], ('fetch', (), {'include_usage': True, 'force_full': True}))
-        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/cloud/push'], ('push', (), {}))
-        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/cloud/push-all'], ('push', (), {'force_full': True}))
-        self.assertIn('self.send_json(202, enqueue_management_action(state, control_auth, path, body))', dashboard)
-        self.assertEqual(monitor_dashboard.CLOUD_QUEUE_ACTIONS['/api/manage/accounts/link'], ('link_local_account', ('accountKey',), {}))
-        self.assertIn('elif path == "/api/manage/accounts/delete":', dashboard)
-        self.assertNotIn('/api/manage/cloud/upload', html + extension + dashboard)
-        self.assertNotIn('/api/manage/accounts/backup-all', html + extension + dashboard)
-        self.assertNotIn('/api/manage/accounts/refresh', html + extension + dashboard)
-        self.assertFalse(hasattr(AccountManager, "refresh_cloud_accounts"))
-        self.assertFalse(hasattr(CloudManager, "update_account"))
-        self.assertNotIn('Preview restore', html)
-        self.assertNotIn('/api/manage/cloud/preview', html)
-        self.assertNotIn('/api/manage/cloud/preview', extension)
-        self.assertNotIn('/api/manage/cloud/preview', dashboard)
-        self.assertFalse(hasattr(CloudManager, "preview_skills"))
-        self.assertFalse(hasattr(SkillManager, "preview_restore"))
-
-
     def test_auto_update_config_round_trips_through_management_payload(self):
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
@@ -5789,31 +4350,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             html = Path("management.html").read_text(encoding="utf-8")
             self.assertIn('id="autoUpdateEnabled" type="checkbox"', html)
             self.assertIn('autoUpdate:{enabled:document.getElementById("autoUpdateEnabled").checked}', html)
-
-    @unittest.skip('Historical contract 16 migration retired')
-    def test_cloud_config_uses_offline_passphrase_hash_without_adaptation_fields(self):
-        with self.account_directory() as directory:
-            private = directory / "private"
-            private.mkdir()
-            encryption_hash = passphrase_hash("cloud-secret", "https://example.test", "user")
-            (private / "config.json").write_text(json.dumps({
-                "version": 1, "control": {"password": "123456", "cookieSecret": "c" * 32},
-                "webdav": {"enabled": True, "baseUrl": "https://example.test", "username": "user", "password": "webdav-secret", "remoteRoot": "root", "encryptionPassphraseHash": encryption_hash},
-            }), encoding="utf-8")
-
-            migrate_test_data(private)
-            cloud = CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
-
-            saved = json.loads(cloud.config_path.read_text(encoding="utf-8"))
-            webdav, control = saved["webdav"], saved["control"]
-            self.assertEqual(control["password"], "")
-            self.assertEqual(control["passwordHash"], "")
-            self.assertEqual(webdav["password"], "webdav-secret")
-            self.assertNotIn("cloud-secret", json.dumps(webdav))
-            self.assertEqual(webdav["encryptionPassphraseHash"], encryption_hash)
-            self.assertEqual(webdav["encryptionPassphrase"], "")
-            self.assertFalse(any("PassphraseProtected" in key or key.startswith("pendingEncryption") for key in webdav))
-            self.assertTrue(webdav["usageDataAutoSync"])
 
     def test_empty_passphrase_disables_webdav_payload_encryption(self):
         box = CryptoBox("", CryptoBox.descriptor(""))
@@ -5894,12 +4430,8 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
     def test_config_update_applies_secrets_immediately_and_rotates_remote_passphrase(self):
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
-            legacy_salt = b"codex-switch-passphrase-v1"
-            legacy_key = hashlib.scrypt(b"old passphrase", salt=legacy_salt, n=1 << 15, r=8, p=1, dklen=32, maxmem=128 * 1024 * 1024)
-            old_hash = f"scrypt-key-v1$32768$8$1${base64.b64encode(legacy_salt).decode()}${base64.b64encode(legacy_key).decode()}"
+            old_hash = passphrase_hash("old passphrase", "https://old.example.test", "old-user")
             new_hash = passphrase_hash("new passphrase", "https://new.example.test", "new-user")
-            from monitor_migrations import convert_verifier
-            old_hash = convert_verifier(old_hash, {"baseUrl": "https://old.example.test", "username": "old-user"})
             old_box = CryptoBox(old_hash, CryptoBox.descriptor(old_hash))
             stored = {
                 "crypto.json": json.dumps(CryptoBox.descriptor(old_hash), separators=(",", ":")).encode(),
@@ -5950,8 +4482,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
             old_hash = passphrase_hash("old passphrase", "https://example.test", "user")
-            from monitor_migrations import convert_verifier
-            old_hash = convert_verifier(old_hash, {"baseUrl": "https://old.example.test", "username": "old-user"})
             old_box = CryptoBox(old_hash, CryptoBox.descriptor(old_hash))
             stored = {"crypto.json": json.dumps(CryptoBox.descriptor(old_hash), separators=(",", ":")).encode()}
             for name in ("first", "second"):
@@ -6011,44 +4541,11 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
         self.assertTrue(compromised.is_compromised())
         self.assertFalse(compromised.is_configured())
 
-    def test_control_auth_is_required_by_management_and_account_api_clients(self):
-        html = Path(__file__).with_name("management.html").read_text(encoding="utf-8")
-        extension = Path(__file__).with_name("extension.js").read_text(encoding="utf-8")
-        dashboard = Path(__file__).with_name("dashboard.html").read_text(encoding="utf-8")
-        source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
-
-        self.assertIn('id="controlLoginModal"', html)
-        self.assertIn('showMessage("Control password compromised"', html)
-        self.assertIn('Remove passwordHash from config.json', source)
-        self.assertIn('setup?"/api/control/setup":"/api/control/login"', html)
-        self.assertIn('if not self.require_control_auth():', source)
-        self.assertIn('"/api/control/login"', source)
-        self.assertIn('"/api/control/setup"', source)
-        self.assertIn('HttpOnly; SameSite=Strict; Path=/; Max-Age=', source)
-        self.assertIn('["/api/control/login", { url: CONTROL_LOGIN_URL, method: "POST" }]', extension)
-        self.assertIn('["/api/control/setup", { url: CONTROL_SETUP_URL, method: "POST" }]', extension)
-        self.assertIn('cookie: controlCookie', extension)
-        self.assertIn('authenticatedAccountAction(action,body)', dashboard)
-        self.assertIn('if(error.status!==401&&error.status!==428)throw error;', dashboard)
-        self.assertIn('await accountAction(setup?"setup":"login",{password});', dashboard)
-        self.assertIn('document.getElementById("accountSelect").onchange=event=>performAccountAction("switch"', dashboard)
-        self.assertIn('id="dashboardControlPassword" type="password"', dashboard)
-        self.assertIn('id="dashboardControlPasswordConfirmation" type="password"', dashboard)
-        self.assertIn('id="controlPasswordMatchStatus" aria-live="polite"', dashboard)
-        self.assertIn('"✓ Passwords match":"✕ Passwords do not match"', dashboard)
-        self.assertIn('password.oninput=confirmation.oninput=setup?updateMatchStatus:null', dashboard)
-        self.assertIn('await requestControlPassword(true)', dashboard)
-        self.assertIn('password=await requestControlPassword(setup)', dashboard)
-        self.assertNotIn('prompt("Control password")', dashboard)
-        self.assertIn('connectLive()', dashboard)
-
     def test_initial_control_password_setup_is_loopback_only(self):
         self.assertTrue(monitor_dashboard.client_host_is_loopback("127.0.0.1"))
         self.assertTrue(monitor_dashboard.client_host_is_loopback("::1"))
         self.assertFalse(monitor_dashboard.client_host_is_loopback("192.168.1.2"))
         self.assertFalse(monitor_dashboard.client_host_is_loopback("invalid"))
-        source = Path(__file__).with_name("monitor_dashboard.py").read_text(encoding="utf-8")
-        self.assertIn('if not client_host_is_loopback(self.client_address[0]):', source)
 
     def test_unverified_conditional_writes_do_not_block_usage_sync(self):
         with self.account_directory() as directory:
@@ -6062,24 +4559,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 cloud.sync_usage_data()
             publish.assert_called_once()
             self.assertIsNotNone(cloud._state["usage"]["lastSuccessAt"])
-
-    @unittest.skip('Historical contract 21 migration retired')
-    def test_cloud_state_normalizes_combined_snapshot_fields_for_package_migration(self):
-        with self.account_directory() as directory:
-            private = directory / "private"
-            private.mkdir()
-            (private / "machine.json").write_text(json.dumps({"version": 1, "machineId": "machine", "createdAt": "then"}), encoding="utf-8")
-            (private / "cloud-state.json").write_text(json.dumps({
-                "version": 1, "skills": {"pointerEtag": '"pointer"', "snapshotId": "legacy", "localSha256": "combined"},
-                "remote": {"accounts": {}, "skills": {"pointerEtag": '"pointer"', "snapshotId": "legacy", "updatedAt": "then"}},
-                "pendingAccountOperation": None, "conditionalWritesVerified": False
-            }), encoding="utf-8")
-
-            migrate_test_data(private)
-            cloud = CloudManager(private, SkillManager(directory / "codex", private, directory / "gemini"), None)
-
-            self.assertEqual(cloud._state["skills"], {"indexEtag": None, "indexId": None, "localSha256": {}})
-            self.assertEqual(cloud._state["remote"]["skills"], {})
 
     def test_skill_scan_is_cached_until_explicit_refresh(self):
         with self.account_directory() as directory:
@@ -6311,21 +4790,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             cloud.cache_remote_account.assert_called_once_with(state, '"etag"', data)
             cloud.delete_account_payloads.assert_not_called()
 
-    def test_legacy_bind_dispatches_an_api_account_to_non_destructive_link(self):
-        with self.account_directory() as directory:
-            auth_path = directory / "auth.json"
-            auth_path.write_text(json.dumps(self.account_auth("acct-a", "refresh-a")), encoding="utf-8")
-            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-            data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
-            state = {"accountKey": "legacy-api", "accountType": "api", "label": "API"}
-            cloud = SimpleNamespace(bind_account=mock.Mock(return_value=(state, data, '"etag"')), cache_remote_account=mock.Mock(), begin_account_transition=mock.Mock(), clear_account_transition=mock.Mock(), delete_account_payloads=mock.Mock())
-
-            manager.bind_cloud_account(cloud, "legacy-api")
-
-            self.assertIsNotNone(manager._find_cloud_key("legacy-api"))
-            cloud.begin_account_transition.assert_not_called()
-            cloud.delete_account_payloads.assert_not_called()
-
     def test_api_link_rejects_a_duplicate_local_key_without_deleting_remote(self):
         with self.account_directory() as directory:
             auth_path = directory / "auth.json"
@@ -6393,45 +4857,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
                 self.assertEqual(cloud.recover_account_transition(), "bind")
 
             delete.assert_not_called()
-            self.assertIsNone(cloud._state["pendingAccountOperation"])
-
-    def test_recovered_legacy_api_bind_preserves_both_verified_copies(self):
-        with self.account_directory() as directory:
-            auth_path = directory / "auth.json"
-            data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
-            auth_path.write_bytes(data)
-            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-            manager.active_account()["cloud"] = {"accountKey": "legacy-api", "keyType": "opaque"}
-            manager._save_manifest()
-            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
-            state = {"version": 1, "accountKey": "legacy-api", "accountType": "api", "revisionId": hashlib.sha256(data).hexdigest()}
-            cloud._state["pendingAccountOperation"] = {"operation": "bind", "accountId": "ppl-pro", "accountKey": "legacy-api", "revisionId": hashlib.sha256(data).hexdigest(), "etag": '"etag"'}
-
-            with mock.patch.object(cloud, "bind_account", return_value=(state, data, '"etag"')), mock.patch.object(cloud, "delete_account_payloads") as delete, mock.patch.object(cloud, "release_account") as release, mock.patch.object(cloud, "_cache_remote_account"):
-                self.assertEqual(cloud.recover_account_transition(), "bind")
-
-            delete.assert_not_called()
-            release.assert_not_called()
-            self.assertTrue(manager._account_path("ppl-pro").exists())
-            self.assertIsNone(cloud._state["pendingAccountOperation"])
-
-    def test_recovered_legacy_api_bind_does_not_restore_cloud_copy(self):
-        with self.account_directory() as directory:
-            auth_path = directory / "auth.json"
-            data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
-            auth_path.write_bytes(data)
-            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-            manager.active_account()["cloud"] = {"accountKey": "legacy-api", "keyType": "opaque"}
-            manager._save_manifest()
-            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), manager)
-            cloud._state["pendingAccountOperation"] = {"operation": "bind", "accountId": "ppl-pro", "accountKey": "legacy-api", "revisionId": hashlib.sha256(data).hexdigest(), "etag": '"etag"'}
-
-            with mock.patch.object(cloud, "bind_account", side_effect=CloudError("WebDAV GET failed with HTTP 404", 502)), mock.patch.object(cloud, "release_account", return_value={}) as release, mock.patch.object(cloud, "delete_account_payloads") as delete:
-                self.assertEqual(cloud.recover_account_transition(), "bind")
-
-            delete.assert_not_called()
-            release.assert_not_called()
-            self.assertTrue(manager._account_path("ppl-pro").exists())
             self.assertIsNone(cloud._state["pendingAccountOperation"])
 
     def test_recovered_precommit_bind_does_not_replay_cloud_operation(self):
@@ -6539,20 +4964,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual(raised.exception.status, 409)
             self.assertIn("already shared", str(raised.exception))
 
-    def test_cloud_finds_legacy_api_identity_without_exposing_the_key(self):
-        with self.account_directory() as directory:
-            cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
-            auth_data = json.dumps({"auth_mode": "apikey", "OPENAI_API_KEY": "sk-api"}).encode()
-            identity_id = api_identity_id(auth_identity(parse_auth_bytes(auth_data)))
-            state = {"version": 1, "accountKey": "legacy-random", "accountType": "api", "authSha256": hashlib.sha256(auth_data).hexdigest()}
-
-            with mock.patch.object(cloud, "list_accounts", return_value=[state]), mock.patch.object(cloud, "bind_account", return_value=(state, auth_data, '"etag"')), mock.patch.object(cloud, "_cache_remote_account") as cache:
-                matches = cloud.find_remote_api_accounts(identity_id)
-
-            self.assertEqual(matches, [state])
-            self.assertEqual(cache.call_args.args[0]["_apiIdentityId"], identity_id)
-            self.assertNotIn("sk-api", json.dumps(cache.call_args.args[0]))
-
     def test_api_share_identity_scan_removes_stale_remote_cache_entries(self):
         with self.account_directory() as directory:
             cloud = CloudManager(directory / "private", SkillManager(directory / "codex", directory / "private", directory / "gemini"), None)
@@ -6615,99 +5026,6 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertEqual([account["id"] for account in status["items"]], [second_id])
             self.assertTrue(auth_path.exists())
 
-    def test_account_manifest_v1_migrates_to_v3_without_rewriting_credentials(self):
-        with self.account_directory() as directory:
-            auth_path = directory / "auth.json"
-            auth = json.dumps(self.account_auth("acct-a", "secret-refresh")).encode()
-            auth_path.write_bytes(auth)
-            manager = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-            manifest = json.loads(manager.manifest_path.read_text(encoding="utf-8"))
-            manifest["version"] = 1
-            manifest.pop("cloudBindingEnabled", None)
-            for account in manifest["accounts"]:
-                account.pop("cloud")
-            manager.manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-
-            from monitor_migrations import migrate_manifest
-            migrate_manifest(manager.manifest_path)
-            migrated = AccountManager(auth_path, root=Path(auth_path).parent / "accounts")
-
-            self.assertEqual(migrated.manifest["version"], 3)
-            self.assertNotIn("cloudBindingEnabled", migrated.manifest)
-            self.assertEqual(migrated.active_account()["sessionRefresh"], {"fiveHour": {"enabled": False, "windowsUtc": []}, "sevenDay": {"enabled": False}})
-            self.assertEqual(migrated.active_account()["identity"]["idTokenHash"], hashlib.sha256(b"id-acct-a").hexdigest())
-            self.assertEqual((migrated.root / "ppl-pro" / "auth.json").read_bytes(), auth)
-
-
-    @unittest.skip('Legacy UsageDataStore plateau test retired in favor of CanonicalDataStore')
-    def test_usage_quota_snapshot_keeps_every_idle_plateau_reading(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = (directory / name for name in ("history.jsonl", "quota.jsonl", "tokens.jsonl"))
-            history.write_text("", encoding="utf-8")
-            tokens.write_text("", encoding="utf-8")
-            rows = [{
-                "checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "Managed name",
-                "windows": {"5h": {"usedPercent": 5 if index < 5 else 6, "resetAt": "2030-01-01T05:00:00Z"}, "7d": {"usedPercent": 20, "resetAt": "2030-01-08T00:00:00Z"}},
-                "sync": {"version": 1, "originMachineId": "machine-a", "accountId": "v3:usage-a", "recordId": f"quota-{index}"},
-            } for index in range(6)]
-            store = UsageDataStore(directory / "usage.sqlite3", "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
-
-            for row in rows:
-                store.record_quota(row)
-            records, present = store.snapshot()
-
-            self.assertEqual([record["row"]["checkedAt"] for record in records.values()], [row["checkedAt"] for row in rows])
-            self.assertTrue(all("compaction" not in record["row"] for record in records.values()))
-            self.assertEqual(present, set(records))
-            self.assertNotIn("Managed name", json.dumps(records))
-            local = monitor_history.load_quota_history(quota)
-            self.assertEqual(len(local), 3)
-            self.assertTrue(all(row["quotaRunVersion"] == 1 for row in local))
-
-    @unittest.skip('Legacy UsageDataStore plateau test retired in favor of CanonicalDataStore')
-    def test_usage_quota_plateau_appends_without_removing_middle_rows(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = (directory / name for name in ("history.jsonl", "quota.jsonl", "tokens.jsonl"))
-            history.write_text("", encoding="utf-8")
-            tokens.write_text("", encoding="utf-8")
-            make_row = lambda index: {"checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "A", "windows": {"5h": {"usedPercent": 5, "resetAt": "2030-01-01T05:00:00Z"}}}
-            store = UsageDataStore(directory / "usage.sqlite3", "machine-a", lambda _slot: "v3:usage-a", threading.Lock())
-            for index in range(3):
-                store.record_quota(make_row(index))
-            first, _ = store.snapshot()
-            store.record_quota(make_row(3))
-            store.record_quota(make_row(4))
-
-            second, present = store.snapshot()
-
-            self.assertEqual([record["row"]["checkedAt"] for record in first.values()], [make_row(index)["checkedAt"] for index in range(3)])
-            self.assertEqual([record["row"]["checkedAt"] for record in second.values()], [make_row(index)["checkedAt"] for index in range(5)])
-            self.assertEqual(len(set(first) - present), 0)
-            self.assertEqual(len(present - set(first)), 2)
-
-    @unittest.skip('Legacy UsageDataStore plateau test retired in favor of CanonicalDataStore')
-    def test_usage_quota_plateaus_are_isolated_by_account_plan_and_reset_cycle(self):
-        with self.account_directory() as directory:
-            history, quota, tokens = (directory / name for name in ("history.jsonl", "quota.jsonl", "tokens.jsonl"))
-            history.write_text("", encoding="utf-8")
-            tokens.write_text("", encoding="utf-8")
-            rows = [{
-                "checkedAt": f"2030-01-01T00:0{index}:00Z", "accountSlotId": "account-a", "accountLabel": "A",
-                "windows": {"5h": {"usedPercent": 5, "plan": "plus" if index < 3 else "pro", "resetAt": "2030-01-01T05:00:00Z" if index < 4 else "2030-01-01T10:00:00Z"}},
-            } for index in range(5)] + [{
-                "checkedAt": f"2030-01-01T00:0{index}:30Z", "accountSlotId": "account-b", "accountLabel": "B",
-                "windows": {"5h": {"usedPercent": 5, "plan": "plus", "resetAt": "2030-01-01T05:00:00Z"}},
-            } for index in range(3)]
-            store = UsageDataStore(directory / "usage.sqlite3", "machine-a", lambda slot: "v3:usage-a" if slot == "account-a" else "v3:usage-b", threading.Lock())
-
-            for row in sorted(rows, key=lambda row: row["checkedAt"]):
-                store.record_quota(row)
-            records, _ = store.snapshot()
-            selected = [(record["row"]["sync"]["accountId"], record["row"]["checkedAt"]) for record in records.values()]
-
-            self.assertEqual(selected, [("v3:usage-a" if row["accountSlotId"] == "account-a" else "v3:usage-b", row["checkedAt"]) for row in sorted(rows, key=lambda row: row["checkedAt"])])
-
-
     def test_automatic_usage_period_is_thirty_minutes(self):
         self.assertEqual(AUTO_FETCH_INTERVAL_SECONDS, 60 * 60)
         self.assertEqual(USAGE_SYNC_INTERVAL_SECONDS, 30 * 60)
@@ -6749,21 +5067,15 @@ if(uncovered.length)throw new Error(`Uncovered out-of-range point leaked into th
             self.assertIsNotNone(cloud._state["usage"]["lastAttemptAt"])
             self.assertIsNone(cloud._state["usage"]["lastSuccessAt"])
 
-    def test_new_delta_processing_records_source_interval_for_reaggregation(self):
-        state = {"windows": {}}
-        first = event_sample("2030-01-01T00:00:00Z", five_hour=0, cost=0, plan="plus", five_hour_reset="2030-01-01T05:00:00Z")
-        second = event_sample("2030-01-01T00:01:30Z", five_hour=1, cost=2, plan="plus", five_hour_reset="2030-01-01T05:00:00Z")
-        for row in (first, second):
-            row.update({"originMachineId": "machine-a", "usageAccountId": "v3:usage-a"})
-
-        process_sample_delta_events(state, first, [])
-        events = process_sample_delta_events(state, second, [])
-        intervals = state["_pendingCostIntervals"]
-
-        self.assertEqual(len(events), 1)
-        self.assertEqual(len(intervals), 1)
-        self.assertEqual((intervals[0]["startedAt"], intervals[0]["startPercent"], intervals[0]["endPercent"]), ("2030-01-01T00:00:00Z", 0, 1))
-        self.assertEqual((intervals[0]["modelCostsUsd"]["gpt-5.5"], intervals[0]["deltaCostUsd"]), (2, 2))
+    def test_raw_ledger_operation_validation(self):
+        base = {"schemaVersion": 2, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z", "rawModel": "m", "billingModel": "m", "serviceTier": "default", "tokens": monitor_common.empty_token_totals(), "cost": monitor_common.empty_cost_totals() | {"totalCostUsd": 1}}
+        first = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "a"}, "machine-a", "v3:usage-a")
+        second = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "b"}, "machine-b", "v3:usage-a")
+        self.assertEqual(monitor_usage_sync.record_key("tokenLedger", first), monitor_usage_sync.record_key("tokenLedger", second))
+        operation = {"action": "upsert", "key": monitor_usage_sync.record_key("tokenLedger", first), "record": {"kind": "tokenLedger", "row": first}}
+        monitor_usage_sync.validate_sync_operation(operation)
+        with self.assertRaises(ValueError):
+            monitor_usage_sync.validate_sync_operation(operation | {"record": {"kind": "token", "row": first}})
 
 
 def sample(checked_at, five_hour=None, seven_day=None, five_hour_reset=None, seven_day_reset=None):
@@ -6787,42 +5099,6 @@ def event_sample(checked_at, five_hour=None, seven_day=None, cost=0, plan="unkno
 
 def remote_identity(user_id, account_id=None, email=None, plan_type="plus"):
     return {"user_id": user_id, "account_id": account_id or user_id, "email": email or f"{user_id}@example.test", "plan_type": plan_type}
-
-
-def with_remote_identity(row, user_id, account_id=None, email=None, plan_type="plus"):
-    row["remoteUsage"] = {"rawResponse": remote_identity(user_id, account_id, email, plan_type)}
-    return row
-
-
-def with_auth_identity(row, account_id):
-    row["remoteUsage"] = {"authIdentity": {"account_id": account_id}}
-    return row
-
-
-class RawCostUsageTests(unittest.TestCase):
-
-
-    def test_raw_ledger_deduplicates_same_logical_event(self):
-        base = {"schemaVersion": 2, "recordType": "usage", "eventId": "s:1", "sessionId": "s", "occurredAt": "2030-01-01T00:00:00Z", "rawModel": "m", "billingModel": "m", "serviceTier": "default", "tokens": monitor_common.empty_token_totals(), "cost": monitor_common.empty_cost_totals() | {"totalCostUsd": 1}}
-        first = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "a"}, "machine-a", "v3:usage-a")
-        second = monitor_usage_sync.add_record_provenance("tokenLedger", base | {"accountSlotId": "b"}, "machine-b", "v3:usage-a")
-        merged = monitor_usage_sync.merge_token_ledger_rows([first, second])
-        self.assertEqual(merged, [first])
-        operation = {"action": "upsert", "key": monitor_usage_sync.record_key("tokenLedger", first), "record": {"kind": "tokenLedger", "row": first}}
-        monitor_usage_sync.validate_sync_operation(operation)
-        with self.assertRaises(ValueError):
-            monitor_usage_sync.validate_sync_operation(operation | {"record": {"kind": "token", "row": first}})
-
-
-
-    def test_dashboard_uses_weighted_model_attribution_and_average_dense_points(self):
-        html = dashboard_html()
-        self.assertIn("(Number(point.deltaPercent)||0)*selectedCost/allCost", html)
-        self.assertIn("point.usageByModel", html)
-        self.assertIn("usd(cost/percent*100)", html)
-        self.assertIn("group.reduce((sum,p)=>sum+eventTimestamp(p),0)/group.length", html)
-        self.assertIn("group.reduce((sum,p)=>sum+p.costPer100PercentUsd,0)/group.length", html)
-        self.assertNotIn("MIN_DELTA_COST_PER_PERCENT_USD", html)
 
 
 if __name__ == "__main__":

@@ -294,16 +294,16 @@ class WebDavClient:
         parts = [urllib.parse.quote(part, safe="") for part in f"{self.root}/{path}".strip("/").split("/") if part]
         return urllib.parse.urljoin(self.base, "/".join(parts))
 
-    def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204), output=None, *, _coordination=False) -> tuple[bytes, str | None, int]:
-        if not getattr(self, "diagnostic_log", None):
-            return self._request(method, path, data, headers, expected, output, coordination=_coordination)
+    def request(self, method: str, path: str = "", data: bytes | None = None, headers: dict | None = None, expected: tuple[int, ...] = (200, 201, 204), *, _coordination=False) -> tuple[bytes, str | None, int]:
+        if self.diagnostic_log is None:
+            return self._request(method, path, data, headers, expected, coordination=_coordination)
         started = time.monotonic()
         diagnostic = {"requestId": uuid.uuid4().hex, "method": method, "url": WebDavLog.safe_url(self._url(path)), "category": "metadata" if _coordination else self.transfer_category,
             "expectedStatuses": expected, "timeoutSeconds": 30, "conditional": bool(headers and any(key.lower() in {"if-match", "if-none-match", "if"} for key in headers)),
             "lockHeld": self.access_lock.claimed, "lockWriting": self.access_lock.writing}
         self.diagnostic_log.write("request_start", secrets=self._diagnostic_secrets, **diagnostic)
         try:
-            result = self._request(method, path, data, headers, expected, output, diagnostic, coordination=_coordination)
+            result = self._request(method, path, data, headers, expected, diagnostic, coordination=_coordination)
             diagnostic.update(status=result[2], outcome="succeeded")
             return result
         except Exception as exc:
@@ -313,21 +313,16 @@ class WebDavClient:
             diagnostic["elapsedMs"] = round((time.monotonic() - started) * 1000, 3)
             self.diagnostic_log.write("request_end", secrets=self._diagnostic_secrets, **diagnostic)
 
-    def _request(self, method, path, data, headers, expected, output, diagnostic=None, coordination=False):
+    def _request(self, method, path, data, headers, expected, diagnostic=None, coordination=False):
         if coordination or not self.access_lock.required:
-            return self._send_request(method, path, data, headers, expected, output, diagnostic, category="metadata" if coordination else None)
+            return self._send_request(method, path, data, headers, expected, diagnostic, category="metadata" if coordination else None)
         self.access_lock.prepare(method)
-        result = self._send_request(method, path, data, headers, expected, output, diagnostic)
+        result = self._send_request(method, path, data, headers, expected, diagnostic)
         self.access_lock.check()
         return result
 
-    def _send_request(self, method, path, data, headers, expected, output, diagnostic=None, *, category=None):
+    def _send_request(self, method, path, data, headers, expected, diagnostic=None, *, category=None):
         size = len(data) if isinstance(data, bytes) else 0
-        if data is not None and hasattr(data, "seek"):
-            data.seek(0, 2)
-            size = data.tell()
-            data.seek(0)
-            headers = dict(headers or {}) | {"Content-Length": str(size)}
         request = urllib.request.Request(self._url(path), data=data, method=method, headers=headers or {})
         request.add_unredirected_header("Authorization", self.authorization)
         transfer = {"method": method, "path": path, "category": category or self.transfer_category, "attemptedUploadBytes": size if method == "PUT" else 0, "successfulUploadBytes": 0, "downloadBytes": 0}
@@ -340,18 +335,8 @@ class WebDavClient:
                 etag, status = response.headers.get("ETag"), response.status
                 if diagnostic is not None:
                     diagnostic.update(status=status, responseHeaders=WebDavLog.response_headers(response.headers), rateLimited=status == 429)
-                if output is None:
-                    body = response.read()
-                    transfer["downloadBytes"] = len(body)
-                else:
-                    from monitor_streaming import CHUNK_BYTES, PAYLOAD_LIMIT
-                    for chunk in iter(lambda: response.read(CHUNK_BYTES), b""):
-                        transfer["downloadBytes"] += len(chunk)
-                        if transfer["downloadBytes"] > PAYLOAD_LIMIT * 2:
-                            raise CloudError("WebDAV payload is too large", 409)
-                        output.write(chunk)
-                    output.seek(0)
-                    body = b""
+                body = response.read()
+                transfer["downloadBytes"] = len(body)
         except urllib.error.HTTPError as exc:
             if diagnostic is not None:
                 diagnostic.update(status=exc.code, reason=str(exc.reason), responseHeaders=WebDavLog.response_headers(exc.headers), rateLimited=exc.code == 429)
@@ -389,15 +374,9 @@ class WebDavClient:
         body, etag, _ = self.request("GET", path)
         return body, etag
 
-    def get_file(self, path, output):
-        _, etag, _ = self.request("GET", path, output=output)
-        return etag
-
     def _put(self, path, data, headers):
         for attempt in range(WEBDAV_PUT_MAX_ATTEMPTS):
             try:
-                if hasattr(data, "seek"):
-                    data.seek(0)
                 return self.request("PUT", path, data, headers)[1]
             except CloudError as exc:
                 if attempt + 1 >= WEBDAV_PUT_MAX_ATTEMPTS or exc.category != "network" and exc.http_status not in {408, 425, 429, 500, 502, 503, 504}:
@@ -411,9 +390,6 @@ class WebDavClient:
                     self.diagnostic_log.write("request_retry", secrets=self._diagnostic_secrets, method="PUT", url=WebDavLog.safe_url(self._url(path)),
                         attempt=attempt + 1, maxAttempts=WEBDAV_PUT_MAX_ATTEMPTS, delaySeconds=WEBDAV_PUT_RETRY_SECONDS, status=exc.http_status, errorCategory=exc.category)
                 time.sleep(WEBDAV_PUT_RETRY_SECONDS)
-
-    def put_file(self, path, source, create=False):
-        return self._put(path, source, {"Content-Type": "application/octet-stream", **({"If-None-Match": "*"} if create else {})})
 
     def get_if_changed(self, path: str, etag: str | None) -> tuple[bytes | None, str | None]:
         body, current_etag, status = self.request("GET", path, headers={"If-None-Match": etag} if etag else None, expected=(200, 304))
@@ -488,7 +464,7 @@ class CloudManager:
         return self._queue
 
     def _queue_generation(self):
-        webdav = getattr(self, "_config", {}).get("webdav", {})
+        webdav = self._config.get("webdav", {})
         return hashlib.sha256(json.dumps({key: webdav.get(key) for key in ("enabled", "baseUrl", "username", "password", "remoteRoot", "encryptionPassphraseHash", "allowOptimisticWrites")}, sort_keys=True).encode()).hexdigest()
 
     def _queue_sanitize(self, value):
@@ -499,7 +475,7 @@ class CloudManager:
         if isinstance(value, (tuple, list)):
             return [self._queue_sanitize(item) for item in value]
         if isinstance(value, str):
-            secret = getattr(self, "_config", {}).get("webdav", {}).get("password", "")
+            secret = self._config.get("webdav", {}).get("password", "")
             if secret:
                 value = value.replace(secret, "[redacted]")
         return value
@@ -507,7 +483,7 @@ class CloudManager:
     def submit_operation(self, method_name, args=(), kwargs=None, *, source="manual", context=None, on_success=None, validate=None):
         args, kwargs = deepcopy(args), deepcopy(kwargs or {})
         generation = self._queue_generation()
-        secrets_to_redact = [self._config.get("webdav", {}).get("password", "")] if hasattr(self, "_config") else []
+        secrets_to_redact = [self._config.get("webdav", {}).get("password", "")]
         if method_name == "update_config" and args and isinstance(args[0], dict):
             secrets_to_redact.extend(args[0].get("webdav", {}).get(key, "") for key in ("password", "encryptionPassphrase"))
             secrets_to_redact.append(args[0].get("controlPassword", ""))
@@ -716,8 +692,6 @@ class CloudManager:
         self._state["remote"] = {"accounts": {}, "skills": {}}
         self._state["skills"]["indexEtag"] = None
         self._state["usage"]["remote"] = {}
-        self._state.setdefault("usageV4", {})["remote"] = {}
-        self._state["usageV4"]["localHeadEtag"] = None
         self._save_state()
         atomic_write_json(self.config_path, config)
 
@@ -781,12 +755,6 @@ class CloudManager:
         self._next_usage_fetch_at = time.monotonic()
         self._next_usage_upload_retry_at = 0
         self._next_usage_sync_at = time.monotonic()
-
-    def reset_usage_apply_cursors(self) -> None:
-        self._state["usage"]["remote"] = {}
-        self._state["usage"]["lastSuccessAt"] = None
-        self._state["usage"]["lastAttemptAt"] = None
-        self._save_state()
 
     def _usage_account_identity(self, account_slot_id: str | None) -> tuple[str, str]:
         identity = {}
@@ -961,7 +929,7 @@ class CloudManager:
             raise CloudError("Skill package identity check failed", 409)
         return data
 
-    def _skill_packages_needing_fetch(self, index: dict, pointer_changed: bool) -> set[str]:
+    def _skill_packages_needing_fetch(self, index: dict) -> set[str]:
         expected = {name: item["contentSha256"] for name, item in index.get("packages", {}).items()}
         current = self.skills.content_hashes(set(expected))
         return {name for name, content_hash in expected.items() if current.get(name) != content_hash}
@@ -1009,8 +977,8 @@ class CloudManager:
         if pointer_data is not None:
             cached_skills = self._parse_skill_pointer(box, pointer_data, pointer_etag)
         if cached_skills.get("indexId"):
-            package_names = set(cached_skills.get("packages", {})) if force_full and cached_skills.get("version") == 2 else self._skill_packages_needing_fetch(cached_skills, skills_changed)
-            if package_names is None or package_names:
+            package_names = set(cached_skills.get("packages", {})) if force_full and cached_skills.get("version") == 2 else self._skill_packages_needing_fetch(cached_skills)
+            if package_names:
                 snapshot = self._download_skill_snapshot(client, box, cached_skills, package_names)
                 skill_merge = self.skills.merge(snapshot)
             else:
@@ -1028,7 +996,7 @@ class CloudManager:
             self._finish_fetch_baseline(time.monotonic())
         return {
             "accountsChanged": len(changed), "accountsRemoved": len(removed), "skillsChanged": skills_changed, "skillsAdded": skill_merge["added"],
-            "skillsUpdated": skill_merge["updated"], "skillsDeleted": skill_merge.get("deleted", []), "accountsUpdated": 0, "usage": usage,
+            "skillsUpdated": skill_merge["updated"], "skillsDeleted": skill_merge.get("deleted", []), "usage": usage,
             "projectionErrors": skill_merge["projectionErrors"], "fetchedAt": cached["fetchedAt"]
         }
 
@@ -1132,9 +1100,6 @@ class CloudManager:
         self._state["remote"] = {"accounts": {}, "skills": {}}
         self._state["skills"]["indexEtag"] = None
         self._state["usage"]["remote"] = {}
-        self._state.setdefault("usageV4", {})["remote"] = {}
-        self._state["usageV4"]["localHeadEtag"] = None
-        self._state["usageV4"].pop("lastGcDay", None)
         self._state["conditionalWritesVerified"] = False
         self._state["decryptFailure"] = None
         self._save_state()
@@ -1252,7 +1217,7 @@ class CloudManager:
     def push(self, force_full: bool = False) -> dict:
         accounts = {"pushedAccounts": []}
         result = {"skills": self.upload_skills(force=True) if force_full else self.upload_skills(), "accounts": accounts, "usage": self._push_usage_data()}
-        result["changed"] = bool(result["skills"].get("changed") or result["usage"].get("daysChanged"))
+        result["changed"] = bool(result["skills"].get("changed") or result["usage"].get("packagesUploaded"))
         self._finish_successful_push(time.monotonic())
         self._state["decryptFailure"] = None
         self._save_state()
@@ -1392,12 +1357,7 @@ class CloudManager:
     @_serialized_cloud_operation
     def delete_remote_account(self, account_key: str, expected_etag: str | None = None) -> list[dict]:
         self.ensure_no_pending_account_operation()
-        return self.delete_account_payloads(str(account_key or ""), expected_etag) if expected_etag is not None else self.delete_account_payloads(str(account_key or ""))
-
-    @_serialized_cloud_operation
-    def delete_local_account(self, account_id: str) -> dict:
-        self.ensure_no_pending_account_operation()
-        return self.accounts.delete(account_id)
+        return self.delete_account_payloads(str(account_key or ""), expected_etag)
 
     def delete_account_payloads(self, key: str, expected_etag: str | None = None) -> dict:
         client, box = self._connection()
@@ -1441,8 +1401,8 @@ class CloudManager:
             return {"skipped": True}
         client, box = self._connection(True)
         try:
-            from monitor_packages import sync
-            return {**sync(self, client, box), "pushedAt": _timestamp()}
+            from monitor_packages import push
+            return {**push(self, client, box, force=True), "pushedAt": _timestamp()}
         finally:
             self._record_usage_transfers(client)
 

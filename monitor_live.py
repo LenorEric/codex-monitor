@@ -14,30 +14,16 @@ from monitor_delivery import encoded
 
 def send_bulk(handler, delivery):
     compressed = "gzip" in (handler.headers.get("Accept-Encoding") or "").lower()
-    if hasattr(delivery, "snapshot_file"):
-        with delivery.snapshot_file(compressed) as (file, size):
-            handler.send_response(200)
-            handler.send_header("Content-Type", "application/json; charset=utf-8")
-            handler.send_header("Cache-Control", "no-store")
-            handler.send_header("Vary", "Accept-Encoding")
-            if compressed:
-                handler.send_header("Content-Encoding", "gzip")
-            handler.send_header("Content-Length", str(size))
-            handler.end_headers()
-            shutil.copyfileobj(file, handler.wfile, length=64 * 1024)
-        return True
-    body = delivery.bulk(compressed)
-    if body is None:
-        return False
-    handler.send_response(200)
-    handler.send_header("Content-Type", "application/json; charset=utf-8")
-    handler.send_header("Cache-Control", "no-store")
-    handler.send_header("Vary", "Accept-Encoding")
-    if compressed:
-        handler.send_header("Content-Encoding", "gzip")
-    handler.send_header("Content-Length", str(len(body)))
-    handler.end_headers()
-    handler.wfile.write(body)
+    with delivery.snapshot_file(compressed) as (file, size):
+        handler.send_response(200)
+        handler.send_header("Content-Type", "application/json; charset=utf-8")
+        handler.send_header("Cache-Control", "no-store")
+        handler.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            handler.send_header("Content-Encoding", "gzip")
+        handler.send_header("Content-Length", str(size))
+        handler.end_headers()
+        shutil.copyfileobj(file, handler.wfile, length=64 * 1024)
     return True
 
 

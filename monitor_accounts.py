@@ -368,9 +368,9 @@ class AccountManager:
         return assignments, tables
 
     @classmethod
-    def _toml_ownership(cls, text: str) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]], set[tuple[str, ...]]]:
+    def _toml_ownership(cls, text: str) -> tuple[set[tuple[str, ...]], set[tuple[str, ...]]]:
         assignments, tables = cls._toml_layout(text)
-        return {path for path, _ in assignments if path}, {path for path, _, _ in tables}, cls._toml_leaf_paths(tomllib.loads(text)) if text.strip() else set()
+        return {path for path, _ in assignments if path}, {path for path, _, _ in tables}
 
     def _config_editor_parts(self, header_hint: str = "") -> tuple[str, str]:
         if not self.config_path.exists():
@@ -378,7 +378,7 @@ class AccountManager:
         text = self.config_path.read_text(encoding="utf-8")
         try:
             tomllib.loads(text)
-            known_keys, known_tables, _ = self._toml_ownership(header_hint) if header_hint.strip() else (set(), set(), set())
+            known_keys, known_tables = self._toml_ownership(header_hint) if header_hint.strip() else (set(), set())
         except tomllib.TOMLDecodeError:
             return text, ""
         common, header = [], []
@@ -771,9 +771,6 @@ class AccountManager:
                 return False, None
             console_log(f"External auth.json update matched {target['label']!r}; restored {active['label']!r} and started background credential validation.")
             return False, {"id": target["id"], "label": target["label"], "data": live_data, "fingerprint": auth_fingerprint(self._account_path(target["id"]).read_bytes())}
-
-    def sync_active_from_live(self) -> bool:
-        return self.reconcile_active_from_live()[0]
 
     def inactive_ready_credentials(self, include_active: bool = False) -> list[dict]:
         with self.lock:
@@ -1305,12 +1302,6 @@ class AccountManager:
             credential_path = self._account_path(target["id"])
             if not target.get("ready"):
                 data, auth = b"{}", {}
-            elif target["id"] == self.manifest.get("activeAccountId"):
-                if not self.auth_path.exists():
-                    raise AccountError(f"Account release refused: current auth.json for {target['label']} is missing", 409)
-                data = self.auth_path.read_bytes()
-                auth = parse_auth_bytes(data)
-                self._validate_live_matches_saved(target, auth)
             else:
                 data = credential_path.read_bytes()
                 auth = parse_auth_bytes(data)

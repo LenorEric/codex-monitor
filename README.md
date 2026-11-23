@@ -4,7 +4,7 @@
 
 **A local-first Codex quota, token, cost, account, skill, and encrypted-sync dashboard for VS Code.**
 
-[![Version](https://img.shields.io/badge/version-1.5.13-4f8cff)](#quick-start)
+[![Version](https://img.shields.io/badge/version-1.6.14-4f8cff)](#quick-start)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#requirements)
@@ -81,7 +81,7 @@ python codex_monitor_daemon.py
 
 ### 2. Install the VS Code extension
 
-Install `release/codex-usage-monitor-1.5.13.vsix` from VS Code:
+Install `release/codex-usage-monitor-1.6.14.vsix` from VS Code:
 
 1. Open **Extensions**.
 2. Select **Views and More Actions (…) → Install from VSIX…**.
@@ -90,7 +90,7 @@ Install `release/codex-usage-monitor-1.5.13.vsix` from VS Code:
 The command line is also supported:
 
 ```console
-code --install-extension release/codex-usage-monitor-1.5.13.vsix
+code --install-extension release/codex-usage-monitor-1.6.14.vsix
 ```
 
 ### 3. Complete first-run setup
@@ -124,7 +124,7 @@ The extension contributes **Codex Usage Monitor: Show Details**. Opening it fetc
 
 The account vault lives in `~/.codex-switch/accounts`. On first startup, the current valid `auth.json` becomes **Current account**.
 
-Codex exclusively owns refresh-token rotation for the active account. The monitor reloads and mirrors Codex's live `auth.json` before polling, uses its access token while valid, and pauses remote quota polling if Codex has not refreshed an expiring token yet. Ready inactive accounts are isolated from Codex and are polled every ten minutes; the monitor may rotate those credentials, reports failed inactive polls in the account selector, and never retries an ambiguous rotating-token exchange.
+Codex exclusively owns refresh-token rotation for the active account. The monitor reloads and mirrors Codex's live `auth.json` before polling, uses its access token while valid, and pauses remote quota polling if Codex has not refreshed an expiring token yet. Ready inactive accounts are isolated from Codex and are polled every three minutes; the monitor may rotate those credentials, reports failed inactive polls in the account selector, and never retries an ambiguous rotating-token exchange.
 
 ### Create and sign in to another account
 
@@ -254,13 +254,13 @@ The canonical data root is `~/.codex-switch`:
 | `webdav.log` | Local WebDAV operation and HTTP diagnostics, capped at 5 MB (5,000,000 bytes); oldest complete entries are removed when full | Never |
 | `usage_monitor_sync_cache-v4.sqlite3` | Permanent Local/Merged canonical data, upload buffer, package receipts, parser checkpoints and prepared UI data | Never uploaded as a database |
 
-Each token event stores its cost calculated using the price effective at the event time. Stored costs remain authoritative after pricing changes; redundant price-epoch records and references are removed by the ordered data-contract migration after verifying totals. Existing session-only totals are preserved as schema 2 `sessionBaseline` records, which contribute to token summaries but not Cost vs Usage charts. Source high-water totals are retained to prevent historical usage from being replayed.
+Each token event stores its cost calculated using the price effective at the event time. Stored costs remain authoritative after pricing changes, and source checkpoints prevent historical usage from being replayed.
 
-In the cloud sync root, each account is one encrypted `accounts/<account-key>.enc` file containing metadata and credentials together. Metadata responses never include credential bytes. Separate cloud state and revision files are retired; the current folder was converted offline without changing cloud contract 5.
+In the cloud sync root, each account is one encrypted `accounts/<account-key>.enc` file containing metadata and credentials together. Metadata responses never include credential bytes. Separate cloud state and revision files are retired; cloud deployments follow cloud contract 5.
 
 SQLite permanently stores both canonical datasets and recorded token costs in typed `canonical_quota` and `canonical_tokens` tables selected by `dataset`. The shared reader and UI preparation implementation serve both datasets; core business values are SQL columns, with JSON reserved for unknown metadata and serialization boundaries. Ingestion commits Local, corresponding Merged changes, upload-buffer entries and parser checkpoints atomically. Session files are read incrementally while their consumed prefix is unchanged; replacement, truncation or changed prefixes trigger reparsing with identity deduplication, preserving committed history. Raw cloud payloads and intermediate parsed events have no persistent queue.
 
-Canonical JSONL backups are retired. Enable `saveRawQuotaResponses` explicitly to log quota API response bodies, including invalid responses, with capture time/account/status metadata. Token events, costs, processed records and authentication headers are never included; logging failures do not block ingestion. Contract 22 preserves saved results while converting the old ownership layout to canonical datasets and a temporary buffer. Released local contract 23 converts those JSON canonical records to typed columns, preserving identities, costs, quota decisions and prepared delivery artifacts without historical replay; cloud contract 5 is unchanged. Freed pages remain reusable without automatic compaction. Cloud contract 5 replaces day/month discovery with immutable packages; local migration codecs remain available for sequential upgrades. Cloud conversion is complete; the runtime rejects older or populated unmarked cloud roots without migration.
+Canonical JSONL backups are retired. Enable `saveRawQuotaResponses` explicitly to log quota API response bodies, including invalid responses, with capture time/account/status metadata. Token events, costs, processed records and authentication headers are never included; logging failures do not block ingestion. Local data contract 27 validates runtime compatibility on startup without automatic compaction, and cloud contract 5 uses immutable packages while rejecting older or incompatible cloud roots.
 
 > [!WARNING]
 > Protect the whole `~/.codex-switch` directory. Never commit it, place it in support bundles, log it, or share screenshots of its contents. Losing the encryption passphrase makes encrypted remote data unrecoverable.
@@ -269,7 +269,7 @@ For WebDAV failures, inspect `webdav.log` as JSON lines: Unix timestamps and ope
 (including `Retry-After`, rate-limit headers, and server request IDs). Credentials, authorization/cookie/lock headers, and request/response bodies are omitted. Treat remote paths and diagnostic error messages as private.
 Logging is automatic; a full log drops its oldest entries, and a logging I/O failure does not interrupt synchronization.
 
-Dashboard series and status are intentionally readable from the configured server address. Every account, skill, WebDAV, cloud, server, and configuration mutation requires the control password.
+Dashboard snapshots (`/api/dashboard`), live WebSocket streams (`/api/dashboard/live`), and status (`/api/status`) are intentionally readable from the configured server address. Every account, skill, WebDAV, cloud, server, and configuration mutation requires the control password.
 Control requests are accepted through public addresses and reverse proxies without an origin restriction so cloud deployments retain all dashboard features.
 
 First-time control-password setup is loopback-only. If you do not need LAN or WAN access, change the server host to `127.0.0.1` and restart the monitor.
@@ -358,7 +358,7 @@ Credentials, local history, caches, tests, reference sources, and development-on
 | `codex_monitor_daemon.py` | Canonical CLI entry point, monitor startup, automatic update coordination, and restart. |
 | `monitor_codex_usage.py` | Compatibility wrapper for the former entry command. |
 | `monitor_auto_update.py` | Verified background runtime updater. |
-| `monitor_migrations.py` | Sequential local migrations, rollback recovery and local old-format conversion. |
+| `monitor_migrations.py` | Local data contract (27) startup validation and downgrade guard. |
 | `monitor_cloud_contract.py` | Current cloud contract validation and empty-root initialization. |
 | `monitor_dashboard.py` | Polling loops, dashboard/API server, response caches, control authorization, and UI datasets. |
 | `monitor_accounts.py` | Local credential vault, identity-safe switching, API copy transfer, and OpenAI move transfer. |
@@ -368,7 +368,7 @@ Credentials, local history, caches, tests, reference sources, and development-on
 | `monitor_sources.py` / `monitor_sqlite.py` | Shared file notifications, synchronization and SQLite maintenance. |
 | `monitor_skills.py` | Skill discovery, managed storage, validation, assignments, and projections. |
 | `monitor_tokens.py` | Incremental session-log parsing, token aggregation, Fast attribution, and cost calculation. |
-| `monitor_token_ledger.py` | Current token/cost ledger and derived session totals; historical readers live in migration-only modules. |
+| `monitor_token_ledger.py` | Current token/cost ledger and derived session totals. |
 | `monitor_events.py` / `monitor_quota.py` | Remote usage interpretation, reset handling, and delta validation. |
 | `monitor_history.py` / `monitor_usage_sync.py` | Local persistence, compaction, provenance, synchronized cache, and merged datasets. |
 | `extension.js` / `package.json` | Thin VS Code extension host and manifest. |
@@ -387,4 +387,4 @@ Only `reset_at` determines resets; `reset_after_seconds` is ignored. Every decre
 
 Existing quota and token JSONL files remain untouched. They are neither written nor used as runtime ingestion or recovery inputs. Raw quota-response logging is a separate, opt-in diagnostic setting.
 
-Pending local contract 26 removes redundant `canonical_seen` storage. Token deduplication uses the canonical token primary key atomically, preserving first-committed costs. The same migration streams saved display results into final delivery rows, replaces preparation copies/permanent snapshots with pending work and final output, and switches the delivery epoch once. Published token groups remain fixed; quota changes update only usage/attribution. Ordinary updates do not build full snapshots or replay canonical history. See [delivery details](dashboard-delivery.md) and [measurements](final-delivery-benchmark.md). Cloud contract 5 is unchanged; conversion runs on startup with journaled recovery and no automatic compaction.
+Local contract 27 removes redundant `canonical_seen` storage and uses the canonical token primary key atomically, preserving first-committed costs. Display delivery streams directly from final `delivery_items` rows without intermediate preparation copies or permanent full snapshots. Published token groups remain fixed; quota changes update only usage/attribution, and ordinary updates do not build full snapshots or replay canonical history. See [delivery details](dashboard-delivery.md). Cloud contract 5 is unchanged.

@@ -95,23 +95,6 @@ def weighted(rows):
     return math.floor((sum(row[1] * row[-1] for row in rows) / cost if cost else sum(row[1] for row in rows) / len(rows)) + .5)
 
 
-def aggregate_tokens(rows, intervals, api=False):
-    boundaries = sorted({stamp for values in intervals.values() for row in values for stamp in row[1:3]})
-    groups = defaultdict(list)
-    ends = {window: [row[2] for row in values] for window, values in intervals.items()}
-    for row in rows:
-        key = math.floor(row[1] / 60) if api else (bisect.bisect_right(boundaries, row[1]), *[nearest(values, row[1], ends[window]) for window, values in intervals.items()]) if boundaries else row[0]
-        groups[key].append(row)
-    result = []
-    for key, values in groups.items():
-        models = defaultdict(lambda: [0] * 5)
-        for row in values:
-            for index, amount in enumerate(row[4:]):
-                models[(row[2], row[3])][index] += amount
-        result.append([f"bulk:{key}", weighted(values), [[model, tier, *amounts] for (model, tier), amounts in sorted(models.items())]])
-    return sorted(result, key=lambda row: (row[1], row[0]))
-
-
 def chart_rows(events, intervals, max_distance=MAX_ATTRIBUTION_DISTANCE_SECONDS):
     groups = defaultdict(list)
     ends = [row[2] for row in intervals]

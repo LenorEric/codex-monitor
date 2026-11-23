@@ -31,12 +31,6 @@ def initialize(db):
 
 
 class CanonicalIndex(IndexState):
-    canonical = True
-
-    def maintain_disk_space(self):
-        # Contract 23 deliberately retains freed pages for subsequent ingestion.
-        return 0
-
     def __init__(self, path):
         self.path, self.lock = Path(path), threading.RLock()
         self._db = None
@@ -146,11 +140,6 @@ class CanonicalIndex(IndexState):
             if row.get("serviceTier") == "fast":
                 cached["fastByModel"].setdefault(row["rawModel"], empty_token_totals())[name] += amount
 
-    def revision(self):
-        with self.transaction() as db:
-            return self.get(db, "canonicalRevision", 0)
-
-
 def default_database_path(data_home: Path) -> Path:
     return data_home / "usage_monitor_sync_cache-v4.sqlite3"
 
@@ -182,15 +171,6 @@ class CanonicalDataStore(NormalizedRecords):
         with self.index.transaction() as db:
             return tuple(records.rows(db, view, kind) for kind in ("quota", "tokenLedger"))
 
-    def snapshot(self, view="local"):
-        quotas, tokens = self.datasets(view)
-        local = {}
-        for row in quotas:
-            local[record_key("quota", row)] = {"kind": "quota", "row": row}
-        for row in tokens:
-            local[record_key("tokenLedger", row)] = {"kind": "tokenLedger", "row": row}
-        return local, set(local)
-
     def buffer_status(self):
         with self.index.transaction() as db:
             count, oldest = db.execute("SELECT COUNT(*),MIN(arrived) FROM upload_buffer").fetchone()
@@ -206,14 +186,6 @@ class CanonicalDataStore(NormalizedRecords):
             return
         db.execute("INSERT OR IGNORE INTO upload_buffer(record_key,arrived,data) VALUES(?,?,?)", (
             record_key(kind, row), time.time() if now is None else now, canonical_json(self._transport_record(kind, row)).decode()))
-
-    def _changed(self, db, view, kind, account, key):
-        # The typed-table triggers durably enqueue the actual mutation, including
-        # deletions and changed extents, in the same transaction as these facts.
-        if not db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_pending'").fetchone():
-            db.execute("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", (view, account))
-            db.execute("INSERT OR IGNORE INTO delivery_work VALUES(?,?,?,?)", (view, account, kind, key))
-        self.index.put(db, "canonicalRevision", self.index.get(db, "canonicalRevision", 0) + 1)
 
     def _save(self, db, view, kind, row):
         row = {"accountSlotId": "unknown", "accountLabel": "Unknown"} | row
@@ -234,7 +206,6 @@ class CanonicalDataStore(NormalizedRecords):
             if usage is not None:
                 self.index.add_usage(usage, row)
                 self.index.put(db, "canonicalUsageTotals", usage)
-        self._changed(db, view, kind, account, key)
         return True
 
     @staticmethod

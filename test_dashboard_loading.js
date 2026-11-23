@@ -537,7 +537,7 @@ test("combined hover lookup keeps real gaps and honors precomputed compacted ran
         {timestamp:20000,fiveHour:{continuous:30}}];
         gapItem={label:'fiveHour',points:gapPoints,valueOf:point=>point.fiveHour.continuous,compactedRanges:[]}`);
     assert.equal(h.run("costTimeUsageAt(gapItem,10000)"), null);
-    h.run("gapPoints[1].overviewBucket={start:0,end:20000};gapItem.compactedRanges=compactedUsageRanges(gapPoints)");
+    h.run("gapPoints[1].compactedFrom=0;gapItem.compactedRanges=compactedUsageRanges(gapPoints)");
     assert.equal(h.run("costTimeUsageAt(gapItem,10000)"), 20);
 });
 

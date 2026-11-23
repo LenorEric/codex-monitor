@@ -245,7 +245,7 @@ class CloudLockTests(CloudContractFixture):
             client.access_lock.prepare("PUT")
             before = len(self.calls)
             client.put("payload", b"accepted")
-            client.put_file("stream", io.BytesIO(b"streamed"))
+            client.put("stream", b"streamed")
             self.assertEqual([(method, path) for method, path, _ in self.calls[before:]], [("PUT", "payload"), ("PUT", "stream")])
         finally:
             client.release_file_lock()
@@ -260,14 +260,13 @@ class CloudLockTests(CloudContractFixture):
             def lose_response(method, path, data, headers, *args, **kwargs):
                 result = original(method, path, data, headers, *args, **kwargs)
                 if path == "stream" and method == "PUT":
-                    data.seek(0)
-                    uploads.append(data.read())
+                    uploads.append(data)
                     if len(uploads) == 1:
                         raise CloudError("response lost", 502, category="network")
                 return result
             before = len(self.calls)
             with mock.patch.object(client, "_send_request", side_effect=lose_response):
-                client.put_file("stream", io.BytesIO(b"retry the complete file"), create=True)
+                client.put("stream", b"retry the complete file", create=True)
             self.assertEqual(uploads, [b"retry the complete file"] * 2)
             self.assertEqual([(method, path) for method, path, _ in self.calls[before:]], [("PUT", "stream")] * 2)
             self.assertEqual(self.files["stream"][0], b"retry the complete file")
@@ -337,11 +336,8 @@ class CloudLockTests(CloudContractFixture):
                 self.assertEqual(self.record()["owner"], client.access_lock.owner)
                 self.assertIsNone(client.put("payload", b"no etags"))
                 self.assertEqual(client.get("payload"), (b"no etags", None))
-                output = io.BytesIO()
-                self.assertIsNone(client.get_file("payload", output))
-                self.assertEqual(output.read(), b"no etags")
                 self.assertEqual(client.get_if_changed("payload", None), (b"no etags", None))
-                self.assertIsNone(client.put_file("stream", io.BytesIO(b"streamed")))
+                self.assertIsNone(client.put("stream", b"streamed"))
                 self.assertEqual(client.get("stream"), (b"streamed", None))
                 client.access_lock.renew()
                 client.release_file_lock()
@@ -376,9 +372,7 @@ class CloudLockTests(CloudContractFixture):
             return original_send(method, path, *args, **kwargs)
         with mock.patch.object(client.access_lock, "_log", side_effect=record), mock.patch.object(client, "_send_request", side_effect=block):
             client.acquire_file_lock()
-            output = io.BytesIO()
-            client.get_file("payload", output)
-            self.assertEqual(output.read(), b"download")
+            self.assertEqual(client.get("payload")[0], b"download")
             self.assertEqual(self.record()["expiresAt"], clock.wall + 300)
             client.release_file_lock()
         records = [json.loads(line) for line in client.diagnostic_log.path.read_text().splitlines()]

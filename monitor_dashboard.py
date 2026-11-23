@@ -38,7 +38,6 @@ from monitor_history import (
 )
 from monitor_skills import SkillError, SkillManager
 from monitor_session_refresh import refresh_session
-from monitor_token_ledger import token_cost_snapshot, token_sessions_from_ledger
 from monitor_usage_sync import add_record_provenance
 
 DASHBOARD_HTML_PATH = Path(__file__).with_name("dashboard.html")
@@ -46,7 +45,7 @@ MANAGEMENT_HTML_PATH = Path(__file__).with_name("management.html")
 DASHBOARD_PORT = 8765
 DASHBOARD_INSTANCE_NAME = f"CodexUsageMonitorDashboard-{DASHBOARD_PORT}"
 ACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS = 90
-INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS = 10 * 60
+INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS = 3 * 60
 SESSION_REFRESH_MAX_ATTEMPTS = 10
 SESSION_REFRESH_FAILURE_RETRY_SECONDS = 60 * 60
 SESSION_REFRESH_RESET_LATENCY_SECONDS = 60
@@ -158,9 +157,6 @@ class ControlAuth:
         return 0 <= current - issued_at <= CONTROL_COOKIE_MAX_AGE_SECONDS and hmac.compare_digest(signature, hmac.new(self.cookie_secret, payload, hashlib.sha256).hexdigest())
 
 def dashboard_safe_json(value):
-    from monitor_streaming import Records
-    if isinstance(value, Records):
-        return Records(lambda: (dashboard_safe_json(item) for item in value))
     if isinstance(value, dict):
         return {key: dashboard_safe_json(item) for key, item in value.items() if key not in SENSITIVE_DASHBOARD_FIELDS or key in {"password", "encryptionPassphrase"} and isinstance(item, bool)}
     if isinstance(value, list):
@@ -182,14 +178,21 @@ def dashboard_sample(sample: dict | None) -> dict | None:
         projected["usageAccountId"] = usage_account_id
     return projected
 
+def _assign_display_labels(items: list[dict], *, default_label: str, suffix_fn) -> None:
+    label_counts = {}
+    for item in items:
+        key = str(item.get("label") or default_label).casefold()
+        label_counts[key] = label_counts.get(key, 0) + 1
+    for item in items:
+        label = item.get("label") or default_label
+        item["displayLabel"] = f"{label} · {suffix_fn(item)}" if label_counts[label.casefold()] > 1 else label
+
+
 def dashboard_account_status(status: dict, usage_account_resolver=None, activation_history: list[dict] | None = None, slot_order: list | None = None) -> dict:
     items = [{key: account.get(key) for key in ("id", "label", "ready", "active", "pollError", "pollErrorAt", "stale", "accountType", "isApiAccount", "sessionRefresh", "configHeaderToml")} for account in status.get("items", [])]
-    label_counts = {}
-    for account in items:
-        label_counts[str(account.get("label") or "Unknown").casefold()] = label_counts.get(str(account.get("label") or "Unknown").casefold(), 0) + 1
+    _assign_display_labels(items, default_label="Unknown", suffix_fn=lambda account: str(account.get("id") or "profile")[-6:])
     for account in items:
         account["usageAccountId"] = usage_account_resolver(account.get("id")) if usage_account_resolver is not None else account.get("id") or "unknown"
-        account["displayLabel"] = f"{account.get('label') or 'Unknown'} · {str(account.get('id') or 'profile')[-6:]}" if label_counts[str(account.get("label") or "Unknown").casefold()] > 1 else account.get("label") or "Unknown"
     groups = {}
     for account in items:
         groups.setdefault(account["usageAccountId"], []).append(account)
@@ -220,8 +223,8 @@ def dashboard_account_status(status: dict, usage_account_resolver=None, activati
 def dashboard_accounts(state) -> dict:
     return dashboard_account_status(
         state.accounts.status(),
-        getattr(state.cloud, "usage_account_id", None) if hasattr(state, "cloud") else None,
-        state.accounts.attribution_timeline() if hasattr(state.accounts, "attribution_timeline") else [],
+        state.cloud.usage_account_id,
+        state.accounts.attribution_timeline(),
     )
 
 def dashboard_skill_status(status: dict) -> dict:
@@ -436,14 +439,12 @@ class UsageDashboardState:
         reset_runtime_baselines(self.console_event_state)
         previous_sample = self.runtime_state.get("lastSample")
         if isinstance(previous_sample, dict) and previous_sample.get("checkedAt"):
-            process_sample_delta_events(self.console_event_state, copy.deepcopy(previous_sample), None)
+            process_sample_delta_events(self.console_event_state, copy.deepcopy(previous_sample))
         self.console_event_state["_specialEvents"] = []
         with self.usage_data.index.transaction() as db:
             self.usage_data.index.put(db, "consoleState", self.console_event_state)
 
     def sync_device_auth(self, status: dict | None = None) -> None:
-        if not hasattr(self, "device_auth"):
-            return
         status = status or self.accounts.status()
         active = next((account for account in status["items"] if account["id"] == status["activeAccountId"]), None)
         self.device_auth.activate(active["id"] if active and not active.get("ready") and not active.get("isApiAccount") else None)
@@ -466,8 +467,7 @@ class UsageDashboardState:
         from monitor_sampling import WINDOWS, accepted_windows
         with self.usage_data.index.transaction() as db:
             state = self.usage_data.index.get(db, f"samplingState:local:{record_account_key(sample)}", {"windows": {}})
-            point = (self.usage_data.quota_preprocessor.observations.get(record_account_key(sample), {}) if getattr(self.usage_data.index, "canonical", False)
-                else self.usage_data.index.get(db, f"quotaObservation:{record_account_key(sample)}", {}))
+            point = self.usage_data.quota_preprocessor.observations.get(record_account_key(sample), {})
         sample["windows"], sample["rejectedWindows"] = accepted_windows(state["windows"]), {}
         for name, (label, _) in WINDOWS.items():
             if (raw_windows.get(label, {}).get("usedPercent") is not None
@@ -506,19 +506,16 @@ class UsageDashboardState:
             "activeAccountSlotId": account_id,
             "windows": ((previous or {}).get("windows") or {}) | sample["windows"],
         }
-        if event := getattr(self, "session_refresh_event", None):
-            event.set()
+        self.session_refresh_event.set()
         return True
 
     def _active_account_status_locked(self, accounts: dict, account_id: str | None = None) -> dict | None:
         if accounts["awaitingLogin"] and account_id in (None, accounts["activeAccountId"]):
             return None
-        if not hasattr(self, "account_statuses"):
-            self.account_statuses = {}
         for account in accounts["items"]:
             self.account_statuses.setdefault(account["id"], None)
         active_id = account_id if account_id is not None else accounts["activeAccountId"]
-        candidate = self.last_sample or getattr(self, "runtime_state", {}).get("lastSample")
+        candidate = self.last_sample or self.runtime_state.get("lastSample")
         if self.account_statuses.get(active_id) is None and isinstance(candidate, dict) and candidate.get("activeAccountSlotId") == active_id:
             self._update_account_status_locked(active_id, candidate)
         active = next((account for account in accounts["items"] if account["id"] == active_id), None)
@@ -535,8 +532,7 @@ class UsageDashboardState:
     def _dashboard_accounts_locked(self) -> dict:
         status = dashboard_accounts(self)
         for account in status["items"]:
-            errors = getattr(self, "inactive_account_poll_errors", {})
-            if error := errors.get(account["usageAccountId"]) or errors.get(account["id"]):
+            if error := self.inactive_account_poll_errors.get(account["usageAccountId"]) or self.inactive_account_poll_errors.get(account["id"]):
                 account.update({"pollError": True, "pollErrorAt": error["at"], "stale": True})
         return status
 
@@ -554,16 +550,16 @@ class UsageDashboardState:
             for account in accounts["items"]:
                 account_sample = last_sample if account["id"] == accounts["activeAccountId"] else self._active_account_status_locked(accounts, account["id"])
                 account_statuses[account["id"]] = {"lastSample": dashboard_sample(account_sample), "display": dashboard_display(account_sample)}
-            control_password_configured = control_password_is_configured(self.cloud.config()["control"]) if hasattr(self, "cloud") else True
-            processing = {"ingestion": dict(self.usage_data.index.metrics), "projection": {}} if hasattr(self, "usage_data") else None
+            control_password_configured = control_password_is_configured(self.cloud.config()["control"])
+            processing = {"ingestion": dict(self.usage_data.index.metrics), "projection": {}}
             return {
-                "revision": _dashboard_revision({"sample": sample, "accountStatuses": {key: value["lastSample"] for key, value in account_statuses.items()}, "accounts": accounts, "error": self.last_error, "controlPasswordConfigured": control_password_configured, **({"processing": processing} if processing else {})}),
+                "revision": _dashboard_revision({"sample": sample, "accountStatuses": {key: value["lastSample"] for key, value in account_statuses.items()}, "accounts": accounts, "error": self.last_error, "controlPasswordConfigured": control_password_configured, "processing": processing}),
                 "controlPasswordConfigured": control_password_configured,
                 "lastSample": sample,
                 "display": dashboard_display(last_sample),
                 "accounts": accounts,
                 "accountStatuses": account_statuses,
-                **({"processing": processing} if processing else {}),
+                "processing": processing,
             }
 
 
@@ -575,10 +571,8 @@ class UsageDashboardState:
                 cloud_refresh = self._dashboard_cloud_pending
                 self._dashboard_cloud_pending = False
             try:
-                if hasattr(self, "delivery"):
-                    self.delivery.cloud_pending |= cloud_refresh
-                    self.delivery.prepare(status=self.status_payload())
-                    self.usage_data.index.maintain_disk_space()
+                self.delivery.cloud_pending |= cloud_refresh
+                self.delivery.prepare(status=self.status_payload())
             except Exception as exc:
                 if cloud_refresh:
                     with self._dashboard_signal_lock:
@@ -586,27 +580,16 @@ class UsageDashboardState:
                 console_log(f"Dashboard display cache maintenance failed: {exc}", level="error")
 
     def _signal_dashboard_cache(self, reason: str = "local") -> None:
-        if reason == "cloud" and hasattr(self, "_dashboard_signal_lock"):
+        if reason == "cloud":
             with self._dashboard_signal_lock:
                 self._dashboard_cloud_pending = True
-        event = getattr(self, "dashboard_cache_event", None)
-        if event is not None:
-            event.set()
-
-    def state(self) -> dict:
-        with self.lock:
-            return copy.deepcopy(self.runtime_state)
-
-    def quota_history(self) -> list[dict]:
-        with self.lock:
-            return self.usage_data.index.rows("quota")
+        self.dashboard_cache_event.set()
 
     def _print_usage_console_events(self, sample: dict) -> None:
-        process_sample_delta_events(self.console_event_state, copy.deepcopy(sample), None)
+        process_sample_delta_events(self.console_event_state, copy.deepcopy(sample))
         print_special_events(self.console_event_state.get("_specialEvents") or [])
-        if hasattr(self, "usage_data") and hasattr(self.usage_data, "index"):
-            with self.usage_data.index.transaction() as db:
-                self.usage_data.index.put(db, "consoleState", self.console_event_state)
+        with self.usage_data.index.transaction() as db:
+            self.usage_data.index.put(db, "consoleState", self.console_event_state)
 
     def run_token_capture(self) -> None:
         while self.running:
@@ -664,24 +647,6 @@ class UsageDashboardState:
                     account_status["activeAccountId"], sample["accountLabel"], self.accounts.attribution_timeline(),
                     lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
                 )
-            elif token_usage:
-                from monitor_token_ledger import reconcile_token_ledger
-                rows, new_costs = reconcile_token_ledger(
-                    self.usage_data.index.rows("tokenLedger"), token_usage.get("events") or [],
-                    account_status["activeAccountId"], sample["accountLabel"], self.accounts.attribution_timeline(),
-                    lambda row: add_record_provenance("tokenLedger", row, self.cloud.machine_id, self.cloud.usage_account_id(row.get("accountSlotId") or (row.get("session") or {}).get("accountSlotId"))),
-                    token_usage.get("sourceFiles"), self.cloud.machine_id,
-                )
-                self.usage_data.record_ledger(rows)
-                for row in new_costs:
-                    self.accounts.promote_active_slot_on_cost(row)
-                token_sessions = token_sessions_from_ledger(rows)
-                sample["cost"], sample["costByModel"] = token_cost_snapshot(token_sessions)
-                token_usage.pop("sessions", None)
-                token_usage.pop("events", None)
-                token_usage.pop("completeSessionIds", None)
-                token_usage.pop("incompleteSessionIds", None)
-                token_usage.pop("sourceFiles", None)
             self.runtime_state["activeAccountSlotId"] = account_status["activeAccountId"]
             if not api_account:
                 self._record_quota_sample_locked(sample)
@@ -750,11 +715,6 @@ class UsageDashboardState:
             if now - self.inactive_account_poll_started_at.get(credential["usageAccountId"], float("-inf")) < INACTIVE_ACCOUNT_POLL_INTERVAL_SECONDS:
                 continue
             self.inactive_account_poll_started_at[credential["usageAccountId"]] = now
-            try:
-                if is_api_auth(json.loads(credential["data"].decode("utf-8"))):
-                    continue
-            except (UnicodeDecodeError, json.JSONDecodeError):
-                continue
             try:
                 self._poll_inactive_account(credential)
                 with self.lock:
@@ -1031,7 +991,7 @@ class UsageDashboardState:
                 self.accounts.sync_config_from_disk()
             except AccountError as exc:
                 self.accounts.error = f"config.toml update could not be recorded: {exc}"
-            if getattr(self, "skill_scan_requested", False) or time.monotonic() - getattr(self, "skill_scan_at", 0) >= 60:
+            if self.skill_scan_requested or time.monotonic() - self.skill_scan_at >= 60:
                 self.skill_scan_requested = False
                 try:
                     self.skill_scan_snapshot = self.skills.scan(refresh=True)
@@ -1178,12 +1138,7 @@ def dashboard_remote_accounts(accounts: list[dict], local_api_identity_ids: set[
         "accountKey": item.get("accountKey"), "label": item.get("label"), "accountType": item.get("accountType", "account"),
         **({"canLink": (item.get("_apiIdentityId") or item.get("apiIdentityId")) not in local_api_identity_ids} if item.get("accountType") == "api" else {"canBind": item.get("accountKey") not in local_cloud_keys}),
     } for item in accounts]
-    label_counts = {}
-    for account in rows:
-        label_counts[str(account.get("label") or "Cloud account").casefold()] = label_counts.get(str(account.get("label") or "Cloud account").casefold(), 0) + 1
-    for account in rows:
-        label = account.get("label") or "Cloud account"
-        account["displayLabel"] = f"{label} · {str(account.get('accountKey') or 'profile')[:6]}" if label_counts[label.casefold()] > 1 else label
+    _assign_display_labels(rows, default_label="Cloud account", suffix_fn=lambda account: str(account.get("accountKey") or "profile")[:6])
     return rows
 
 CLOUD_QUEUE_ACTIONS = {
@@ -1244,57 +1199,32 @@ def enqueue_management_action(state, control_auth, path, body):
 
 
 def management_payload(state: UsageDashboardState, include_remote: bool = False, refresh_scan: bool = False) -> dict:
-    if refresh_scan and hasattr(state, "skill_scan_snapshot") and time.monotonic() - state.skill_scan_at >= 30:
+    if refresh_scan and time.monotonic() - state.skill_scan_at >= 30:
         state.skill_scan_requested = True
         state.config_monitor_event.set()
-    remote_accounts = state.cloud.cached_remote_accounts()
-    api_identity_ids = state.accounts.api_identity_ids() if hasattr(state.accounts, "api_identity_ids") else {}
+    api_identity_ids = state.accounts.api_identity_ids()
     accounts = dashboard_accounts(state)
-    if hasattr(state, "sync_device_auth"):
-        state.sync_device_auth(accounts)
-    remote_api_identity_ids = {item.get("_apiIdentityId") or item.get("apiIdentityId") for item in remote_accounts if item.get("accountType") == "api"}
-    for account in accounts["items"]:
-        if account.get("isApiAccount"):
-            account["canShare"] = bool(account.get("ready")) and api_identity_ids.get(account["id"]) not in remote_api_identity_ids
+    state.sync_device_auth(accounts)
     payload = {
         "programVersion": getattr(state, "program_version", installed_version(Path(__file__).resolve().parent)),
         "server": state.cloud.config()["server"],
         "editableConfig": state.cloud.editable_config(),
         "skills": dashboard_skill_status(state.skills.status()),
-        "scan": [{**{key: item.get(key) for key in ("name", "sources", "authoritativeSource", "defaultAssignments")}, **({"error": "Skill scan error"} if item.get("error") else {})} for item in (state.skill_scan_snapshot if hasattr(state, "skill_scan_snapshot") else state.skills.scan(refresh_scan))],
+        "scan": [{**{key: item.get(key) for key in ("name", "sources", "authoritativeSource", "defaultAssignments")}, **({"error": "Skill scan error"} if item.get("error") else {})} for item in state.skill_scan_snapshot],
         "cloud": dashboard_cloud_status(state.cloud.redacted_status()),
         "accounts": accounts,
-        "deviceAuth": state.device_auth.status() if hasattr(state, "device_auth") else None,
-        "apiConfig": state.accounts.config_editor_payload() if hasattr(state.accounts, "config_editor_payload") else {},
+        "deviceAuth": state.device_auth.status(),
+        "apiConfig": state.accounts.config_editor_payload(),
     }
     if include_remote and payload["cloud"]["webdav"].get("enabled"):
         state.cloud.fetch(include_usage=False)
-        remote_accounts = state.cloud.cached_remote_accounts()
-        remote_api_identity_ids = {item.get("_apiIdentityId") or item.get("apiIdentityId") for item in remote_accounts if item.get("accountType") == "api"}
-        for account in accounts["items"]:
-            if account.get("isApiAccount"):
-                account["canShare"] = bool(account.get("ready")) and api_identity_ids.get(account["id"]) not in remote_api_identity_ids
-    payload["remoteAccounts"] = dashboard_remote_accounts(remote_accounts, set(api_identity_ids.values()), state.accounts.cloud_account_keys() if hasattr(state.accounts, "cloud_account_keys") else set())
+    remote_accounts = state.cloud.cached_remote_accounts()
+    remote_api_identity_ids = {item.get("_apiIdentityId") or item.get("apiIdentityId") for item in remote_accounts if item.get("accountType") == "api"}
+    for account in accounts["items"]:
+        if account.get("isApiAccount"):
+            account["canShare"] = bool(account.get("ready")) and api_identity_ids.get(account["id"]) not in remote_api_identity_ids
+    payload["remoteAccounts"] = dashboard_remote_accounts(remote_accounts, set(api_identity_ids.values()), state.accounts.cloud_account_keys())
     return payload
-
-def dashboard_status_payload(state: UsageDashboardState) -> dict:
-    if hasattr(state, "status_payload"):
-        return state.status_payload()
-    accounts = dashboard_accounts(state)
-    last_sample = state.last_sample
-    if accounts["awaitingLogin"] or not isinstance(last_sample, dict) or last_sample.get("activeAccountSlotId") != accounts["activeAccountId"]:
-        last_sample = None
-    sample = dashboard_sample(last_sample)
-    return {
-        "revision": _dashboard_revision({"sample": sample, "accounts": accounts}),
-        "streamId": None,
-        "newestIndex": 0,
-        "mergedRevision": None,
-        "controlPasswordConfigured": control_password_is_configured(state.cloud.config()["control"]) if hasattr(state, "cloud") else True,
-        "lastSample": sample,
-        "display": dashboard_display(last_sample),
-        "accounts": accounts,
-    }
 
 def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_opener_factory=None, runtime_dir: Path | None = None) -> int:
     try:
@@ -1350,34 +1280,6 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
             self.wfile.write(body)
 
         def send_json(self, status: int, payload: dict, headers: dict | None = None, *, sanitize: bool = True, cache_key: str | None = None):
-            from monitor_streaming import Records, dashboard_json_chunks
-            def streamed(value):
-                return isinstance(value, Records) or isinstance(value, dict) and any(streamed(item) for item in value.values())
-            if streamed(payload):
-                from monitor_streaming import close_records
-                with tempfile.TemporaryFile() as spool:
-                    compress = "gzip" in (self.headers.get("Accept-Encoding") or "").lower()
-                    output = gzip.GzipFile(fileobj=spool, mode="wb") if compress else spool
-                    try:
-                        for chunk in dashboard_json_chunks(dashboard_safe_json(payload) if sanitize else payload):
-                            output.write(chunk)
-                    finally:
-                        close_records(payload)
-                    if compress:
-                        output.close()
-                    length = spool.tell()
-                    spool.seek(0)
-                    self.send_response(status)
-                    self.send_header("Content-Type", "application/json; charset=utf-8")
-                    for key, value in ({"Cache-Control": "no-store", "Vary": "Accept-Encoding"} | (headers or {})).items():
-                        self.send_header(key, value)
-                    if compress:
-                        self.send_header("Content-Encoding", "gzip")
-                    self.send_header("Content-Length", str(length))
-                    self.end_headers()
-                    for chunk in iter(lambda: spool.read(65536), b""):
-                        self.wfile.write(chunk)
-                return
             body = None
             if cache_key:
                 with response_body_cache_lock:
@@ -1446,15 +1348,9 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                 self.end_headers()
                 self.wfile.write(management_html().encode("utf-8"))
                 return
-            if path == "/api/series":
-                self.send_json(410, {"error": "The series protocol has been removed; use /api/dashboard bulk snapshots"})
-                return
             if path == "/api/dashboard/live":
                 from monitor_live import serve_live
                 serve_live(self, state.delivery, lambda: state.running)
-                return
-            if path == "/api/dashboard/chunk":
-                self.send_json(410, {"error": "Reload the dashboard to obtain a complete bulk snapshot"})
                 return
             if path == "/api/dashboard":
                 from monitor_live import send_bulk
@@ -1463,7 +1359,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
                     self.send_json(503, {"error": "History is being prepared", "preparing": True}, {"Retry-After": "1"})
                 return
             if path == "/api/status":
-                payload = getattr(getattr(state, "delivery", None), "state", None) or dashboard_status_payload(state)
+                payload = state.delivery.state or state.status_payload()
                 etag = f'W/"status-{payload["revision"]}"'
                 if self.headers.get("If-None-Match") == etag:
                     self.send_not_modified(etag)
@@ -1488,13 +1384,13 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
 
         def handle_post(self):
             path = urllib.parse.urlparse(self.path).path
-            allowed = {
+            allowed = set(CLOUD_QUEUE_ACTIONS) | {
                 "/api/control/login", "/api/control/setup",
-                "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/accounts/session-refresh", "/api/accounts/device-code", "/api/manage/skills/manage", "/api/manage/skills/unmanage", "/api/manage/skills/assign", "/api/manage/skills/share",
-                "/api/manage/cloud/test", "/api/manage/cloud/fetch", "/api/manage/cloud/fetch-all", "/api/manage/cloud/push", "/api/manage/cloud/push-all", "/api/manage/cloud/restore", "/api/manage/cloud/overwrite", "/api/manage/accounts/bind", "/api/manage/accounts/link", "/api/manage/accounts/release", "/api/manage/accounts/share", "/api/manage/accounts/delete", "/api/manage/accounts/delete-remote", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/accounts/migrate-sessions", "/api/manage/server", "/api/manage/config", "/api/manage/config/reload", "/api/manage/update/check"
+                "/api/accounts", "/api/accounts/switch", "/api/accounts/rename", "/api/accounts/delete", "/api/accounts/session-refresh", "/api/accounts/device-code",
+                "/api/manage/skills/manage", "/api/manage/skills/assign",
+                "/api/manage/accounts/delete", "/api/manage/accounts/header", "/api/manage/accounts/common-header", "/api/manage/accounts/common", "/api/manage/accounts/migrate-sessions",
+                "/api/manage/server", "/api/manage/update/check", "/api/manage/cloud/queue/cancel",
             }
-            allowed.add("/api/manage/accounts/common")
-            allowed.add("/api/manage/cloud/queue/cancel")
             if path not in allowed:
                 self.send_json(404, {"error": "Not found"})
                 return
@@ -1609,7 +1505,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
     control_auth = ControlAuth(state.cloud.config()["control"])
     def managed_worker(operation):
         from monitor_common import REQUEST_STOP
-        REQUEST_STOP.event = getattr(state, "stop_event", None)
+        REQUEST_STOP.event = state.stop_event
         operation()
     console_log("Startup: starting token capture, quota polling, session refresh, dashboard, cloud, and configuration workers...")
     args.background_token_capture = True
@@ -1655,8 +1551,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         except Exception as exc:
             console_log(f"Final auth.json reconciliation failed: {exc}", level="error")
         state.running = False
-        if hasattr(state, "stop_event"):
-            state.stop_event.set()
+        state.stop_event.set()
         state.device_auth.stop()
         state.wake_event.set()
         state.inactive_account_poll_event.set()
@@ -1671,9 +1566,7 @@ def serve_dashboard(args, opener: urllib.request.OpenerDirector | None, update_o
         for worker in (thread, inactive_account_thread, session_refresh_thread, dashboard_cache_thread, config_thread):
             worker.join()
         server.server_close()
-        if hasattr(state, "delivery") and hasattr(state.delivery, "close"):
-            state.delivery.close()
-        if hasattr(state, "usage_data"):
-            state.usage_data.index.close()
+        state.delivery.close()
+        state.usage_data.index.close()
         instance_lock.release()
     return AUTO_UPDATE_RESTART if auto_updater is not None and auto_updater.restart_requested else 0

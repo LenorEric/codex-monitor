@@ -240,11 +240,8 @@ class CanonicalRepository:
 
     @classmethod
     def dirty_all(cls, db):
-        if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_pending'").fetchone():
-            from monitor_delivery import enqueue_accounts
-            enqueue_accounts(db)
-        else:
-            db.executemany("INSERT OR IGNORE INTO delivery_dirty VALUES(?,?)", cls.accounts(db))
+        from monitor_delivery import enqueue_accounts
+        enqueue_accounts(db)
 
     @staticmethod
     def update_account(db, account, slot, label):
@@ -255,7 +252,5 @@ class CanonicalRepository:
     @staticmethod
     def rename_account(db, slot, label):
         for table, fields in TABLES.values():
-            if not db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_pending'").fetchone():
-                db.execute(f"INSERT OR IGNORE INTO delivery_dirty SELECT dataset,account FROM {table} WHERE account_slot=?", (slot,))
             mask = 1 << next(bit for bit, field in enumerate(fields) if field[0] == "account_label")
             db.execute(f"UPDATE {table} SET account_label=?,present=present|? WHERE account_slot=?", (label, mask, slot))

@@ -1,7 +1,7 @@
 
 import unittest
 
-from monitor_interpretation import PRO_CUTOVER, aggregate_tokens, chart_rows, connected, multiplier, nearest, usage_runs, valid_intervals, weighted
+from monitor_interpretation import PRO_CUTOVER, chart_rows, connected, multiplier, nearest, usage_runs, valid_intervals, weighted
 
 
 def point(stamp, value, reset=100000, plan="plus", weekly=None):
@@ -57,14 +57,6 @@ class InterpretationTests(unittest.TestCase):
         runs = usage_runs([point(0, 1, plan="pro"), point(100, 2, plan="pro"), point(200, 3, plan="plus"), point(300, 4, plan="plus")], "5h")
         self.assertEqual([row[3:] for row in valid_intervals(runs)], [[20, 20], [1, 1]])
 
-    def test_union_of_window_boundaries(self):
-        intervals = {"5h": [["a", 0, 3, 1, 1], ["b", 3, 7, 1, 1]], "7d": [["c", 2, 6, 1, 1]]}
-        events = [[str(t), t, "m", "default", 1, 2, 3, 4, 10] for t in (.5, 1, 2.5, 4, 5, 6.5)]
-        rows = aggregate_tokens(events, intervals)
-        self.assertEqual(len(rows), 4)
-        self.assertEqual(sum(model[-1] for row in rows for model in row[2]), 60)
-        self.assertEqual(sum(model[2] for row in rows for model in row[2]), 6)
-
     def test_nearest_ties_choose_earlier_interval(self):
         intervals = [["a", 0, 10], ["b", 20, 30]]
         self.assertEqual(nearest(intervals, 15), 0)
@@ -87,7 +79,6 @@ class InterpretationTests(unittest.TestCase):
         events = [[str(t), t, "m", "default", 1, 0, 0, 0, 100] for t in (399, 400, 1050, 1700, 1701, 5000)]
         self.assertEqual(sum(model[1] for row in chart_rows(events, intervals["5h"]) for model in row[6]), 300)
         self.assertEqual(sum(model[1] for row in chart_rows(events, intervals["7d"]) for model in row[6]), 600)
-        self.assertEqual(sum(model[-1] for row in aggregate_tokens(events, intervals) for model in row[2]), 600)
 
     def test_flat_and_outside_costs_are_never_lost(self):
         events = [[str(t), t, "m", "default", 1, 0, 0, 0, 100] for t in (-10, 5, 15, 25, 50)]
@@ -95,17 +86,9 @@ class InterpretationTests(unittest.TestCase):
         rows = chart_rows(events, intervals)
         self.assertEqual(sum(m[1] for row in rows for m in row[6]), 500)
         self.assertEqual([row[6][0][1] for row in rows], [300, 200])
-        self.assertEqual(len(aggregate_tokens(events, {"5h": [], "7d": []})), 5)
 
-    def test_api_minute_groups_and_zero_cost_average(self):
-        events = [[str(t), t, "m", "default", 1, 0, 0, 0, 0] for t in (1, 59, 60)]
-        rows = aggregate_tokens(events, {}, api=True)
-        self.assertEqual([row[1] for row in rows], [30, 60])
+    def test_weighted_average_cost_rounding(self):
         self.assertEqual(weighted([["a", 10, 1], ["b", 20, 3]]), 18)
-
-
-if __name__ == "__main__":
-    unittest.main()
 
 
 if __name__ == "__main__":

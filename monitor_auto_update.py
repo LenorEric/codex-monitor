@@ -8,7 +8,6 @@ import os
 import re
 import shutil
 import sys
-import tempfile
 import threading
 import time
 import urllib.parse
@@ -75,23 +74,6 @@ def validate_manifest(value) -> tuple[str, dict[str, dict]]:
             raise AutoUpdateError("Runtime update exceeds the maximum total size")
         normalized[name] = {"size": descriptor["size"], "sha256": digest}
     return version, normalized
-
-
-def _atomic_write(path: Path, data: bytes) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
-    try:
-        with os.fdopen(descriptor, "wb") as output:
-            output.write(data)
-            output.flush()
-            os.fsync(output.fileno())
-        os.replace(temporary, path)
-    except Exception:
-        try:
-            os.unlink(temporary)
-        except OSError:
-            pass
-        raise
 
 
 def check_startup_update(runtime_dir: Path, data_home: Path, opener_factory, timeout: int = 10) -> bool:

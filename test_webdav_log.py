@@ -67,13 +67,13 @@ class WebDavLogTests(unittest.TestCase):
             self.assertNotIn(secret, self.log.path.read_text())
         self.assertTrue(error.fp.closed)
 
-    def test_success_expected_http_error_and_streamed_bytes(self):
+    def test_success_expected_http_error_and_downloaded_bytes(self):
         client = self.client()
         response = mock.MagicMock(status=200, headers={"ETag": '"1"'})
         response.__enter__.return_value = response
-        response.read.side_effect = [b"one", b"two", b""]
+        response.read.return_value = b"onetwo"
         client.opener.open = mock.Mock(return_value=response)
-        client.request("GET", "file", output=io.BytesIO())
+        client.request("GET", "file")
         self.assertEqual(self.records()[-1]["transfer"]["downloadBytes"], 6)
         client.opener.open.side_effect = urllib.error.HTTPError(client.base, 404, "missing", {}, io.BytesIO(b""))
         self.assertEqual(client.request("DELETE", "missing", expected=(204, 404))[2], 404)

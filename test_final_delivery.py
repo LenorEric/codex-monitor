@@ -19,7 +19,6 @@ from monitor_delivery import Totals, encoded
 from monitor_interpretation import chart_rows, nearest, usage_runs, valid_intervals
 from monitor_live import send_bulk
 from monitor_sampling import quota_point
-from test_support_delivery import released_delivery
 from monitor_common import empty_token_totals, empty_cost_totals
 
 
@@ -71,7 +70,8 @@ class FinalDeliveryTests(unittest.TestCase):
         return row
 
     def bulk(self):
-        return json.loads(self.delivery.bulk(False))
+        with self.delivery.snapshot_file(False) as (file, _):
+            return json.loads(file.read())
 
     def view(self, view="local"):
         return self.bulk()["accounts"][0][view]
@@ -154,7 +154,8 @@ class FinalDeliveryTests(unittest.TestCase):
             self.assertEqual(target, {row[0]: row for row in expected})
         restarted = DashboardDelivery(self.store.index)
         self.addCleanup(restarted.close)
-        self.assertEqual(json.loads(restarted.bulk(False)), self.bulk())
+        with restarted.snapshot_file(False) as (file, _):
+            self.assertEqual(json.loads(file.read()), self.bulk())
 
     def test_late_quota_updates_chart_without_reading_or_replacing_old_tokens(self):
         for stamp in (1100, 1500, 1900):
@@ -480,7 +481,8 @@ class FinalDeliveryTests(unittest.TestCase):
             self.delivery.prepare()
             old.seek(0)
             self.assertEqual(old.read(), saved)
-        self.assertEqual(gzip.decompress(self.delivery.bulk()), self.delivery.bulk(False))
+        with self.delivery.snapshot_file(True) as (gz, _), self.delivery.snapshot_file(False) as (plain, _):
+            self.assertEqual(gzip.decompress(gz.read()), plain.read())
         class Handler:
             headers = {"Accept-Encoding": "gzip"}
             wfile = io.BytesIO()
@@ -488,8 +490,7 @@ class FinalDeliveryTests(unittest.TestCase):
             def send_header(self, key, value): pass
             def end_headers(self): pass
         handler = Handler()
-        with mock.patch.object(self.delivery, "bulk", side_effect=AssertionError("HTTP materialized full bytes")):
-            self.assertTrue(send_bulk(handler, self.delivery))
+        self.assertTrue(send_bulk(handler, self.delivery))
         self.assertEqual(json.loads(gzip.decompress(handler.wfile.getvalue())), self.bulk())
 
     def test_no_preparation_tables_or_durable_snapshot(self):
@@ -521,7 +522,7 @@ class FinalDeliveryTests(unittest.TestCase):
         self.assertIsNone(self.delivery.replay(self.delivery.head[0], cursor))
 
     def test_migration_recalculation_removes_orphans_without_discarding_tokens(self):
-        from monitor_delivery import request_attribution_rebuild
+        from monitor_delivery import enqueue_quota_recalculation
         self.put_quota(1000, 10)
         self.put_quota(2000, 20)
         self.token("a", 1500)
@@ -531,7 +532,8 @@ class FinalDeliveryTests(unittest.TestCase):
             db.execute("DELETE FROM canonical_quota")
             db.execute("DELETE FROM delivery_pending")  # Simulate lost derived progress.
         with self.store.index.transaction() as db:
-            request_attribution_rebuild(db)
+            enqueue_quota_recalculation(db)
+            db.execute("INSERT OR REPLACE INTO delivery_meta VALUES('attributionRule',?)", ("1",))
         self.delivery.prepare()
         self.assertEqual(self.view()["tokens"], before)
         self.assertEqual(self.view()["usage:5h"], [])
@@ -592,12 +594,6 @@ class FinalDeliveryTests(unittest.TestCase):
             insert(21, 2000)
             self.assertLess(steps(), before * 2 + 100)
 
-
-class FinalDeliveryMigrationTests(unittest.TestCase):
-    setUp = FinalDeliveryTests.setUp
-    quota = staticmethod(FinalDeliveryTests.quota)
-    put_quota = FinalDeliveryTests.put_quota
-    token = FinalDeliveryTests.token
 
 if __name__ == '__main__':
     unittest.main()

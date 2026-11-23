@@ -396,7 +396,7 @@ class SkillManager:
             raise
         _unlink_directory_link(quarantine) if _is_link(quarantine) else shutil.rmtree(quarantine) if quarantine.is_dir() else quarantine.unlink()
 
-    def assign(self, name: str, app: str, enabled: bool) -> dict:
+    def _apply_assignment(self, name: str, app: str, enabled: bool) -> None:
         name = _safe_name(name)
         if app not in self.paths or not (self.skills_root / name / "SKILL.md").is_file():
             raise SkillError("Unknown managed skill or application", 404)
@@ -411,6 +411,9 @@ class SkillManager:
             self._remove_projection(name, app)
         record[app] = bool(enabled)
         record.pop(f"{app}Error", None)
+
+    def assign(self, name: str, app: str, enabled: bool) -> dict:
+        self._apply_assignment(name, app, enabled)
         self._save()
         self._invalidate_status()
         return self.status()
@@ -443,7 +446,7 @@ class SkillManager:
                 errors = []
                 for app in item["defaultAssignments"]:
                     try:
-                        self.assign(name, app, True)
+                        self._apply_assignment(name, app, True)
                     except SkillError as exc:
                         self.state["skills"][name][f"{app}Error"] = str(exc)
                         errors.append(str(exc))
@@ -546,7 +549,7 @@ class SkillManager:
                         record[app] = False
                         record.pop(f"{app}Error", None)
                         continue
-                    self.assign(name, app, bool(record.get(app)))
+                    self._apply_assignment(name, app, bool(record.get(app)))
                 except SkillError as exc:
                     record[f"{app}Error"] = str(exc)
                     errors.append({"name": name, "app": app, "error": str(exc)})
@@ -628,9 +631,6 @@ class SkillManager:
             archive.writestr("manifest.json", json.dumps(manifest, separators=(",", ":"), ensure_ascii=False).encode())
         return buffer.getvalue()
 
-    def content_hash(self) -> str:
-        return hashlib.sha256(json.dumps(self.content_hashes(), sort_keys=True, separators=(",", ":")).encode()).hexdigest()
-
     def content_hashes(self, names: set[str] | None = None) -> dict[str, str]:
         self._invalidate_status()
         current = {item["name"] for item in self.status()["items"] if item["shared"]}
@@ -646,9 +646,6 @@ class SkillManager:
             }
             hashes[name] = hashlib.sha256(json.dumps(content, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
         return hashes
-
-    def snapshot_content_hash(self, data: bytes) -> str:
-        return hashlib.sha256(json.dumps({name: self.skill_package_hash(package) for name, package in self.split_snapshot(data).items()}, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
     def skill_package_hash(self, data: bytes) -> str:
         manifest, _ = self.inspect_snapshot(data)

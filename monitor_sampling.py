@@ -1,24 +1,8 @@
 """Quota observation helpers."""
 
-import json
-from contextlib import contextmanager
-from contextvars import ContextVar
-
 from monitor_common import coerce_float, parse_timestamp
-from monitor_interpretation import quota_point_order
 
 WINDOWS = {"fiveHour": ("5h", 18000), "sevenDay": ("7d", 604800)}
-_refresh_deferred = ContextVar("sampling_refresh_deferred", default=False)
-
-
-@contextmanager
-def defer_refresh():
-    """Keep queued sampling work until the complete migration cascade finishes."""
-    token = _refresh_deferred.set(True)
-    try:
-        yield
-    finally:
-        _refresh_deferred.reset(token)
 
 
 def quota_point(row):
@@ -51,17 +35,3 @@ def accepted_windows(state):
     return {label: {"usedPercent": state[name]["raw"], "resetAt": state[name]["resetAt"], "plan": state[name]["plan"],
         "planMultiplier": multiplier(state[name]["plan"], state[name]["timestamp"]), "percentCheckedAt": state[name]["checkedAt"]}
         for name, (label, _) in WINDOWS.items() if name in state}
-
-
-def point_key(point):
-    return point.get("_key") or (f"{point['checkedAt']}:reset:{point['resetWindow']}" if point.get("resetWindow") else point["checkedAt"])
-
-
-def stored_points(db, view, account=None):
-    query = "SELECT data FROM processing_sampled_quota WHERE view=?"
-    values = [view]
-    if account is not None:
-        query += " AND account=?"
-        values.append(account)
-    points = [json.loads(row[0]) for row in db.execute(query + " ORDER BY event_at IS NULL,event_at,account,record_key", values)]
-    return sorted(points, key=quota_point_order)

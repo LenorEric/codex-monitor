@@ -374,11 +374,5 @@ def coerce_float(value) -> float | None:
         return None
     return parsed if parsed == parsed and parsed not in (float("inf"), float("-inf")) else None
 
-def first_value(mapping: dict, *keys: str):
-    for key in keys:
-        if key in mapping:
-            return mapping[key]
-    return None
-
 def poll_sleep_seconds(acquire_started_at: float, interval: int | float, now: float | None = None) -> float:
     return max(max(interval, 1) - ((time.monotonic() if now is None else now) - acquire_started_at), 0)

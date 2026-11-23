@@ -195,11 +195,6 @@ class FinalDelivery:
         return db.execute("SELECT value FROM delivery_meta WHERE name='epoch'").fetchone()[0], cls.cursors(db)
 
     @staticmethod
-    def _runs(db, view, account, window):
-        return [json.loads(body) for body, in db.execute("SELECT body FROM delivery_items WHERE view=? AND account=? AND channel=? "
-            "ORDER BY first,json_extract(body,'$[3]') IS NULL,json_extract(body,'$[3]'),id", (view, account, "usage:" + window))]
-
-    @staticmethod
     def _stage(db):
         db.execute("CREATE TABLE stage.edits" + ITEM_DDL)
         db.execute("CREATE INDEX stage.edits_end ON edits(view,account,channel,last,id)")
@@ -683,11 +678,6 @@ class FinalDelivery:
             with self.lock:
                 artifact.release()
 
-    def bulk(self, compressed=True):
-        """Compatibility for tests/exporters. HTTP must use snapshot_file()."""
-        with self.snapshot_file(compressed) as (file, _):
-            return file.read()
-
     def replay(self, epoch, cursors, page_bytes=256 * 1024):
         if not isinstance(cursors, dict) or not cursors or any(stream not in {"local", "merged", "state"} or type(seq) is not int or seq < 0 for stream, seq in cursors.items()):
             raise ValueError("Invalid stream cursor")
@@ -742,11 +732,4 @@ def numeric_state(value):
     return result
 
 
-def request_attribution_rebuild(db):
-    enqueue_quota_recalculation(db)
-    if db.execute("SELECT 1 FROM sqlite_master WHERE name='delivery_meta'").fetchone():
-        db.execute("INSERT OR REPLACE INTO delivery_meta VALUES('attributionRule',?)", ("1",))
-
-
-initialize_delivery = initialize
 DashboardDelivery = FinalDelivery

@@ -50,7 +50,6 @@ class ConsoleStateTests(unittest.TestCase):
         self.assertEqual(state.console_event_state["windows"]["5h"]["cumulativeCostUsd"], 14)
         self.assertEqual(state.console_event_state["windows"]["5h"]["models"]["model-a"]["cumulativePercent"], 7)
         self.assertEqual(state.console_event_state["windows"]["5h"]["baselinePercent"], 20)
-        self.assertEqual(state.console_event_state["_pendingCostIntervals"], [])
         self.assertEqual(state.console_event_state["_specialEvents"], [])
         state.usage_data.datasets.assert_called_once_with("local")
         with self.index.transaction() as db:
@@ -64,7 +63,6 @@ class ConsoleStateTests(unittest.TestCase):
         self.assertEqual(state.console_event_state["windows"]["5h"]["cumulativePercent"], 10)
         self.assertEqual(state.console_event_state["windows"]["5h"]["cumulativeCostUsd"], 20)
         self.assertEqual(state.console_event_state["windows"]["5h"]["baselinePercent"], 20)
-        self.assertEqual(state.console_event_state["_pendingCostIntervals"], [])
 
     def test_missing_or_malformed_cache_can_recover_without_a_previous_sample(self):
         for cached in (None, {}, {"windows": []}, {"windows": {"5h": None, "7d": {}}}):
@@ -99,18 +97,18 @@ class ConsoleStateTests(unittest.TestCase):
 
     def test_incremental_unavailable_window_retains_totals_and_rebases_on_return(self):
         state = {}
-        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=10), None)
-        first = process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=6, cost=12), None)
+        process_sample_delta_events(state, event_sample("2030-01-01T00:00:00Z", five_hour=5, cost=10))
+        first = process_sample_delta_events(state, event_sample("2030-01-01T01:00:00Z", five_hour=6, cost=12))
         self.assertEqual(first[0]["cumulativePercent"], 1)
         models = copy.deepcopy(state["windows"]["5h"]["models"])
         unavailable = event_sample("2030-01-01T02:00:00Z", cost=15)
         unavailable["windows"]["5h"] = {"unavailable": True}
-        self.assertEqual(process_sample_delta_events(state, unavailable, None), [])
+        self.assertEqual(process_sample_delta_events(state, unavailable), [])
         self.assertEqual(state["windows"]["5h"]["cumulativePercent"], 1)
         self.assertEqual(state["windows"]["5h"]["models"], models)
         self.assertNotIn("baselinePercent", state["windows"]["5h"])
-        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T03:00:00Z", five_hour=8, cost=18), None), [])
-        last = process_sample_delta_events(state, event_sample("2030-01-01T04:00:00Z", five_hour=9, cost=20), None)
+        self.assertEqual(process_sample_delta_events(state, event_sample("2030-01-01T03:00:00Z", five_hour=8, cost=18)), [])
+        last = process_sample_delta_events(state, event_sample("2030-01-01T04:00:00Z", five_hour=9, cost=20))
         self.assertEqual(last[0]["cumulativePercent"], 2)
         self.assertEqual(last[0]["cumulativeCostUsd"], 4)
         self.assertFalse(delta_state_needs_hydration(state))

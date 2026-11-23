@@ -36,11 +36,7 @@ def compact_quota(data: dict) -> dict:
     for label in TARGET_WINDOWS:
         if label not in windows:
             windows[label] = {"path": None, "values": {}, "unavailable": True}
-    return {"complete": not errors, "missingWindows": [], "windows": windows, "errors": errors}
-
-
-def compact_quota_for_debug(compact: dict) -> dict:
-    return {key: value for key, value in compact.items() if key != "matches"}
+    return {"complete": not errors, "windows": windows, "errors": errors}
 
 def fetch_usage(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Path | None, timeout: int, debug: dict | None = None, retries: int = DEFAULT_RETRY_LIMIT, auth_lock=None, refreshed_callback=None, allow_token_refresh: bool = True) -> dict:
     debug = debug if debug is not None else {}
@@ -97,5 +93,5 @@ def fetch_usage(auth: dict, opener: urllib.request.OpenerDirector, auth_path: Pa
         "rawResponse": data,
     })
     compact = compact_quota(data)
-    debug["compactQuota"] = compact_quota_for_debug(compact)
+    debug["compactQuota"] = compact
     return {"endpoint": USAGE_ENDPOINT, "status": status, "usage": compact}

@@ -31,7 +31,7 @@ class UsageAccountPollingTests(unittest.TestCase):
         self.assertEqual([(r["usageAccountId"], r["id"]) for r in state._inactive_usage_credentials()], [("b", "b1"), ("c", "c1")])
         state.inactive_account_poll_started_at["b"] = 100
         state.inactive_account_poll_started_at["c"] = 100
-        self.assertEqual(state.inactive_account_poll_wait_seconds(101), 599)
+        self.assertEqual(state.inactive_account_poll_wait_seconds(101), 179)
         with mock.patch.object(state, "_poll_inactive_account") as poll:
             self.assertEqual(state.poll_due_inactive_accounts(101), 0)
             poll.assert_not_called()

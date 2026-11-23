@@ -4,7 +4,7 @@
 
 **一个本地优先的 Codex 配额、Token、成本、账号、技能与加密同步仪表盘，并提供 VS Code 集成。**
 
-[![Version](https://img.shields.io/badge/version-1.5.13-4f8cff)](#快速开始)
+[![Version](https://img.shields.io/badge/version-1.6.14-4f8cff)](#快速开始)
 [![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![VS Code](https://img.shields.io/badge/VS%20Code-1.96%2B-007ACC?logo=visualstudiocode&logoColor=white)](https://code.visualstudio.com/)
 [![Platforms](https://img.shields.io/badge/platform-Windows%20%7C%20Linux-6b7280)](#运行要求)
@@ -78,7 +78,7 @@ python codex_monitor_daemon.py
 
 ### 2. 安装 VS Code 扩展
 
-在 VS Code 中安装 `release/codex-usage-monitor-1.5.13.vsix`：
+在 VS Code 中安装 `release/codex-usage-monitor-1.6.14.vsix`：
 
 1. 打开 **扩展**。
 2. 选择 **视图和更多操作 (…) → 从 VSIX 安装…**。
@@ -87,7 +87,7 @@ python codex_monitor_daemon.py
 也可以使用命令行：
 
 ```console
-code --install-extension release/codex-usage-monitor-1.5.13.vsix
+code --install-extension release/codex-usage-monitor-1.6.14.vsix
 ```
 
 ### 3. 完成首次设置
@@ -120,7 +120,7 @@ code --install-extension release/codex-usage-monitor-1.5.13.vsix
 
 账号保险库位于 `~/.codex-switch/accounts`。第一次启动时，当前有效的 `auth.json` 会保存为 **Current account**。
 
-当前账号的刷新令牌只由 Codex 轮换。监控服务会在轮询前重新加载并镜像 Codex 的实时 `auth.json`，在访问令牌有效时使用它；如果 Codex 尚未刷新即将过期的令牌，则暂停远程配额轮询。已就绪的非当前账号与 Codex 隔离并每十分钟轮询一次；监控服务可以轮换这些账号的凭据，会在账号选择器中标记轮询失败，并且不会重试结果不明确的刷新令牌轮换请求。
+当前账号的刷新令牌只由 Codex 轮换。监控服务会在轮询前重新加载并镜像 Codex 的实时 `auth.json`，在访问令牌有效时使用它；如果 Codex 尚未刷新即将过期的令牌，则暂停远程配额轮询。已就绪的非当前账号与 Codex 隔离并每三分钟轮询一次；监控服务可以轮换这些账号的凭据，会在账号选择器中标记轮询失败，并且不会重试结果不明确的刷新令牌轮换请求。
 
 ### 创建并登录另一个账号
 
@@ -247,16 +247,16 @@ Push 前请先执行 **Test WebDAV**。坚果云用户可以使用 `https://dav.
 
 规范 JSONL 备份已停用，现有文件保持不变。管理页的 `saveRawQuotaResponses` 默认关闭，显式启用后只记录额度 API 原始响应（包括无效响应）及采集时间、账号和状态元数据，不记录 Token 事件、成本、处理结果或认证头；日志失败不影响处理。
 
-每条 Token 事件保存按事件发生时价格计算的成本，价格更新后仍以已记录成本为准。按顺序执行的数据契约迁移在验证汇总后移除冗余价格时期记录及引用。旧会话汇总转换为 schema 2 的 `sessionBaseline` 记录，参与 Token 汇总，但不参与 Cost vs Usage 图表。无法从基线等价推导的旧源累计上限仍予保留，避免重复计数。
+每条 Token 事件保存按事件发生时价格计算的成本，价格更新后仍以已记录成本为准，并通过源解析检查点避免历史用量重复计入。
 
-云同步根目录中，每个账号只使用一个加密的 `accounts/<account-key>.enc` 文件，同时保存元数据和凭据。元数据接口不返回凭据内容。独立的云端状态文件和修订目录已停用；当前文件夹通过离线转换迁移，云契约保持为 5。
+云同步根目录中，每个账号只使用一个加密的 `accounts/<account-key>.enc` 文件，同时保存元数据和凭据。元数据接口不返回凭据内容。独立的云端状态文件和修订目录已停用，当前根目录遵循云契约 5。
 
-Local、对应的 Merged 变更、上传缓冲和解析检查点在同一事务提交。会话文件前缀不变时增量读取，替换、截断或前缀变化后重新解析并按稳定身份去重，保留已提交历史。契约 22 保留已有结果并转换旧归属结构；云契约 5 改用不可变包发现。本地已发布迁移及旧编解码仍保留，支持顺序升级和中断重试；云迁移代码已移除。
+Local、对应的 Merged 变更、上传缓冲和解析检查点在同一事务提交。会话文件前缀不变时增量读取，替换、截断或前缀变化后重新解析并按稳定身份去重，保留已提交历史。本地数据契约 27 在启动时校验运行时兼容性且不自动压缩数据库；云契约 5 采用不可变包发现，并拒绝旧版或不兼容的云同步根目录。
 
 > [!WARNING]
 > 请保护整个 `~/.codex-switch`。不要提交到仓库、放入支持包、写入日志或分享其内容截图。丢失加密口令后，远端加密数据将无法恢复。
 
-仪表盘序列与状态按配置的服务器地址开放读取。所有账号、技能、WebDAV、云端、服务器与配置修改都必须通过控制密码认证。控制请求不受来源限制，以便通过公网地址或反向代理部署时能够使用全部仪表盘功能。首次设置控制密码只允许本机。如果不需要局域网或广域网访问，请将服务器地址改为 `127.0.0.1` 并重启。默认 `0.0.0.0` 会监听所有网络接口；当网络将 8765 端口路由至监控程序时，可以通过请求中的局域网或公网 IP 完整使用受控制密码保护的仪表盘。
+仪表盘快照（`/api/dashboard`）、实时 WebSocket（`/api/dashboard/live`）与状态接口（`/api/status`）按配置的服务器地址开放读取。所有账号、技能、WebDAV、云端、服务器与配置修改都必须通过控制密码认证。控制请求不受来源限制，以便通过公网地址或反向代理部署时能够使用全部仪表盘功能。首次设置控制密码只允许本机。如果不需要局域网或广域网访问，请将服务器地址改为 `127.0.0.1` 并重启。默认 `0.0.0.0` 会监听所有网络接口；当网络将 8765 端口路由至监控程序时，可以通过请求中的局域网或公网 IP 完整使用受控制密码保护的仪表盘。
 
 ## 命令行参考
 
@@ -339,13 +339,13 @@ npm run release
 | `codex_monitor_daemon.py` | 标准 CLI 入口、监控服务启动、自动更新协调与重启。 |
 | `monitor_codex_usage.py` | 旧入口命令的兼容包装。 |
 | `monitor_auto_update.py` | 经校验的后台运行时更新器。 |
-| `monitor_migrations.py` | 本地/云端契约目标、顺序迁移、回滚恢复与旧格式转换。 |
+| `monitor_migrations.py` | 本地数据契约（27）启动校验与降级保护。 |
 | `monitor_dashboard.py` | 轮询循环、仪表盘/API 服务、响应缓存、控制认证与 UI 数据集。 |
 | `monitor_accounts.py` | 本地凭据保险库、身份安全切换、API 复制传输与 OpenAI 移动传输。 |
 | `monitor_cloud.py` | 配置、WebDAV、加密、串行云操作、软件包与使用记录。 |
 | `monitor_skills.py` | 技能发现、托管存储、验证、分配与投影。 |
 | `monitor_tokens.py` | 增量会话日志解析、Token 聚合、Fast 归因与成本计算。 |
-| `monitor_token_ledger.py` | 追加式 Token/成本账本、精简旧数据基线迁移与会话汇总派生。 |
+| `monitor_token_ledger.py` | 追加式 Token/成本账本与会话汇总派生。 |
 | `monitor_events.py` / `monitor_quota.py` | 远端使用量解释、重置处理与增量校验。 |
 | `monitor_history.py` / `monitor_usage_sync.py` | 本地持久化、压缩、来源信息、同步缓存与合并数据集。 |
 | `extension.js` / `package.json` | 轻量 VS Code 扩展宿主与清单。 |
@@ -362,4 +362,4 @@ SQLite 永久保存额度规范结果、区间及各账号、窗口的下降保�
 
 只使用 `reset_at`，完全忽略 `reset_after_seconds`。下降读数只有在重置时间前移且严格晚于“上次接受读数的采样时间 + 窗口周期（5 小时或 7 天）”时才直接接受；否则拒绝并将当前值设为下降保护基线。后续读数大于等于保护基线就接受并清除保护，小于基线则继续拒绝并更新保护基线。缺失窗口保留状态，套餐变化重新建立基线，两个窗口独立处理，拒绝读数不会事后转为接受。
 
-待发布本地合同 26 合并身份表清理与增量交付重构：旧快照和 journal 流式转为最终 `delivery_items`，移除 preparation 副本及永久整份快照。已交付 Token 分组固定，新增只追加，Quota 仅更新局部额度曲线和成本归因。完整快照按需从最终行流式生成到共享临时文件。转换切换一次 epoch，保留成本、上传状态及解析进度，不回放有效 Canonical、不自动压缩数据库；云合同保持 5。详见 [交付说明](dashboard-delivery.md) 和 [实测结果](final-delivery-benchmark.md)。
+本地合同 27 移除冗余 `canonical_seen` 存储并使用原子化的 Canonical Token 主键，交付系统直接由最终 `delivery_items` 行构建增量更新与按需流式快照（不再维护 preparation 副本及永久整份快照）。已交付 Token 分组固定，新增只追加，Quota 仅更新局部额度曲线和成本归因；云合同保持 5。详见 [交付说明](dashboard-delivery.md)。
