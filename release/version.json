@@ -1,13 +1,13 @@
 {
-  "version": "1.6.13",
+  "version": "1.6.14",
   "files": {
     "codex_monitor_daemon.py": {
       "size": 3497,
       "sha256": "089fe5f8892617473fec571a0ada1740fb3a38b69452ce6f5a7ecbdcf6761fa3"
     },
     "dashboard.html": {
-      "size": 130376,
-      "sha256": "0473083644481918501510fc2376d5d1057423b9cbcad856cdca9d60312ecede"
+      "size": 130454,
+      "sha256": "c9ff2cefe99e4d1964cf5e8709f143cbc13b31e6158a5304dd6a5e6c400b9bc5"
     },
     "LICENSE": {
       "size": 35147,
@@ -167,7 +167,7 @@
     },
     "version.json": {
       "size": 88,
-      "sha256": "705346c8a3da6e3a7d13bc842a500323392e20f6db7e4ed21962c1c0055ee624"
+      "sha256": "cffa29ab6673979857b007121097000e89f218a441d67e4c2ee42d9b0a837c27"
     }
   }
 }

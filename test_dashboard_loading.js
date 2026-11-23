@@ -17,9 +17,21 @@ test("usage and spending folds require the configured width savings", () => {
         h.context.candidateKind = kind;
         for (const [width, expected] of [[threshold, 0], [threshold + 1, 1]]) {
             h.context.candidateWidth = width;
-            assert.equal(h.run("usageTimeFolds([], 'fiveHour', null, 0, 1000, 0, 1000, 6).length"), expected, `${kind} usage at ${width}px`);
-            assert.equal(h.run("costTimeFolds({start:0,end:1000}, [], 0, 1000, 6).length"), expected, `${kind} spending at ${width}px`);
+            assert.equal(h.run("usageTimeFolds([], 'fiveHour', null, 0, 43200, 0, 43200, 6).length"), expected, `${kind} usage at ${width}px`);
+            assert.equal(h.run("costTimeFolds({start:0,end:43200}, [], 0, 43200, 6).length"), expected, `${kind} spending at ${width}px`);
         }
+    }
+});
+
+test("folding starts at twelve hours for usage and spending", () => {
+    const h = harness();
+    h.run(`usageTimeFoldMetrics=ranges=>ranges.map(range=>({...range,width:10}));
+        usageTimeFoldCandidates=()=>[{start:100,end:1000,duration:900,kind:'gap'}];
+        costTimeFoldCandidates=()=>[{start:100,end:1000,duration:900,kind:'gap'}];`);
+    for (const [span, expected] of [[43199, 0], [43200, 1]]) {
+        h.context.span = span;
+        assert.equal(h.run("usageTimeFolds([], 'fiveHour', null, 0, span, 0, span, 6).length"), expected);
+        assert.equal(h.run("costTimeFolds({start:0,end:span}, [], 0, span, 6).length"), expected);
     }
 });
 
@@ -30,7 +42,7 @@ test("flat usage folds preserve gaps in other selected accounts", () => {
         valueOf=point=>point.fiveHour.continuous;`);
     assert.deepEqual(JSON.parse(h.run("JSON.stringify(usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,false,true).map(({start,end})=>[start,end]))")), [[23400, 37000]]);
     assert.deepEqual(JSON.parse(h.run("JSON.stringify(usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,true,true).map(({start,end})=>[start,end]))")), [[0, 37000]]);
-    assert.ok(h.run("usageTimeFolds(groups,'fiveHour',valueOf,0,38000,0,800,6,false,true).length") > 0);
+    assert.ok(h.run("usageTimeFolds(groups,'fiveHour',valueOf,0,43200,0,800,6,false,true).length") > 0);
     assert.equal(h.run("usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,true,false).length"), 0);
     h.run("groups[1][1]=[point(23400,0),point(37000,0),point(38000,3)]");
     assert.deepEqual(JSON.parse(h.run("JSON.stringify(usageTimeFoldCandidates(groups,'fiveHour',valueOf,0,38000,false,true).map(({start,end})=>[start,end]))")), [[23400, 37000]]);
@@ -398,7 +410,7 @@ test("combined chart collapses only zero spending with BOTH quota windows unchan
     const h = combinedCostHarness();
     assert.equal(h.run("costTimeFoldCandidates(fixture,costTimeUsageSeries(0,36000)).length"), 1);
     assert.equal(h.run("costTimeFoldCandidates(fixture,costTimeUsageSeries(0,36000))[0].start"), 3600);
-    assert.ok(h.run("costTimeFolds(fixture,costTimeUsageSeries(0,36000),0,1000,6).length") > 0);
+    assert.equal(h.run("costTimeFolds(fixture,costTimeUsageSeries(0,36000),0,1000,6).length"), 0);
     h.run("fixture.buckets[1].amount=1");
     assert.equal(h.run("costTimeFoldCandidates(fixture,costTimeUsageSeries(0,36000)).length"), 0);
     h.run("fixture.buckets[1].amount=0;payload.quotaPoints[2].sevenDay.continuous=2.1");
@@ -424,14 +436,14 @@ test("combined chart requires every account and does not treat missing quota as 
 
 test("combined flat toggle and folded coordinates preserve active cost and time lookup", () => {
     const h = combinedCostHarness();
-    h.run("fixture.end=10800;fixture.buckets=[{start:0,end:1800,amount:1},{start:1800,end:9000,amount:0},{start:9000,end:10800,amount:2}];payload.quotaPoints.forEach((point,index)=>point.timestamp=[0,1800,9000,10800][index]);");
-    assert.equal(h.run("costTimeFoldCandidates(fixture,costTimeUsageSeries(0,10800))[0].kind"), "unchanged");
+    h.run("fixture.end=43200;fixture.buckets=[{start:0,end:7200,amount:1},{start:7200,end:36000,amount:0},{start:36000,end:43200,amount:2}];payload.quotaPoints.forEach((point,index)=>{point.timestamp=[0,7200,36000,43200][index];point.breakBefore=false});");
+    assert.equal(h.run("costTimeFoldCandidates(fixture,costTimeUsageSeries(0,43200))[0].kind"), "unchanged");
     h.run("collapseUsageFlat=false");
-    assert.equal(h.run("costTimeFoldCandidates(fixture,costTimeUsageSeries(0,10800)).length"), 0);
-    h.run("collapseUsageFlat=true;folds=costTimeFolds(fixture,costTimeUsageSeries(0,10800),0,1000,6);scale=usageTimeScale(0,10800,folds,0,1000)");
+    assert.equal(h.run("costTimeFoldCandidates(fixture,costTimeUsageSeries(0,43200)).length"), 0);
+    h.run("collapseUsageFlat=true;folds=costTimeFolds(fixture,costTimeUsageSeries(0,43200),0,1000,6);scale=usageTimeScale(0,43200,folds,0,1000)");
     assert.ok(h.run("folds.length") > 0);
-    assert.ok(h.run("Math.abs(scale.timestampAt(scale.x(4500))-4500)") < 1e-6);
-    assert.ok(h.run("scale.x(1800)-scale.x(0)") > 150);
+    assert.ok(h.run("Math.abs(scale.timestampAt(scale.x(18000))-18000)") < 1e-6);
+    assert.ok(h.run("scale.x(7200)-scale.x(0)") > 150);
 });
 
 test("combined canvas keeps quota curves and excludes quota from cost tooltips", () => {

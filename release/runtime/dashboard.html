@@ -1072,6 +1072,7 @@ function usageTimeFinalizeEdgeFolds(folds,x0,x1,left,right){
   return folds.map(fold=>{const start=fold.sourceStart+fold.leadingMargin*secondsPerPixel, end=fold.sourceEnd-fold.trailingMargin*secondsPerPixel;return {...fold,start,end,duration:end-start}});
 }
 function usageTimeFolds(groups,label,valueOf,x0,x1,left,right,charWidth,collapseGaps=true,collapseFlat=true){
+  if(x1-x0<12*3600)return [];
   const folds=[], candidates=usageTimeFoldMetrics(usageTimeFoldCandidates(groups,label,valueOf,x0,x1,collapseGaps,collapseFlat).map(range=>usageTimeEdgeFoldRange(range,x0,x1,left,right)).filter(Boolean),x0,x1,left,right,charWidth);
   while(true){
     const timeScale=usageTimeScale(x0,x1,folds,left,right), additions=candidates.filter(gap=>!folds.includes(gap)&&timeScale.x(gap.end)-timeScale.x(gap.start)>gap.width*(gap.kind==="gap"?3:6));
@@ -1362,6 +1363,7 @@ function costTimeFoldCandidates(series,usage){
   return candidates;
 }
 function costTimeFolds(series,usage,left,right,charWidth){
+  if(series.end-series.start<12*3600)return [];
   const folds=[], candidates=usageTimeFoldMetrics(costTimeFoldCandidates(series,usage).map(range=>usageTimeEdgeFoldRange(range,series.start,series.end,left,right)).filter(Boolean),series.start,series.end,left,right,charWidth);
   while(true){
     const scale=usageTimeScale(series.start,series.end,folds,left,right);
